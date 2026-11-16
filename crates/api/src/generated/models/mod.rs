@@ -642,6 +642,8 @@ pub mod run_workflow_step_run_element;
 pub use self::run_workflow_step_run_element::RunWorkflowStepRunElement;
 pub mod run_workflow_wait;
 pub use self::run_workflow_wait::RunWorkflowWait;
+pub mod run_workflow_wait_question;
+pub use self::run_workflow_wait_question::RunWorkflowWaitQuestion;
 pub mod runner_activation;
 pub use self::runner_activation::RunnerActivation;
 pub mod runner_activation_artifact;

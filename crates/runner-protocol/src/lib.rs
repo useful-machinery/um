@@ -254,12 +254,86 @@ pub struct TreeRootProgress {
     pub steps: Vec<TreeStepObservation>,
 }
 
-/// The `{kind, since, step}` of a waiting tree run's `wait.json`.
+/// The wait a waiting tree run reports: the `{kind, since, step}` of its
+/// `wait.json` and, for an answer wait, the questions it asks (REQ-COMPAT-18).
+/// `questions` is `None` when the wait reports none, and the encoder then
+/// writes no `questions` member; `Some` of an empty list is written as `[]`.
+/// The schema admits `questions` only on kind `answer`, which the encoder does
+/// not check.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeProgressWait {
     pub kind: String,
     pub since: String,
     pub step: Vec<Value>,
+    pub questions: Option<TreeProgressWaitQuestions>,
+}
+
+/// At most this many questions on one wait; mirrors the schema's `maxItems` on
+/// `TreeProgressWait.questions`.
+pub const MAXIMUM_TREE_PROGRESS_WAIT_QUESTIONS: usize = 64;
+/// At most this many characters in a question `id`; mirrors the schema's
+/// `maxLength` on `TreeProgressWaitQuestion.id`.
+pub const MAXIMUM_TREE_PROGRESS_WAIT_QUESTION_ID_CHARACTERS: usize = 255;
+/// At most this many bytes in the `questions` array as the encoder writes it;
+/// mirrors `runnerprotocol.MaxTreeProgressWaitQuestionsBytes`, which keeps a
+/// report ordinary-size beside 64 worst-case step observations.
+pub const MAXIMUM_TREE_PROGRESS_WAIT_QUESTIONS_BYTES: usize = 98_304;
+
+/// One question an answer wait asks: the `id` an answer names and the
+/// question's optional text.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreeProgressWaitQuestion {
+    pub id: String,
+    pub text: Option<String>,
+}
+
+/// The questions of one answer wait, within the bounds Cloud admits
+/// (REQ-COMPAT-18). Only [`TreeProgressWaitQuestions::new`] makes one, so the
+/// encoder is never handed a list Cloud refuses: a refused list would fail
+/// `encode_runner_frame` or exceed the ordinary frame size, and a root report
+/// that cannot be sent ends the run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreeProgressWaitQuestions(Vec<TreeProgressWaitQuestion>);
+
+impl TreeProgressWaitQuestions {
+    /// The list, or `None` when any bound breaks: more than
+    /// [`MAXIMUM_TREE_PROGRESS_WAIT_QUESTIONS`] questions, an empty `id` or one
+    /// over [`MAXIMUM_TREE_PROGRESS_WAIT_QUESTION_ID_CHARACTERS`] characters, a
+    /// NUL in an `id` or a text, or an encoded array over
+    /// [`MAXIMUM_TREE_PROGRESS_WAIT_QUESTIONS_BYTES`]. Nothing is truncated.
+    pub fn new(questions: Vec<TreeProgressWaitQuestion>) -> Option<Self> {
+        let admitted = questions.len() <= MAXIMUM_TREE_PROGRESS_WAIT_QUESTIONS
+            && questions.iter().all(|question| {
+                !question.id.is_empty()
+                    && question.id.chars().count()
+                        <= MAXIMUM_TREE_PROGRESS_WAIT_QUESTION_ID_CHARACTERS
+                    && !question.id.contains('\0')
+                    && !question
+                        .text
+                        .as_deref()
+                        .is_some_and(|text| text.contains('\0'))
+            });
+        let questions = Self(questions);
+        let encoded = serde_json::to_vec(&tree_progress_wait_questions_value(&questions)).ok()?;
+        (admitted && encoded.len() <= MAXIMUM_TREE_PROGRESS_WAIT_QUESTIONS_BYTES)
+            .then_some(questions)
+    }
+}
+
+/// The `questions` array exactly as the encoder writes it, which is also what
+/// [`TreeProgressWaitQuestions::new`] measures.
+fn tree_progress_wait_questions_value(questions: &TreeProgressWaitQuestions) -> Value {
+    questions
+        .0
+        .iter()
+        .map(|question| {
+            let mut value = json!({ "id": question.id });
+            if let Some(text) = &question.text {
+                value["text"] = json!(text);
+            }
+            value
+        })
+        .collect()
 }
 
 /// One step observation of a tree run (REQ-COMPAT-18): the run inside the tree
@@ -1375,11 +1449,17 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
                 "attempt": progress.attempt,
                 "state": if progress.wait.is_some() { "waiting" } else { "running" },
                 "position": progress.position,
-                "wait": progress.wait.as_ref().map(|wait| json!({
-                    "kind": wait.kind,
-                    "since": wait.since,
-                    "step": wait.step,
-                })),
+                "wait": progress.wait.as_ref().map(|wait| {
+                    let mut value = json!({
+                        "kind": wait.kind,
+                        "since": wait.since,
+                        "step": wait.step,
+                    });
+                    if let Some(questions) = &wait.questions {
+                        value["questions"] = tree_progress_wait_questions_value(questions);
+                    }
+                    value
+                }),
                 "reportedAt": progress.reported_at,
             });
             if !progress.steps.is_empty() {
@@ -3338,6 +3418,11 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/tree-progress-steps.json"
         )),
+        // REQ-COMPAT-18
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/tree-progress-waiting-questions.json"
+        )),
         // REQ-TRIGGER-136
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -3487,6 +3572,19 @@ mod tests {
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/invalid/tree-progress-steps-too-many.json"
+        )),
+        // REQ-COMPAT-18
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/tree-progress-questions-other-wait.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/tree-progress-questions-too-many.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/tree-progress-questions-empty-id.json"
         )),
         // REQ-TRIGGER-136
         include_bytes!(concat!(
@@ -3766,31 +3864,42 @@ mod tests {
         }
     }
 
-    // REQ-RUN-88, REQ-RUNNERENROLL-99
-    #[test]
-    fn tree_progress_encodes_the_contract_fixtures_and_requires_a_wait_while_waiting() {
-        let fixture = |name: &str| -> Value {
-            let path = format!(
-                "{}/../../tests/fixtures/runner-protocol/v1/valid/{name}",
-                env!("CARGO_MANIFEST_DIR")
-            );
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
-        };
-        let progress =
-            |message_id: &str, sequence, progress_sequence, progress| RunnerFrame::TreeProgress {
-                envelope: RunnerEnvelope {
-                    message_id: message_id.to_owned(),
-                    runner_id: "rnr_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-                    boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-                    sequence,
-                    sent_at: format!("2026-07-23T00:00:0{sequence}Z"),
-                },
-                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-                attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-                progress_sequence,
-                progress,
-            };
-        let waiting = progress(
+    fn valid_runner_fixture(name: &str) -> Value {
+        let path = format!(
+            "{}/../../tests/fixtures/runner-protocol/v1/valid/{name}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+    }
+
+    fn tree_progress_frame(
+        message_id: &str,
+        sequence: u64,
+        progress_sequence: u64,
+        progress: TreeRootProgress,
+    ) -> RunnerFrame {
+        RunnerFrame::TreeProgress {
+            envelope: RunnerEnvelope {
+                message_id: message_id.to_owned(),
+                runner_id: "rnr_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                sequence,
+                sent_at: format!("2026-07-23T00:00:0{sequence}Z"),
+            },
+            assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            progress_sequence,
+            progress,
+        }
+    }
+
+    /// The waiting report of `tree-progress-waiting.json`, with the given wait
+    /// kind and questions.
+    fn fixture_waiting_report(
+        kind: &str,
+        questions: Option<TreeProgressWaitQuestions>,
+    ) -> RunnerFrame {
+        tree_progress_frame(
             "rmsg_01k0z6r1w8f4jy2m7q9v3x5atp",
             6,
             2,
@@ -3798,20 +3907,27 @@ mod tests {
                 attempt: 2,
                 position: vec![json!("merge")],
                 wait: Some(TreeProgressWait {
-                    kind: "external".to_owned(),
+                    kind: kind.to_owned(),
                     since: "2026-07-23T00:00:05Z".to_owned(),
                     step: vec![json!("merge")],
+                    questions,
                 }),
                 reported_at: "2026-07-23T00:00:06Z".to_owned(),
                 steps: Vec::new(),
             },
-        );
+        )
+    }
+
+    // REQ-RUN-88, REQ-RUNNERENROLL-99
+    #[test]
+    fn tree_progress_encodes_the_contract_fixtures_and_requires_a_wait_while_waiting() {
+        let waiting = fixture_waiting_report("external", None);
         let encoded = encode_runner_frame(&waiting).unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&encoded).unwrap(),
-            fixture("tree-progress-waiting.json")
+            valid_runner_fixture("tree-progress-waiting.json")
         );
-        let running = progress(
+        let running = tree_progress_frame(
             "rmsg_01k0z6r1w8f4jy2m7q9v3x5atq",
             5,
             1,
@@ -3826,12 +3942,147 @@ mod tests {
         let encoded = encode_runner_frame(&running).unwrap();
         assert_eq!(
             serde_json::from_slice::<Value>(&encoded).unwrap(),
-            fixture("tree-progress-running.json")
+            valid_runner_fixture("tree-progress-running.json")
         );
 
-        let mut unwaiting = fixture("tree-progress-waiting.json");
+        let mut unwaiting = valid_runner_fixture("tree-progress-waiting.json");
         unwaiting["payload"]["wait"] = Value::Null;
         assert!(decode_frame(&serde_json::to_vec(&unwaiting).unwrap()).is_err());
+    }
+
+    fn question(id: &str, text: Option<&str>) -> TreeProgressWaitQuestion {
+        TreeProgressWaitQuestion {
+            id: id.to_owned(),
+            text: text.map(str::to_owned),
+        }
+    }
+
+    /// One question whose `questions` array encodes to exactly `bytes` bytes.
+    fn questions_of_encoded_size(bytes: usize) -> Vec<TreeProgressWaitQuestion> {
+        let overhead = serde_json::to_vec(&json!([{"id": "a", "text": ""}]))
+            .unwrap()
+            .len();
+        vec![question("a", Some(&"x".repeat(bytes - overhead)))]
+    }
+
+    // REQ-COMPAT-18, REQ-RUNNERENROLL-119: the bounds a wait's questions are reported
+    // within, whole or not at all.
+    #[test]
+    fn tree_progress_wait_writes_only_questions_cloud_admits() {
+        let encoded_payload = |frame: &RunnerFrame| {
+            let encoded = encode_runner_frame(frame).expect("the frame encodes");
+            assert!(decode_frame(&encoded).is_ok());
+            serde_json::from_slice::<Value>(&encoded).unwrap()
+        };
+
+        let asked = TreeProgressWaitQuestions::new(vec![
+            question("scope", Some("Which packages does the change cover?")),
+            question("2", None),
+        ])
+        .expect("the fixture's questions are admitted");
+        assert_eq!(
+            encoded_payload(&fixture_waiting_report("answer", Some(asked))),
+            valid_runner_fixture("tree-progress-waiting-questions.json")
+        );
+        let unknown = encoded_payload(&fixture_waiting_report("answer", None));
+        assert!(unknown["payload"]["wait"].get("questions").is_none());
+        let none = TreeProgressWaitQuestions::new(Vec::new()).expect("an empty list is admitted");
+        let empty = encoded_payload(&fixture_waiting_report("answer", Some(none)));
+        assert_eq!(empty["payload"]["wait"]["questions"], json!([]));
+
+        let refused = [
+            (0..=MAXIMUM_TREE_PROGRESS_WAIT_QUESTIONS)
+                .map(|ordinal| question(&ordinal.to_string(), None))
+                .collect(),
+            vec![question("", None)],
+            vec![question(
+                &"a".repeat(MAXIMUM_TREE_PROGRESS_WAIT_QUESTION_ID_CHARACTERS + 1),
+                None,
+            )],
+            vec![question("a\0b", None)],
+            vec![question("a", Some("a\0b"))],
+            questions_of_encoded_size(MAXIMUM_TREE_PROGRESS_WAIT_QUESTIONS_BYTES + 1),
+        ];
+        for questions in refused {
+            assert_eq!(TreeProgressWaitQuestions::new(questions), None);
+        }
+
+        let at_bound = questions_of_encoded_size(MAXIMUM_TREE_PROGRESS_WAIT_QUESTIONS_BYTES);
+        let admitted = [
+            (1..=MAXIMUM_TREE_PROGRESS_WAIT_QUESTIONS)
+                .map(|ordinal| question(&ordinal.to_string(), None))
+                .collect(),
+            vec![question(
+                &"\u{1F600}".repeat(MAXIMUM_TREE_PROGRESS_WAIT_QUESTION_ID_CHARACTERS),
+                None,
+            )],
+            at_bound.clone(),
+            vec![question(
+                "quoted",
+                Some("say \"so\"\nthen\u{2028}\u{1F600}"),
+            )],
+        ];
+        for questions in admitted {
+            let questions = TreeProgressWaitQuestions::new(questions.clone())
+                .unwrap_or_else(|| panic!("refused {questions:?}"));
+            let frame = encoded_payload(&fixture_waiting_report("answer", Some(questions.clone())));
+            assert_eq!(
+                frame["payload"]["wait"]["questions"],
+                tree_progress_wait_questions_value(&questions)
+            );
+        }
+        let frame = encoded_payload(&fixture_waiting_report(
+            "answer",
+            TreeProgressWaitQuestions::new(at_bound),
+        ));
+        assert_eq!(
+            serde_json::to_vec(&frame["payload"]["wait"]["questions"])
+                .unwrap()
+                .len(),
+            MAXIMUM_TREE_PROGRESS_WAIT_QUESTIONS_BYTES
+        );
+
+        // The largest report Cloud admits: questions at the bound beside 64
+        // worst-case step observations and the longest position and wait step.
+        let step = |ordinal: usize| format!("s{ordinal:063}");
+        let path = (0..64)
+            .map(|ordinal| json!(step(ordinal)))
+            .collect::<Vec<_>>();
+        let maximal = RunnerFrame::TreeProgress {
+            envelope: maximal_envelope(),
+            assignment_id: "asn_07zzzzzzzzzzzzzzzzzzzzzzzz".to_owned(),
+            attempt_id: "atm_07zzzzzzzzzzzzzzzzzzzzzzzz".to_owned(),
+            progress_sequence: i64::MAX as u64,
+            progress: TreeRootProgress {
+                attempt: 2_147_483_647,
+                position: path.clone(),
+                wait: Some(TreeProgressWait {
+                    kind: "answer".to_owned(),
+                    since: "9999-12-31T23:59:59.999999999Z".to_owned(),
+                    step: path,
+                    questions: TreeProgressWaitQuestions::new(questions_of_encoded_size(
+                        MAXIMUM_TREE_PROGRESS_WAIT_QUESTIONS_BYTES,
+                    )),
+                }),
+                reported_at: "9999-12-31T23:59:59.999999999Z".to_owned(),
+                steps: (0..64)
+                    .map(|ordinal| TreeStepObservation {
+                        run: (0..16)
+                            .map(|depth| TreeStepRunElement {
+                                step: step(depth),
+                                item: Some(2_147_483_647),
+                                ordinal: 2_147_483_647,
+                            })
+                            .collect(),
+                        run_attempt: 2_147_483_647,
+                        step: step(ordinal),
+                        state: TreeStepState::CapturingOutputs,
+                    })
+                    .collect(),
+            },
+        };
+        let encoded = encode_runner_frame(&maximal).expect("the maximal report encodes");
+        assert!(encoded.len() <= MAXIMUM_ORDINARY_FRAME_BYTES);
     }
 
     // REQ-COMPAT-18
@@ -3943,13 +4194,7 @@ mod tests {
     // REQ-TRIGGER-136
     #[test]
     fn trigger_delivery_decodes_its_event_and_claim_and_the_application_encodes_the_fixtures() {
-        let fixture = |name: &str| -> Value {
-            let path = format!(
-                "{}/../../tests/fixtures/runner-protocol/v1/valid/{name}",
-                env!("CARGO_MANIFEST_DIR")
-            );
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
-        };
+        let fixture = valid_runner_fixture;
         let delivered = fixture("cloud-trigger-delivery.json");
         let CloudFrame::TriggerDelivery {
             effect_id,
@@ -4033,13 +4278,7 @@ mod tests {
     // REQ-RUNNERENROLL-90
     #[test]
     fn run_control_decodes_its_kind_and_the_application_encodes_the_fixtures() {
-        let fixture = |name: &str| -> Value {
-            let path = format!(
-                "{}/../../tests/fixtures/runner-protocol/v1/valid/{name}",
-                env!("CARGO_MANIFEST_DIR")
-            );
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
-        };
+        let fixture = valid_runner_fixture;
         let control = |document: &Value| {
             let CloudFrame::RunControl {
                 effect_id,

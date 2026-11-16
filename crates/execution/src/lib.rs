@@ -204,8 +204,9 @@ pub use workflow::wait::{
     CONTROL_ANSWER, CONTROL_APPROVE, CONTROL_CANCEL, CONTROL_HAND_BACK, CONTROL_INTERRUPT,
     CONTROL_LIFT, CONTROL_RELEASE, CONTROL_RETRY, CONTROL_STOP, CONTROL_WITHDRAW, ConditionError,
     ConditionSource, ControlEvent, ControlTrigger, Event, ExternalEvent, NoConditions, RuleError,
-    WaitKind, WaitRecord, WaitRule, append_control, evaluate, event_literal, position_path,
-    read_controls, read_numbered_controls, stop_in_force, wait_identity, wait_payload,
+    WaitKind, WaitQuestion, WaitQuestions, WaitRecord, WaitRule, append_control, evaluate,
+    event_literal, position_path, read_controls, read_numbered_controls, stop_in_force,
+    wait_identity, wait_payload, wait_questions,
 };
 pub use workflow::workspace_snapshot::{
     CloudContinuationSnapshot, capture_cloud_continuation_snapshot,

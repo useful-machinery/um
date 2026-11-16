@@ -120,6 +120,62 @@ pub struct WaitRecord {
     pub payload: Map<String, Value>,
 }
 
+/// One question an `answer` wait's payload lists: the `id` an answer names and the
+/// question's text, when the payload gives one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WaitQuestion {
+    pub id: String,
+    pub text: Option<String>,
+}
+
+/// The questions an `answer` wait's payload asks (REQ-LOCALRUN-182, REQ-RUNNERENROLL-119).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WaitQuestions {
+    /// The payload's `questions` array, in order: an answer names one of these ids, and the
+    /// answer set is complete once each has an answer.
+    Listed(Vec<WaitQuestion>),
+    /// A payload without such an array asks one question, which any id answers; its text
+    /// is the payload's `questions` when that is a string.
+    Unlisted { text: Option<String> },
+}
+
+/// The questions `payload`, a wait record's payload, asks (REQ-LOCALRUN-182): when its
+/// `questions` is an array, each element by its string `id`, else its one-based position as
+/// a decimal string, and by its text, the element itself when it is a string, else its
+/// string `text`, else its string `question`; otherwise the one question of
+/// `WaitQuestions::Unlisted`. `um workflow run answer` and the runner's progress report
+/// read a wait's questions through this one function (REQ-RUNNERENROLL-119).
+pub fn wait_questions(payload: &Map<String, Value>) -> WaitQuestions {
+    let Some(questions) = payload.get("questions").and_then(Value::as_array) else {
+        return WaitQuestions::Unlisted {
+            text: payload
+                .get("questions")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        };
+    };
+    let string = |question: &Value, field: &str| {
+        question
+            .get(field)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    WaitQuestions::Listed(
+        questions
+            .iter()
+            .enumerate()
+            .map(|(index, question)| WaitQuestion {
+                id: string(question, "id").unwrap_or_else(|| (index + 1).to_string()),
+                text: question
+                    .as_str()
+                    .map(str::to_owned)
+                    .or_else(|| string(question, "text"))
+                    .or_else(|| string(question, "question")),
+            })
+            .collect(),
+    )
+}
+
 /// One `controls/<NNNN>-<event>.json` (REQ-WFDEF-6).
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]

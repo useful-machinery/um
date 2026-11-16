@@ -56,8 +56,9 @@ const RUN_URL: &str = "https://usefulmachinery.com/acme/runs/run_01k0z6r1w8f4jy2
 /// engine's `{"outcome":"succeeded"}` when it is unset: for state `waiting`
 /// beside a `wait.json` of kind `$TREE_TEST_WAIT_KIND` whose rule names
 /// `$TREE_TEST_WAIT_SOURCE`, its `step` and the record's `position` the JSON
-/// `$TREE_TEST_POSITION` (`["merge"]` when unset) and its `then` `$TREE_TEST_THEN` (`merge`
-/// when unset), the record first reading `running` at that position while
+/// `$TREE_TEST_POSITION` (`["merge"]` when unset), its `then` `$TREE_TEST_THEN` (`merge`
+/// when unset) and its `payload` the JSON `$TREE_TEST_WAIT_PAYLOAD` (`{}` when unset), the
+/// record first reading `running` at that position while
 /// `$TREE_TEST_LOG/running` exists, and for state `cancellable` a running record until `run
 /// cancel` ends it `canceled`; for state `refused` it makes no run and answers with the
 /// runtime's rejection of a root whose `requires.tools` names a missing tool. Each `run resume` appends its command line to
@@ -95,6 +96,8 @@ const UM_FIXTURE: &str = r#"#!/bin/sh
 log="$TREE_TEST_LOG"
 position='["merge"]'
 [ -z "$TREE_TEST_POSITION" ] || position="$TREE_TEST_POSITION"
+wait_payload='{}'
+[ -z "$TREE_TEST_WAIT_PAYLOAD" ] || wait_payload="$TREE_TEST_WAIT_PAYLOAD"
 if [ -f "$log/noise" ]; then head -c "$(cat "$log/noise")" /dev/zero >&2; fi
 stage() {
   if [ -d "$log/stages/$1" ]; then cp -R "$log/stages/$1/." "$run/"; fi
@@ -146,7 +149,7 @@ case "$1 $2 $3" in
       n=0
       while [ -e "$log/running" ] && [ "$n" -lt 400 ]; do sleep 0.05; n=$((n + 1)); done
     fi
-    printf '{"kind":"%s","since":"2026-07-23T00:00:05Z","step":%s,"then":"%s","rule":{"source":"%s","event":"pull_request.merged"},"payload":{}}\n' "$TREE_TEST_WAIT_KIND" "$position" "${TREE_TEST_THEN:-merge}" "$TREE_TEST_WAIT_SOURCE" > "$run/wait.json"
+    printf '{"kind":"%s","since":"2026-07-23T00:00:05Z","step":%s,"then":"%s","rule":{"source":"%s","event":"pull_request.merged"},"payload":%s}\n' "$TREE_TEST_WAIT_KIND" "$position" "${TREE_TEST_THEN:-merge}" "$TREE_TEST_WAIT_SOURCE" "$wait_payload" > "$run/wait.json"
     printf '{"state":"waiting","outcome":null,"attempts":1,"position":%s}\n' "$position" > "$run/run.json"
     ;;
   exited)
@@ -2903,6 +2906,166 @@ async fn later_progress_carries_only_changed_steps_under_their_engine_attempt() 
     assert_eq!(chosen_outcome(&reports).as_deref(), Some("landed"));
 }
 
+/// The `wait` of each encoded `tree_progress` frame among `reports` that carries one, as
+/// Cloud reads it, beside the frame's step observations.
+fn reported_waits(reports: &[ExecutionReport], offer: &AssignmentOffer) -> Vec<(Value, Value)> {
+    reports
+        .iter()
+        .map(|report| encoded_frame(report, offer))
+        .filter(|frame| frame["type"] == "tree_progress" && !frame["payload"]["wait"].is_null())
+        .map(|mut frame| {
+            (
+                frame["payload"]["wait"].take(),
+                frame["payload"]["steps"].take(),
+            )
+        })
+        .collect()
+}
+
+/// A control answering the fixture's `answer` wait.
+fn answering(id: &str) -> Value {
+    json!({
+        "kind": "answer",
+        "wait": {"kind": "answer", "since": WAIT_SINCE},
+        "answers": [{"question": id, "text": "Yes."}],
+    })
+}
+
+// REQ-RUNNERENROLL-119: an `answer` wait's report carries the questions its payload asks,
+// whole or not at all, and the run goes on either way; another kind's carries none.
+#[tokio::test]
+async fn waiting_report_carries_the_questions_of_an_answer_wait_whole_or_not_at_all() {
+    let many = (1..=65)
+        .map(|n| json!({ "id": format!("q{n}"), "text": "?" }))
+        .collect::<Vec<_>>();
+    let cases = [
+        (
+            "answer",
+            json!({"questions": [
+                {"question": "A", "default": "x"},
+                {"question": "B", "default": "y"},
+            ]}),
+            Some(json!([{ "id": "1", "text": "A" }, { "id": "2", "text": "B" }])),
+        ),
+        (
+            "answer",
+            json!({"questions": "Which scope?"}),
+            Some(json!([{ "id": "1", "text": "Which scope?" }])),
+        ),
+        ("answer", json!({"questions": []}), Some(json!([]))),
+        ("answer", json!({ "questions": many }), None),
+        (
+            "answer",
+            json!({"questions": [{"id": "scope", "text": "A\u{0}B"}]}),
+            None,
+        ),
+        (
+            "approval",
+            json!({"questions": [{"id": "scope", "text": "A"}]}),
+            None,
+        ),
+    ];
+    for (kind, payload, questions) in cases {
+        let payload = payload.to_string();
+        let mut fixture =
+            control_wait_fixture(kind, &[("TREE_TEST_WAIT_PAYLOAD", payload.as_str())]);
+        start(&mut fixture).await;
+        wait_for_waiting(&mut fixture).await;
+        let control = if kind == "answer" {
+            answering("1")
+        } else {
+            resolving("approve", kind)
+        };
+        send_control(&mut fixture, CONTROL_ID, control);
+        let reports = finished_reports(&mut fixture.manager).await;
+
+        let mut expected = json!({ "kind": kind, "since": WAIT_SINCE, "step": ["merge"] });
+        if let Some(questions) = questions {
+            expected["questions"] = questions;
+        }
+        let waits = reported_waits(&reports, &fixture.offer);
+        assert!(!waits.is_empty(), "{payload}: {reports:#?}");
+        for (wait, _) in &waits {
+            assert_eq!(wait, &expected, "{payload}");
+        }
+        let Some(ExecutionReport::TreeFinished { outcome, .. }) = reports.last() else {
+            panic!("expected a tree finish: {reports:#?}");
+        };
+        assert_eq!(outcome["outcome"], "succeeded", "{payload}");
+    }
+}
+
+// REQ-RUNNERENROLL-119: a report sent for steps alone restates the wait's questions with
+// the root it restates.
+#[tokio::test]
+async fn report_for_steps_alone_restates_the_questions_of_the_wait() {
+    let payload = json!({"questions": [
+        {"id": "scope", "text": "A"},
+        {"id": "q2", "text": "B"},
+    ]})
+    .to_string();
+    let mut fixture = fixture_with(
+        TREE_DIGEST,
+        "waiting",
+        "null",
+        &[
+            ("TREE_TEST_WAIT_KIND", "answer"),
+            ("TREE_TEST_WAIT_SOURCE", "um"),
+            ("TREE_TEST_WAIT_PAYLOAD", payload.as_str()),
+            ("TREE_TEST_RESUMES", "held continue"),
+        ],
+    );
+    stage_state(
+        &fixture.log,
+        "create",
+        "",
+        &[(1, vec![step("merge", "running")])],
+    );
+    stage_state(
+        &fixture.log,
+        "resume1",
+        "",
+        &[(1, vec![step("merge", "succeeded")])],
+    );
+    fs::write(fixture.log.join("proceed"), b"").unwrap();
+    start(&mut fixture).await;
+    wait_for_reports(&mut fixture.manager, |reports| {
+        step_frames(reports).len() == 1
+    })
+    .await;
+    send_control(&mut fixture, CONTROL_ID, answering("scope"));
+    let merged = observed(json!([]), 1, "merge", "succeeded");
+    wait_for_reports(&mut fixture.manager, |reports| {
+        reported_steps(reports).contains(&merged)
+    })
+    .await;
+    send_control(
+        &mut fixture,
+        "rct_01k0z6r1w8f4jy2m7q9v3x5acs",
+        answering("q2"),
+    );
+    let reports = finished_reports(&mut fixture.manager).await;
+
+    let expected = json!({
+        "kind": "answer",
+        "since": WAIT_SINCE,
+        "step": ["merge"],
+        "questions": [{ "id": "scope", "text": "A" }, { "id": "q2", "text": "B" }],
+    });
+    let waits = reported_waits(&reports, &fixture.offer);
+    assert_eq!(
+        waits,
+        [
+            (
+                expected.clone(),
+                json!([observed(json!([]), 1, "merge", "running")])
+            ),
+            (expected, json!([merged])),
+        ]
+    );
+    assert_eq!(chosen_outcome(&reports).as_deref(), Some("landed"));
+}
+
 // REQ-RUNNERENROLL-88
 #[tokio::test]
 async fn run_ending_in_its_first_command_flushes_its_steps_split_at_64_a_report() {
@@ -3032,11 +3195,11 @@ async fn entry_without_a_run_record_is_a_fan_out_element_as_the_engine_reads_it(
     assert_eq!(chosen_outcome(&reports).as_deref(), Some("planned"));
 }
 
-// INV-ENGINE-41, REQ-RUNNERENROLL-88, REQ-RUNNERENROLL-90, REQ-WFEXEC-75, REQ-CONTINUE-92: a
-// runner reports SC-WFEXEC-6's nested run with the frames it has. The root's records carry
-// the nested stage's position and its carried wait, the step reader finds the stage under
-// its nested run, and a control naming the wait by kind and since resolves it; every frame
-// encodes under the closed protocol schema.
+// INV-ENGINE-41, REQ-RUNNERENROLL-88, REQ-RUNNERENROLL-90, REQ-RUNNERENROLL-119,
+// REQ-WFEXEC-75, REQ-CONTINUE-92: a runner reports SC-WFEXEC-6's nested run with the frames
+// it has. The root's records carry the nested stage's position and its carried wait, the
+// step reader finds the stage under its nested run, and a control naming the wait by kind
+// and since resolves it; every frame encodes under the closed protocol schema.
 #[tokio::test]
 async fn nested_run_is_reported_and_answered_with_the_frames_it_has() {
     let path = json!(["outer", { "item": 2 }, "ask"]);
@@ -3178,7 +3341,13 @@ async fn nested_run_is_reported_and_answered_with_the_frames_it_has() {
             )
         })
         .collect::<Vec<_>>();
-    let waiting = json!({ "kind": "answer", "since": WAIT_SINCE, "step": path });
+    // An empty payload asks one question, which any id answers (REQ-RUNNERENROLL-119).
+    let waiting = json!({
+        "kind": "answer",
+        "since": WAIT_SINCE,
+        "step": path,
+        "questions": [{ "id": "1" }],
+    });
     let mut distinct = roots.clone();
     distinct.dedup();
     assert_eq!(
@@ -3967,14 +4136,7 @@ async fn refused_first_resume_ends_the_attempt_failed_with_the_refusal_code() {
     );
     assert_eq!(result.outcome()["outcome"], "failed");
     assert_eq!(transitions.last().unwrap()["to"]["state"], "failed");
-    assert_eq!(
-        exit,
-        TreeExit {
-            chosen_outcome: None,
-            mirror: Vec::new(),
-            claim_release: false,
-        }
-    );
+    assert_eq!(exit, unreported_exit());
 }
 
 // REQ-RUNNERENROLL-91: a `create` the runtime refuses, here with its rejection of a root whose
@@ -4221,17 +4383,207 @@ async fn cancelled_first_resume_that_started_no_attempt_reports_nothing_of_the_a
             panic!("a cancelled first resume has a result: {end:#?}");
         };
         assert_eq!(result, expected);
-        assert_eq!(
-            exit,
-            TreeExit {
-                chosen_outcome: None,
-                mirror: Vec::new(),
-                claim_release: false,
-            },
-            "{reason:?}"
-        );
+        assert_eq!(exit, unreported_exit(), "{reason:?}");
         assert_eq!(files(&adopted.run), retained, "{reason:?}");
     }
+}
+
+/// The exit of an adopting attempt that reports nothing of the adopted record.
+fn unreported_exit() -> TreeExit {
+    TreeExit {
+        chosen_outcome: None,
+        mirror: Vec::new(),
+        claim_release: false,
+    }
+}
+
+// REQ-RUNNERENROLL-89: a cancellation the runner holds when it begins to drive an adopted run
+// applies none of the offer's deliveries and launches no first `resume --from`. Over an
+// `exited` record the attempt ends cancelled or interrupted with no command run, the record
+// and its attempt count as the earlier attempt left them; a run that still stands is
+// cancelled, or left as it stands for the runner's shutdown, as a run no process holds.
+#[tokio::test]
+async fn adopted_run_cancelled_before_its_drive_applies_no_delivery_and_resumes_nothing() {
+    let departed = [comment_written(), state_write("written", json!({}))];
+    let pending = [delivery("wtd_01k0z6r1w8f4jy2m7q9v3x5abt")];
+    let cases: [(
+        Adopted,
+        CancellationReason,
+        TransportResult,
+        &[TriggerDelivery],
+    ); 3] = [
+        (
+            adopted(record("exited", Some("landed"), 1, json!([])), None),
+            CancellationReason::UserRequest,
+            TransportResult::Cancelled {
+                reason: CancellationReason::UserRequest,
+            },
+            &pending,
+        ),
+        (
+            adopted_failure(&departed),
+            CancellationReason::RunnerShutdown,
+            TransportResult::Interrupted {
+                reason: CancellationReason::RunnerShutdown,
+            },
+            &[],
+        ),
+        (
+            adopted(record("exited", Some("canceled"), 1, json!([])), None),
+            CancellationReason::ExecutionLeaseExpired,
+            TransportResult::Interrupted {
+                reason: CancellationReason::ExecutionLeaseExpired,
+            },
+            &[],
+        ),
+    ];
+    for (adopted, reason, expected, pending) in cases {
+        let run = adopt_run_with(&adopted, &["build"], "continue", "cancel", pending).unwrap();
+        // An unfixed resume would land at once.
+        fs::write(adopted.log.join("proceed"), b"").unwrap();
+        let retained = files(&adopted.run);
+        assert!(run.cancellation().source().request_cancellation(reason));
+        let reports = Mutex::new(Vec::new());
+        let end = run
+            .drive(&|report| {
+                reports.lock().unwrap().push(report);
+                true
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(resumes(&adopted.log), 0, "{reason:?}");
+        assert!(!adopted.log.join("cancel.args").exists(), "{reason:?}");
+        assert!(!adopted.log.join("event.args").exists(), "{reason:?}");
+        assert_eq!(order(&adopted.log), Vec::<String>::new(), "{reason:?}");
+        assert_eq!(applications(&reports.into_inner().unwrap()), []);
+        let TreeConclusion::Terminal { result, exit, .. } = end.conclusion() else {
+            panic!("a cancelled adopted run has a result: {end:#?}");
+        };
+        assert_eq!(result, expected);
+        assert_eq!(exit, unreported_exit(), "{reason:?}");
+        assert_eq!(files(&adopted.run), retained, "{reason:?}");
+    }
+
+    let waiting = adopted_merge_stop();
+    let run = adopt_run(&waiting, &["merge"], "continue").unwrap();
+    fs::write(waiting.log.join("proceed"), b"").unwrap();
+    assert!(
+        run.cancellation()
+            .source()
+            .request_cancellation(CancellationReason::UserRequest)
+    );
+    let end = run.drive(&|_| true).await.unwrap();
+
+    assert_eq!(resumes(&waiting.log), 0);
+    assert_eq!(
+        logged_lines(&waiting.log, "cancel.args")[..3],
+        ["workflow", "run", "cancel"]
+    );
+    let TreeConclusion::Terminal { result, exit, .. } = end.conclusion() else {
+        panic!("a cancelled standing adopted run has a result: {end:#?}");
+    };
+    assert_eq!(result.outcome()["outcome"], "cancelled");
+    assert_eq!(exit.chosen_outcome.as_deref(), Some("canceled"));
+
+    // The runner's shutdown cancels nothing: the standing run is left as it stands.
+    let left = adopted_merge_stop();
+    let run = adopt_run(&left, &["merge"], "continue").unwrap();
+    fs::write(left.log.join("proceed"), b"").unwrap();
+    let retained = files(&left.run);
+    assert!(
+        run.cancellation()
+            .source()
+            .request_cancellation(CancellationReason::RunnerShutdown)
+    );
+    let end = run.drive(&|_| true).await.unwrap();
+
+    assert_eq!(resumes(&left.log), 0);
+    assert!(!left.log.join("cancel.args").exists());
+    let TreeConclusion::Terminal { result, exit, .. } = end.conclusion() else {
+        panic!("an interrupted standing adopted run has a result: {end:#?}");
+    };
+    assert_eq!(
+        result,
+        TransportResult::Interrupted {
+            reason: CancellationReason::RunnerShutdown,
+        }
+    );
+    assert_eq!(exit, unreported_exit());
+    assert_eq!(files(&left.run), retained);
+}
+
+// REQ-RUNNERENROLL-89: a cancellation that arrives while the offer's pending delivery is being
+// applied abandons it, reported as nothing, and launches no first `resume --from`; the
+// adopted `exited` record is left as the earlier attempt left it.
+#[tokio::test]
+async fn adopted_run_cancelled_while_a_pending_delivery_is_applied_resumes_nothing() {
+    let adopted = adopted_failure(&[]);
+    fs::write(adopted.log.join("proceed"), b"").unwrap();
+    let run = adopt_run_with(
+        &adopted,
+        &["build"],
+        "continue",
+        "hang",
+        &[delivery("wtd_01k0z6r1w8f4jy2m7q9v3x5abt")],
+    )
+    .unwrap();
+    let retained = files(&adopted.run);
+    let reports = Mutex::new(Vec::new());
+    let report = |report| {
+        reports.lock().unwrap().push(report);
+        true
+    };
+    let cancel = async {
+        let hang = hanging_event(&adopted.log).await;
+        assert!(
+            run.cancellation()
+                .source()
+                .request_cancellation(CancellationReason::UserRequest)
+        );
+        hang
+    };
+    let (end, hang) = crate::service::test_support::with_watchdog(async {
+        tokio::join!(run.drive(&report), cancel)
+    })
+    .await
+    .expect("the hanging event was not abandoned");
+    let end = end.unwrap();
+
+    assert!(
+        ended(hang).await,
+        "the event's process group was not killed"
+    );
+    assert_eq!(order(&adopted.log), ["event"]);
+    assert_eq!(resumes(&adopted.log), 0);
+    assert!(!adopted.log.join("cancel.args").exists());
+    assert_eq!(applications(&reports.into_inner().unwrap()), []);
+    let TreeConclusion::Terminal { result, exit, .. } = end.conclusion() else {
+        panic!("a cancelled adopted run has a result: {end:#?}");
+    };
+    assert_eq!(
+        result,
+        TransportResult::Cancelled {
+            reason: CancellationReason::UserRequest,
+        }
+    );
+    assert_eq!(exit, unreported_exit());
+    assert_eq!(files(&adopted.run), retained);
+}
+
+/// A home whose one run waits at `merge` on a stop only a control resolves.
+fn adopted_merge_stop() -> Adopted {
+    adopted(
+        record("waiting", None, 1, json!(["merge"])),
+        Some(json!({
+            "kind": "stop",
+            "since": "2026-07-23T00:00:05Z",
+            "step": ["merge"],
+            "then": "merge",
+            "rule": { "source": "um", "event": "pull_request.merged" },
+            "payload": {},
+        })),
+    )
 }
 
 /// A home whose one run reads `exited` `failed`, its current attempt recording `build`
@@ -4285,14 +4637,7 @@ async fn adopted_exit_reports_the_run_mirror_and_a_refused_resume_releases_nothi
     let TreeConclusion::Terminal { exit, .. } = end.conclusion() else {
         panic!("a refused first resume has a result: {end:#?}");
     };
-    assert_eq!(
-        exit,
-        TreeExit {
-            chosen_outcome: None,
-            mirror: Vec::new(),
-            claim_release: false,
-        }
-    );
+    assert_eq!(exit, unreported_exit());
 }
 
 /// Drives the adopted run its offer carrying `pending` to its end and returns the end and
@@ -4320,17 +4665,7 @@ async fn drive_adopted_with(
 // leaves its named steps unresumed, and a refused one lets the run resume from them.
 #[tokio::test]
 async fn adopted_run_applies_its_offer_pending_deliveries_before_its_first_command() {
-    let waiting = adopted(
-        record("waiting", None, 1, json!(["merge"])),
-        Some(json!({
-            "kind": "stop",
-            "since": "2026-07-23T00:00:05Z",
-            "step": ["merge"],
-            "then": "merge",
-            "rule": { "source": "um", "event": "pull_request.merged" },
-            "payload": {},
-        })),
-    );
+    let waiting = adopted_merge_stop();
     let (end, reports) = drive_adopted_with(
         &waiting,
         &["merge"],

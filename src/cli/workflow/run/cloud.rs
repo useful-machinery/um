@@ -721,7 +721,31 @@ fn write_progress(out: &mut impl Write, progress: &Value) -> io::Result<()> {
     } else {
         write!(out, " · running")?;
     }
-    writeln!(out, " · reported {}", field(progress, "reportedAt"))
+    writeln!(out, " · reported {}", field(progress, "reportedAt"))?;
+    if wait["kind"] == "answer" {
+        write_questions(out, &wait["questions"])?;
+    }
+    Ok(())
+}
+
+/// An answer wait's questions, one indented line each as `<id>: <text>` or the id alone,
+/// `unknown` when Cloud sent null or omitted them and `none` when the wait asks none.
+fn write_questions(out: &mut impl Write, questions: &Value) -> io::Result<()> {
+    let Some(questions) = questions.as_array() else {
+        return writeln!(out, "questions: unknown");
+    };
+    if questions.is_empty() {
+        return writeln!(out, "questions: none");
+    }
+    writeln!(out, "questions:")?;
+    for question in questions {
+        write!(out, "  {}", field(question, "id"))?;
+        if let Some(question_text) = question["text"].as_str() {
+            write!(out, ": {}", text(question_text))?;
+        }
+        writeln!(out)?;
+    }
+    Ok(())
 }
 
 fn write_exits(out: &mut impl Write, exits: &Value) -> io::Result<()> {

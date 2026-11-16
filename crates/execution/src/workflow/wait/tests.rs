@@ -1051,3 +1051,87 @@ fn a_stop_is_in_force_until_a_later_lift_for_the_same_step() {
     assert_eq!(stop_in_force(&build, "design"), None);
     assert_eq!(stop_in_force(&build, "build"), Some(&build[0]));
 }
+
+// REQ-LOCALRUN-182, REQ-RUNNERENROLL-119: the questions `um workflow run answer` accepts
+// and the runner reports are one derivation over the wait's payload.
+#[test]
+fn a_wait_payload_lists_its_questions_by_id_and_text_or_asks_one() {
+    let listed = |questions: &[(&str, Option<&str>)]| {
+        WaitQuestions::Listed(
+            questions
+                .iter()
+                .map(|(id, text)| WaitQuestion {
+                    id: (*id).to_owned(),
+                    text: text.map(str::to_owned),
+                })
+                .collect(),
+        )
+    };
+    let many = (1..=65)
+        .map(|n| json!({"id": format!("q{n}"), "text": format!("Question {n}?")}))
+        .collect::<Vec<_>>();
+    let many_ids = (1..=65).map(|n| format!("q{n}")).collect::<Vec<_>>();
+    let many_texts = (1..=65)
+        .map(|n| format!("Question {n}?"))
+        .collect::<Vec<_>>();
+    let cases = [
+        (
+            json!({"questions": [{"id": "scope", "text": "A"}, {"id": "q2", "text": "B"}]}),
+            listed(&[("scope", Some("A")), ("q2", Some("B"))]),
+        ),
+        (
+            json!({"questions": [
+                {"question": "A", "default": "x"},
+                {"question": "B", "default": "y"},
+            ]}),
+            listed(&[("1", Some("A")), ("2", Some("B"))]),
+        ),
+        (
+            json!({"questions": "Which scope?"}),
+            WaitQuestions::Unlisted {
+                text: Some("Which scope?".to_owned()),
+            },
+        ),
+        (json!({}), WaitQuestions::Unlisted { text: None }),
+        (
+            json!({"questions": {"id": "scope"}}),
+            WaitQuestions::Unlisted { text: None },
+        ),
+        (json!({"questions": []}), listed(&[])),
+        (
+            json!({"questions": many}),
+            listed(
+                &many_ids
+                    .iter()
+                    .zip(&many_texts)
+                    .map(|(id, text)| (id.as_str(), Some(text.as_str())))
+                    .collect::<Vec<_>>(),
+            ),
+        ),
+        (
+            json!({"questions": [{"id": "scope", "text": "A\u{0}B"}]}),
+            listed(&[("scope", Some("A\u{0}B"))]),
+        ),
+        (
+            json!({"questions": [
+                "Plain?",
+                {"id": 7, "text": "Numbered"},
+                {"id": "both", "text": "T", "question": "Q"},
+                {"default": "x"},
+            ]}),
+            listed(&[
+                ("1", Some("Plain?")),
+                ("2", Some("Numbered")),
+                ("both", Some("T")),
+                ("4", None),
+            ]),
+        ),
+    ];
+    for (payload, expected) in cases {
+        assert_eq!(
+            wait_questions(&object(payload.clone())),
+            expected,
+            "{payload}"
+        );
+    }
+}

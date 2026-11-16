@@ -27,7 +27,11 @@
 //! `ClassifiedEnd::Refused` rather than as a failure. A cancellation that reaches that first
 //! command before it starts an engine attempt, the record still reading `exited` as the
 //! earlier attempt left it, ends the loop as a `ClassifiedEnd::Unstarted`: the attempt is
-//! cancelled or interrupted and reports nothing of that record.
+//! cancelled or interrupted and reports nothing of that record. The adopted start reads the
+//! assignment's cancellation before it runs anything: one already requested applies none of
+//! the offer's pending deliveries, and one requested by the time they are applied launches no
+//! first command, the loop ending `Unstarted` over an `exited` record and ending a standing
+//! run as one no process holds.
 //!
 //! Each trigger delivery for the assignment is applied once with `um workflow run event`
 //! and its application reported (REQ-TRIGGER-136): while a process runs, beside it, so a
@@ -298,6 +302,7 @@ impl Progress<'_> {
                     kind: wait.kind.clone(),
                     since: wait.since.clone(),
                     step: wait.step.clone(),
+                    questions: wait.questions.clone(),
                 }),
             )),
         };
@@ -469,13 +474,33 @@ async fn drive_to_end(driver: &mut Driver<'_>) -> Result<TreeEnd, DriveFailure> 
             };
             match (driver.directory.clone(), steps.first()) {
                 (Some(directory), Some(first)) if !ended => {
-                    adopted_exit = observe_record(directory.clone())
+                    let adopted_record = observe_record(directory.clone())
                         .await
-                        .filter(|(record, _)| record.state == RecordState::Exited)
-                        .map(|(record, _)| record.attempts);
-                    let exit = driver
-                        .command(command::resume_from_arguments(&directory, steps))
-                        .await?;
+                        .map(|(record, _)| record);
+                    adopted_exit = adopted_record
+                        .as_ref()
+                        .filter(|record| record.state == RecordState::Exited)
+                        .map(|record| record.attempts);
+                    // A cancellation already requested launches no resume: over an exited
+                    // record the loop ends as on a resume it reached before it started an
+                    // attempt, and a standing run is ended as one no process holds.
+                    let exit = match (
+                        run.cancellation.source().cancellation_reason(),
+                        adopted_record,
+                    ) {
+                        (Some(reason), Some(record)) if record.state != RecordState::Exited => {
+                            return driver.cancelled(reason, &directory, record).await;
+                        }
+                        (Some(reason), _) => CommandExit {
+                            document: None,
+                            cancellation: Some(reason),
+                        },
+                        (None, _) => {
+                            driver
+                                .command(command::resume_from_arguments(&directory, steps))
+                                .await?
+                        }
+                    };
                     if exit.cancellation.is_none()
                         && let Some(code) = refusal(exit.document.as_ref())
                     {
@@ -794,8 +819,12 @@ impl Driver<'_> {
 
     /// Applies the offer's pending deliveries to the adopted run at `directory` before its
     /// first command, as `create`'s stop lets them precede a created run's first step; true
-    /// when they ended a run that was standing, which then resumes no step.
+    /// when they ended a run that was standing, which then resumes no step. A cancellation
+    /// already requested applies none of them, so they stay open for the run's next attempt.
     async fn apply_adopted_pending(&mut self, directory: &Path) -> Result<bool, DriveFailure> {
+        if self.run.cancellation.source().is_cancelled() {
+            return Ok(false);
+        }
         let pending = self.take_pending();
         if pending.is_empty() {
             return Ok(false);

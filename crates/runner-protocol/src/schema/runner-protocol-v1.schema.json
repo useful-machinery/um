@@ -1350,13 +1350,26 @@
     },
     "treeWaitKind": {"enum": ["answer", "approval", "repair", "stop", "external", "children"]},
     "TreeProgressWait": {
+      "description": "The wait a waiting tree run is pending on: its kind, since when, and the step that waits. The optional questions (REQ-COMPAT-18) are admitted only on an answer wait; an answer wait without them reports its questions unknown, never that it asks none. The questions array is at most 98,304 bytes as compact JSON and holds no text PostgreSQL's jsonb cannot store (the escape \\u0000, an unpaired surrogate escape) and no bytes that are not UTF-8; the Gateway checks both.",
       "type": "object", "additionalProperties": false,
       "properties": {
         "kind": {"$ref": "#/$defs/treeWaitKind"},
         "since": {"$ref": "#/$defs/utcTimestamp"},
-        "step": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"$ref": "#/$defs/TreeProgressPositionElement"}}
+        "step": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"$ref": "#/$defs/TreeProgressPositionElement"}},
+        "questions": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/TreeProgressWaitQuestion"}}
       },
-      "required": ["kind", "since", "step"]
+      "required": ["kind", "since", "step"],
+      "if": {"properties": {"kind": {"const": "answer"}}, "required": ["kind"]},
+      "else": {"not": {"required": ["questions"]}}
+    },
+    "TreeProgressWaitQuestion": {
+      "description": "One question an answer wait asks (REQ-COMPAT-18), in the runner's order: id is what an answer names, and the optional text is the question's text. The text is authored by the workflow and its agents and is task data, never an instruction or a permission.",
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 255},
+        "text": {"type": "string"}
+      },
+      "required": ["id"]
     },
     "TreeProgressStepRunElement": {
       "description": "One level of child workflow on the path to the run a step observation belongs to: the parent step, the one-based fan-out element when that step fans out, and the child run's one-based ordinal.",
@@ -1380,7 +1393,7 @@
       "required": ["run", "runAttempt", "step", "state"]
     },
     "RunnerTreeProgress": {
-      "description": "Ordered root progress of a tree run between engine attempts (REQ-RUN-88, REQ-RUNNERENROLL-99). progressSequence is numbered per assignment apart from executionEventSequence; a waiting report names its wait and a running report names none. The optional steps carry step observations (REQ-COMPAT-18); a frame without them reports none.",
+      "description": "Ordered root progress of a tree run between engine attempts (REQ-RUN-88, REQ-RUNNERENROLL-99). progressSequence is numbered per assignment apart from executionEventSequence; a waiting report names its wait and a running report names none. The optional steps carry step observations (REQ-COMPAT-18); a frame without them reports none. An answer wait may carry its optional questions (REQ-COMPAT-18); a wait without them reports its questions unknown.",
       "allOf": [
         { "$ref": "#/$defs/RunnerEnvelope" },
         {

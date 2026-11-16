@@ -13,12 +13,13 @@
 
 use std::path::Path;
 
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use um_execution::{
     CancellationReason, LocalRunDirectoryError, MirrorAction, MirrorHook, MirrorSkipReason,
-    MirrorWrite, MirrorWriteOutcome, read_durable_record, wait_identity,
+    MirrorWrite, MirrorWriteOutcome, WaitQuestions, read_durable_record, wait_identity,
+    wait_questions,
 };
-use um_runner_protocol::TreeExit;
+use um_runner_protocol::{TreeExit, TreeProgressWaitQuestion, TreeProgressWaitQuestions};
 use um_support::is_diagnostic_slug;
 
 /// The most mirror results one finish carries, the protocol's bound.
@@ -105,13 +106,17 @@ pub(in crate::service) fn mirror_read_failure(error: &LocalRunDirectoryError) ->
 /// The class recorded when the blocking worker reading a run's `mirror/` did not return.
 pub(in crate::service) const MIRROR_READER_LOST: &str = "mirror_reader_lost";
 
-/// What `wait.json` reads: the wait's kind, start and step, and its rule's source.
+/// What `wait.json` reads: the wait's kind, start and step, its rule's source and, for an
+/// `answer` wait, the questions it reports (REQ-RUNNERENROLL-119).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::service) struct TreeWait {
     pub(in crate::service) kind: String,
     pub(in crate::service) since: String,
     pub(in crate::service) step: Vec<Value>,
     pub(in crate::service) source: String,
+    /// `None` when the wait reports no questions: another kind, a payload that is not an
+    /// object, or questions outside the bounds Cloud admits.
+    pub(in crate::service) questions: Option<TreeProgressWaitQuestions>,
 }
 
 impl TreeWait {
@@ -128,15 +133,43 @@ impl TreeWait {
 }
 
 /// Reads `<run directory>/wait.json`; `None` when it is absent, unreadable as `read_json`
-/// reads it, or not a wait record.
+/// reads it, or not a wait record. A question never makes it `None`.
 pub(in crate::service) fn read_wait(run_directory: &Path) -> Option<TreeWait> {
     let wait = read_json(run_directory, "wait.json")?;
+    let kind = wait["kind"].as_str()?.to_owned();
+    let questions = if kind == "answer" {
+        wait["payload"].as_object().and_then(answer_questions)
+    } else {
+        None
+    };
     Some(TreeWait {
-        kind: wait["kind"].as_str()?.to_owned(),
+        kind,
         since: wait["since"].as_str()?.to_owned(),
         step: wait["step"].as_array()?.clone(),
         source: wait["rule"]["source"].as_str()?.to_owned(),
+        questions,
     })
+}
+
+/// The questions an `answer` wait's `payload` asks, read as `um workflow run answer` reads
+/// them (REQ-RUNNERENROLL-119): the listed questions, or the one question with id `1` that a
+/// payload without a list asks; `None` when they break a bound Cloud admits, so the wait is
+/// reported without them and nothing is truncated.
+fn answer_questions(payload: &Map<String, Value>) -> Option<TreeProgressWaitQuestions> {
+    let questions = match wait_questions(payload) {
+        WaitQuestions::Listed(questions) => questions
+            .into_iter()
+            .map(|question| TreeProgressWaitQuestion {
+                id: question.id,
+                text: question.text,
+            })
+            .collect(),
+        WaitQuestions::Unlisted { text } => vec![TreeProgressWaitQuestion {
+            id: "1".to_owned(),
+            text,
+        }],
+    };
+    TreeProgressWaitQuestions::new(questions)
 }
 
 /// How the attempt ends on the wire.

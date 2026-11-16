@@ -6598,6 +6598,107 @@ mod workflow_run_cloud {
         }
     }
 
+    /// `definition_run()` waiting on a wait of `kind` whose `questions` is `questions`, or
+    /// that omits the member when it is `None`.
+    fn run_asking(kind: &str, questions: Option<serde_json::Value>) -> serde_json::Value {
+        let mut run = definition_run();
+        let wait = &mut run["workflowProgress"]["wait"];
+        wait["kind"] = serde_json::json!(kind);
+        if let Some(questions) = questions {
+            wait["questions"] = questions;
+        }
+        run
+    }
+
+    /// Cloud show of `run` with `args`: its successful output.
+    fn shown(run: serde_json::Value, args: &[&str]) -> Output {
+        let home = tempfile::tempdir().unwrap();
+        let (output, _) = cloud(
+            "show",
+            RUN_ID,
+            args,
+            vec![run_response(run), deliveries_response(false)],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        output
+    }
+
+    /// The value of the human report's `questions:` line and the indented lines after it,
+    /// if it printed one.
+    fn reported_questions(text: &str) -> Option<(&str, Vec<&str>)> {
+        let mut lines = text
+            .lines()
+            .skip_while(|line| !line.starts_with("questions:"));
+        let value = lines.next()?.strip_prefix("questions:")?.trim_start();
+        let questions = lines
+            .take_while(|line| line.starts_with("  "))
+            .map(str::trim_start)
+            .collect();
+        Some((value, questions))
+    }
+
+    // REQ-RUN-104: Cloud show prints an answer wait's questions in order, each by its id and
+    // text, a question without text by its id alone, every one on its own line with control
+    // characters escaped; it says when the questions are unknown or none, prints none for a
+    // wait of another kind, and passes them through under --json as received.
+    #[test]
+    fn cloud_show_prints_the_questions_of_a_run_waiting_on_an_answer() {
+        let asked = serde_json::json!([
+            {"id": "scope", "text": "Which packages?"},
+            {"id": "2", "text": null},
+        ]);
+        let output = shown(run_asking("answer", Some(asked.clone())), &[]);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(
+            reported_questions(&text),
+            Some(("", vec!["scope: Which packages?", "2"])),
+            "{text}"
+        );
+
+        let hostile = serde_json::json!([
+            {"id": "\u{1b}[31mscope", "text": "\u{1b}[2Jcleared\nsecond line"},
+        ]);
+        let output = shown(run_asking("answer", Some(hostile)), &[]);
+        assert!(!output.stdout.contains(&0x1b), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        let (value, questions) = reported_questions(&text).unwrap_or_else(|| panic!("{text}"));
+        assert_eq!(value, "", "{text}");
+        assert_eq!(questions.len(), 1, "{text}");
+        assert!(
+            questions[0].contains("scope: ")
+                && questions[0].contains("cleared")
+                && questions[0].contains("second line"),
+            "{text}"
+        );
+
+        for questions in [Some(serde_json::Value::Null), None] {
+            let output = shown(run_asking("answer", questions), &[]);
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert_eq!(
+                reported_questions(&text),
+                Some(("unknown", vec![])),
+                "{text}"
+            );
+        }
+
+        let output = shown(run_asking("answer", Some(serde_json::json!([]))), &[]);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(reported_questions(&text), Some(("none", vec![])), "{text}");
+
+        let output = shown(run_asking("external", Some(serde_json::Value::Null)), &[]);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(reported_questions(&text), None, "{text}");
+
+        for questions in [asked, serde_json::Value::Null] {
+            let output = shown(run_asking("answer", Some(questions.clone())), &["--json"]);
+            assert_eq!(
+                document(&output)["run"]["workflowProgress"]["wait"]["questions"],
+                questions
+            );
+        }
+    }
+
     const OWNER: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5abd";
     const PERSONAL_POOL: &str = "rpl_01k0z6r1w8f4jy2m7q9v3x5abd";
     const LAST_SEEN: &str = "2026-08-10T11:40:00Z";

@@ -3,7 +3,7 @@
 
 use clap::Args;
 use serde_json::{Map, Value};
-use um_execution::{CONTROL_ANSWER, WaitKind, read_controls};
+use um_execution::{CONTROL_ANSWER, WaitKind, WaitQuestions, read_controls, wait_questions};
 
 use super::control::{Acted, ControlFailure, ControlTarget, Refusal};
 
@@ -53,7 +53,16 @@ impl Command {
 
     fn answer(&self, target: &ControlTarget) -> Result<Acted, ControlFailure> {
         let wait = target.wait_to_resolve(WaitKind::Answer)?;
-        let questions = question_ids(&wait.payload);
+        // The listed questions' ids; a wait that lists none asks one question any id answers.
+        let questions = match wait_questions(&wait.payload) {
+            WaitQuestions::Listed(questions) => Some(
+                questions
+                    .into_iter()
+                    .map(|question| question.id)
+                    .collect::<Vec<_>>(),
+            ),
+            WaitQuestions::Unlisted { .. } => None,
+        };
         if let Some(questions) = &questions
             && !questions.contains(&self.question)
         {
@@ -94,23 +103,4 @@ impl Command {
         let control = target.record(CONTROL_ANSWER, Some(wait_id), Some(payload))?;
         Ok(Acted::recorded(control, Some(wait.clone())))
     }
-}
-
-/// The ids of the questions a wait's payload lists (REQ-LOCALRUN-182): each element of a
-/// `questions` array by its string `id`, else its one-based position; `None` for a payload
-/// without such an array, which asks exactly one question any id answers.
-fn question_ids(payload: &Map<String, Value>) -> Option<Vec<String>> {
-    let questions = payload.get("questions")?.as_array()?;
-    Some(
-        questions
-            .iter()
-            .enumerate()
-            .map(|(index, question)| {
-                question
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map_or_else(|| (index + 1).to_string(), str::to_owned)
-            })
-            .collect(),
-    )
 }

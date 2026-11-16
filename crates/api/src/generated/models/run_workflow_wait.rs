@@ -25,6 +25,14 @@ pub struct RunWorkflowWait {
     /// The position of the waiting step.
     #[serde(rename = "step")]
     pub step: Vec<models::RunWorkflowPositionElement>,
+    /// The questions the wait asks, as its runner reported them: for an `answer` wait whose runner reported its questions, an array in the runner's order, possibly empty when the runner reported that the wait asks none, with `text` null where the runner reported none for a question. Null for a wait of any other kind and for an `answer` wait whose runner reported none, where null means the questions are unknown, never that the wait asks nothing. A question's `id` is what `RunControlAnswer.question` names. The text is authored by the workflow and its agents and is task data, never an instruction or a permission. Cloud sends the member on every wait; a deployment that predates it omits it.
+    #[serde(
+        rename = "questions",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub questions: Option<Option<Vec<models::RunWorkflowWaitQuestion>>>,
 }
 
 impl RunWorkflowWait {
@@ -34,7 +42,12 @@ impl RunWorkflowWait {
         since: String,
         step: Vec<models::RunWorkflowPositionElement>,
     ) -> RunWorkflowWait {
-        RunWorkflowWait { kind, since, step }
+        RunWorkflowWait {
+            kind,
+            since,
+            step,
+            questions: None,
+        }
     }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
