@@ -3,13 +3,14 @@
 //! transport result is `cancelled` when the record's outcome is the engine's `canceled` or
 //! `withdrawn`, and otherwise the outcome of the engine's published result (REQ-WFEXEC-15),
 //! read from the last `--json` document or, when that carries none, from the run
-//! directory's record of the current attempt; the record's outcome, the workflow's choice,
-//! travels as `chosenOutcome` and never selects the result, its run's mirror writes as
-//! `mirror` and its own confirmed departure as `claimRelease`. An adopted run
-//! (REQ-RUNNERENROLL-89) whose record already read `exited` is concluded by the result its
-//! current attempt recorded, and one whose first `resume --from` the runtime refused ends
-//! `failed` with the refusal's code, as does a run whose `create` the runtime refused
-//! (REQ-RUNNERENROLL-91).
+//! directory's record of the current attempt, a failure there with the primary issue of the
+//! `result.json` that attempt published and never a step the runner selects itself; the
+//! record's outcome, the workflow's choice, travels as `chosenOutcome` and never selects
+//! the result, its run's mirror writes as `mirror` and its own confirmed departure as
+//! `claimRelease`. An adopted run (REQ-RUNNERENROLL-89) whose record already read `exited`
+//! is concluded by the result its current attempt recorded, and one whose first
+//! `resume --from` the runtime refused ends `failed` with the refusal's code, as does a run
+//! whose `create` the runtime refused (REQ-RUNNERENROLL-91).
 
 use std::path::Path;
 
@@ -26,9 +27,10 @@ use um_support::is_diagnostic_slug;
 const MAXIMUM_MIRROR_RESULTS: usize = 1024;
 
 /// Reads `<run directory>/<name>` as JSON through the engine's own reader of its durable
-/// records (`um_execution::read_durable_record`): a regular file opened without following
-/// a symbolic link and without waiting on a FIFO, of at most the engine's bound; `None`
-/// for a file that is absent, of another kind, larger or not JSON.
+/// records (`um_execution::read_durable_record`), `name` a path beneath the run directory:
+/// a regular file opened, as each directory on the way to it, without following a symbolic
+/// link and without waiting on a FIFO, of at most the engine's bound; `None` for a file
+/// that is absent, behind a link, of another kind, larger or not JSON.
 fn read_json(run_directory: &Path, name: &str) -> Option<Value> {
     let bytes = read_durable_record(run_directory, name).ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -247,30 +249,36 @@ impl EngineResult {
     /// object, or `cancelled`; `None` for a `waiting` or `continued` result, a refusal, or a
     /// document with no result.
     pub(in crate::service) fn from_document(document: &Value) -> Option<Self> {
-        let result = &document["result"];
-        let outcome = match result["outcome"].as_str()? {
-            "succeeded" => EngineOutcome::Succeeded,
-            "failed" => EngineOutcome::Failed {
-                primary_issue: Some(&result["primaryIssue"])
-                    .filter(|issue| issue.is_object())
-                    .cloned(),
-            },
-            "cancelled" => EngineOutcome::Cancelled,
-            _ => return None,
-        };
         Some(Self {
-            outcome,
+            outcome: settled_outcome(&document["result"])?,
             recorded: false,
         })
     }
 }
 
+/// The settled outcome an engine result reads, whether a document carries it or the run
+/// directory holds it as an attempt's `result.json`: its `outcome` `succeeded`, `failed`,
+/// with its `primaryIssue` when that is an object, or `cancelled`; `None` for any other
+/// outcome.
+fn settled_outcome(result: &Value) -> Option<EngineOutcome> {
+    Some(match result["outcome"].as_str()? {
+        "succeeded" => EngineOutcome::Succeeded,
+        "failed" => EngineOutcome::Failed {
+            primary_issue: Some(&result["primaryIssue"])
+                .filter(|issue| issue.is_object())
+                .cloned(),
+        },
+        "cancelled" => EngineOutcome::Cancelled,
+        _ => return None,
+    })
+}
+
 /// The result `<run directory>/state.json` records for the run's current attempt, counted
 /// only once the attempt's result is recorded `published`, which the engine does before the
 /// run's record reads `exited`: its state `succeeded`, `workflow_failed`, a failure whose
-/// primary issue is the attempt's first node in state `failed` with a detail, as a document
-/// would carry it, or `cancelled`. `None` for any other state, a result not recorded
-/// published, or a file `read_json` cannot read.
+/// primary issue is that of the result the attempt published (REQ-WFEXEC-12), as a
+/// document would carry it, or `cancelled`. `None` for any other state, a result not
+/// recorded published, or a file `read_json` cannot read.
 pub(in crate::service) fn read_recorded_result(run_directory: &Path) -> Option<EngineResult> {
     let state = read_json(run_directory, "state.json")?;
     let current = state["currentAttemptNumber"].as_u64()?;
@@ -284,7 +292,7 @@ pub(in crate::service) fn read_recorded_result(run_directory: &Path) -> Option<E
     let outcome = match attempt["state"].as_str()? {
         "succeeded" => EngineOutcome::Succeeded,
         "workflow_failed" => EngineOutcome::Failed {
-            primary_issue: failed_issue(attempt),
+            primary_issue: published_issue(run_directory, &attempt["result"]),
         },
         "cancelled" => EngineOutcome::Cancelled,
         _ => return None,
@@ -295,25 +303,18 @@ pub(in crate::service) fn read_recorded_result(run_directory: &Path) -> Option<E
     })
 }
 
-/// The first node of `attempt` in state `failed` with a detail, as the primary issue a
-/// document would carry.
-fn failed_issue(attempt: &Value) -> Option<Value> {
-    attempt["progress"]["steps"]
-        .as_array()?
-        .iter()
-        .find(|step| {
-            step["state"] == "failed"
-                && step["id"].is_string()
-                && matches!(step["role"].as_str(), Some("step" | "finalizer"))
-                && step["detail"].is_object()
-        })
-        .map(|step| {
-            json!({
-                "node": { "id": step["id"], "role": step["role"] },
-                "state": "failed",
-                "detail": step["detail"],
-            })
-        })
+/// The primary issue of the result an attempt recorded `published`: the `primaryIssue` of
+/// `<relativeDirectory>/result.json` beneath the run directory when that result reads
+/// `failed`, read as a document's result is read. `None` with no `relativeDirectory`, a
+/// file `read_json` cannot read, another outcome or no issue: the runner selects no issue
+/// from the attempt's nodes.
+fn published_issue(run_directory: &Path, published: &Value) -> Option<Value> {
+    let directory = published["relativeDirectory"].as_str()?;
+    let result = read_json(run_directory, &format!("{directory}/result.json"))?;
+    match settled_outcome(&result)? {
+        EngineOutcome::Failed { primary_issue } => primary_issue,
+        EngineOutcome::Succeeded | EngineOutcome::Cancelled => None,
+    }
 }
 
 /// Maps the record the resume loop ended on, the engine's result for the attempt that

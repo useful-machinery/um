@@ -768,6 +768,13 @@ async fn exited_run_without_a_settled_document_finishes_by_its_recorded_result()
         "state.json",
         &attempt_state("workflow_failed", published_result(), json!([failed_step])),
     );
+    stage(
+        &fixture.log,
+        "exited",
+        "attempts/000001/result",
+        "result.json",
+        &published_failure(&issue),
+    );
     let reports = execute(&mut fixture).await;
 
     let payload = finished_payload(&reports, &fixture.offer);
@@ -3961,6 +3968,26 @@ fn build_failure() -> (Value, Value) {
     )
 }
 
+/// The bytes of a published `result.json` that reads `failed` with `issue` as its primary
+/// issue.
+fn published_failure(issue: &Value) -> Vec<u8> {
+    serde_json::to_vec(&json!({ "outcome": "failed", "primaryIssue": issue })).unwrap()
+}
+
+/// Writes `run`'s `attempts/000001/result/result.json`, the result `published_result()`
+/// records, as `published_failure` builds it.
+fn write_published_failure(run: &Path, issue: &Value) {
+    let directory = run.join("attempts/000001/result");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(directory.join("result.json"), published_failure(issue)).unwrap();
+}
+
+/// `step` as the engine's attempt records it under `policy`, its `failurePolicy`.
+fn with_policy(mut step: Value, policy: &str) -> Value {
+    step["failurePolicy"] = json!(policy);
+    step
+}
+
 // REQ-RUNNERENROLL-89
 #[tokio::test]
 async fn adopted_exited_run_is_reported_as_it_reads_without_a_command() {
@@ -3997,6 +4024,7 @@ async fn adopted_failed_record_reports_the_failure_its_attempt_recorded() {
         published_result(),
         json!([{ "id": "design", "role": "step", "state": "succeeded" }, failed_step]),
     );
+    write_published_failure(&adopted.run, &issue);
     let (end, _) = drive_adopted(&adopted, &[], "").await;
 
     assert_eq!(resumes(&adopted.log), 0);
@@ -4027,6 +4055,7 @@ async fn adopted_exited_record_concludes_from_its_current_attempt_result() {
         published_result(),
         json!([failed_step]),
     );
+    write_published_failure(&blocked.run, &issue);
     let (end, _) = drive_adopted(&blocked, &[], "").await;
     assert_eq!(resumes(&blocked.log), 0);
     let TreeConclusion::Terminal { result, exit, .. } = end.conclusion() else {
@@ -4063,6 +4092,111 @@ async fn adopted_exited_record_concludes_from_its_current_attempt_result() {
             TreeConclusion::Unreportable("tree_run_failure_unclassified")
         );
     }
+}
+
+// REQ-RUNNERENROLL-99: a failure read from the run directory reports the primary issue of
+// the result its current attempt published, never a step the runner picks from the
+// attempt's progress: not an advisory step that failed first, and a required step that
+// ended `blocked` when the result names it. With no published issue to read, here no
+// result directory, a result with no primary issue, a result directory replaced by a
+// symbolic link that leaves the run directory, or a recorded result directory that names
+// a parent directory, it has none to report.
+#[tokio::test]
+async fn recorded_failure_reports_the_primary_issue_its_attempt_published() {
+    let (build_step, build_issue) = build_failure();
+    let failed_with = |steps: Value| {
+        let adopted = adopted(record("exited", Some("failed"), 1, json!([])), None);
+        write_attempt(&adopted.run, "workflow_failed", published_result(), steps);
+        adopted
+    };
+    let failed = |primary_issue: Value| TransportResult::Failed {
+        primary_issue,
+        diagnostic: Some(json!({ "stage": "tree_run_adopted_failure" })),
+    };
+    let lint = json!({
+        "id": "lint",
+        "role": "step",
+        "state": "failed",
+        "detail": { "phase": "execution", "code": "command_exit", "exitCode": 1 },
+    });
+    let advisory_first = failed_with(json!([
+        with_policy(lint, "advisory"),
+        with_policy(build_step.clone(), "required"),
+    ]));
+    write_published_failure(&advisory_first.run, &build_issue);
+    assert_eq!(
+        concluded_result(&advisory_first).await,
+        failed(build_issue.clone())
+    );
+
+    let blocked_detail = json!({
+        "code": "prerequisites_unsatisfied",
+        "prerequisites": [{ "kind": "control", "node": "verify" }],
+    });
+    let blocked = failed_with(json!([with_policy(
+        json!({ "id": "deploy", "role": "step", "state": "blocked", "detail": blocked_detail }),
+        "required",
+    )]));
+    let blocked_issue = json!({
+        "node": { "id": "deploy", "role": "step" },
+        "state": "blocked",
+        "detail": blocked_detail,
+    });
+    write_published_failure(&blocked.run, &blocked_issue);
+    assert_eq!(concluded_result(&blocked).await, failed(blocked_issue));
+
+    let failed_build = || failed_with(json!([with_policy(build_step.clone(), "required")]));
+    let without_directory = failed_build();
+    let without_issue = failed_build();
+    let directory = without_issue.run.join("attempts/000001/result");
+    fs::create_dir_all(&directory).unwrap();
+    fs::write(
+        directory.join("result.json"),
+        serde_json::to_vec(&json!({ "outcome": "failed" })).unwrap(),
+    )
+    .unwrap();
+    let linked = failed_build();
+    let outside = linked.log.join("outside-result");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("result.json"), published_failure(&build_issue)).unwrap();
+    fs::create_dir_all(linked.run.join("attempts/000001")).unwrap();
+    std::os::unix::fs::symlink(&outside, linked.run.join("attempts/000001/result")).unwrap();
+    let climbing = failed_build();
+    write_attempt(
+        &climbing.run,
+        "workflow_failed",
+        json!({
+            "status": "published",
+            "relativeDirectory": "attempts/../attempts/000001/result",
+        }),
+        json!([with_policy(build_step.clone(), "required")]),
+    );
+    write_published_failure(&climbing.run, &build_issue);
+    for (case, adopted) in [
+        ("no result directory", without_directory),
+        ("no primary issue", without_issue),
+        ("linked result directory", linked),
+        ("parent directory named", climbing),
+    ] {
+        let (end, _) = drive_adopted(&adopted, &[], "").await;
+        assert_eq!(resumes(&adopted.log), 0);
+        assert_eq!(
+            end.conclusion(),
+            TreeConclusion::Unreportable("tree_run_failure_unclassified"),
+            "{case}"
+        );
+    }
+}
+
+/// The transport result of the adopted run, driven with no named step, which runs no
+/// command and concludes by its exited record.
+async fn concluded_result(adopted: &Adopted) -> TransportResult {
+    let (end, _) = drive_adopted(adopted, &[], "").await;
+    assert_eq!(resumes(&adopted.log), 0);
+    let TreeConclusion::Terminal { result, .. } = end.conclusion() else {
+        panic!("a published failure has a result: {end:#?}");
+    };
+    result
 }
 
 // REQ-RUNNERENROLL-89
@@ -4587,7 +4721,8 @@ fn adopted_merge_stop() -> Adopted {
 }
 
 /// A home whose one run reads `exited` `failed`, its current attempt recording `build`
-/// failed and its result published, beside `writes` as its `mirror/` files.
+/// failed and its result published with `build`'s failure as its primary issue, beside
+/// `writes` as its `mirror/` files.
 fn adopted_failure(writes: &[Value]) -> Adopted {
     let adopted = adopted(record("exited", Some("failed"), 1, json!([])), None);
     write_attempt(
@@ -4596,6 +4731,7 @@ fn adopted_failure(writes: &[Value]) -> Adopted {
         published_result(),
         json!([build_failure().0]),
     );
+    write_published_failure(&adopted.run, &build_failure().1);
     let mirror = adopted.run.join("mirror");
     fs::create_dir(&mirror).unwrap();
     for (index, write) in writes.iter().enumerate() {

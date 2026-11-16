@@ -7800,15 +7800,38 @@ pub const MAXIMUM_DURABLE_RECORD_BYTES: u64 = MAXIMUM_DURABLE_JSON_BYTES;
 
 /// Reads the bytes of the durable record `name` of the run at `requested` as the engine
 /// reads its own records: a regular file opened without following a symbolic link and
-/// without waiting on a FIFO, of at most `MAXIMUM_DURABLE_RECORD_BYTES`. A reader outside
-/// the engine, such as the runner observing a tree run whose steps can replace the file,
-/// reads a record through this one reader, never through one of its own.
+/// without waiting on a FIFO, of at most `MAXIMUM_DURABLE_RECORD_BYTES`. `name` may be a
+/// path beneath the run directory, such as an attempt's `result/result.json`: each
+/// directory on the way to the file is opened from the run directory without following a
+/// symbolic link, as the file is, so no component is followed and the read cannot leave
+/// the run directory; a name with any component other than a plain name is refused. A reader
+/// outside the engine, such as the runner observing a tree run whose steps can replace the
+/// file, reads a record through this one reader, never through one of its own.
 pub fn read_durable_record(
     requested: &Path,
     name: &str,
 ) -> Result<Vec<u8>, LocalRunDirectoryError> {
-    let (_, root) = open_run_root(requested)?;
-    read_regular_file(&root, name)
+    let (_, mut parent) = open_run_root(requested)?;
+    let mut components = Path::new(name).components();
+    let file = match components.next_back() {
+        Some(std::path::Component::Normal(file)) => file.to_str(),
+        _ => None,
+    };
+    let Some(file) = file.filter(|_| {
+        components
+            .clone()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+    }) else {
+        return Err(LocalRunDirectoryError::StateFile {
+            path: file_locator(&parent, name),
+            operation: "resolve",
+            source: Box::new(LocalRunDirectoryError::InvalidPath),
+        });
+    };
+    for directory in components {
+        parent = open_directory_at(&parent, directory)?;
+    }
+    read_regular_file(&parent, file)
 }
 
 pub(super) fn open_run_root(
