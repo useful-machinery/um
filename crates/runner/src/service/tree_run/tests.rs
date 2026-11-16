@@ -86,7 +86,8 @@ const RUN_URL: &str = "https://usefulmachinery.com/acme/runs/run_01k0z6r1w8f4jy2
 /// after one. `run stop` and `run lift` record their command lines; `run answer`, `approve`
 /// and `hand-back` append theirs to `control.args` and answer `recorded`, or, with
 /// `$TREE_TEST_CONTROL` `refuse`, refuse `question_unknown`, with `hang` hang until killed,
-/// and with `record_hang` (`approve` and `hand-back`) record their control for the run's
+/// with `silent` exit 0 printing nothing, which the runner reads as no document, and with
+/// `record_hang` (`approve` and `hand-back`) record their control for the run's
 /// wait under `controls/` and then hang until killed; `run retry` appends its command
 /// line there too and then answers as `resume`. `event`, `stop`, `lift`, `answer`,
 /// `approve`, `hand-back`, `retry` and `resume` (but not a retry's) each append their name
@@ -215,6 +216,9 @@ case "$1 $2 $3" in
   if [ "$TREE_TEST_CONTROL" = refuse ]; then
     printf '{"schemaVersion":1,"command":"um workflow run %s","outcome":"refused","exitStatus":1,"runDirectory":"%s","diagnostics":[{"code":"question_unknown","message":"unknown"}]}\n' "$3" "$4"
     exit 1
+  fi
+  if [ "$TREE_TEST_CONTROL" = silent ]; then
+    exit 0
   fi
   if [ "$TREE_TEST_CONTROL" = record_hang ]; then
     name=$(printf '%s' "$3" | tr - _)
@@ -1737,6 +1741,8 @@ async fn control_that_outlived_its_bound_unrecorded_is_refused_and_its_class_log
     assert!(failed[0].contains("class=timeout"), "{}", failed[0]);
     // A command killed at its bound ended without an I/O error to name.
     assert!(!failed[0].contains("kind="), "{}", failed[0]);
+    // The run's controls were read and hold no such control: no read failed.
+    assert!(!failed[0].contains("controls_read="), "{}", failed[0]);
     assert_eq!(resumes(&fixture.log), 0);
     cancel_assignment(&mut fixture);
     let reports = finished_reports(&mut fixture.manager).await;
@@ -1752,6 +1758,88 @@ async fn control_that_outlived_its_bound_unrecorded_is_refused_and_its_class_log
     );
     assert_eq!(order(&fixture.log), ["approve"]);
     assert_eq!(chosen_outcome(&reports).as_deref(), Some("canceled"));
+}
+
+// REQ-RUNNERENROLL-90: when the run's controls cannot be read to tell whether a control
+// command that outlived its bound or printed no outcome recorded its control, the control
+// is refused `control_command_failed` and left unapplied, and the run's log names the
+// failed read's class beside the command's.
+#[tokio::test]
+async fn control_whose_controls_cannot_be_read_is_refused_and_the_read_class_logged() {
+    // A stray file under `controls/` that is not a control event.
+    let stray: fn(&Path) = |log| {
+        stage(
+            log,
+            "create",
+            "controls",
+            "0001-approve.json",
+            b"not a control\n",
+        );
+    };
+    // A `controls` that is a regular file, not a directory.
+    let misplaced: fn(&Path) = |log| stage(log, "create", "", "controls", b"");
+    // A control file that is a symbolic link, which the read does not follow.
+    let linked: fn(&Path) = |log| {
+        let controls = log.join("stages/create/controls");
+        fs::create_dir_all(&controls).unwrap();
+        std::os::unix::fs::symlink(log.join("absent.json"), controls.join("0001-approve.json"))
+            .unwrap();
+    };
+    let cases = [
+        (
+            "hang",
+            stray,
+            &["class=timeout", "controls_read=control_event_invalid"][..],
+        ),
+        (
+            "silent",
+            misplaced,
+            &["class=no_document", "controls_read=controls_layout_invalid"],
+        ),
+        (
+            "silent",
+            linked,
+            &[
+                "class=no_document",
+                "controls_read=controls_file_unavailable",
+                "controls_read_kind=",
+            ],
+        ),
+    ];
+    for (word, staged, fields) in cases {
+        let mut fixture = control_wait_fixture_bounded(
+            "approval",
+            &[("TREE_TEST_CONTROL", word)],
+            HANGING_CONTROL_BOUND,
+        );
+        staged(&fixture.log);
+        start(&mut fixture).await;
+        wait_for_waiting(&mut fixture).await;
+        send_control(&mut fixture, CONTROL_ID, resolving("approve", "approval"));
+        wait_for_reports(&mut fixture.manager, |reports| {
+            !control_applications(reports).is_empty()
+        })
+        .await;
+        let failed = failure_lines(&run_log(&fixture), "control_command_failed");
+        assert_eq!(failed.len(), 1, "{word} {fields:?}: {failed:#?}");
+        for field in fields {
+            assert!(failed[0].contains(field), "{field}: {}", failed[0]);
+        }
+        assert_eq!(resumes(&fixture.log), 0);
+        cancel_assignment(&mut fixture);
+        let reports = finished_reports(&mut fixture.manager).await;
+
+        assert_eq!(
+            control_applications(&reports),
+            [RunControlApplication {
+                control_id: CONTROL_ID.to_owned(),
+                outcome: RunControlOutcome::Refused {
+                    code: "control_command_failed".to_owned(),
+                },
+            }]
+        );
+        assert_eq!(order(&fixture.log), ["approve"]);
+    }
 }
 
 // REQ-RUNNERENROLL-90

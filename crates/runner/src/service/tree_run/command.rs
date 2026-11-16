@@ -38,7 +38,7 @@ use serde_json::Value;
 use um_execution::{
     CONTROL_ANSWER, CONTROL_APPROVE, CONTROL_HAND_BACK, CONTROL_LIFT, CONTROL_RETRY,
     CancellationReason, CancellationSource, CaptureCancellation, ControlEvent, EnvironmentSnapshot,
-    wait_identity,
+    LocalRunDirectoryError, wait_identity,
 };
 use um_runner_protocol::{
     RunControlAction, RunControlAnswer, RunControlOutcome, TriggerDelivery, TriggerDeliveryAction,
@@ -722,8 +722,9 @@ impl fmt::Display for Unanswered {
 }
 
 /// Appends the line naming why a command failed with `code`, `[tree-run: CODE FIELDS]`,
-/// `fields` its class as `Unanswered` writes it, to the run's log on a blocking worker;
-/// never the command's arguments or output, which the log already holds.
+/// `fields` its class as `Unanswered` writes it, followed for a control whose run's controls
+/// could not be read by that read's class as `ControlsUnread` writes it, to the run's log on
+/// a blocking worker; never the command's arguments or output, which the log already holds.
 async fn log_failure(log: &RunLog, code: &str, fields: impl fmt::Display) {
     let (log, line) = (log.clone(), format!("\n[tree-run: {code} {fields}]\n"));
     // A log that cannot be written loses this line; the application is still reported.
@@ -1033,15 +1034,68 @@ impl Recorded {
     }
 
     /// Whether the controls of the run at `run_directory`, read on a blocking worker, hold
-    /// this control.
-    async fn held_by(self, run_directory: &Path) -> bool {
+    /// this control, or why they could not be read.
+    async fn held_by(self, run_directory: &Path) -> Result<bool, ControlsUnread> {
         let run_directory = run_directory.to_owned();
         tokio::task::spawn_blocking(move || {
             um_execution::read_controls(&run_directory)
-                .is_ok_and(|controls| controls.iter().any(|control| self.holds(control)))
+                .map(|controls| controls.iter().any(|control| self.holds(control)))
+                .map_err(ControlsUnread::Read)
         })
         .await
-        .unwrap_or(false)
+        .map_err(ControlsUnread::ReaderLost)?
+    }
+}
+
+/// Why the run's controls could not be read to tell whether a control command recorded its
+/// control (REQ-RUNNERENROLL-90).
+#[derive(Debug)]
+enum ControlsUnread {
+    /// The engine's reader refused the run directory or its `controls/`.
+    Read(LocalRunDirectoryError),
+    /// The blocking worker reading them did not return.
+    ReaderLost(tokio::task::JoinError),
+}
+
+impl ControlsUnread {
+    /// The closed class of the failed read: a file under `controls/` that is not a control
+    /// event for its name, or a repeated ordinal; a `controls/` or a file in it of the wrong
+    /// kind or size; a file operation that failed; any other refusal of the run directory;
+    /// or a worker that did not return.
+    fn class(&self) -> &'static str {
+        match self {
+            Self::Read(LocalRunDirectoryError::StateFile { source, .. }) => match **source {
+                LocalRunDirectoryError::ControlEventInvalid => "control_event_invalid",
+                _ => "controls_layout_invalid",
+            },
+            Self::Read(LocalRunDirectoryError::File { .. }) => "controls_file_unavailable",
+            Self::Read(_) => "controls_directory_unavailable",
+            Self::ReaderLost(_) => "controls_reader_lost",
+        }
+    }
+}
+
+/// The log's fields for the failed read: `controls_read=CLASS`, and for a failed file
+/// operation ` controls_read_kind=KIND`, the kind of its I/O error; never the error's path
+/// or text.
+impl fmt::Display for ControlsUnread {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "controls_read={}", self.class())?;
+        match self {
+            Self::Read(LocalRunDirectoryError::File { source, .. }) => {
+                write!(formatter, " controls_read_kind={:?}", source.kind())
+            }
+            Self::Read(_) | Self::ReaderLost(_) => Ok(()),
+        }
+    }
+}
+
+impl std::error::Error for ControlsUnread {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Read(error) => Some(error),
+            Self::ReaderLost(error) => Some(error),
+        }
     }
 }
 
@@ -1160,7 +1214,8 @@ fn reported(document: &Value) -> Option<RunControlOutcome> {
 /// command that launched and printed no `outcome` or outlived its bound, `applied`
 /// `recorded` once the run's controls hold `recorded`, the control it records for the wait
 /// it names; and otherwise `refused` `control_command_failed`, the run's log naming the
-/// failure's class.
+/// failure's class and, when the run's controls could not be read to tell, the failed
+/// read's class beside it.
 async fn control_outcome(
     log: &RunLog,
     document: Result<Value, Unanswered>,
@@ -1173,16 +1228,26 @@ async fn control_outcome(
     let printed_outcome = document
         .as_ref()
         .is_ok_and(|document| document["outcome"].is_string());
+    let mut unread = None;
     if !printed_outcome
         && !matches!(document, Err(Unanswered::Launch(_)))
         && let Some(recorded) = recorded
-        && recorded.held_by(run_directory).await
     {
-        return RunControlOutcome::Applied {
-            action_outcome: RECORDED.to_owned(),
-        };
+        match recorded.held_by(run_directory).await {
+            Ok(true) => {
+                return RunControlOutcome::Applied {
+                    action_outcome: RECORDED.to_owned(),
+                };
+            }
+            Ok(false) => {}
+            Err(error) => unread = Some(error),
+        }
     }
-    log_failure(log, CONTROL_COMMAND_FAILED, unanswered(&document)).await;
+    let read = unread
+        .map(|unread| format!(" {unread}"))
+        .unwrap_or_default();
+    let class = unanswered(&document);
+    log_failure(log, CONTROL_COMMAND_FAILED, format!("{class}{read}")).await;
     command_failed()
 }
 
