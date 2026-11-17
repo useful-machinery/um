@@ -463,10 +463,11 @@ fn mirror_templates_name_only_their_hooks_variables() {
     assert_mirror_location(&location, "onWait.comment");
 }
 
-// REQ-WFFORMAT-101, REQ-WFDEF-10: `operator`, `run.id` and `run.url` are every hook's.
+// REQ-WFFORMAT-101, REQ-WFDEF-10: `operator`, `run.id`, `run.url` and `run.reference` are
+// every hook's.
 #[test]
 fn mirror_templates_name_the_operator_and_the_run_in_every_hook() {
-    const EVERY_HOOK: &str = "{{operator}} {{run.id}} {{run.url}}";
+    const EVERY_HOOK: &str = "{{operator}} {{run.id}} {{run.url}} {{run.reference}}";
     let mut root = ROOT_WORKFLOW.to_owned();
     for template in [
         "Engineering started by {{operator}}. Run: {{run.url}}",

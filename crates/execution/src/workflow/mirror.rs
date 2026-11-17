@@ -84,9 +84,25 @@ impl MirrorHook {
 /// The variables a hook's template may name (REQ-WFFORMAT-101).
 pub fn hook_variables(hook: MirrorHook) -> &'static [&'static str] {
     match hook {
-        MirrorHook::Start | MirrorHook::Outcome => &["operator", "run.id", "run.url"],
-        MirrorHook::Stage => &["operator", "run.id", "run.url", "stage", "summary"],
-        MirrorHook::Wait => &["operator", "run.id", "run.url", "wait.kind", "wait.summary"],
+        MirrorHook::Start | MirrorHook::Outcome => {
+            &["operator", "run.id", "run.url", "run.reference"]
+        }
+        MirrorHook::Stage => &[
+            "operator",
+            "run.id",
+            "run.url",
+            "run.reference",
+            "stage",
+            "summary",
+        ],
+        MirrorHook::Wait => &[
+            "operator",
+            "run.id",
+            "run.url",
+            "run.reference",
+            "wait.kind",
+            "wait.summary",
+        ],
     }
 }
 
@@ -486,24 +502,33 @@ pub fn read_numbered_mirror_writes(
     WRITES.read(run_directory)
 }
 
+/// What a run's mirror holds of the run (REQ-LOCALRUN-191): the values of the `operator`,
+/// `run.id`, `run.url` and `run.reference` placeholders, each composed by the caller, and
+/// the run directory the mirror's records go under.
+#[derive(Clone, Debug)]
+pub struct MirrorRun {
+    pub operator: String,
+    pub id: String,
+    pub url: String,
+    pub reference: String,
+    pub directory: PathBuf,
+}
+
 /// A run's mirror (REQ-LOCALRUN-193): the root's block, the issue identifier, the bound
 /// values of its revision's bindings snapshot by key (or why they cannot be had), the
-/// resolved provider ids by key when the revision has a resolution record, the operator,
-/// the run's id and URL and the run directory the records go under. With resolved ids the
-/// outcome's guard and state write go by id, else by the bound name (REQ-LOCALRUN-192).
-/// Each hook performs the block's write when the block declares it and appends one
-/// record of how it ended; its only error is that record's own write failing, and a failed
-/// write is a record, never an error.
+/// resolved provider ids by key when the revision has a resolution record, and the run
+/// (`MirrorRun`): the operator, the run's id, URL and reference, and the run directory the
+/// records go under. With resolved ids the outcome's guard and state write go by id, else
+/// by the bound name (REQ-LOCALRUN-192). Each hook performs the block's write when the
+/// block declares it and appends one record of how it ended; its only error is that
+/// record's own write failing, and a failed write is a record, never an error.
 #[derive(Clone, Debug)]
 pub struct Mirror {
     block: MirrorBlock,
     issue: String,
     bindings: Result<BTreeMap<String, String>, MirrorFailure>,
     resolved_ids: Option<BTreeMap<String, String>>,
-    operator: String,
-    run_id: String,
-    run_url: String,
-    run_directory: PathBuf,
+    run: MirrorRun,
 }
 
 impl Mirror {
@@ -511,20 +536,14 @@ impl Mirror {
         block: MirrorBlock,
         issue: String,
         bindings: Result<BTreeMap<String, String>, MirrorFailure>,
-        operator: String,
-        run_id: String,
-        run_url: String,
-        run_directory: PathBuf,
+        run: MirrorRun,
     ) -> Self {
         Self {
             block,
             issue,
             bindings,
             resolved_ids: None,
-            operator,
-            run_id,
-            run_url,
-            run_directory,
+            run,
         }
     }
 
@@ -646,9 +665,10 @@ impl Mirror {
             return template.to_owned();
         };
         let value = |name: &str| match name {
-            "operator" => Some(self.operator.as_str()),
-            "run.id" => Some(self.run_id.as_str()),
-            "run.url" => Some(self.run_url.as_str()),
+            "operator" => Some(self.run.operator.as_str()),
+            "run.id" => Some(self.run.id.as_str()),
+            "run.url" => Some(self.run.url.as_str()),
+            "run.reference" => Some(self.run.reference.as_str()),
             _ => variables
                 .iter()
                 .find(|(variable, _)| *variable == name)
@@ -723,7 +743,7 @@ impl Mirror {
         performed: Performed,
     ) -> Result<(), LocalRunDirectoryError> {
         let write = MirrorWrite::new(hook, &self.issue, action, performed)?;
-        append_write(&self.run_directory, &write).map(|_| ())
+        append_write(&self.run.directory, &write).map(|_| ())
     }
 }
 
@@ -850,6 +870,17 @@ mod tests {
         .collect()
     }
 
+    /// The run `run_x` of `saeed`, its records under `directory`.
+    fn mirror_run(directory: &Path) -> MirrorRun {
+        MirrorRun {
+            operator: "saeed".to_owned(),
+            id: "run_x".to_owned(),
+            url: "file:///tmp/run_x".to_owned(),
+            reference: "um workflow run show run_x".to_owned(),
+            directory: directory.to_owned(),
+        }
+    }
+
     fn mirror(
         root: &tempfile::TempDir,
         bindings: Result<BTreeMap<String, String>, MirrorFailure>,
@@ -858,10 +889,7 @@ mod tests {
             sketch_block(),
             "AUTO-143".to_owned(),
             bindings,
-            "saeed".to_owned(),
-            "run_x".to_owned(),
-            "file:///tmp/run_x".to_owned(),
-            root.path().to_owned(),
+            mirror_run(root.path()),
         )
     }
 
@@ -1147,10 +1175,7 @@ mod tests {
             block,
             "AUTO-143".to_owned(),
             Ok(engineering_bindings()),
-            "saeed".to_owned(),
-            "run_x".to_owned(),
-            "file:///tmp/run_x".to_owned(),
-            root.path().to_owned(),
+            mirror_run(root.path()),
         );
         quiet.start(&target).unwrap();
         assert_eq!(target.calls(), []);
@@ -1218,10 +1243,7 @@ mod tests {
             sketch_block(),
             "AUTO-143".to_owned(),
             Ok(partial),
-            "saeed".to_owned(),
-            "run_x".to_owned(),
-            "file:///tmp/run_x".to_owned(),
-            other.path().to_owned(),
+            mirror_run(other.path()),
         );
         mirror.outcome(&target, "withdrawn").unwrap();
         assert_eq!(target.calls(), []);

@@ -797,6 +797,37 @@ fn a_resolution_record_moves_the_issue_by_state_id_and_run_url_is_the_external_u
     );
 }
 
+// REQ-LOCALRUN-191, REQ-WFFORMAT-101
+#[test]
+fn run_reference_is_the_external_url_else_the_show_command() {
+    let tree = engineering_tree(true);
+    let root = fs::read_to_string(Path::new(tree.path()).join("workflow.yaml")).unwrap();
+    tree.write(
+        "workflow.yaml",
+        &replaced(&root, "Run: {{run.url}}", "Run: {{run.reference}}"),
+    );
+    let published = Published::publish(tree);
+    let stub = LinearStub::start();
+
+    let run = create(&published, "AUTO-1", |command| stub.point(command));
+    let id = run_record(&run)["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        comments(&stub)[0],
+        format!("Engineering started by {MIRROR_OPERATOR}. Run: um workflow run show {id}")
+    );
+
+    stub.clear();
+    let external = "https://usefulmachinery.test/acme/runs/run_x";
+    create(&published, "AUTO-2", |command| {
+        stub.point(command)
+            .args(["--external", &format!("url={external}")])
+    });
+    assert_eq!(
+        comments(&stub)[0],
+        format!("Engineering started by {MIRROR_OPERATOR}. Run: {external}")
+    );
+}
+
 // REQ-WFDEF-32, REQ-LOCALRUN-192: with a resolution record the guard
 // `issue.state != $ownedState` compares state ids: it does not hold for an issue in the
 // owned state a person renamed, and holds for one in another state now bearing the owned

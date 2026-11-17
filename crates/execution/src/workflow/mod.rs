@@ -88,8 +88,8 @@ pub use canonical_json::CanonicalJsonError;
 pub use claude_code::ClaudeCodeConfig;
 pub use mirror::{
     Mirror, MirrorAction, MirrorBlock, MirrorFailure, MirrorGuard, MirrorGuardError,
-    MirrorGuardOperator, MirrorHook, MirrorSkipReason, MirrorState, MirrorTarget, MirrorWrite,
-    MirrorWriteOutcome, Template, TemplateError, TemplateSegment, hook_variables,
+    MirrorGuardOperator, MirrorHook, MirrorRun, MirrorSkipReason, MirrorState, MirrorTarget,
+    MirrorWrite, MirrorWriteOutcome, Template, TemplateError, TemplateSegment, hook_variables,
     read_mirror_writes, read_numbered_mirror_writes,
 };
 pub use pi::PiConfig;

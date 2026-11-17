@@ -14,8 +14,9 @@ use std::sync::Arc;
 use zeroize::Zeroizing;
 
 use um_execution::{
-    DefinitionError, LocalRunDirectoryError, Mirror, MirrorFailure, MirrorTarget, ResolvedInput,
-    ResolvedInputs, ValidatedWorkflow, WorkflowHome, WorkflowRunRecord, read_revision_bindings,
+    DefinitionError, LocalRunDirectoryError, Mirror, MirrorFailure, MirrorRun, MirrorTarget,
+    ResolvedInput, ResolvedInputs, ValidatedWorkflow, WorkflowHome, WorkflowRunRecord,
+    read_revision_bindings,
 };
 
 use super::create::blocking_operation;
@@ -78,22 +79,30 @@ pub(super) fn mirror_for_run(
             resolved_ids,
         ),
     };
-    // REQ-LOCALRUN-191: the record's `external.url`, which a Cloud runner sets to the run's
-    // page, else the run directory.
-    let run_url = record.external.get("url").cloned().unwrap_or_else(|| {
+    // REQ-LOCALRUN-191: the run's URL is the record's `external.url`, which a Cloud runner
+    // sets to the run's page, else the run directory; its reference is that same external
+    // URL, else the command that shows the run on this host.
+    let external_url = record.external.get("url");
+    let run_url = external_url.cloned().unwrap_or_else(|| {
         url::Url::from_file_path(run_directory).map_or_else(
             |()| format!("file://{}", run_directory.display()),
             String::from,
         )
     });
+    let run_reference = external_url
+        .cloned()
+        .unwrap_or_else(|| format!("um workflow run show {}", record.id));
     let mirror = Mirror::new(
         block.clone(),
         issue.unwrap_or_default(),
         bindings,
-        record.owner.clone(),
-        record.id.clone(),
-        run_url,
-        run_directory.to_owned(),
+        MirrorRun {
+            operator: record.owner.clone(),
+            id: record.id.clone(),
+            url: run_url,
+            reference: run_reference,
+            directory: run_directory.to_owned(),
+        },
     );
     Some(match resolved_ids {
         Some(resolved_ids) => mirror.with_resolved_ids(resolved_ids),
