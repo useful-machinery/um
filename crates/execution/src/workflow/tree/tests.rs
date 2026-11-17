@@ -751,8 +751,12 @@ fn a_schedule_trigger_reads_no_event_and_has_a_timetable_of_the_right_shape() {
         ("0 6 * *", "UTC", "schedule"),
         ("0 6 ? * MON", "UTC", "schedule"),
         ("0 6 * * MONDAY", "UTC", "schedule"),
-        ("0 6 * * *", "Mars", "timezone"),
         ("0 6 * * *", "Europe/", "timezone"),
+        ("0 6 * * *", "Local", "timezone"),
+        ("0 6 * * *", "/etc/localtime", "timezone"),
+        ("0 6 * * *", "Europe//Berlin", "timezone"),
+        ("0 6 * * *", "+02:00", "timezone"),
+        ("0 6 * * *", "../etc/passwd", "timezone"),
     ] {
         assert_eq!(
             trigger_rejections(&timing(schedule, timezone)),
@@ -766,6 +770,13 @@ fn a_schedule_trigger_reads_no_event_and_has_a_timetable_of_the_right_shape() {
             "America/Argentina/Buenos_Aires",
         ),
         ("0 6 * * *", "Etc/GMT+5"),
+        ("0 6 * * *", "GMT"),
+        ("0 6 * * *", "CET"),
+        ("0 6 * * *", "Japan"),
+        ("0 6 * * *", "Zulu"),
+        ("0 6 * * *", "GMT+0"),
+        ("0 6 * * *", "UTC"),
+        ("0 6 * * *", "Etc/GMT"),
     ] {
         let tree = trigger_tree(&timing(schedule, timezone));
         validate_workflow_tree(tree.path())

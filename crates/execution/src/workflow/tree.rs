@@ -797,17 +797,17 @@ fn is_cron_shape(cron: &str) -> bool {
         })
 }
 
-/// `UTC` or the `Area/City` form of a zone name: two or more `/`-separated segments, each a
-/// letter followed by letters, digits, `_`, `+` or `-`. Cloud publication resolves it.
+/// The shape of a zone name: one or more `/`-separated segments, each a letter followed by
+/// letters, digits, `_`, `+` or `-`, and not `Local`. The check is lexical; Cloud resolves
+/// the name when it checks that the definition can start (REQ-CLOUDDEF-9).
 fn is_zone_shape(timezone: &str) -> bool {
-    timezone == "UTC"
-        || timezone.split('/').count() >= 2
-            && timezone.split('/').all(|segment| {
-                segment.starts_with(|character: char| character.is_ascii_alphabetic())
-                    && segment
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || b"_+-".contains(&byte))
-            })
+    timezone != "Local"
+        && timezone.split('/').all(|segment| {
+            segment.starts_with(|character: char| character.is_ascii_alphabetic())
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_+-".contains(&byte))
+        })
 }
 
 /// The root's `mirror` block (REQ-WFFORMAT-101): its issue input, outcome keys, states,
