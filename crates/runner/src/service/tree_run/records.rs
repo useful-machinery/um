@@ -436,17 +436,32 @@ fn recorded_exit(record: &TreeRecord) -> TreeExit {
     }
 }
 
-/// The writes as `MirrorResult`s, each its file without `schemaVersion`: the latest
-/// `MAXIMUM_MIRROR_RESULTS` of them, so the outcome's write is always among them.
+/// The writes as `MirrorResult`s, each its file without `schemaVersion` and without a
+/// `reason` the protocol does not name (`travels`): the latest `MAXIMUM_MIRROR_RESULTS` of
+/// them, so the outcome's write is always among them.
 fn mirror_results(writes: &[MirrorWrite]) -> Vec<Value> {
     writes[writes.len().saturating_sub(MAXIMUM_MIRROR_RESULTS)..]
         .iter()
         .filter_map(|write| {
             let mut result = serde_json::to_value(write).ok()?;
-            result.as_object_mut()?.remove("schemaVersion");
+            let result_object = result.as_object_mut()?;
+            result_object.remove("schemaVersion");
+            if !write.reason.is_none_or(travels) {
+                result_object.remove("reason");
+            }
             Some(result)
         })
         .collect()
+}
+
+/// Whether the runner protocol's `MirrorResult` names `reason`, so that it travels with its
+/// write (REQ-RUNNERENROLL-99): a reason the protocol does not name would have Cloud refuse
+/// the frame, so its write travels `skipped` with no `reason`.
+const fn travels(reason: MirrorSkipReason) -> bool {
+    match reason {
+        MirrorSkipReason::GuardHeld => true,
+        MirrorSkipReason::StartAnnounced => false,
+    }
 }
 
 /// Whether `write` confirms a departure (REQ-RUNNERENROLL-99): the outcome hook's state

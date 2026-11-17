@@ -81,7 +81,8 @@ pub(super) fn mirror_for_run(
     };
     // REQ-LOCALRUN-191: the run's URL is the record's `external.url`, which a Cloud runner
     // sets to the run's page, else the run directory; its reference is that same external
-    // URL, else the command that shows the run on this host.
+    // URL, else the command that shows the run on this host. The external URL itself is what
+    // the start comment looks for on the issue (REQ-LOCALRUN-216).
     let external_url = record.external.get("url");
     let run_url = external_url.cloned().unwrap_or_else(|| {
         url::Url::from_file_path(run_directory).map_or_else(
@@ -101,6 +102,7 @@ pub(super) fn mirror_for_run(
             id: record.id.clone(),
             url: run_url,
             reference: run_reference,
+            external_url: external_url.cloned(),
             directory: run_directory.to_owned(),
         },
     );

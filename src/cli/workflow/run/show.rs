@@ -490,6 +490,7 @@ fn mirror_text(write: &MirrorWrite) -> String {
         MirrorWriteOutcome::Written => "written".to_owned(),
         MirrorWriteOutcome::Skipped => match write.reason {
             Some(MirrorSkipReason::GuardHeld) => "skipped guard_held".to_owned(),
+            Some(MirrorSkipReason::StartAnnounced) => "skipped start_announced".to_owned(),
             None => "skipped -".to_owned(),
         },
         MirrorWriteOutcome::Failed => format!("failed {}", or_dash(write.code.as_deref())),

@@ -1456,6 +1456,51 @@ fn claim_release_is_requested_only_after_a_confirmed_departure() {
     encode_finish(exit).unwrap();
 }
 
+// REQ-RUNNERENROLL-99: a start comment skipped `start_announced` travels `skipped` with no
+// `reason`, a value the protocol's `MirrorResult` does not name, and confirms no departure.
+#[test]
+fn a_start_announced_skip_travels_without_its_reason() {
+    let start = mirror_write(
+        "start",
+        json!({"kind": "comment", "body": "Started."}),
+        "skipped",
+        json!({"reason": "start_announced"}),
+    );
+    let outcome = state_write("written", json!({}));
+    let writes = [start.clone(), outcome.clone()];
+    let TreeConclusion::Terminal { exit, .. } = conclude_documented(
+        Some(&exited_with(&writes, 0)),
+        Some(&result_document("succeeded")),
+        None,
+    ) else {
+        panic!("an exited record has a result");
+    };
+    assert_eq!(
+        exit.mirror,
+        vec![
+            json!({
+                "hook": start["hook"],
+                "at": start["at"],
+                "issue": start["issue"],
+                "action": start["action"],
+                "outcome": start["outcome"],
+            }),
+            mirror_result(outcome),
+        ]
+    );
+    // Each item is a `MirrorResult` the protocol admits.
+    encode_finish(exit).unwrap();
+
+    let TreeConclusion::Terminal { exit, .. } = conclude_documented(
+        Some(&exited_with(&[start], 0)),
+        Some(&result_document("succeeded")),
+        None,
+    ) else {
+        panic!("an exited record has a result");
+    };
+    assert!(!exit.claim_release);
+}
+
 // REQ-RUNNERENROLL-99: only a departure the attempt's own outcome write confirmed requests
 // release; an earlier attempt's write is still reported but confirms nothing for it.
 #[test]

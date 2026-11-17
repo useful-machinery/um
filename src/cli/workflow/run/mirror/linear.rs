@@ -30,6 +30,11 @@ const ISSUE_STATE: (&str, &str) = (
     "IssueState",
     "query IssueState($id: String!) { issue(id: $id) { id identifier updatedAt state { id name } team { id states(first: 100) { nodes { id name } } } } }",
 );
+/// `IssueState`'s selection with the issue's 50 newest comments, Linear's default order.
+const ISSUE_COMMENTS: (&str, &str) = (
+    "IssueComments",
+    "query IssueComments($id: String!) { issue(id: $id) { id identifier updatedAt state { id name } team { id states(first: 100) { nodes { id name } } } comments(first: 50) { nodes { body } } } }",
+);
 const CREATE_COMMENT: (&str, &str) = (
     "CreateIssueComment",
     "mutation CreateIssueComment($input: CommentCreateInput!) { commentCreate(input: $input) { success } }",
@@ -239,8 +244,20 @@ impl LinearTarget {
 
     /// One `IssueState` for `requested`, which the answer's `field` must repeat.
     fn read(&self, requested: &str, field: &str) -> Result<Issue, MirrorFailure> {
-        let data = self.post(ISSUE_STATE, json!({"id": requested}))?;
-        let issue = match data.get("issue") {
+        self.read_document(ISSUE_STATE, requested, field)
+            .map(|(issue, _)| issue)
+    }
+
+    /// One `document`, whose selection holds `IssueState`'s, for `requested`, which the
+    /// answer's `field` must repeat: the issue and the answer's issue object.
+    fn read_document(
+        &self,
+        document: (&str, &str),
+        requested: &str,
+        field: &str,
+    ) -> Result<(Issue, Value), MirrorFailure> {
+        let mut data = self.post(document, json!({"id": requested}))?;
+        let issue = match data.get_mut("issue").map(Value::take) {
             None | Some(Value::Null) => {
                 return Err(MirrorFailure::issue_unavailable(format!(
                     "Linear has no issue {requested} the credential can read."
@@ -273,7 +290,7 @@ impl LinearTarget {
                 "Linear's document for {requested} has no id, state name, state id or team states."
             )));
         };
-        Ok(Issue {
+        let read = Issue {
             identifier: text(issue.get("identifier")).unwrap_or_default(),
             id,
             state,
@@ -281,7 +298,8 @@ impl LinearTarget {
             team: text(issue.pointer("/team/id")),
             updated_at: text(issue.get("updatedAt")),
             states,
-        })
+        };
+        Ok((read, issue))
     }
 
     /// Moves the issue whose Linear id is `issue_id` to the state whose id is `state_id`.
@@ -337,6 +355,29 @@ impl MirrorTarget for LinearTarget {
 
     fn issue_state_id(&self, issue: &str) -> Result<String, MirrorFailure> {
         self.issue(issue).map(|issue| issue.state_id)
+    }
+
+    /// One `IssueComments` by identifier, uncached, whose issue is kept as `IssueState`'s
+    /// is, so a comment after it reads nothing more; a failed read keeps nothing
+    /// (REQ-LOCALRUN-216).
+    fn comments(&self, issue: &str) -> Result<Vec<String>, MirrorFailure> {
+        let (read, answer) = self.read_document(ISSUE_COMMENTS, issue, "identifier")?;
+        let bodies = answer
+            .pointer("/comments/nodes")
+            .and_then(Value::as_array)
+            .and_then(|nodes| {
+                nodes
+                    .iter()
+                    .map(|node| node.get("body").and_then(Value::as_str).map(str::to_owned))
+                    .collect::<Option<Vec<_>>>()
+            })
+            .ok_or_else(|| {
+                MirrorFailure::unavailable(format!(
+                    "Linear's document for {issue} has no comment bodies."
+                ))
+            })?;
+        *self.issue.borrow_mut() = Some(read);
+        Ok(bodies)
     }
 
     fn comment(&self, issue: &str, body: &str) -> Result<(), MirrorFailure> {
@@ -588,6 +629,90 @@ mod tests {
             operations(&seen),
             ["IssueState", "CreateIssueComment", "CreateIssueComment"]
         );
+    }
+
+    /// `issue("Engineering")` with the comments `bodies`, newest first.
+    fn issue_with_comments(bodies: &[&str]) -> Value {
+        let mut answer = issue("Engineering");
+        answer["data"]["issue"]["comments"] = json!({"nodes": bodies
+            .iter()
+            .map(|body| json!({"body": body}))
+            .collect::<Vec<_>>()});
+        answer
+    }
+
+    // REQ-LOCALRUN-216: the comments are one `IssueComments` by identifier, answered in
+    // Linear's order, and the issue it read keys the comment written after it.
+    #[test]
+    fn comments_read_the_issue_with_its_newest_comments_and_serve_the_comment_after() {
+        let (target, seen) = linear(
+            Some(KEY),
+            vec![
+                (
+                    "IssueComments",
+                    200,
+                    issue_with_comments(&["newest", "older"]),
+                ),
+                (
+                    "CreateIssueComment",
+                    200,
+                    json!({"data": {"commentCreate": {"success": true}}}),
+                ),
+            ],
+        );
+        assert_eq!(target.comments("AUTO-143").unwrap(), ["newest", "older"]);
+        assert_eq!(operations(&seen), ["IssueComments"]);
+        let read = seen.borrow()[0].2.clone();
+        assert_eq!(read["variables"], json!({"id": "AUTO-143"}));
+        let query = read["query"].as_str().unwrap();
+        assert!(
+            query.contains("comments(first: 50) { nodes { body } }") && !query.contains("orderBy"),
+            "{query}"
+        );
+
+        target.comment("AUTO-143", "x").unwrap();
+        assert_eq!(operations(&seen), ["IssueComments", "CreateIssueComment"]);
+        assert_eq!(
+            seen.borrow()[1].2["variables"],
+            json!({"input": {"issueId": "uuid-143", "body": "x"}})
+        );
+    }
+
+    // REQ-LOCALRUN-216: a refused or failed read, or an answer without every comment's body,
+    // is an error that keeps no issue, so a comment after it reads the issue itself.
+    #[test]
+    fn a_failed_comments_read_keeps_nothing_for_the_comment_after() {
+        let mut bodyless = issue_with_comments(&["kept"]);
+        bodyless["data"]["issue"]["comments"]["nodes"][0]["body"] = Value::Null;
+        for (status, answer) in [
+            (
+                200,
+                json!({"errors": [{"message": "Cannot query field comments"}]}),
+            ),
+            (500, json!({})),
+            (200, issue("Engineering")),
+            (200, bodyless),
+        ] {
+            let (target, seen) = linear(
+                Some(KEY),
+                vec![
+                    ("IssueComments", status, answer.clone()),
+                    ("IssueState", 200, issue("Engineering")),
+                    (
+                        "CreateIssueComment",
+                        200,
+                        json!({"data": {"commentCreate": {"success": true}}}),
+                    ),
+                ],
+            );
+            assert!(target.comments("AUTO-143").is_err(), "{answer}");
+            target.comment("AUTO-143", "x").unwrap();
+            assert_eq!(
+                operations(&seen),
+                ["IssueComments", "IssueState", "CreateIssueComment"],
+                "{answer}"
+            );
+        }
     }
 
     // REQ-LOCALRUN-192: Linear's refusal is `mirror_write_rejected` with its message and

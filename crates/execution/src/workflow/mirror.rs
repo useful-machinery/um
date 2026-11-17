@@ -313,10 +313,12 @@ impl std::error::Error for MirrorFailure {}
 /// Where the mirror writes: the execution crate declares it and the CLI implements it over
 /// Linear. `issue_state` answers the issue's state name and `set_state` moves it to the state
 /// of a name; `issue_state_id` and `set_state_id` do the same by the provider's state id, for
-/// a revision with a resolution record (REQ-WFDEF-32).
+/// a revision with a resolution record (REQ-WFDEF-32). `comments` answers the bodies of the
+/// issue's newest comments, at most 50, for the start rule (REQ-LOCALRUN-216).
 pub trait MirrorTarget {
     fn issue_state(&self, issue: &str) -> Result<String, MirrorFailure>;
     fn issue_state_id(&self, issue: &str) -> Result<String, MirrorFailure>;
+    fn comments(&self, issue: &str) -> Result<Vec<String>, MirrorFailure>;
     fn comment(&self, issue: &str, body: &str) -> Result<(), MirrorFailure>;
     fn set_state(&self, issue: &str, state: &str) -> Result<(), MirrorFailure>;
     fn set_state_id(&self, issue: &str, state_id: &str) -> Result<(), MirrorFailure>;
@@ -352,11 +354,14 @@ pub enum MirrorWriteOutcome {
     Failed,
 }
 
-/// Why a write was skipped: the outcome's `unless` guard held.
+/// Why a write was skipped (REQ-LOCALRUN-193).
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MirrorSkipReason {
+    /// The outcome's `unless` guard held.
     GuardHeld,
+    /// The start comment was left unwritten because the issue already links the run.
+    StartAnnounced,
 }
 
 /// One `mirror/<NNNN>-<hook>.json` (REQ-LOCALRUN-193).
@@ -503,14 +508,18 @@ pub fn read_numbered_mirror_writes(
 }
 
 /// What a run's mirror holds of the run (REQ-LOCALRUN-191): the values of the `operator`,
-/// `run.id`, `run.url` and `run.reference` placeholders, each composed by the caller, and
-/// the run directory the mirror's records go under.
+/// `run.id`, `run.url` and `run.reference` placeholders, each composed by the caller, the
+/// record's `external.url` when it has one, which the start rule looks for on the issue
+/// (REQ-LOCALRUN-216), and the run directory the mirror's records go under. `url` and
+/// `reference` fall back to the run directory and the `show` command, so only
+/// `external_url` says whether the record has an external URL.
 #[derive(Clone, Debug)]
 pub struct MirrorRun {
     pub operator: String,
     pub id: String,
     pub url: String,
     pub reference: String,
+    pub external_url: Option<String>,
     pub directory: PathBuf,
 }
 
@@ -555,7 +564,8 @@ impl Mirror {
         self
     }
 
-    /// `onStart`, once when `um workflow run create` has made the run.
+    /// `onStart`, once when `um workflow run create` has made the run, skipped when the issue
+    /// already links the run (`start_announced`, REQ-LOCALRUN-216).
     pub fn start(&self, target: &dyn MirrorTarget) -> Result<(), LocalRunDirectoryError> {
         self.comment(target, MirrorHook::Start, &[])
     }
@@ -652,10 +662,33 @@ impl Mirror {
         };
         let body = self.render(template, variables);
         let performed = match &self.bindings {
+            Ok(_) if hook == MirrorHook::Start && self.start_announced(target) => {
+                Performed::Skipped(MirrorSkipReason::StartAnnounced)
+            }
             Ok(_) => target.comment(&self.issue, &body).into(),
             Err(failure) => Performed::Failed(failure.clone()),
         };
         self.record(hook, MirrorAction::Comment { body }, performed)
+    }
+
+    /// Whether one of the issue's newest comments already links the run (REQ-LOCALRUN-216):
+    /// it contains the record's non-empty external URL, as the target answers it or with
+    /// every backslash removed, which undoes Markdown's escapes. A run without one reads
+    /// nothing, and a read that fails is no announcement and leaves no trace.
+    fn start_announced(&self, target: &dyn MirrorTarget) -> bool {
+        let Some(url) = self
+            .run
+            .external_url
+            .as_deref()
+            .filter(|url| !url.is_empty())
+        else {
+            return false;
+        };
+        target.comments(&self.issue).is_ok_and(|bodies| {
+            bodies
+                .iter()
+                .any(|body| body.contains(url) || body.replace('\\', "").contains(url))
+        })
     }
 
     /// The template with each placeholder replaced by its value; one the hook does not
@@ -767,6 +800,7 @@ mod tests {
     enum Call {
         IssueState(String),
         IssueStateId(String),
+        Comments(String),
         Comment(String, String),
         SetState(String, String),
         SetStateId(String, String),
@@ -776,6 +810,7 @@ mod tests {
     struct FakeTarget {
         state: Result<String, MirrorFailure>,
         state_id: Result<String, MirrorFailure>,
+        comments: Result<Vec<String>, MirrorFailure>,
         writes: Result<(), MirrorFailure>,
         calls: RefCell<Vec<Call>>,
     }
@@ -785,6 +820,7 @@ mod tests {
             Self {
                 state: Ok("Engineering".to_owned()),
                 state_id: Ok("state-engineering".to_owned()),
+                comments: Ok(Vec::new()),
                 writes: Ok(()),
                 calls: RefCell::default(),
             }
@@ -815,6 +851,13 @@ mod tests {
                 .borrow_mut()
                 .push(Call::IssueStateId(issue.to_owned()));
             self.state_id.clone()
+        }
+
+        fn comments(&self, issue: &str) -> Result<Vec<String>, MirrorFailure> {
+            self.calls
+                .borrow_mut()
+                .push(Call::Comments(issue.to_owned()));
+            self.comments.clone()
         }
 
         fn comment(&self, issue: &str, body: &str) -> Result<(), MirrorFailure> {
@@ -877,6 +920,7 @@ mod tests {
             id: "run_x".to_owned(),
             url: "file:///tmp/run_x".to_owned(),
             reference: "um workflow run show run_x".to_owned(),
+            external_url: None,
             directory: directory.to_owned(),
         }
     }
@@ -1251,6 +1295,150 @@ mod tests {
             record_json(&other, "0001-outcome.json")["code"],
             "mirror_bindings_unavailable"
         );
+    }
+
+    /// The Cloud run page a run's record names as its `external.url`.
+    const RUN_PAGE: &str = "https://usefulmachinery.test/acme/runs/run_x";
+
+    /// The sketch's mirror for a run whose record has `external_url`, which `run.url` and
+    /// `run.reference` then are, as `mirror_for_run` composes them.
+    fn external_mirror(
+        root: &tempfile::TempDir,
+        bindings: Result<BTreeMap<String, String>, MirrorFailure>,
+        external_url: Option<&str>,
+    ) -> Mirror {
+        let mut run = mirror_run(root.path());
+        if let Some(url) = external_url {
+            url.clone_into(&mut run.url);
+            url.clone_into(&mut run.reference);
+        }
+        run.external_url = external_url.map(str::to_owned);
+        Mirror::new(sketch_block(), "AUTO-143".to_owned(), bindings, run)
+    }
+
+    /// A target whose issue holds the comments `bodies`.
+    fn commented(bodies: &[&str]) -> FakeTarget {
+        FakeTarget {
+            comments: Ok(bodies.iter().map(|body| (*body).to_owned()).collect()),
+            ..FakeTarget::new()
+        }
+    }
+
+    /// The sketch's start comment for a run whose `run.url` is `url`.
+    fn start_text(url: &str) -> String {
+        format!("Engineering started by saeed. Run: {url}")
+    }
+
+    // REQ-LOCALRUN-216: a comment holding the run's external URL, as Linear returns it or
+    // with its backslashes removed, leaves the start comment unwritten and recorded
+    // `skipped` `start_announced` with the body it would have written.
+    #[test]
+    fn a_start_comment_is_skipped_when_the_issue_already_links_the_run() {
+        for announced in [
+            format!("Cloud started the run: {RUN_PAGE}"),
+            "Cloud started [run\\_x](https://usefulmachinery.test/acme/runs/run\\_x).".to_owned(),
+        ] {
+            let root = run_root();
+            let mirror = external_mirror(&root, Ok(engineering_bindings()), Some(RUN_PAGE));
+            let target = commented(&["An earlier note.", &announced]);
+            mirror.start(&target).unwrap();
+            assert_eq!(
+                target.calls(),
+                [Call::Comments("AUTO-143".to_owned())],
+                "{announced}"
+            );
+            let write = record_json(&root, "0001-start.json");
+            assert_eq!(write["hook"], "start", "{write}");
+            assert_eq!(write["outcome"], "skipped", "{write}");
+            assert_eq!(write["reason"], "start_announced", "{write}");
+            assert_eq!(
+                write["action"],
+                json!({"kind": "comment", "body": start_text(RUN_PAGE)})
+            );
+            assert_eq!(read_mirror_writes(root.path()).unwrap().len(), 1);
+        }
+    }
+
+    // REQ-LOCALRUN-216: comments that do not hold the URL, or a read that fails, leave the
+    // start comment to be written as without the rule, and nothing of the read is recorded.
+    #[test]
+    fn a_start_comment_is_written_when_no_comment_links_the_run_or_none_can_be_read() {
+        for target in [
+            commented(&[&start_text("https://usefulmachinery.test/acme/runs/run_y")]),
+            FakeTarget {
+                comments: Err(MirrorFailure::unavailable(
+                    "Linear answered IssueComments with HTTP 500.",
+                )),
+                ..FakeTarget::new()
+            },
+        ] {
+            let root = run_root();
+            let mirror = external_mirror(&root, Ok(engineering_bindings()), Some(RUN_PAGE));
+            mirror.start(&target).unwrap();
+            assert_eq!(
+                target.calls(),
+                [
+                    Call::Comments("AUTO-143".to_owned()),
+                    Call::Comment("AUTO-143".to_owned(), start_text(RUN_PAGE)),
+                ]
+            );
+            let write = record_json(&root, "0001-start.json");
+            assert_eq!(write["outcome"], "written", "{write}");
+            assert_eq!(
+                write.as_object().unwrap().keys().collect::<Vec<_>>(),
+                ["action", "at", "hook", "issue", "outcome", "schemaVersion"]
+            );
+        }
+    }
+
+    // REQ-LOCALRUN-216: a run without an external URL, or with an empty one, and every other
+    // hook never ask for the comments, and a mirror without its bindings asks nothing.
+    #[test]
+    fn only_the_start_of_a_run_with_an_external_url_and_its_bindings_reads_the_comments() {
+        for external_url in [None, Some("")] {
+            let root = run_root();
+            let mirror = external_mirror(&root, Ok(engineering_bindings()), external_url);
+            let target = commented(&[&start_text(RUN_PAGE)]);
+            mirror.start(&target).unwrap();
+            let body = start_text(external_url.unwrap_or("file:///tmp/run_x"));
+            assert_eq!(
+                target.calls(),
+                [Call::Comment("AUTO-143".to_owned(), body)],
+                "{external_url:?}"
+            );
+            assert_eq!(record_json(&root, "0001-start.json")["outcome"], "written");
+        }
+
+        let root = run_root();
+        let mirror = external_mirror(&root, Ok(engineering_bindings()), Some(RUN_PAGE));
+        let target = commented(&[&start_text(RUN_PAGE)]);
+        mirror.stage(&target, "design", "blocked", None).unwrap();
+        mirror.wait(&target, &approval_wait()).unwrap();
+        assert_eq!(
+            target.calls(),
+            [
+                Call::Comment("AUTO-143".to_owned(), "design: blocked".to_owned()),
+                Call::Comment(
+                    "AUTO-143".to_owned(),
+                    "Waiting for approval: review".to_owned()
+                ),
+            ]
+        );
+
+        let root = run_root();
+        let mirror = external_mirror(
+            &root,
+            Err(MirrorFailure::bindings_unavailable(
+                "definition_record_invalid: bindings snapshot does not match its digest",
+            )),
+            Some(RUN_PAGE),
+        );
+        let target = commented(&[&start_text(RUN_PAGE)]);
+        mirror.start(&target).unwrap();
+        assert_eq!(target.calls(), []);
+        let write = record_json(&root, "0001-start.json");
+        assert_eq!(write["outcome"], "failed", "{write}");
+        assert_eq!(write["code"], "mirror_bindings_unavailable", "{write}");
     }
 
     // REQ-LOCALRUN-193

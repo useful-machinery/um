@@ -76,8 +76,10 @@ inputs:
 /// `POST /graphql` by the body's `operationName`, answering `IssueState` with the issue in
 /// its current state, by the name and the id of the team state so named, its `updatedAt`
 /// (`ISSUE_UPDATED_AT`), and its team, `team-auto` until it is moved, with the team's
-/// states, `STATES` until one is renamed, and each mutation with `success` true, or with
-/// HTTP 500 and a GraphQL error while it fails mutations. A mutation it is told to hold stays
+/// states, `STATES` until one is renamed; `IssueComments` with the same issue and its
+/// comments, none until one is added, or with HTTP 500 and a GraphQL error while it fails
+/// that read; and each mutation with `success` true, or with HTTP 500 and a GraphQL error
+/// while it fails mutations. A mutation it is told to hold stays
 /// in flight, unanswered, until it is released. It records every body in order, and the
 /// `Authorization` value each request carried.
 pub(super) struct LinearStub {
@@ -92,6 +94,9 @@ struct StubState {
     team: String,
     /// The team's states by name and id.
     states: Vec<(String, String)>,
+    /// The issue's comment bodies, newest first.
+    comments: Vec<String>,
+    failing_comments: bool,
     failing: bool,
     /// The text a mutation's body holds that keeps it in flight until released, and whether
     /// one is held.
@@ -113,6 +118,8 @@ impl LinearStub {
                 .iter()
                 .map(|(name, id)| ((*name).to_owned(), (*id).to_owned()))
                 .collect(),
+            comments: Vec::new(),
+            failing_comments: false,
             failing: false,
             hold: None,
             held: false,
@@ -184,6 +191,20 @@ impl LinearStub {
             .find(|(_, state_id)| state_id == id)
             .unwrap();
         name.clone_into(&mut entry.0);
+    }
+
+    /// Adds a comment with `body` to the issue, newest.
+    pub(super) fn add_comment(&self, body: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .comments
+            .insert(0, body.to_owned());
+    }
+
+    /// Whether `IssueComments` is answered HTTP 500 with a GraphQL error.
+    pub(super) fn fail_comments(&self, failing: bool) {
+        self.state.lock().unwrap().failing_comments = failing;
     }
 
     /// Whether every mutation is answered HTTP 500 with a GraphQL error.
@@ -275,12 +296,15 @@ impl StubState {
             .to_owned();
         let identifier = body["variables"]["id"].clone();
         self.bodies.push(body);
+        let refused = |message: &str| {
+            (
+                "500 Internal Server Error",
+                json!({"errors": [{"message": message}]}),
+            )
+        };
         let mutation = |field: &str| {
             if self.failing {
-                (
-                    "500 Internal Server Error",
-                    json!({"errors": [{"message": "stub refuses mutations"}]}),
-                )
+                refused("stub refuses mutations")
             } else {
                 ("200 OK", json!({"data": {field: {"success": true}}}))
             }
@@ -290,21 +314,30 @@ impl StubState {
             .iter()
             .find(|(name, _)| *name == self.issue_state)
             .map_or("current", |(_, id)| id.as_str());
+        let mut issue = json!({
+            "id": "issue-1",
+            "identifier": identifier,
+            "state": {"id": state_id, "name": self.issue_state},
+            "updatedAt": ISSUE_UPDATED_AT,
+            "team": {"id": self.team, "states": {"nodes": self
+                .states
+                .iter()
+                .map(|(name, id)| json!({"id": id, "name": name}))
+                .collect::<Vec<_>>()}},
+        });
         match (path, operation.as_str()) {
-            ("/graphql", "IssueState") => (
-                "200 OK",
-                json!({"data": {"issue": {
-                    "id": "issue-1",
-                    "identifier": identifier,
-                    "state": {"id": state_id, "name": self.issue_state},
-                    "updatedAt": ISSUE_UPDATED_AT,
-                    "team": {"id": self.team, "states": {"nodes": self
-                        .states
-                        .iter()
-                        .map(|(name, id)| json!({"id": id, "name": name}))
-                        .collect::<Vec<_>>()}},
-                }}}),
-            ),
+            ("/graphql", "IssueState") => ("200 OK", json!({"data": {"issue": issue}})),
+            ("/graphql", "IssueComments") if self.failing_comments => {
+                refused("stub refuses the comments")
+            }
+            ("/graphql", "IssueComments") => {
+                issue["comments"] = json!({"nodes": self
+                    .comments
+                    .iter()
+                    .map(|body| json!({"body": body}))
+                    .collect::<Vec<_>>()});
+                ("200 OK", json!({"data": {"issue": issue}}))
+            }
             ("/graphql", "CreateIssueComment") => mutation("commentCreate"),
             ("/graphql", "UpdateIssueState") => mutation("issueUpdate"),
             _ => ("404 Not Found", json!({})),
@@ -443,9 +476,10 @@ fn comments(stub: &LinearStub) -> Vec<String> {
         .collect()
 }
 
-// REQ-LOCALRUN-191, REQ-LOCALRUN-192: a definition run of a mirrored root comments when it
-// starts and when its stage exits, each comment keyed by the issue's id it read first, moves
-// the issue to the bound `Done` on `landed`, and records each write under `mirror/`.
+// REQ-LOCALRUN-191, REQ-LOCALRUN-192, REQ-LOCALRUN-216: a definition run of a mirrored root
+// comments when it starts and when its stage exits, each comment keyed by the issue's id it
+// read first, moves the issue to the bound `Done` on `landed`, and records each write under
+// `mirror/`; without an `external.url` its start reads no comments.
 #[test]
 fn a_mirrored_run_comments_at_start_and_stage_and_moves_the_issue_on_its_outcome() {
     let published = engineering(true);
@@ -826,6 +860,103 @@ fn run_reference_is_the_external_url_else_the_show_command() {
         comments(&stub)[0],
         format!("Engineering started by {MIRROR_OPERATOR}. Run: {external}")
     );
+}
+
+/// The Cloud run page the runs below name as their `external.url`.
+const RUN_PAGE: &str = "https://usefulmachinery.test/acme/runs/run_x";
+
+/// `create` of the definition for `ticket` against `stub`, with `external.url` `RUN_PAGE`.
+fn create_with_run_page(published: &Published, stub: &LinearStub, ticket: &str) -> PathBuf {
+    create(published, ticket, |command| {
+        stub.point(command)
+            .args(["--external", &format!("url={RUN_PAGE}")])
+    })
+}
+
+// REQ-LOCALRUN-216, REQ-LOCALRUN-189: a run whose issue already holds a comment linking its
+// `external.url` posts no start comment, records the write skipped `start_announced` with
+// the text it would have written, and `show` lists it so.
+#[test]
+fn a_start_comment_is_skipped_when_the_issue_already_links_the_run() {
+    let published = engineering(true);
+    let stub = LinearStub::start();
+    stub.add_comment(&format!("Cloud started this run: [run_x]({RUN_PAGE})"));
+    let start = format!("Engineering started by {MIRROR_OPERATOR}. Run: {RUN_PAGE}");
+
+    let run = create_with_run_page(&published, &stub, "AUTO-1");
+    assert_eq!(run_record(&run)["outcome"], "landed");
+    assert_eq!(comments(&stub), ["design: succeeded"]);
+    assert_eq!(
+        stub.operations(),
+        [
+            "IssueComments",
+            "IssueState",
+            "CreateIssueComment",
+            "IssueState",
+            "UpdateIssueState"
+        ]
+    );
+    let writes = mirror_writes(&run);
+    let (name, start_write) = &writes[0];
+    assert_eq!(name, "0001-start.json");
+    assert_eq!(start_write["outcome"], "skipped", "{start_write}");
+    assert_eq!(start_write["reason"], "start_announced", "{start_write}");
+    assert_eq!(
+        start_write["action"],
+        json!({"kind": "comment", "body": start})
+    );
+
+    let run_argument = run.to_str().unwrap();
+    assert_eq!(
+        shown_mirror(&published.command(&["show", run_argument]).output().unwrap())[..2],
+        [
+            "mirror:".to_owned(),
+            format!("  0001 · start · comment {start} · skipped start_announced"),
+        ]
+    );
+    let document = shown_document(
+        &published
+            .command(&["show", run_argument, "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(document["mirror"][0]["outcome"], "skipped", "{document}");
+    assert_eq!(
+        document["mirror"][0]["reason"], "start_announced",
+        "{document}"
+    );
+}
+
+// REQ-LOCALRUN-216: comments that do not link the run, or comments that cannot be read,
+// leave the start comment to be written, after an issue read of its own when the comments
+// read failed.
+#[test]
+fn a_start_comment_is_written_when_no_comment_links_the_run_or_none_can_be_read() {
+    let published = engineering(true);
+    let start = format!("Engineering started by {MIRROR_OPERATOR}. Run: {RUN_PAGE}");
+
+    let stub = LinearStub::start();
+    stub.add_comment("Cloud started this run: https://usefulmachinery.test/acme/runs/run_y");
+    let run = create_with_run_page(&published, &stub, "AUTO-1");
+    assert_eq!(comments(&stub)[0], start);
+    assert_eq!(
+        stub.operations()[..2],
+        ["IssueComments", "CreateIssueComment"]
+    );
+    assert_eq!(mirror_writes(&run)[0].1["outcome"], "written");
+
+    let stub = LinearStub::start();
+    stub.add_comment(&format!("Cloud started this run: {RUN_PAGE}"));
+    stub.fail_comments(true);
+    let run = create_with_run_page(&published, &stub, "AUTO-2");
+    assert_eq!(comments(&stub)[0], start);
+    assert_eq!(
+        stub.operations()[..3],
+        ["IssueComments", "IssueState", "CreateIssueComment"]
+    );
+    let (_, start_write) = &mirror_writes(&run)[0];
+    assert_eq!(start_write["outcome"], "written", "{start_write}");
+    assert_eq!(start_write.get("diagnostic"), None, "{start_write}");
 }
 
 // REQ-WFDEF-32, REQ-LOCALRUN-192: with a resolution record the guard
