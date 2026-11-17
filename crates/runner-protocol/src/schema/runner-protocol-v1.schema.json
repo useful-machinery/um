@@ -975,7 +975,11 @@
         "harnessInput": {"$ref": "#/$defs/diagnosticSlug"},
         "declineCause": {"$ref": "#/$defs/diagnosticSlug"},
         "launchFailure": {"$ref": "#/$defs/diagnosticSlug"},
-        "osError": {"$ref": "#/$defs/diagnosticInteger"}
+        "osError": {"$ref": "#/$defs/diagnosticInteger"},
+        "validationCode": {"$ref": "#/$defs/diagnosticSlug"},
+        "validationLocation": {"$ref": "#/$defs/diagnosticSlug"},
+        "validationPath": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^[^/]+(?:/[^/]+)*$"},
+        "validationStep": {"$ref": "#/$defs/stepId"}
       }
     },
     "diagnosticSlug": {

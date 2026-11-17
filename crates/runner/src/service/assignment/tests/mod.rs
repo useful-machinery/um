@@ -1605,7 +1605,7 @@ async fn assert_workflow_environment_unsupported(manager: &mut AssignmentManager
     assert!(matches!(
         &pending[0].observation,
         AssignmentObservation::Decision(AssignmentDecision::Rejected {
-            decline: AssignmentDecline::Diagnosed { decline, stage: "admission", cause: "admission_invalid" },
+            decline: AssignmentDecline::Diagnosed { decline, stage: "admission", cause: "admission_invalid", .. },
             ..
         }) if **decline == AssignmentDecline::RunnerUnable(RunnerUnableReason::WorkflowEnvironmentUnsupported)
     ));

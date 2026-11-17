@@ -31,7 +31,7 @@ use um_execution::{
 };
 use um_runner_protocol::{
     AssignmentDecline, ExecutionSpecInvalidReason, ExecutionSpecV1RunnerProjection, RunControl,
-    RunnerUnableReason, TriggerDelivery, WorkflowTreeV1RunnerProjection,
+    RunnerUnableReason, TriggerDelivery, ValidationFacts, WorkflowTreeV1RunnerProjection,
 };
 
 use super::Sleeper;
@@ -334,8 +334,11 @@ pub(super) struct TreePreparation<'a> {
 }
 
 /// Downloads, verifies and publishes the tree and stages the run inputs, on the
-/// calling blocking worker. A published digest other than the spec's declines the
-/// assignment `workflow_source_digest_mismatch` (cause `workflow_tree_digest_mismatch`).
+/// calling blocking worker. A publish that refuses the tree declines the assignment
+/// `workflow_source_invalid` (cause `workflow_tree_publication_refused`) with the validation
+/// facts its report gives, the path only when it is one of the offered tree's files; a
+/// published digest other than the spec's declines it `workflow_source_digest_mismatch`
+/// (cause `workflow_tree_digest_mismatch`).
 pub(super) fn prepare(
     dependencies: &TreeRunDependencies,
     preparation: &TreePreparation<'_>,
@@ -395,13 +398,25 @@ pub(super) fn prepare(
     )
     .map_err(|failure| match failure {
         PublishFailure::Launch => environment_decline("workflow_tree_publication"),
-        PublishFailure::Refused => AssignmentDecline::ExecutionSpecInvalid(
-            ExecutionSpecInvalidReason::WorkflowSourceInvalid,
-        )
-        .diagnosed(
-            "workflow_tree_publication",
-            "workflow_tree_publication_refused",
-        ),
+        PublishFailure::Refused(report) => {
+            let path = report
+                .path
+                .as_deref()
+                .filter(|path| preparation.tree.files.iter().any(|file| file.path == *path));
+            AssignmentDecline::ExecutionSpecInvalid(
+                ExecutionSpecInvalidReason::WorkflowSourceInvalid,
+            )
+            .diagnosed(
+                "workflow_tree_publication",
+                "workflow_tree_publication_refused",
+            )
+            .with_validation_facts(ValidationFacts::new(
+                report.code.as_deref(),
+                report.location.as_deref(),
+                path,
+                report.step.as_deref(),
+            ))
+        }
         PublishFailure::Abandoned if preparation.cancellation.is_cancelled() => fenced(),
         PublishFailure::Abandoned => {
             AssignmentDecline::RunnerUnable(RunnerUnableReason::ExecutionEnvironmentUnavailable)

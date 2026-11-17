@@ -533,3 +533,34 @@ pub(crate) fn write_waiting(out: &mut impl Write, observation: &RunObservation) 
         None => writeln!(out, "waiting: {reason}"),
     }
 }
+
+/// The block saying why Cloud rejected a run, nothing when it did not: its reason, under it
+/// each validation fact its runner diagnostic holds, in the order code, location, path and
+/// step (REQ-DIAG-29, REQ-DIAG-42), and its recovery reason when it has one. It prints no
+/// other diagnostic member and escapes every value: a fact is untrusted runner text.
+pub(crate) fn write_rejection(out: &mut impl Write, run: &Run) -> io::Result<()> {
+    let Some(rejection) = run.rejection.as_deref() else {
+        return Ok(());
+    };
+    writeln!(out, "rejection:")?;
+    writeln!(out, "  reason: {}", visible_text(&rejection.reason))?;
+    if let Some(diagnostic) = rejection.diagnostic.as_deref() {
+        for (label, fact) in [
+            ("validation code", &diagnostic.validation_code),
+            ("validation location", &diagnostic.validation_location),
+            ("validation path", &diagnostic.validation_path),
+            ("validation step", &diagnostic.validation_step),
+        ] {
+            if let Some(fact) = fact {
+                writeln!(out, "  {label}: {}", visible_text(fact))?;
+            }
+        }
+    }
+    if let Some(reason) = rejection.recovery_reason {
+        let reason = um_support::wire_name(reason).ok_or_else(|| {
+            io::Error::other("Cloud run recovery reason is not a contracted string")
+        })?;
+        writeln!(out, "  recovery reason: {}", visible_text(&reason))?;
+    }
+    Ok(())
+}

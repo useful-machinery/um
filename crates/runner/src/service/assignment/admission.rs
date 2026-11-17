@@ -269,8 +269,9 @@ impl AssignmentManager {
                 return Err(AssignmentManagerFailure::DecisionCapacity);
             };
             let offer = preparing.offer;
-            self.finish_offered_run(&offer.assignment_id, &preparing.run_event, "rejected");
-            let response = rejected(&offer, environment_unavailable());
+            let decline = environment_unavailable();
+            self.reject_offered_run(&offer.assignment_id, &preparing.run_event, &decline);
+            let response = rejected(&offer, decline);
             return self.retain_decision(offer, response);
         }
         Ok(())
@@ -406,7 +407,7 @@ impl AssignmentManager {
             _ => RunEvent::default(),
         };
         run_event.leave(PhaseEnd::Failed);
-        self.finish_offered_run(&offer.assignment_id, &run_event, "rejected");
+        self.reject_offered_run(&offer.assignment_id, &run_event, &decline);
         let response = AssignmentDecision::Rejected {
             effect_id: prepare_effect_id,
             assignment_id: offer.assignment_id.clone(),

@@ -632,8 +632,9 @@ fn wire(value: impl Serialize) -> String {
 }
 
 /// The run as `show` prints it without `--json`: its identity, owner, route and what it
-/// waits for, workspace, claim, workflow state and outcome, latest progress, exits with
-/// their mirror results and its deliveries, acceptance apart from the runner's application.
+/// waits for, workspace, claim, workflow state and outcome, its rejection as `um run show`
+/// prints it (REQ-RUN-105), latest progress, exits with their mirror results and its
+/// deliveries, acceptance apart from the runner's application.
 fn write_plain(
     organization: &str,
     typed: &Run,
@@ -693,6 +694,7 @@ fn write_plain(
     }
     writeln!(out, "workflow state: {}", field(run, "workflowState"))?;
     writeln!(out, "workflow outcome: {}", field(run, "workflowOutcome"))?;
+    cli::run::write_rejection(&mut out, typed)?;
     write_progress(&mut out, &run["workflowProgress"])?;
     write_exits(&mut out, &run["exits"])?;
     write_deliveries(&mut out, deliveries, more_deliveries)?;

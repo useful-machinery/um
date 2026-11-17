@@ -45,6 +45,14 @@ pub struct RunnerDiagnostic {
     pub launch_failure: Option<String>,
     #[serde(rename = "osError", skip_serializing_if = "Option::is_none")]
     pub os_error: Option<i32>,
+    #[serde(rename = "validationCode", skip_serializing_if = "Option::is_none")]
+    pub validation_code: Option<String>,
+    #[serde(rename = "validationLocation", skip_serializing_if = "Option::is_none")]
+    pub validation_location: Option<String>,
+    #[serde(rename = "validationPath", skip_serializing_if = "Option::is_none")]
+    pub validation_path: Option<String>,
+    #[serde(rename = "validationStep", skip_serializing_if = "Option::is_none")]
+    pub validation_step: Option<String>,
 }
 
 impl RunnerDiagnostic {
@@ -64,6 +72,10 @@ impl RunnerDiagnostic {
             decline_cause: None,
             launch_failure: None,
             os_error: None,
+            validation_code: None,
+            validation_location: None,
+            validation_path: None,
+            validation_step: None,
         }
     }
 }

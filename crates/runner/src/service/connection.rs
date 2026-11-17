@@ -5627,6 +5627,7 @@ mod tests {
                 .await
                 .expect("acknowledge release effect");
             socket.close(None).await.expect("close fixture socket");
+            rejection["payload"]["decline"].clone()
         });
 
         let config = ConfigFixture::new(&endpoint, test_credential(), true)
@@ -5641,7 +5642,7 @@ mod tests {
         assert_eq!(outcome.effects_received, 3);
         assert_eq!(outcome.effect_acknowledgements_confirmed, 3);
         assert_eq!(next_sequence, 9);
-        server.await.expect("join fixture server");
+        let decline = server.await.expect("join fixture server");
 
         let all_events = capture.events();
         let preparation = all_events
@@ -5679,6 +5680,11 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0]["um.run.result"], "rejected");
         assert_eq!(runs[0]["um.outcome"], "rejected");
+        // REQ-TELEMETRY-47: the run names the decline the frame carried, and no
+        // validation code for a decline that is not a refused tree.
+        assert_eq!(runs[0]["um.protocol.decline_type"], decline["type"]);
+        assert_eq!(runs[0]["um.protocol.decline_reason"], decline["reason"]);
+        assert_eq!(runs[0].get("um.workflow.validation_code"), None);
         // Source materialization failed, so checkout failed and preparation
         // never began.
         let checkouts = all_events

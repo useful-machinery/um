@@ -5414,6 +5414,66 @@ fn run_show_json_keeps_harness_failure_and_input_size_diagnostic() {
     }
 }
 
+/// A run a runner rejected because its `um` refused the run's workflow tree, its
+/// diagnostic holding the refusal's validation facts (REQ-DIAG-42).
+fn workflow_validation_rejection() -> serde_json::Value {
+    serde_json::json!({
+        "reason": "workflow_source_invalid",
+        "diagnostic": {"stage": "workflow_tree_publication",
+            "declineCause": "workflow_tree_publication_refused",
+            "validationCode": "child_workflow_nested", "validationLocation": "step_workflow",
+            "validationPath": "workflow.yaml", "validationStep": "parts"}
+    })
+}
+
+/// The validation facts of `workflow_validation_rejection` as a human report labels them.
+const WORKFLOW_VALIDATION_FACTS: [(&str, &str); 4] = [
+    ("validation code", "child_workflow_nested"),
+    ("validation location", "step_workflow"),
+    ("validation path", "workflow.yaml"),
+    ("validation step", "parts"),
+];
+
+// REQ-DIAG-29, REQ-DIAG-30, REQ-DIAG-42
+#[test]
+fn run_show_json_keeps_workflow_validation_diagnostic() {
+    let mut body = run_body_with_state("rejected");
+    body["rejection"] = workflow_validation_rejection();
+    for json in [true, false] {
+        let (server, _directory, credential_path) = prepared_run(vec![run_response(body.clone())]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let mut arguments = vec!["run", "show", ORGANIZATION, RUN_ID];
+        if json {
+            arguments.push("--json");
+        }
+        arguments.push("--allow-insecure-http");
+        let output = run_with_env(&arguments, &environment);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if json {
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["run"]["rejection"], body["rejection"]);
+        } else {
+            let text = String::from_utf8(output.stdout).unwrap();
+            for (label, value) in WORKFLOW_VALIDATION_FACTS {
+                assert!(
+                    text.lines()
+                        .any(|line| line.trim_start() == format!("{label}: {value}")),
+                    "missing {label} in {text}"
+                );
+            }
+            assert!(
+                !text.contains("workflow_tree_publication"),
+                "runner diagnostic rendered in {text}"
+            );
+        }
+        assert_eq!(server.finish().len(), 1);
+    }
+}
+
 // REQ-RUN-60
 #[test]
 fn run_show_distinguishes_pending_creation_and_creation_rejection() {
@@ -6697,6 +6757,39 @@ mod workflow_run_cloud {
                 questions
             );
         }
+    }
+
+    // REQ-RUN-105, REQ-DIAG-29: Cloud show prints a rejected run's reason and validation
+    // facts beside its workflow state, passes the rejection through under --json as
+    // received, and prints no rejection for a run without one.
+    #[test]
+    fn cloud_show_prints_a_rejected_runs_reason_and_validation_facts() {
+        let mut rejected = definition_run();
+        rejected["state"] = serde_json::json!("rejected");
+        rejected["rejection"] = workflow_validation_rejection();
+        rejected["workflowState"] = serde_json::json!("exited");
+        let output = shown(rejected.clone(), &[]);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(reported(&text, "workflow state"), Some("exited"), "{text}");
+        assert_eq!(
+            reported(&text, "reason"),
+            Some("workflow_source_invalid"),
+            "{text}"
+        );
+        for (label, value) in WORKFLOW_VALIDATION_FACTS {
+            assert_eq!(reported(&text, label), Some(value), "{text}");
+        }
+        assert!(!text.contains("workflow_tree_publication"), "{text}");
+
+        let output = shown(rejected.clone(), &["--json"]);
+        assert_eq!(document(&output)["run"]["rejection"], rejected["rejection"]);
+
+        let output = shown(definition_run(), &[]);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            !text.lines().any(|line| line.starts_with("rejection")),
+            "{text}"
+        );
     }
 
     const OWNER: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5abd";

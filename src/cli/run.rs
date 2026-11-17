@@ -32,7 +32,7 @@ pub(super) use continuation::{
     Submission as ContinuationSubmission, parse_step as parse_continuation_step,
 };
 use output::{CloudOutput, CloudSnapshot};
-pub(super) use output::{write_route, write_waiting};
+pub(super) use output::{write_rejection, write_route, write_waiting};
 
 // Keep the closed envelope fields grouped at the rendering boundary, without
 // repeating its context at every signal, timeout and completion call site.
@@ -1837,13 +1837,10 @@ fn write_run_terminal_issue(out: &mut impl Write, run: &Run) -> anyhow::Result<(
             writeln!(out, "  recovery reason: {}", enum_text(reason)?)?;
         }
     }
-    if let Some(rejection) = run.rejection.as_deref() {
-        writeln!(out, "\nrejection:")?;
-        writeln!(out, "  reason: {}", visible_text(&rejection.reason))?;
-        if let Some(reason) = &rejection.recovery_reason {
-            writeln!(out, "  recovery reason: {}", enum_text(reason)?)?;
-        }
+    if run.rejection.is_some() {
+        writeln!(out)?;
     }
+    write_rejection(out, run)?;
     Ok(())
 }
 
@@ -2619,7 +2616,23 @@ mod tests {
         );
     }
 
-    // REQ-DIAG-29
+    /// The lines `write_run_terminal_issue` prints for a run rejected with `rejection`.
+    fn rejection_lines(rejection: serde_json::Value) -> Vec<String> {
+        let mut rejected = serde_json::to_value(run(RunState::Rejected)).unwrap();
+        rejected["rejection"] = rejection;
+        let mut output = Vec::new();
+        super::write_run_terminal_issue(&mut output, &serde_json::from_value(rejected).unwrap())
+            .unwrap();
+        String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    // REQ-DIAG-29, REQ-DIAG-42: a failure and a rejection print without their runner
+    // diagnostic, except that a rejection prints, under its reason and before its recovery
+    // reason, each validation fact its diagnostic holds, escaped.
     #[test]
     fn terminal_run_human_output_includes_primary_issue_or_rejection() {
         let mut failed = serde_json::to_value(run(RunState::Failed)).unwrap();
@@ -2651,18 +2664,72 @@ mod tests {
             "runner diagnostic rendered in {text}"
         );
 
-        let mut rejected = serde_json::to_value(run(RunState::Rejected)).unwrap();
-        rejected["rejection"] = serde_json::json!({"reason": "source_commit_unavailable",
+        let text = rejection_lines(serde_json::json!({"reason": "source_commit_unavailable",
             "diagnostic": {"stage": "rejection-stage-sentinel",
-                "transportError": "rejection-transport-sentinel"}});
-        let mut output = Vec::new();
-        super::write_run_terminal_issue(&mut output, &serde_json::from_value(rejected).unwrap())
-            .unwrap();
-        let text = String::from_utf8(output).unwrap();
+                "transportError": "rejection-transport-sentinel"}}))
+        .join("\n");
         assert!(text.contains("source_commit_unavailable"));
         assert!(
             !text.contains("sentinel"),
             "runner diagnostic rendered in {text}"
+        );
+        assert!(!text.contains("validation"), "{text}");
+
+        let lines = rejection_lines(serde_json::json!({
+            "reason": "workflow_source_invalid",
+            "recoveryReason": "workspace_not_found",
+            "diagnostic": {"stage": "workflow_tree_publication",
+                "declineCause": "workflow_tree_publication_refused",
+                "validationCode": "child_workflow_nested", "validationLocation": "step_workflow",
+                "validationPath": "workflow.yaml", "validationStep": "parts"}
+        }));
+        let text = lines.join("\n");
+        let reason = lines
+            .iter()
+            .position(|line| line.trim_start() == "reason: workflow_source_invalid")
+            .unwrap_or_else(|| panic!("{text}"));
+        assert_eq!(
+            lines[reason + 1..]
+                .iter()
+                .map(|line| line.trim_start())
+                .collect::<Vec<_>>(),
+            [
+                "validation code: child_workflow_nested",
+                "validation location: step_workflow",
+                "validation path: workflow.yaml",
+                "validation step: parts",
+                "recovery reason: workspace_not_found",
+            ],
+            "{text}"
+        );
+        assert!(!text.contains("workflow_tree_publication"), "{text}");
+
+        let lines = rejection_lines(serde_json::json!({
+            "reason": "workflow_source_invalid",
+            "diagnostic": {"validationCode": "child_workflow_nested"}
+        }));
+        let facts = lines
+            .iter()
+            .filter(|line| line.trim_start().starts_with("validation"))
+            .map(|line| line.trim_start())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            facts,
+            ["validation code: child_workflow_nested"],
+            "{lines:?}"
+        );
+
+        let lines = rejection_lines(serde_json::json!({
+            "reason": "workflow_source_invalid",
+            "diagnostic": {"validationStep": "\u{1b}[2Jparts"}
+        }));
+        let text = lines.join("\n");
+        assert!(!text.contains('\u{1b}'), "{text:?}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.trim_start() == "validation step: \\x1b[2Jparts"),
+            "{text}"
         );
     }
 

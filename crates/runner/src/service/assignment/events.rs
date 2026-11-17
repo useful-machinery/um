@@ -136,10 +136,10 @@ impl AssignmentManager {
                                     }
                                     _ => environment_unavailable(),
                                 };
-                                self.finish_offered_run(
+                                self.reject_offered_run(
                                     &assignment_id,
                                     &preparing.run_event,
-                                    "rejected",
+                                    &decline,
                                 );
                                 let response = rejected(&offer, decline);
                                 if let Err(failure) = self.retain_decision(offer, response) {
@@ -259,10 +259,10 @@ impl AssignmentManager {
                         }
                         Err(failure) => {
                             let (root, decline) = *failure;
-                            self.finish_offered_run(
+                            self.reject_offered_run(
                                 &offer.assignment_id,
                                 &preparing.run_event,
-                                "rejected",
+                                &decline,
                             );
                             let response = AssignmentDecision::Rejected {
                                 effect_id: prepare_effect_id,
@@ -653,6 +653,19 @@ impl AssignmentManager {
             self.run_events.remove(assignment_id);
         }
         run.finish(Some(result));
+    }
+
+    /// Ends the run opened for an offer the runner answers with `decline`: names the
+    /// decline on its record, then finishes it `rejected` (REQ-TELEMETRY-47). Every
+    /// rejected ending goes through here.
+    pub(super) fn reject_offered_run(
+        &mut self,
+        assignment_id: &str,
+        run: &RunEvent,
+        decline: &AssignmentDecline,
+    ) {
+        run.decline(decline);
+        self.finish_offered_run(assignment_id, run, "rejected");
     }
 
     pub(super) fn retire_assignment_observations(&mut self, assignment_id: &str) {

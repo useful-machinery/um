@@ -735,11 +735,10 @@ impl AssignmentManager {
                 event.finish(TelemetryOutcome::Cancelled);
             }
             let offer = preparing.offer.clone();
-            self.finish_offered_run(assignment_id, &preparing.run_event, "rejected");
-            let response = rejected(
-                &offer,
-                AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable),
-            );
+            let decline =
+                AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable);
+            self.reject_offered_run(assignment_id, &preparing.run_event, &decline);
+            let response = rejected(&offer, decline);
             self.retain_decision(offer, response)?;
             self.retire_assignment_observations(assignment_id);
             if let Some(root) = preparing.root.take() {

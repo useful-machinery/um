@@ -40,15 +40,17 @@ use um_runner_protocol::{
     RunControlApplication, RunControlOutcome, RunControlSkip, RunnerEnvelope, RunnerFrame,
     RunnerUnableReason, SourceDisplayRepositoryV1RunnerProjection, TreeExit, TriggerDelivery,
     TriggerDeliveryAction, TriggerDeliveryApplication, TriggerDeliveryOutcome,
-    TriggerIssueObservation, WorkflowTreeFileV1RunnerProjection, decode_cloud_frame,
-    encode_runner_frame,
+    TriggerIssueObservation, ValidationFacts, WorkflowTreeFileV1RunnerProjection,
+    decode_cloud_frame, encode_runner_frame,
 };
 
 const TREE_DIGEST: &str = "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945";
 const RUN_URL: &str = "https://usefulmachinery.com/acme/runs/run_01k0z6r1w8f4jy2m7q9v3x5abp";
 
 /// The injected `um`: answers `definition publish --json` with revision 1 of
-/// `$TREE_TEST_DIGEST`, making its revision directory as the local publish does, records
+/// `$TREE_TEST_DIGEST`, making its revision directory as the local publish does, or, while
+/// `$TREE_TEST_PUBLISH_REPORT` is set, prints its value and exits 1 as a refused publish
+/// does, after writing `publish.args` either way; records
 /// each command line under `$TREE_TEST_LOG`, and for `run create` copies the revision's
 /// `resolution.json` there when one exists, copies the directory `$TREE_TEST_MIRROR`, when
 /// set, as the run's `mirror/`, and leaves a `run.json` reading `$TREE_TEST_STATE` and
@@ -119,6 +121,10 @@ fi
 case "$1 $2 $3" in
 "workflow definition publish")
   printf '%s\n' "$@" > "$log/publish.args"
+  if [ "${TREE_TEST_PUBLISH_REPORT+set}" ]; then
+    printf '%s' "$TREE_TEST_PUBLISH_REPORT"
+    exit 1
+  fi
   env > "$log/publish.env"
   if test -x "$4/bin/check.sh"; then echo executable; else echo plain; fi > "$log/check.mode"
   if test -x "$4/workflow.yaml"; then echo executable; else echo plain; fi > "$log/workflow.mode"
@@ -1055,6 +1061,205 @@ async fn published_digest_other_than_the_spec_declines_the_assignment() {
         )
     );
     assert!(!fixture.log.join("create.args").exists());
+}
+
+/// The report a publish that refuses the tree prints, of `outcome` and `diagnostics`.
+fn publish_report(outcome: &str, diagnostics: Value) -> String {
+    serde_json::to_string_pretty(&json!({
+        "schemaVersion": 1,
+        "command": "um workflow definition publish",
+        "outcome": outcome,
+        "diagnostics": diagnostics,
+    }))
+    .unwrap()
+}
+
+/// The decline of a publication the runner's `um` refused, carrying `facts`.
+fn refused_publication(facts: Option<ValidationFacts>) -> AssignmentDecline {
+    AssignmentDecline::ExecutionSpecInvalid(ExecutionSpecInvalidReason::WorkflowSourceInvalid)
+        .diagnosed(
+            "workflow_tree_publication",
+            "workflow_tree_publication_refused",
+        )
+        .with_validation_facts(facts)
+}
+
+/// Offers `TREE_FILES` to a runner whose `um` prints `report` and exits 1 when publishing,
+/// asserting that the publish ran and no `create` did, and answers the decline.
+async fn decline_of_refused_publication(report: &str) -> Option<AssignmentDecline> {
+    let mut fixture = fixture_with(
+        TREE_DIGEST,
+        "exited",
+        "\"planned\"",
+        &[("TREE_TEST_PUBLISH_REPORT", report)],
+    );
+    let decline = prepare_offered(&mut fixture.manager, &fixture.offer).await;
+    assert!(fixture.log.join("publish.args").exists());
+    assert!(!fixture.log.join("create.args").exists());
+    decline
+}
+
+/// The report of a publish that refuses `TREE_FILES` for nesting a child workflow at the
+/// step `parts` of `workflow.yaml`.
+fn nested_child_report() -> String {
+    publish_report(
+        "invalid",
+        json!([{
+            "code": "child_workflow_nested",
+            "location": {"kind": "workflow", "path": "workflow.yaml"},
+            "workflowLocation": {"kind": "step_workflow", "step": "parts"},
+        }]),
+    )
+}
+
+// REQ-RUNNERENROLL-91, REQ-DIAG-42
+#[tokio::test]
+async fn refused_publication_declines_with_the_reported_validation_facts() {
+    assert_eq!(
+        decline_of_refused_publication(&nested_child_report()).await,
+        Some(refused_publication(ValidationFacts::new(
+            Some("child_workflow_nested"),
+            Some("step_workflow"),
+            Some("workflow.yaml"),
+            Some("parts"),
+        )))
+    );
+}
+
+// REQ-TELEMETRY-47, REQ-TELEMETRY-13: the run a refused tree ends `rejected` names the
+// decline the runner sent and the validation code, never the path or the step.
+#[tokio::test]
+async fn refused_publication_names_the_decline_on_the_run_event() {
+    let (recorder, capture) = crate::telemetry::test_recorder("rbt_fixture");
+    let report = nested_child_report();
+    let mut fixture = fixture_recording(
+        TREE_DIGEST,
+        "exited",
+        "\"planned\"",
+        &[("TREE_TEST_PUBLISH_REPORT", &report)],
+        Some(recorder),
+    );
+    assert!(
+        prepare_offered(&mut fixture.manager, &fixture.offer)
+            .await
+            .is_some()
+    );
+
+    let run = capture.event("runner.run");
+    for (key, value) in [
+        ("um.run.result", "rejected"),
+        ("um.outcome", "rejected"),
+        ("um.protocol.decline_type", "execution_spec_invalid"),
+        ("um.protocol.decline_reason", "workflow_source_invalid"),
+        ("um.diagnostic.stage", "workflow_tree_publication"),
+        (
+            "um.protocol.decline_cause",
+            "workflow_tree_publication_refused",
+        ),
+        ("um.workflow.validation_code", "child_workflow_nested"),
+        ("um.workflow.validation_location", "step_workflow"),
+    ] {
+        assert_eq!(run.get(key), Some(&json!(value)), "{key}");
+    }
+    assert_eq!(run.get("error.type"), None);
+    for leaked in ["workflow.yaml", "parts"] {
+        assert!(
+            run.values().all(|value| value != leaked),
+            "{leaked} is on the run record"
+        );
+    }
+}
+
+// REQ-RUNNERENROLL-91, REQ-DIAG-42: a fact the report does not hold, or that is not the
+// offered tree's path or a step id, is left out; a report the runner cannot read, of
+// another outcome or listing no failure declines the same way without any.
+#[tokio::test]
+async fn refused_publication_sends_only_the_facts_it_can_read() {
+    let failure = |location: Value, workflow_location: Option<Value>| {
+        let mut entry = json!({"code": "child_workflow_nested", "location": location});
+        if let Some(workflow_location) = workflow_location {
+            entry["workflowLocation"] = workflow_location;
+        }
+        json!([entry])
+    };
+    let nested = || {
+        failure(
+            json!({"kind": "workflow", "path": "workflow.yaml"}),
+            Some(json!({"kind": "step_workflow", "step": "parts"})),
+        )
+    };
+    let cases = [
+        (
+            publish_report(
+                "invalid",
+                failure(
+                    json!({"kind": "workflow", "path": "/srv/work/private/tree/workflow.yaml"}),
+                    Some(json!({"kind": "step_workflow", "step": "parts"})),
+                ),
+            ),
+            ValidationFacts::new(
+                Some("child_workflow_nested"),
+                Some("step_workflow"),
+                None,
+                Some("parts"),
+            ),
+        ),
+        (
+            publish_report(
+                "invalid",
+                failure(
+                    json!({"kind": "workflow", "path": "parts/workflow.yaml"}),
+                    Some(json!({"kind": "step_workflow", "step": "parts"})),
+                ),
+            ),
+            ValidationFacts::new(
+                Some("child_workflow_nested"),
+                Some("step_workflow"),
+                None,
+                Some("parts"),
+            ),
+        ),
+        (
+            publish_report(
+                "invalid",
+                failure(
+                    json!({"kind": "step", "path": "bin/check.sh", "step": "build"}),
+                    None,
+                ),
+            ),
+            ValidationFacts::new(
+                Some("child_workflow_nested"),
+                Some("step"),
+                Some("bin/check.sh"),
+                Some("build"),
+            ),
+        ),
+        (
+            publish_report(
+                "invalid",
+                failure(
+                    json!({"kind": "workflow", "path": "workflow.yaml"}),
+                    Some(json!({"kind": "step_workflow", "step": "9 lives"})),
+                ),
+            ),
+            ValidationFacts::new(
+                Some("child_workflow_nested"),
+                Some("step_workflow"),
+                Some("workflow.yaml"),
+                None,
+            ),
+        ),
+        (publish_report("refused", nested()), None),
+        (publish_report("invalid", json!([])), None),
+        (String::new(), None),
+    ];
+    for (report, facts) in cases {
+        assert_eq!(
+            decline_of_refused_publication(&report).await,
+            Some(refused_publication(facts)),
+            "{report}"
+        );
+    }
 }
 
 /// A mirror write as its run's `mirror/<NNNN>-<hook>.json` records it (REQ-LOCALRUN-193),

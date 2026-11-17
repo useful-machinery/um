@@ -624,6 +624,84 @@ impl ExecutionSpecInvalidReason {
     }
 }
 
+/// The validation facts of the first failure a refused workflow tree's report lists
+/// (REQ-DIAG-42): its code and, each only when it fits its grammar, the location's kind,
+/// the tree-relative path and the step. Each value kept is one Cloud's run read returns,
+/// which omits the whole diagnostic when one member is outside its grammar (REQ-DIAG-26),
+/// so a value outside it is left out rather than trimmed (REQ-DIAG-4).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ValidationFacts {
+    code: String,
+    location: Option<String>,
+    path: Option<String>,
+    step: Option<String>,
+}
+
+impl ValidationFacts {
+    /// The facts of a failure reported with `code`, `location` (its kind), `path` and
+    /// `step`: none when the code is absent or no slug, and otherwise the code with each
+    /// other value that fits its grammar.
+    pub fn new(
+        code: Option<&str>,
+        location: Option<&str>,
+        path: Option<&str>,
+        step: Option<&str>,
+    ) -> Option<Self> {
+        let code = code.filter(|code| is_diagnostic_slug(code))?;
+        Some(Self {
+            code: code.to_owned(),
+            location: location
+                .filter(|location| is_diagnostic_slug(location))
+                .map(str::to_owned),
+            path: path
+                .filter(|path| is_validation_path(path))
+                .map(str::to_owned),
+            step: step
+                .filter(|step| step.parse::<generated::StepId>().is_ok())
+                .map(str::to_owned),
+        })
+    }
+
+    /// The failure's validation code, a slug.
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    /// The kind of the failure's location, a slug, when the report gave one that fits.
+    pub fn location(&self) -> Option<&str> {
+        self.location.as_deref()
+    }
+
+    fn insert_into(&self, diagnostic: &mut serde_json::Map<String, Value>) {
+        diagnostic.insert("validationCode".to_owned(), json!(self.code));
+        for (member, value) in [
+            ("validationLocation", &self.location),
+            ("validationPath", &self.path),
+            ("validationStep", &self.step),
+        ] {
+            if let Some(value) = value {
+                diagnostic.insert(member.to_owned(), json!(value));
+            }
+        }
+    }
+}
+
+fn is_diagnostic_slug(value: &str) -> bool {
+    value.parse::<generated::DiagnosticSlug>().is_ok()
+}
+
+/// A tree-relative path of the schema's grammar whose segments are none of `.` and `..`
+/// and that holds no control character: the path Cloud's read returns.
+fn is_validation_path(value: &str) -> bool {
+    value
+        .parse::<generated::RunnerDiagnosticValidationPath>()
+        .is_ok()
+        && value
+            .split('/')
+            .all(|segment| segment != "." && segment != "..")
+        && !value.chars().any(char::is_control)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AssignmentDecline {
     CapacityUnavailable,
@@ -633,6 +711,8 @@ pub enum AssignmentDecline {
         decline: Box<Self>,
         stage: &'static str,
         cause: &'static str,
+        /// Boxed so the decline, the error of many runner results, stays small.
+        facts: Option<Box<ValidationFacts>>,
     },
 }
 
@@ -642,6 +722,27 @@ impl AssignmentDecline {
             decline: Box::new(self),
             stage,
             cause,
+            facts: None,
+        }
+    }
+
+    /// This diagnosed decline carrying `facts` in its diagnostic; a decline that is not
+    /// diagnosed is returned as it is.
+    #[must_use]
+    pub fn with_validation_facts(self, facts: Option<ValidationFacts>) -> Self {
+        match self {
+            Self::Diagnosed {
+                decline,
+                stage,
+                cause,
+                ..
+            } => Self::Diagnosed {
+                decline,
+                stage,
+                cause,
+                facts: facts.map(Box::new),
+            },
+            other => other,
         }
     }
 
@@ -654,12 +755,39 @@ impl AssignmentDecline {
         }
     }
 
+    /// The stage and cause of a diagnosed decline; none for a decline sent without a
+    /// diagnostic.
+    pub fn diagnostic_stage_and_cause(&self) -> Option<(&'static str, &'static str)> {
+        match self {
+            Self::Diagnosed { stage, cause, .. } => Some((stage, cause)),
+            _ => None,
+        }
+    }
+
+    /// The validation facts a diagnosed decline carries, when it carries them.
+    pub fn validation_facts(&self) -> Option<&ValidationFacts> {
+        match self {
+            Self::Diagnosed { facts, .. } => facts.as_deref(),
+            _ => None,
+        }
+    }
+
     fn diagnostic(&self) -> Option<Value> {
         match self {
-            Self::Diagnosed { stage, cause, .. } => Some(json!({
-                "stage": stage,
-                "declineCause": cause,
-            })),
+            Self::Diagnosed {
+                stage,
+                cause,
+                facts,
+                ..
+            } => {
+                let mut diagnostic = serde_json::Map::new();
+                diagnostic.insert("stage".to_owned(), json!(stage));
+                diagnostic.insert("declineCause".to_owned(), json!(cause));
+                if let Some(facts) = facts {
+                    facts.insert_into(&mut diagnostic);
+                }
+                Some(Value::Object(diagnostic))
+            }
             _ => None,
         }
     }
@@ -3243,6 +3371,10 @@ mod tests {
         )),
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/runner-assignment-rejected-validation-facts.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/runner-continuation-ready.json"
         )),
         include_bytes!(concat!(
@@ -3627,6 +3759,10 @@ mod tests {
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/invalid/run-control-skipped-with-refusal-code.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/runner-assignment-rejected-validation-path-absolute.json"
         )),
     ];
 
@@ -4478,6 +4614,142 @@ mod tests {
             })
         );
         assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
+    }
+
+    /// A refused workflow tree's decline carrying `facts`, encoded and checked to decode as
+    /// a valid runner frame, answered as its `payload.decline`.
+    fn refused_tree_decline(facts: Option<ValidationFacts>) -> Value {
+        let frame = RunnerFrame::AssignmentRejected {
+            envelope: maximal_envelope(),
+            effect_id: "eff_01k0z6r1w8f4jy2m7q9v3x5abg".to_owned(),
+            assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abn".to_owned(),
+            decline: AssignmentDecline::ExecutionSpecInvalid(
+                ExecutionSpecInvalidReason::WorkflowSourceInvalid,
+            )
+            .diagnosed(
+                "workflow_tree_publication",
+                "workflow_tree_publication_refused",
+            )
+            .with_validation_facts(facts),
+        };
+        let encoded = encode_runner_frame(&frame).unwrap();
+        assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
+        let value: Value = serde_json::from_slice(&encoded).unwrap();
+        value["payload"]["decline"].clone()
+    }
+
+    // REQ-DIAG-42, REQ-DIAG-4
+    #[test]
+    fn refused_tree_decline_carries_the_validation_facts() {
+        let fixture: Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/runner-assignment-rejected-validation-facts.json"
+        )))
+        .unwrap();
+        let facts = ValidationFacts::new(
+            Some("child_workflow_nested"),
+            Some("step_workflow"),
+            Some("workflow.yaml"),
+            Some("parts"),
+        );
+        assert_eq!(refused_tree_decline(facts), fixture["payload"]["decline"]);
+
+        let code_alone = refused_tree_decline(ValidationFacts::new(
+            Some("child_workflow_nested"),
+            None,
+            None,
+            None,
+        ));
+        assert_eq!(
+            code_alone["diagnostic"],
+            json!({
+                "stage": "workflow_tree_publication",
+                "declineCause": "workflow_tree_publication_refused",
+                "validationCode": "child_workflow_nested",
+            })
+        );
+    }
+
+    // REQ-DIAG-42, REQ-DIAG-4: a fact outside the grammar Cloud's read returns is left out,
+    // never trimmed, and the decline is sent all the same.
+    #[test]
+    fn validation_facts_keep_only_values_of_their_grammar() {
+        let without_facts = json!({
+            "stage": "workflow_tree_publication",
+            "declineCause": "workflow_tree_publication_refused",
+        });
+        for code in [
+            None,
+            Some(""),
+            Some("child_workflow_nested extra"),
+            Some("Child_workflow_nested"),
+            Some("child-workflow-nested"),
+        ] {
+            let facts =
+                ValidationFacts::new(code, Some("step_workflow"), Some("workflow.yaml"), None);
+            assert_eq!(facts, None, "{code:?}");
+            assert_eq!(refused_tree_decline(facts)["diagnostic"], without_facts);
+        }
+
+        let kept = |location, path, step| {
+            let facts = ValidationFacts::new(Some("child_workflow_nested"), location, path, step);
+            refused_tree_decline(facts)["diagnostic"].clone()
+        };
+        let mut expected = without_facts.clone();
+        expected["validationCode"] = json!("child_workflow_nested");
+        expected["validationPath"] = json!("workflow.yaml");
+        expected["validationStep"] = json!("parts");
+        for location in ["Step_workflow", "step workflow", "9step"] {
+            assert_eq!(
+                kept(Some(location), Some("workflow.yaml"), Some("parts")),
+                expected,
+                "{location:?}"
+            );
+        }
+
+        let mut expected = without_facts.clone();
+        expected["validationCode"] = json!("child_workflow_nested");
+        expected["validationLocation"] = json!("step_workflow");
+        expected["validationPath"] = json!("workflow.yaml");
+        for step in ["9 lives", "", "parts!"] {
+            assert_eq!(
+                kept(Some("step_workflow"), Some("workflow.yaml"), Some(step)),
+                expected,
+                "{step:?}"
+            );
+        }
+
+        let mut expected = without_facts.clone();
+        expected["validationCode"] = json!("child_workflow_nested");
+        expected["validationLocation"] = json!("step_workflow");
+        expected["validationStep"] = json!("parts");
+        let too_long = "a".repeat(1025);
+        for path in [
+            "/srv/work/private/tree/workflow.yaml",
+            "bin/./check.sh",
+            "../workflow.yaml",
+            "bin/..",
+            ".",
+            "bin//check.sh",
+            "bin/",
+            "",
+            "bin/check\u{7}.sh",
+            "workflow.yaml\n",
+            too_long.as_str(),
+        ] {
+            assert_eq!(
+                kept(Some("step_workflow"), Some(path), Some("parts")),
+                expected,
+                "{path:?}"
+            );
+        }
+
+        let longest = format!("bin/{}", "a".repeat(1020));
+        expected["validationPath"] = json!(longest);
+        assert_eq!(
+            kept(Some("step_workflow"), Some(&longest), Some("parts")),
+            expected
+        );
     }
 
     #[test]

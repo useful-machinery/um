@@ -108,6 +108,12 @@ pub(crate) mod attribute {
     pub(crate) const PROTOCOL_ACKNOWLEDGED_SEQUENCE: &str = "um.protocol.acknowledged_sequence";
     pub(crate) const PROTOCOL_CLOSE_CODE: &str = "um.protocol.close_code";
     pub(crate) const PROTOCOL_CLOSE_INITIATOR: &str = "um.protocol.close_initiator";
+    /// A `runner.run` that ends `rejected` names the cause of a diagnosed
+    /// decline and, for a refused workflow tree, the validation code and the
+    /// location's kind, never the path or the step (REQ-TELEMETRY-47).
+    pub(crate) const PROTOCOL_DECLINE_CAUSE: &str = "um.protocol.decline_cause";
+    pub(crate) const WORKFLOW_VALIDATION_CODE: &str = "um.workflow.validation_code";
+    pub(crate) const WORKFLOW_VALIDATION_LOCATION: &str = "um.workflow.validation_location";
     pub(crate) const PROTOCOL_DECLINE_REASON: &str = "um.protocol.decline_reason";
     pub(crate) const PROTOCOL_DECLINE_TYPE: &str = "um.protocol.decline_type";
     pub(crate) const PROTOCOL_DIRECTION: &str = "um.protocol.direction";

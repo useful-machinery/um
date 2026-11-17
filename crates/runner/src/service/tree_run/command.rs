@@ -306,15 +306,59 @@ pub(in crate::service) struct Published {
     pub(in crate::service) digest: String,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(in crate::service) enum PublishFailure {
     /// The `um` executable could not be started or its output read.
     Launch,
-    /// The command refused the tree or printed no publication.
-    Refused,
+    /// The command refused the tree or printed no publication, with what its report said
+    /// of the first failure it lists.
+    Refused(RefusalReport),
     /// The command outlived its bound or the preparation's deadline, or the preparation was
     /// cancelled; its process group was killed.
     Abandoned,
+}
+
+/// What a refused publish's report says of the first failure it lists, each value read
+/// raw as the report printed it: none when the report cannot be read, has an `outcome`
+/// other than `invalid` or lists no failure with a string `code` (REQ-RUNNERENROLL-91).
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(in crate::service) struct RefusalReport {
+    /// The failure's `code`.
+    pub(in crate::service) code: Option<String>,
+    /// The kind of its `workflowLocation`, or of its `location` when it has none.
+    pub(in crate::service) location: Option<String>,
+    /// Its `location.path`.
+    pub(in crate::service) path: Option<String>,
+    /// The step of its `workflowLocation`, or of its `location` when it has none.
+    pub(in crate::service) step: Option<String>,
+}
+
+impl RefusalReport {
+    /// Reads the `invalid` report an unsuccessful publish printed as one JSON document.
+    fn read(stdout: &[u8]) -> Self {
+        let Ok(document) = serde_json::from_slice::<Value>(stdout) else {
+            return Self::default();
+        };
+        if document["outcome"].as_str() != Some("invalid") {
+            return Self::default();
+        }
+        let failure = &document["diagnostics"][0];
+        let Some(code) = failure["code"].as_str() else {
+            return Self::default();
+        };
+        let location = &failure["location"];
+        let located = match failure.get("workflowLocation") {
+            Some(workflow_location) if !workflow_location.is_null() => workflow_location,
+            _ => location,
+        };
+        let text = |value: &Value| value.as_str().map(str::to_owned);
+        Self {
+            code: Some(code.to_owned()),
+            location: text(&located["kind"]),
+            path: text(&location["path"]),
+            step: text(&located["step"]),
+        }
+    }
 }
 
 /// Publishes the downloaded tree with the spec's bindings snapshot into the run-scoped
@@ -361,9 +405,10 @@ pub(in crate::service) fn publish(
         return Err(PublishFailure::Abandoned);
     };
     if !status.success() {
-        return Err(PublishFailure::Refused);
+        return Err(PublishFailure::Refused(RefusalReport::read(&stdout)));
     }
-    let document: Value = serde_json::from_slice(&stdout).map_err(|_| PublishFailure::Refused)?;
+    let document: Value = serde_json::from_slice(&stdout)
+        .map_err(|_| PublishFailure::Refused(RefusalReport::default()))?;
     match (
         document["definition"]["id"].as_str(),
         document["revision"]["n"].as_u64(),
@@ -374,7 +419,7 @@ pub(in crate::service) fn publish(
             revision,
             digest: digest.to_owned(),
         }),
-        _ => Err(PublishFailure::Refused),
+        _ => Err(PublishFailure::Refused(RefusalReport::default())),
     }
 }
 

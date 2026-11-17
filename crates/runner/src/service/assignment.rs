@@ -465,6 +465,37 @@ impl RunEvent {
         }
     }
 
+    // Names the decline the runner sends for this run: its type and reason, a
+    // diagnosed decline's stage and cause, and a refused tree's validation code
+    // and location kind, never its path or step (REQ-TELEMETRY-47).
+    fn decline(&self, decline: &AssignmentDecline) {
+        use crate::telemetry::attribute;
+        let (decline_type, reason) = decline.protocol_type_and_reason();
+        self.set(KeyValue::new(
+            attribute::PROTOCOL_DECLINE_TYPE,
+            decline_type,
+        ));
+        if let Some(reason) = reason {
+            self.set(KeyValue::new(attribute::PROTOCOL_DECLINE_REASON, reason));
+        }
+        if let Some((stage, cause)) = decline.diagnostic_stage_and_cause() {
+            self.set(KeyValue::new(attribute::DIAGNOSTIC_STAGE, stage));
+            self.set(KeyValue::new(attribute::PROTOCOL_DECLINE_CAUSE, cause));
+        }
+        if let Some(facts) = decline.validation_facts() {
+            self.set(KeyValue::new(
+                attribute::WORKFLOW_VALIDATION_CODE,
+                facts.code().to_owned(),
+            ));
+            if let Some(location) = facts.location() {
+                self.set(KeyValue::new(
+                    attribute::WORKFLOW_VALIDATION_LOCATION,
+                    location.to_owned(),
+                ));
+            }
+        }
+    }
+
     pub(super) fn result(&self, result: &'static str) {
         let mut state = self.state();
         state.result = Some(result);
