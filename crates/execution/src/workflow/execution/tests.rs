@@ -947,15 +947,6 @@ fn edge_child(outcomes: &str) -> String {
     )
 }
 
-fn routed(outcome: &str) -> StepState<CapturedValue> {
-    StepState::Succeeded {
-        outputs: BTreeMap::from([(
-            "outcome".to_owned(),
-            CapturedValue::text(Arc::from(outcome)),
-        )]),
-    }
-}
-
 // REQ-WFEXEC-57, REQ-WFEXEC-58
 #[tokio::test]
 async fn chosen_outcome_of_an_edge_scheduled_run_is_its_exit_outcome() {
@@ -976,33 +967,22 @@ async fn chosen_outcome_of_an_edge_scheduled_run_is_its_exit_outcome() {
         );
         let workflow = fixture.admitted.workflow().definition.clone();
         let (_, mut result) = executed_definition(&declared_outcome_source(0)).await;
+        assert_eq!(result.outcome, RunOutcome::Succeeded);
 
-        result.steps = BTreeMap::from([
-            ("design".to_owned(), routed("planned")),
-            ("build".to_owned(), routed("built")),
-        ]);
+        result.exit_outcome = Some("landed".to_owned());
         assert_eq!(chosen_outcome(&workflow, &result), "landed");
 
-        result.steps = BTreeMap::from([
-            ("design".to_owned(), routed("blocked")),
-            (
-                "build".to_owned(),
-                StepState::NotRun {
-                    detail: NonExecutionDetail::not_reached(),
-                },
-            ),
-        ]);
-        assert_eq!(chosen_outcome(&workflow, &result), "failed");
-
         // A walk that ended without an exit (`edge_walk_unrouted`) records `failed`.
-        result.steps = BTreeMap::from([("design".to_owned(), routed("unexpected"))]);
+        result.exit_outcome = None;
         assert_eq!(chosen_outcome(&workflow, &result), "failed");
 
-        let (_, failed) = executed_definition(&declared_outcome_source(3)).await;
+        let (_, mut failed) = executed_definition(&declared_outcome_source(3)).await;
         assert!(matches!(failed.outcome, RunOutcome::Failed { .. }));
+        failed.exit_outcome = Some("landed".to_owned());
         assert_eq!(chosen_outcome(&workflow, &failed), "failed");
 
         let mut cancelled = result.clone();
+        cancelled.exit_outcome = Some("landed".to_owned());
         cancelled.outcome = RunOutcome::Cancelled {
             reason: CancellationReason::UserRequest,
         };

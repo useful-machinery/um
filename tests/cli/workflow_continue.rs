@@ -3246,6 +3246,43 @@ fn an_exhausted_limit_waits_for_a_repair_that_a_retry_continues() {
     assert_eq!(record["edges"], serde_json::json!({"review.hand_back": 1}));
 }
 
+// REQ-WFEXEC-57, REQ-WFEXEC-58, REQ-WFEXEC-64: once the limit is reached the hand-back takes its
+// `else`, here an exit, and the run records that exit's outcome.
+#[test]
+fn an_exhausted_limit_whose_else_is_an_exit_records_that_exit() {
+    const OUTCOMES: &str = "outcomes: [landed, failed]\n";
+    const ELSE_WAIT: &str = "        else:\n          wait: repair\n          then: review\n";
+    assert!(LOOP_TREE_ROOT.contains(OUTCOMES), "{LOOP_TREE_ROOT}");
+    let root = LOOP_TREE_ROOT.replacen(OUTCOMES, "outcomes: [landed, exhausted, failed]\n", 1);
+    assert!(root.contains(ELSE_WAIT), "{root}");
+    let root = root.replacen(ELSE_WAIT, "        else: exit.exhausted\n", 1);
+    let bundle = loop_tree_with(
+        &root,
+        "proceed, hand_back, failed",
+        "admitted, landed, failed",
+    );
+    decide(&bundle, "design", "planned");
+    decide_each(&bundle, "review", &["hand_back", "hand_back"]);
+    decide(&bundle, "fix", "built");
+    let destination = bundle.result("exhausted-exit");
+    let documents = chained(
+        &isolated_command(&bundle.args(&destination))
+            .output()
+            .unwrap(),
+    );
+    let outcomes = documents
+        .iter()
+        .map(|document| document["outcome"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(outcomes, ["continued", "continued", "succeeded"]);
+    let run = fs::canonicalize(&destination).unwrap();
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "exhausted", "{record}");
+    assert_eq!(record["attempts"], 3);
+    assert_eq!(record["edges"], serde_json::json!({"review.hand_back": 1}));
+}
+
 /// Removes `path` and everything under it, making each entry writable first.
 fn remove_tree(path: &Path) {
     for entry in fs::read_dir(path).unwrap() {

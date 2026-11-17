@@ -5033,6 +5033,7 @@ async fn cloud_continuation_recovers_unexported_output_across_three_attempts() {
             provenance: fixture.admitted.workflow().source.clone(),
             content_digest: fixture.admitted.workflow().content_digest.clone(),
             withdrawn: false,
+            exit_outcome: None,
         };
     retain_cloud_completed_steps(
         &private1,
@@ -5100,6 +5101,7 @@ async fn cloud_continuation_recovers_unexported_output_across_three_attempts() {
             provenance: fixture.admitted.workflow().source.clone(),
             content_digest: fixture.admitted.workflow().content_digest.clone(),
             withdrawn: false,
+            exit_outcome: None,
         };
     retain_cloud_completed_steps(
         &private2,

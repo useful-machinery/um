@@ -24,8 +24,7 @@ use super::step_runtime::{
     StepFailureCause, StepFailureKind, WorkflowAgentDispatcher, WorkflowCommitPort,
     WorkflowExecutionStart, execute_workflow_observed_with_children,
 };
-use super::validated::{Scheduling, ValidatedEdgeTarget, ValidatedStep, ValidatedWorkflow};
-use super::validation::CHILD_OUTCOME_OUTPUT;
+use super::validated::{Scheduling, ValidatedWorkflow};
 use super::value::CapturedValue;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -42,13 +41,17 @@ pub struct WorkflowExecutionResult<Deadline = ()> {
     /// The attempt ended `cancelled` on a withdrawal honored at a `workflow` step boundary
     /// (REQ-WFEXEC-73), which `chosen_outcome` records as `withdrawn`.
     pub withdrawn: bool,
+    /// The exit an edge-scheduled walk took (REQ-WFEXEC-58), a limited edge's `else` included;
+    /// `None` for a dataflow run and for an attempt that took no exit.
+    pub exit_outcome: Option<String>,
 }
 
 /// The outcome an attempt records on the run record (REQ-WFEXEC-57): `withdrawn` for a run
 /// whose cancellation was a withdrawal (REQ-WFEXEC-73), `canceled` for any other cancelled
 /// run; for a workflow that declares `outcome`, the text of its `from` output when
 /// the run succeeded and `onFailure` when it failed; for an edge-scheduled workflow the exit
-/// outcome its walk took when it succeeded and `failed` when it failed; otherwise
+/// outcome its walk recorded in `exit_outcome` when it succeeded, or `failed` when it
+/// recorded none, and `failed` when it failed; otherwise
 /// `succeeded` or `failed`. A waiting or continued attempt chooses no outcome and the run
 /// record's stays null (REQ-WFEXEC-57), so callers do not ask for one; the call is logged and
 /// answered with the failure outcome.
@@ -71,7 +74,9 @@ pub fn chosen_outcome<Deadline>(
             return failure_outcome(workflow).to_owned();
         }
         (RunOutcome::Succeeded, _) if matches!(workflow.scheduling, Scheduling::Edges { .. }) => {
-            return exit_outcome(workflow, result)
+            return result
+                .exit_outcome
+                .as_deref()
                 .unwrap_or("failed")
                 .to_owned();
         }
@@ -95,34 +100,6 @@ pub fn chosen_outcome<Deadline>(
             declared.on_failure.clone()
         }
     }
-}
-
-/// The exit an edge-scheduled walk took: the `exit.<name>` edge of the settled `workflow`
-/// step whose recorded outcome leads there (REQ-WFEXEC-58). A walk that ended without one
-/// (`edge_walk_unrouted`) has none.
-fn exit_outcome<'a, Deadline>(
-    workflow: &'a ValidatedWorkflow,
-    result: &WorkflowExecutionResult<Deadline>,
-) -> Option<&'a str> {
-    workflow.steps.iter().find_map(|(id, step)| {
-        let ValidatedStep::Workflow(step) = step else {
-            return None;
-        };
-        // An inherited step routes nothing (REQ-WFEXEC-58), so only a step that succeeded in
-        // this attempt can have taken the exit.
-        let StepState::Succeeded { outputs } = result.steps.get(id)? else {
-            return None;
-        };
-        let Some(CapturedValue::Text(outcome)) = outputs.get(CHILD_OUTCOME_OUTPUT) else {
-            return None;
-        };
-        match step.edges.get(outcome.as_str())? {
-            ValidatedEdgeTarget::Exit(name) => Some(name.as_str()),
-            ValidatedEdgeTarget::Step(_)
-            | ValidatedEdgeTarget::Limited { .. }
-            | ValidatedEdgeTarget::Wait { .. } => None,
-        }
-    })
 }
 
 /// The outcome an attempt that fails, or ends without a published result, records
@@ -650,6 +627,7 @@ where
     let output_producers = coordinated.state.output_producers;
     let finalization_summary = coordinated.state.finalization_summary;
     let force_abort = coordinated.state.force_abort;
+    let exit_outcome = coordinated.state.exit_outcome;
     let exports = coordinated
         .state
         .exports
@@ -667,6 +645,7 @@ where
         provenance,
         content_digest,
         withdrawn,
+        exit_outcome,
     })
 }
 
