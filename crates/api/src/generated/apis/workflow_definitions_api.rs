@@ -383,7 +383,7 @@ pub fn create_workflow_definition(
     }
 }
 
-/// Owner only. No Idempotency-Key is accepted: the tree is keyed by its digest, and every success is a fresh database-time-bounded issuance. One capability is issued per file content the organization does not already retain; a sealed tree answers with none. A digest that already names a sealed manifest of other paths, sizes or SHA-256s is 409 `workflow-tree-manifest-conflict`; one that differs only in executable bits answers the sealed tree as it is, and a publication's `executablePaths` carry the new bits. With no publication validator configured the operation is 503 `workflow-validator-unavailable`.
+/// Owner only. No Idempotency-Key is accepted: the tree is keyed by its digest, and every success is a fresh database-time-bounded issuance. One capability is issued per file content the organization does not already retain; a sealed tree answers with none. A digest that already names a sealed manifest of other paths, sizes or SHA-256s is 409 `workflow-tree-manifest-conflict`; one that differs only in executable bits answers the sealed tree as it is, and a publication's `executablePaths` carry the new bits. With no publication validator configured the operation is 503 `workflow-validator-unavailable`. A manifest outside its bounds, a path segment over 255 bytes of UTF-8 included, is 400 `bad-request` and records nothing.
 pub fn create_workflow_tree_upload(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -1169,7 +1169,7 @@ pub fn retry_workflow_definition_evaluation(
     }
 }
 
-/// Owner only. Every file object is confirmed (409 `workflow-tree-upload-incomplete` naming `workflow.missingPaths`), the stored files are rebuilt and validated as `um workflow definition validate` does (422 `workflow-tree-invalid` with the first diagnostic's `workflow.diagnosticCode`), and the rebuilt tree's digest must be the one uploaded (409 `workflow-tree-digest-mismatch`). A validator that reaches no decision is 503 `workflow-validator-unavailable` naming `workflow.validatorFailure`. Before any object is confirmed, a tree whose file list, encoded as a run's assignment offer carries it, exceeds 147,456 bytes is refused 422 `workflow-tree-too-large-for-delivery`, so that every run of a sealed tree reaches its runner in one frame. Sealing a sealed tree answers it as it is.
+/// Owner only. Every file object is confirmed (409 `workflow-tree-upload-incomplete` naming `workflow.missingPaths`), the stored files are rebuilt and validated as `um workflow definition validate` does (422 `workflow-tree-invalid` with the first diagnostic's `workflow.diagnosticCode`), and the rebuilt tree's digest must be the one uploaded (409 `workflow-tree-digest-mismatch`). A validator that reaches no decision is 503 `workflow-validator-unavailable` naming `workflow.validatorFailure`. Before any object is confirmed, a tree whose file list, encoded as a run's assignment offer carries it, exceeds 147,456 bytes is refused 422 `workflow-tree-too-large-for-delivery`, so that every run of a sealed tree reaches its runner in one frame. An upload recorded with a path segment over 255 bytes of UTF-8 cannot be rebuilt: it is refused 400 `bad-request` before any object is confirmed and stays unsealed. Sealing a sealed tree answers it as it is.
 pub fn seal_workflow_tree(
     configuration: &configuration::Configuration,
     organization_ref: &str,

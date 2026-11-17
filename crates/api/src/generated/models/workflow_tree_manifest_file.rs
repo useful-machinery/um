@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowTreeManifestFile {
-    /// A tree-relative path of a regular file, without empty, `.` or `..` segments.
+    /// A tree-relative path of a regular file, without empty, `.` or `..` segments, of at most 1,024 bytes of UTF-8 in all and 255 in any one segment.
     #[serde(rename = "path")]
     pub path: String,
     #[serde(rename = "sizeBytes")]
