@@ -41,9 +41,9 @@ use super::socket_alias::{
     remove_socket_alias,
 };
 
-const INTERNAL_WORKER_ENVIRONMENT: &str = "UM_INTERNAL_CHILD_GUARD_WORKER";
-const INTERNAL_ROOT_ENVIRONMENT: &str = "UM_INTERNAL_CHILD_GUARD_ROOT";
-const INTERNAL_PARENT_ENVIRONMENT: &str = "UM_INTERNAL_CHILD_GUARD_PARENT";
+const INTERNAL_WORKER_ENVIRONMENT: &str = "USEFUL_INTERNAL_CHILD_GUARD_WORKER";
+const INTERNAL_ROOT_ENVIRONMENT: &str = "USEFUL_INTERNAL_CHILD_GUARD_ROOT";
+const INTERNAL_PARENT_ENVIRONMENT: &str = "USEFUL_INTERNAL_CHILD_GUARD_PARENT";
 const GUARD_WORKER: &str = "guard-v1";
 const LEADER_WORKER: &str = "leader-v1";
 const CONTINUE: u8 = b'C';
@@ -461,7 +461,7 @@ fn child_guard_worker_executable() -> io::Result<PathBuf> {
 }
 
 /// The child-guard and result-validation worker this test build resolves as if
-/// `UM_TEST_INTERNAL_WORKER_EXECUTABLE` were unset, without launching it (INV-TESTING-20).
+/// `USEFUL_TEST_INTERNAL_WORKER_EXECUTABLE` were unset, without launching it (INV-TESTING-20).
 #[cfg(feature = "test-fixtures")]
 pub fn unsupplied_internal_worker_executable() -> io::Result<PathBuf> {
     crate::process::unsupplied_internal_worker_executable()
@@ -495,18 +495,18 @@ fn terminate_unready_guard(child: &mut Child) -> io::Result<()> {
 }
 
 fn wait_for_guard_exit(child: &mut Child) -> io::Result<()> {
-    let started = um_support::monotonic_now();
+    let started = useful_support::monotonic_now();
     loop {
         if child.try_wait()?.is_some() {
             return Ok(());
         }
-        if um_support::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
+        if useful_support::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "child process guard did not exit",
             ));
         }
-        um_support::sleep(WORKER_POLL_INTERVAL);
+        useful_support::sleep(WORKER_POLL_INTERVAL);
     }
 }
 
@@ -546,7 +546,7 @@ fn wait_for_boundary<Output>(
     cancellation: &ChildGuardCancellation,
     mut inspect: impl FnMut(&Path) -> io::Result<Option<Output>>,
 ) -> io::Result<Output> {
-    let started = um_support::monotonic_now();
+    let started = useful_support::monotonic_now();
     loop {
         if let Some(output) = inspect(path)? {
             return Ok(output);
@@ -569,13 +569,13 @@ fn check_worker_boundary(
     if child.try_wait()?.is_some() {
         return Err(io::Error::other("child process guard exited early"));
     }
-    if worker_boundary_timed_out(um_support::elapsed(started)) {
+    if worker_boundary_timed_out(useful_support::elapsed(started)) {
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "child process guard did not respond",
         ));
     }
-    um_support::sleep(WORKER_POLL_INTERVAL);
+    useful_support::sleep(WORKER_POLL_INTERVAL);
     Ok(())
 }
 
@@ -746,7 +746,7 @@ fn monitor_guarded_child(
                 return Err(());
             }
         }
-        um_support::sleep(WORKER_POLL_INTERVAL);
+        useful_support::sleep(WORKER_POLL_INTERVAL);
     }
 }
 
@@ -1006,18 +1006,18 @@ fn cleanup_adopted_group(
 
 #[cfg(target_os = "linux")]
 fn reap_owned_process_group(process_group: Pid) -> io::Result<()> {
-    let started = um_support::monotonic_now();
+    let started = useful_support::monotonic_now();
     loop {
         match waitpgid(process_group, WaitOptions::NOHANG) {
             Ok(Some(_)) => {}
             Ok(None) => {
-                if um_support::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
+                if useful_support::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "guarded process group did not exit",
                     ));
                 }
-                um_support::sleep(WORKER_POLL_INTERVAL);
+                useful_support::sleep(WORKER_POLL_INTERVAL);
             }
             Err(Errno::CHILD) => return Ok(()),
             Err(Errno::INTR) => {}
@@ -1030,7 +1030,7 @@ fn reap_owned_process_group(process_group: Pid) -> io::Result<()> {
 // surviving descendants become its direct children even when native tools created new sessions.
 #[cfg(target_os = "linux")]
 fn terminate_and_reap_adopted_descendants() -> io::Result<()> {
-    let started = um_support::monotonic_now();
+    let started = useful_support::monotonic_now();
     loop {
         loop {
             match wait(WaitOptions::NOHANG) {
@@ -1058,13 +1058,13 @@ fn terminate_and_reap_adopted_descendants() -> io::Result<()> {
             }
         }
 
-        if um_support::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
+        if useful_support::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "guarded descendants did not exit",
             ));
         }
-        um_support::sleep(WORKER_POLL_INTERVAL);
+        useful_support::sleep(WORKER_POLL_INTERVAL);
     }
 }
 
@@ -1125,15 +1125,15 @@ fn terminate_and_reap_adopted_descendants() -> io::Result<()> {
 
 #[cfg(target_vendor = "apple")]
 fn reap_owned_process_group(process_group: Pid) -> io::Result<()> {
-    let started = um_support::monotonic_now();
+    let started = useful_support::monotonic_now();
     while !process_group_is_quiescent(process_group) {
-        if um_support::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
+        if useful_support::elapsed(started) >= WORKER_BOUNDARY_TIMEOUT {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "guarded process group did not exit",
             ));
         }
-        um_support::sleep(WORKER_POLL_INTERVAL);
+        useful_support::sleep(WORKER_POLL_INTERVAL);
     }
     Ok(())
 }
@@ -1240,7 +1240,7 @@ mod tests {
     const UNRELATED_SIBLING_FIXTURE: &str =
         "workflow::child_guard::tests::unrelated_sibling_fixture";
     #[cfg(target_os = "linux")]
-    const NESTED_FIXTURE_ROOT: &str = "UM_NESTED_GUARD_FIXTURE_ROOT";
+    const NESTED_FIXTURE_ROOT: &str = "USEFUL_NESTED_GUARD_FIXTURE_ROOT";
 
     struct UnavailableInspector;
 
@@ -1252,7 +1252,7 @@ mod tests {
 
     const LONG_TMPDIR_FIXTURE: &str =
         "workflow::child_guard::tests::guarded_child_long_tmpdir_fixture";
-    const LONG_TMPDIR_FIXTURE_ROOT: &str = "UM_LONG_TMPDIR_FIXTURE_ROOT";
+    const LONG_TMPDIR_FIXTURE_ROOT: &str = "USEFUL_LONG_TMPDIR_FIXTURE_ROOT";
 
     fn long_directory_under(parent: &Path) -> PathBuf {
         let root = parent.join("long-directory-component-".repeat(5));
@@ -1387,7 +1387,7 @@ mod tests {
     #[tokio::test]
     async fn guarded_child_can_receive_streaming_standard_input() {
         let worker = child_guard_worker_executable().unwrap();
-        match std::env::var_os("UM_TEST_INTERNAL_WORKER_EXECUTABLE") {
+        match std::env::var_os("USEFUL_TEST_INTERNAL_WORKER_EXECUTABLE") {
             Some(supplied_worker) => assert_eq!(worker.as_os_str(), supplied_worker),
             None => assert!(
                 worker.ends_with("examples/internal-worker"),
@@ -1475,12 +1475,12 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     fn wait_for_fixture_file(path: &Path) {
-        let started = um_support::monotonic_now();
+        let started = useful_support::monotonic_now();
         while !path.is_file() {
-            assert!(um_support::elapsed(started) < Duration::from_secs(5));
+            assert!(useful_support::elapsed(started) < Duration::from_secs(5));
             // Files are the synchronization ABI between independently executing test binaries;
             // there is no in-process notification primitive at this operating-system boundary.
-            um_support::sleep(WORKER_POLL_INTERVAL);
+            useful_support::sleep(WORKER_POLL_INTERVAL);
         }
     }
 
@@ -1530,12 +1530,15 @@ mod tests {
                     "--ignored",
                     "--test-threads=1",
                 ])
-                .env("UM_NESTED_LEADER_PID", &leader_pid_path)
-                .env("UM_NESTED_LEADER_READY", &leader_ready)
-                .env("UM_NESTED_LEADER_INTERRUPTED", &leader_interrupted)
-                .env("UM_NESTED_DESCENDANT_PID", &descendant_pid_path)
-                .env("UM_NESTED_DESCENDANT_READY", &descendant_ready)
-                .env("UM_NESTED_DESCENDANT_INTERRUPTED", &descendant_interrupted)
+                .env("USEFUL_NESTED_LEADER_PID", &leader_pid_path)
+                .env("USEFUL_NESTED_LEADER_READY", &leader_ready)
+                .env("USEFUL_NESTED_LEADER_INTERRUPTED", &leader_interrupted)
+                .env("USEFUL_NESTED_DESCENDANT_PID", &descendant_pid_path)
+                .env("USEFUL_NESTED_DESCENDANT_READY", &descendant_ready)
+                .env(
+                    "USEFUL_NESTED_DESCENDANT_INTERRUPTED",
+                    &descendant_interrupted,
+                )
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -1558,12 +1561,12 @@ mod tests {
 
             kill_process_group(leader_pid, Signal::KILL).unwrap();
             assert!(!leader.wait().unwrap().success());
-            let started = um_support::monotonic_now();
+            let started = useful_support::monotonic_now();
             while !process_group_is_quiescent(leader_pid) {
-                assert!(um_support::elapsed(started) < Duration::from_secs(5));
+                assert!(useful_support::elapsed(started) < Duration::from_secs(5));
                 // Process-group disappearance has no event descriptor, so this bounded poll is
                 // the unavoidable kernel-observation boundary for the regression fixture.
-                um_support::sleep(WORKER_POLL_INTERVAL);
+                useful_support::sleep(WORKER_POLL_INTERVAL);
             }
             reports.push(serde_json::json!({
                 "processGroup": leader_pid.as_raw_pid(),
@@ -1610,12 +1613,12 @@ mod tests {
     #[test]
     #[ignore = "launched as the nested process-group leader"]
     fn nested_process_group_leader_fixture() {
-        let interrupted = std::env::var_os("UM_NESTED_LEADER_INTERRUPTED").unwrap();
+        let interrupted = std::env::var_os("USEFUL_NESTED_LEADER_INTERRUPTED").unwrap();
         crate::workflow::test_support::process_fixture_interrupt_handler(move || {
             fs::write(interrupted, b"interrupted\n").unwrap();
         });
         fs::write(
-            std::env::var_os("UM_NESTED_LEADER_PID").unwrap(),
+            std::env::var_os("USEFUL_NESTED_LEADER_PID").unwrap(),
             format!("{}\n", std::process::id()),
         )
         .unwrap();
@@ -1632,7 +1635,7 @@ mod tests {
             .spawn()
             .unwrap();
         fs::write(
-            std::env::var_os("UM_NESTED_LEADER_READY").unwrap(),
+            std::env::var_os("USEFUL_NESTED_LEADER_READY").unwrap(),
             b"ready\n",
         )
         .unwrap();
@@ -1645,18 +1648,18 @@ mod tests {
     fn nested_stubborn_descendant_fixture() {
         let interrupted = crate::workflow::test_support::process_fixture_interrupt_receiver();
         fs::write(
-            std::env::var_os("UM_NESTED_DESCENDANT_PID").unwrap(),
+            std::env::var_os("USEFUL_NESTED_DESCENDANT_PID").unwrap(),
             format!("{}\n", std::process::id()),
         )
         .unwrap();
         fs::write(
-            std::env::var_os("UM_NESTED_DESCENDANT_READY").unwrap(),
+            std::env::var_os("USEFUL_NESTED_DESCENDANT_READY").unwrap(),
             b"ready\n",
         )
         .unwrap();
         interrupted.recv().unwrap();
         fs::write(
-            std::env::var_os("UM_NESTED_DESCENDANT_INTERRUPTED").unwrap(),
+            std::env::var_os("USEFUL_NESTED_DESCENDANT_INTERRUPTED").unwrap(),
             b"interrupted\n",
         )
         .unwrap();
@@ -1670,7 +1673,7 @@ mod tests {
     #[ignore = "launched as the unrelated sibling process"]
     fn unrelated_sibling_fixture() {
         fs::write(
-            std::env::var_os("UM_UNRELATED_SIBLING_READY").unwrap(),
+            std::env::var_os("USEFUL_UNRELATED_SIBLING_READY").unwrap(),
             b"ready\n",
         )
         .unwrap();
@@ -1692,7 +1695,7 @@ mod tests {
                 "--ignored",
                 "--test-threads=1",
             ])
-            .env("UM_UNRELATED_SIBLING_READY", &sibling_ready)
+            .env("USEFUL_UNRELATED_SIBLING_READY", &sibling_ready)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -1747,7 +1750,7 @@ mod tests {
             });
             let waited = tokio::select! {
                 result = outer.wait() => Some(result),
-                () = um_support::async_sleep(Duration::from_secs(10)) => None,
+                () = useful_support::async_sleep(Duration::from_secs(10)) => None,
             };
             if waited.is_none() {
                 let _ = outer.force_stop().await;
@@ -1823,7 +1826,7 @@ mod tests {
             if descendant_file.is_file() {
                 break;
             }
-            um_support::sleep(Duration::from_millis(10));
+            useful_support::sleep(Duration::from_millis(10));
         }
         let (_owner_event, owner_events) = mpsc::channel();
 

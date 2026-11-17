@@ -41,7 +41,7 @@ path_basename() {
 # Start the helper itself with an empty environment before inspecting paths or
 # invoking Git. Only absolute tool locations and deterministic process settings
 # cross this boundary.
-if [[ ${UM_FIXTURE_GIT_ISOLATED:-0} != 1 ]]; then
+if [[ ${USEFUL_FIXTURE_GIT_ISOLATED:-0} != 1 ]]; then
   path_dirname "${BASH_SOURCE[0]}"
   script_directory=$REPLY
   path_basename "${BASH_SOURCE[0]}"
@@ -69,8 +69,8 @@ if [[ ${UM_FIXTURE_GIT_ISOLATED:-0} != 1 ]]; then
   path_dirname "$env_binary"
   clean_path+=:$REPLY:$utility_path:/usr/bin:/bin
   exec "$env_binary" -i \
-    UM_FIXTURE_GIT_ISOLATED=1 \
-    UM_FIXTURE_GIT_BINARY="$git_binary" \
+    USEFUL_FIXTURE_GIT_ISOLATED=1 \
+    USEFUL_FIXTURE_GIT_BINARY="$git_binary" \
     HOME=/nonexistent \
     PATH="$clean_path" \
     LC_ALL=C \
@@ -97,7 +97,7 @@ fail() {
 path_dirname "${BASH_SOURCE[0]}"
 script_dir=$(cd "$REPLY" && pwd -P)
 public_root=$(cd "$script_dir/.." && pwd -P)
-git_binary=${UM_FIXTURE_GIT_BINARY:?}
+git_binary=${USEFUL_FIXTURE_GIT_BINARY:?}
 path_dirname "$git_binary"
 git_path=$REPLY:/usr/bin:/bin
 marker_name=.scherzo-fixture-git-root

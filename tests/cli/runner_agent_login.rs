@@ -43,7 +43,7 @@ pub(super) const READY_CODEX: &str = r#"{"provider":"codex","state":"ready","age
 pub(super) const SYNC: [&str; 3] = ["runner", "grant", "sync"];
 /// Its earlier spelling, which sends the same request and prints the same
 /// output with the same exit status, after a line on standard error naming
-/// `um runner grant sync` (REQ-GRANT-77).
+/// `useful runner grant sync` (REQ-GRANT-77).
 pub(super) const EARLIER_SYNC: [&str; 3] = ["runner", "agent-login", "sync"];
 
 const BUSY_RESPONSE: &[u8] =
@@ -63,7 +63,10 @@ fn sync_against(command: [&str; 3], response: Vec<u8>, extra: &[&str]) -> (Outpu
     args.extend_from_slice(extra);
     let output = run_with_env(
         &args,
-        &[("UM_API_URL", "https://cloud-sync-must-not-be-read.example")],
+        &[(
+            "USEFUL_API_URL",
+            "https://cloud-sync-must-not-be-read.example",
+        )],
     );
     (output, socket.request())
 }
@@ -154,7 +157,7 @@ fn the_earlier_sync_spelling_prints_the_same_output_and_exit_status() {
             assert_eq!(earlier.status.code(), Some(code), "{extra:?}");
             assert_eq!(earlier.stdout, output.stdout, "{extra:?}");
             assert_eq!(
-                after_notice(&earlier, "um runner grant sync").as_bytes(),
+                after_notice(&earlier, "useful runner grant sync").as_bytes(),
                 output.stderr,
                 "{extra:?}"
             );
@@ -170,7 +173,7 @@ fn the_earlier_sync_spelling_prints_the_same_output_and_exit_status() {
     assert_eq!(earlier.status.code(), Some(4));
     assert_eq!(earlier.stdout, output.stdout);
     assert_eq!(
-        after_notice(&earlier, "um runner grant sync").as_bytes(),
+        after_notice(&earlier, "useful runner grant sync").as_bytes(),
         output.stderr
     );
 }
@@ -436,7 +439,7 @@ fn sync_against_an_older_runner_says_it_must_be_restarted_on_this_release() {
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("restart"), "{stderr}");
-    assert!(stderr.contains("um runner serve"), "{stderr}");
+    assert!(stderr.contains("useful runner serve"), "{stderr}");
 }
 
 const AGENT_LOGIN_ID: &str = "agl_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -535,7 +538,7 @@ fn serve_gateway_with_agent_logins(listener: TcpListener, agent_logins: fn(&[u8]
     });
 }
 
-/// A live `um runner serve` against a Cloud whose agent-login routes answer
+/// A live `useful runner serve` against a Cloud whose agent-login routes answer
 /// with `agent_logins`, asked once setup has run: `sync --json`, then
 /// `status` and the `credentials.agent-logins` doctor check.
 struct ServedRunner {
@@ -558,7 +561,7 @@ impl ServedRunner {
         // of a login gives no answer and never reaches a provider.
         let empty_path = tempfile::tempdir().unwrap();
         serve_gateway_with_agent_logins(listener, agent_logins);
-        let mut serve = Command::new(env!("CARGO_BIN_EXE_um"))
+        let mut serve = Command::new(env!("CARGO_BIN_EXE_useful"))
             .args(["runner", "serve", "--config", &fixture.config])
             .env("OTEL_SDK_DISABLED", "true")
             .env("PATH", empty_path.path())
@@ -844,7 +847,7 @@ async fn serve_one_assignment(
     }
 }
 
-/// A live `um runner serve` that admits the pinned assignment and is issued
+/// A live `useful runner serve` that admits the pinned assignment and is issued
 /// its GitHub token, once that assignment has ended: the source route has no
 /// credential, so the admission is rejected.
 struct EndedGrantAssignment {
@@ -899,7 +902,7 @@ impl EndedGrantAssignment {
                     }
                 });
         });
-        let mut serve = Command::new(env!("CARGO_BIN_EXE_um"))
+        let mut serve = Command::new(env!("CARGO_BIN_EXE_useful"))
             .args(["runner", "serve", "--config", &fixture.config])
             .env("OTEL_SDK_DISABLED", "true")
             .env("HOME", home.path())

@@ -181,7 +181,7 @@ fn update_current_principal_with_timeout(
             Err(_) => last_transport_failure = UnreachableCategory::Timeout,
         }
         if attempt + 1 < MAX_ATTEMPTS {
-            um_support::sleep(um_support::short_retry_delay());
+            useful_support::sleep(useful_support::short_retry_delay());
         }
     }
 

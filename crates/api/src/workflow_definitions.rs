@@ -1,5 +1,5 @@
 //! Cloud workflow definitions and the trees they publish (REQ-CLOUDDEF-1 to REQ-CLOUDDEF-11),
-//! for `um workflow definition publish --cloud` (REQ-CLOUDDEF-14) and the `um workflow
+//! for `useful workflow definition publish --cloud` (REQ-CLOUDDEF-14) and the `useful workflow
 //! definition cloud` group (REQ-CLOUDDEF-15).
 //!
 //! As for the other resource clients, requests go through the generated configuration and
@@ -1068,7 +1068,7 @@ fn validate_definition(
     id: Option<&str>,
     stage: Stage,
 ) -> Result<(), WorkflowInvalidResponse> {
-    if !um_support::valid_typed_id(&value.id, DEFINITION_ID_PREFIX)
+    if !useful_support::valid_typed_id(&value.id, DEFINITION_ID_PREFIX)
         || id.is_some_and(|id| value.id != id)
         || value.project_id != project
         || value.current_revision < 1
@@ -1099,7 +1099,7 @@ fn validate_evaluation(
     id: Option<&str>,
     stage: Stage,
 ) -> Result<(), WorkflowInvalidResponse> {
-    if !um_support::valid_typed_id(&value.id, EVALUATION_ID_PREFIX)
+    if !useful_support::valid_typed_id(&value.id, EVALUATION_ID_PREFIX)
         || id.is_some_and(|id| value.id != id)
         || value.definition_id != definition
         || value.revision < 1
@@ -1133,7 +1133,7 @@ fn sha256(bytes: &[u8]) -> [u8; 32] {
 }
 
 fn lowercase_hex(bytes: &[u8; 32]) -> String {
-    um_support::lowercase_hex(bytes)
+    useful_support::lowercase_hex(bytes)
 }
 
 #[derive(Debug)]
@@ -1168,7 +1168,7 @@ mod tests {
     use reqwest::StatusCode;
     use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 
-    use um_test_support::{REQUEST_IDEMPOTENCY_KEY_ECHO, ScriptedHttpServer};
+    use useful_test_support::{REQUEST_IDEMPOTENCY_KEY_ECHO, ScriptedHttpServer};
 
     use std::error::Error as _;
     use std::fmt;

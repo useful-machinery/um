@@ -294,7 +294,7 @@ fn copied_local_profile_set_validates_in_human_and_json_modes_without_mutation()
         report,
         json!({
             "schemaVersion": 1,
-            "command": "um artifact validate",
+            "command": "useful artifact validate",
             "outcome": "valid",
             "exitStatus": 0,
             "artifactSetVersion": 1,
@@ -1128,7 +1128,7 @@ fn interruption_during_output_exits_with_the_signal_status_and_no_result() {
         fs::write(artifact.root.join(format!("unexpected-{ordinal:04}")), b"x").unwrap();
     }
     let before = byte_snapshot(&artifact.root);
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_um"))
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_useful"))
         .args(["artifact", "validate", "--json", artifact.argument()])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

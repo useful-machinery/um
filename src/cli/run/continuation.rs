@@ -3,10 +3,10 @@ use clap::Args;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::io::{self, Write};
-use um_api::{
+use useful_api::{
     Run, RunContinuationDefinition, RunContinuationEnvelope, RunContinuationRequest, RunFailure,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 use crate::exit_code::ExitCode;
 
@@ -47,7 +47,7 @@ pub(in crate::cli) fn parse_step(value: &str) -> Result<String, String> {
 struct Recovery {
     key: String,
     envelope: Option<RunContinuationEnvelope>,
-    diagnostic: Option<Vec<um_api::ContinuationAdmissionViolation>>,
+    diagnostic: Option<Vec<useful_api::ContinuationAdmissionViolation>>,
 }
 
 #[derive(Serialize)]
@@ -60,15 +60,15 @@ struct ResultDocument<'a> {
     run_id: &'a str,
     outcome: &'a str,
     idempotency_key: Option<&'a str>,
-    request: Option<&'a um_api::RunContinuationReceipt>,
+    request: Option<&'a useful_api::RunContinuationReceipt>,
     run: Option<&'a Run>,
     code: Option<&'a str>,
-    diagnostic: Option<&'a [um_api::ContinuationAdmissionViolation]>,
+    diagnostic: Option<&'a [useful_api::ContinuationAdmissionViolation]>,
 }
 
 /// A Cloud continuation request, always under the run's inherited definition, with how its
-/// submission is observed and reported: what `um run continue` (REQ-CONTINUE-55) and
-/// `um workflow run resume --cloud` (REQ-CONTINUE-85) both submit through
+/// submission is observed and reported: what `useful run continue` (REQ-CONTINUE-55) and
+/// `useful workflow run resume --cloud` (REQ-CONTINUE-85) both submit through
 /// [`Submission::submit`].
 pub(in crate::cli) struct Submission {
     run: RunReference,
@@ -92,7 +92,7 @@ impl Command {
 }
 
 impl Submission {
-    /// The request `um workflow run resume RUN --cloud ORGANIZATION` sends (REQ-CONTINUE-85):
+    /// The request `useful workflow run resume RUN --cloud ORGANIZATION` sends (REQ-CONTINUE-85):
     /// the steps as given, possibly none, under the run's own definition, with no expected
     /// version, reported once admitted.
     pub(in crate::cli) fn inherited(
@@ -119,7 +119,7 @@ impl Submission {
     }
 
     pub(in crate::cli) fn submit(self, deployment: Deployment) -> super::super::CommandResult {
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate Cloud run continuation identity")?;
         let signal_deployment = deployment.clone();
         let timeout_deployment = deployment.clone();
@@ -403,21 +403,21 @@ fn classify_observation_setup(error: &anyhow::Error) -> Option<RunFailure> {
     // the one observation retry. No POST is retried by this path.
     if error
         .chain()
-        .any(|cause| cause.is::<um_api::HttpClientError>())
+        .any(|cause| cause.is::<useful_api::HttpClientError>())
     {
         Some(RunFailure::Unreachable(
-            um_api::UnreachableCategory::Connection,
+            useful_api::UnreachableCategory::Connection,
         ))
     } else if error.chain().any(|cause| {
         cause
-            .downcast_ref::<um_human_auth::SessionError>()
-            .is_some_and(um_human_auth::SessionError::observation_lock_timeout)
+            .downcast_ref::<useful_human_auth::SessionError>()
+            .is_some_and(useful_human_auth::SessionError::observation_lock_timeout)
     }) {
         Some(RunFailure::Unreachable(
-            um_api::UnreachableCategory::Timeout,
+            useful_api::UnreachableCategory::Timeout,
         ))
     } else if error.chain().any(|cause| {
-        cause.is::<um_human_auth::SessionError>()
+        cause.is::<useful_human_auth::SessionError>()
             || cause.is::<crate::service_auth::ServiceApiKeyError>()
     }) {
         Some(RunFailure::Unauthenticated)
@@ -528,7 +528,11 @@ fn render(
                     ("prior state", &violation.prior_state),
                 ] {
                     if let Some(value) = value {
-                        write!(stderr, " {label}: {}", um_execution::visible_text(value))?;
+                        write!(
+                            stderr,
+                            " {label}: {}",
+                            useful_execution::visible_text(value)
+                        )?;
                     }
                 }
                 writeln!(stderr)?;
@@ -613,7 +617,7 @@ pub(super) fn write_run_continuation(out: &mut impl Write, run: &Run) -> anyhow:
         writeln!(
             out,
             "  effective workflow: {}",
-            um_execution::visible_text(&replacement.replaced.workflow_path)
+            useful_execution::visible_text(&replacement.replaced.workflow_path)
         )?;
     }
     let workspace = &continuation.workspace;
@@ -639,27 +643,25 @@ pub(super) fn write_run_continuation(out: &mut impl Write, run: &Run) -> anyhow:
     )?;
     if matches!(
         workspace.preparation,
-        um_api::RunContinuationPreparation::Unavailable
-    ) && run
-        .interruption
-        .as_deref()
-        .is_some_and(|interruption| interruption.phase == um_api::RunInterruptionPhase::Accepted)
-    {
+        useful_api::RunContinuationPreparation::Unavailable
+    ) && run.interruption.as_deref().is_some_and(|interruption| {
+        interruption.phase == useful_api::RunInterruptionPhase::Accepted
+    }) {
         writeln!(out, "  engine result: not received")?;
     }
     writeln!(
         out,
         "  execution root: {}",
-        um_execution::visible_text(&workspace.execution_root)
+        useful_execution::visible_text(&workspace.execution_root)
     )?;
     writeln!(
         out,
         "  prior execution root: {}",
-        um_execution::visible_text(&workspace.prior_execution_root)
+        useful_execution::visible_text(&workspace.prior_execution_root)
     )?;
     let modified = match workspace.modified.as_ref() {
-        um_api::RunContinuationWorkspaceModified::Boolean(value) => value.to_string(),
-        um_api::RunContinuationWorkspaceModified::String(value) => value.clone(),
+        useful_api::RunContinuationWorkspaceModified::Boolean(value) => value.to_string(),
+        useful_api::RunContinuationWorkspaceModified::String(value) => value.clone(),
     };
     writeln!(out, "  modified: {modified}")?;
     Ok(())
@@ -676,7 +678,7 @@ mod tests {
             "../../../crates/api/tests/fixtures/run-continuation-pending.json"
         ))
         .unwrap();
-        let legacy: um_api::RunContinuationEnvelope =
+        let legacy: useful_api::RunContinuationEnvelope =
             serde_json::from_value(value.clone()).unwrap();
         let mut output = Vec::new();
         write_run_continuation(&mut output, &legacy.run).unwrap();
@@ -696,7 +698,7 @@ mod tests {
             "claimGeneration":null,
             "failure":{"code":"ownership_unproven","recoveryReason":"host_identity_mismatch"}
         });
-        let seeded: um_api::RunContinuationEnvelope = serde_json::from_value(value).unwrap();
+        let seeded: useful_api::RunContinuationEnvelope = serde_json::from_value(value).unwrap();
         let mut output = Vec::new();
         write_run_continuation(&mut output, &seeded.run).unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -711,29 +713,29 @@ mod tests {
 
     #[test]
     fn receipt_observation_setup_distinguishes_auth_network_and_local_failures() {
-        let network = anyhow::Error::new(um_api::HttpClientError::BuildRuntime(io::Error::other(
-            "fixture runtime unavailable",
-        )));
+        let network = anyhow::Error::new(useful_api::HttpClientError::BuildRuntime(
+            io::Error::other("fixture runtime unavailable"),
+        ));
         assert_eq!(
             classify_observation_setup(&network),
             Some(RunFailure::Unreachable(
-                um_api::UnreachableCategory::Connection
+                useful_api::UnreachableCategory::Connection
             ))
         );
-        let auth = anyhow::Error::new(um_human_auth::SessionError::RefreshProtocol {
+        let auth = anyhow::Error::new(useful_human_auth::SessionError::RefreshProtocol {
             reason: "fixture refresh invalid",
         });
         assert_eq!(
             classify_observation_setup(&auth),
             Some(RunFailure::Unauthenticated)
         );
-        let contention = anyhow::Error::new(um_human_auth::SessionError::CredentialStore(
-            um_human_auth::CredentialError::LockTimeout,
+        let contention = anyhow::Error::new(useful_human_auth::SessionError::CredentialStore(
+            useful_human_auth::CredentialError::LockTimeout,
         ));
         assert_eq!(
             classify_observation_setup(&contention),
             Some(RunFailure::Unreachable(
-                um_api::UnreachableCategory::Timeout
+                useful_api::UnreachableCategory::Timeout
             ))
         );
         let key = anyhow::Error::new(crate::service_auth::ServiceApiKeyError::Invalid {

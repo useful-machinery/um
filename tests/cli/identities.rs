@@ -598,7 +598,7 @@ fn service_link_reports_the_committed_result_when_interrupted_after_dispatch() {
     let missing_human_store = directory.path().join("missing-human.json");
     let environment =
         deployment_environment(&server.api_url, missing_human_store.to_str().unwrap());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args([
             "auth",
@@ -774,7 +774,7 @@ fn link_keeps_the_preflight_acting_session_across_browser_proof() {
         credential_path.to_str().unwrap(),
     );
     let empty_path = tempfile::tempdir().unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args([
             "auth",

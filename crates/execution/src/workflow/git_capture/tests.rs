@@ -286,7 +286,7 @@ fn init_repository(path: &Path) {
 }
 
 fn fixture_git_command() -> Command {
-    um_test_support::fixture_git_command(git_executable())
+    useful_test_support::fixture_git_command(git_executable())
 }
 
 fn git(repository: &Path, arguments: &[&str]) -> String {

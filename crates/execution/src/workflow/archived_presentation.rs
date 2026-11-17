@@ -19,7 +19,7 @@ use super::publication::{CancellationReasonV1, WorkflowOutcomeV1, WorkflowStepSt
 use super::publication::{FinalizationTriggerV1, WorkflowResultV1};
 use super::validated::WorkflowNodeRole;
 
-const COMMAND: &str = "um workflow run view";
+const COMMAND: &str = "useful workflow run view";
 use super::render_style::{
     STYLE_BLOCKED, STYLE_FAILURE, STYLE_MUTED, STYLE_PRIMARY, STYLE_SECONDARY, STYLE_SUCCESS,
 };

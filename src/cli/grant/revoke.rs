@@ -2,8 +2,8 @@ use anyhow::Context;
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use um_api::MemberGrantKind;
-use um_human_auth::Deployment;
+use useful_api::MemberGrantKind;
+use useful_human_auth::Deployment;
 
 use super::confirmation::{Confirmation, NATIVE_REVOKE, Stated, Statement};
 use super::{GRANT_HELP, GrantArg, Options, act_on, output, replayed};
@@ -25,7 +25,7 @@ pub(in crate::cli) struct Command {
 /// What revoking does (REQ-GRANT-68): an OAuth grant is erased and revoked at the provider,
 /// and a native grant's runners' runs are asked to stop (REQ-GRANT-48).
 impl Stated for Command {
-    const COMMAND: &'static str = "um grant revoke";
+    const COMMAND: &'static str = "useful grant revoke";
     type Usage = Self;
     const STATEMENT: Statement = Statement::ByKind {
         oauth: &[
@@ -39,7 +39,7 @@ impl Stated for Command {
 
 impl Command {
     pub(super) fn run(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate grant revocation request key")?;
         act_on::<Self, _>(
             deployment,
@@ -57,7 +57,7 @@ impl Command {
             |api_url, grant, after, json| {
                 output::write_revoke(api_url, grant, after.as_ref().map(Option::as_ref), json)
             },
-            |id| format!("um grant revoke {id} --yes"),
+            |id| format!("useful grant revoke {id} --yes"),
         )
     }
 }

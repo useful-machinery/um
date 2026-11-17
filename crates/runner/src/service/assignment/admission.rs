@@ -498,7 +498,7 @@ impl AssignmentManager {
                         Arc::new(tokens)
                     });
             }
-            // The steps, a tree run's `um` commands included, draw from the
+            // The steps, a tree run's `useful` commands included, draw from the
             // process environment with the agent logins the runner keeps now,
             // looked at for this admission (REQ-GRANT-37, REQ-GRANT-44); a
             // selected provider's login the runner keeps none of is withheld
@@ -1092,7 +1092,7 @@ impl AdmissionRuntime {
         // An unavailable snapshot is explicit evidence, not a reason
         // to substitute null or to read the unclaimed workspace.
         root.continuation_snapshot = Some(
-            um_execution::capture_cloud_continuation_snapshot(
+            useful_execution::capture_cloud_continuation_snapshot(
                 &root.execution,
                 continuation.prior_settlement_snapshot.as_ref(),
             )
@@ -1154,11 +1154,11 @@ struct TreeAdmission<'a> {
     tree_run: &'a TreeRunDependencies,
     broker: Arc<dyn SourceCredentialBroker>,
     input_broker: Option<&'a dyn RunInputBroker>,
-    /// The service environment the checkout uses; the tree's `um` commands run with
+    /// The service environment the checkout uses; the tree's `useful` commands run with
     /// `runtime.environment`, which carries the agent logins offered to the assignment.
     environment: &'a EnvironmentSnapshot,
     offer: &'a AssignmentOffer,
-    tree: &'a um_runner_protocol::WorkflowTreeV1RunnerProjection,
+    tree: &'a useful_runner_protocol::WorkflowTreeV1RunnerProjection,
     deadline: PreparationDeadline,
     cancellation: &'a CaptureCancellation,
     sleeper: Arc<dyn Sleeper>,

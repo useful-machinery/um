@@ -13,11 +13,11 @@ use serde::Serialize;
 use super::super::grant::Flow;
 use super::super::{OrganizationArg, PrincipalAuthenticationArgs, ProjectArg};
 use crate::exit_code::ExitCode;
-use um_runner::{AgentLoginProvider, CheckResult, Report, Status, built_in_registry};
-use um_support::{Availability, CredentialStatus, NextAction};
+use useful_runner::{AgentLoginProvider, CheckResult, Report, Status, built_in_registry};
+use useful_support::{Availability, CredentialStatus, NextAction};
 
 pub(super) const ABOUT: &str = "Check local runner prerequisites";
-const COMMAND_NAME: &str = "um runner doctor";
+const COMMAND_NAME: &str = "useful runner doctor";
 
 #[derive(Debug, Args)]
 // `--organization-id` serves each Cloud read and the sign-ins (REQ-CREDREADY-13).
@@ -89,7 +89,7 @@ pub(super) struct Command {
         value_name = "RUNNER",
         requires = "grants_read",
         value_parser = super::super::grant::parse_runner_id,
-        help = "Show each grant's status on this runner alone, by ID as um runner list prints it"
+        help = "Show each grant's status on this runner alone, by ID as useful runner list prints it"
     )]
     runner_id: Option<String>,
 
@@ -225,7 +225,7 @@ impl Command {
     }
 }
 
-fn write_check_list(descriptors: &[um_runner::CheckDescriptor]) -> anyhow::Result<()> {
+fn write_check_list(descriptors: &[useful_runner::CheckDescriptor]) -> anyhow::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     for descriptor in descriptors {
@@ -396,7 +396,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::write_human_report_to;
-    use um_runner::{CheckDescriptor, CheckResult, Outcome, Report, Status};
+    use useful_runner::{CheckDescriptor, CheckResult, Outcome, Report, Status};
 
     fn result(
         id: &'static str,

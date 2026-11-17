@@ -4,7 +4,7 @@ use super::{
     CheckDescriptor, CompatibleHarness, DoctorCheck, Outcome, capability_failure_details,
     compatible_harness_outcome,
 };
-use um_execution::{
+use useful_execution::{
     AgentCompatibilityProfile, PI_JSON_V1_QUALIFICATION_VERSION, PI_JSON_V1_SUPPORTED_RANGE,
     PiIncompatibility, PiInstallationFailure, PiProbe, discover_and_validate_pi_installation,
 };

@@ -103,7 +103,7 @@ impl WorkflowRunRecord {
             position: Vec::new(),
             outcome: None,
             // A clock outside the RFC 3339 range leaves this empty, which `is_valid` refuses.
-            started_at: utc_timestamp(um_support::utc_now()).unwrap_or_default(),
+            started_at: utc_timestamp(useful_support::utc_now()).unwrap_or_default(),
             attempts: 1,
             predecessor: None,
             successor: None,
@@ -129,7 +129,7 @@ impl WorkflowRunRecord {
         child
     }
 
-    /// Whether `name` may name an `external` reference `um workflow run create --external`
+    /// Whether `name` may name an `external` reference `useful workflow run create --external`
     /// records (REQ-LOCALRUN-209): a lowercase letter, then letters, digits and dots.
     pub fn is_external_name(name: &str) -> bool {
         let mut characters = name.chars();

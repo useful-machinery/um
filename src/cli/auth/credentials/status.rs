@@ -1,8 +1,8 @@
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use um_api::{AgentLogin, AgentLoginApi, AgentLoginFailure, Grant, GrantApi, GrantFailure};
-use um_human_auth::Deployment;
+use useful_api::{AgentLogin, AgentLoginApi, AgentLoginFailure, Grant, GrantApi, GrantFailure};
+use useful_human_auth::Deployment;
 
 use super::super::super::grant::every_page;
 use super::super::super::{OrganizationArg, with_human_session_api};
@@ -45,7 +45,7 @@ impl Command {
     fn agent_logins(&self, api: &AgentLoginApi) -> Result<Vec<AgentLogin>, AgentLoginFailure> {
         let organization_id = match self.organization.as_deref() {
             None => None,
-            Some(id) if um_support::valid_typed_id(id, "org_") => Some(id.to_owned()),
+            Some(id) if useful_support::valid_typed_id(id, "org_") => Some(id.to_owned()),
             Some(slug) => Some(api.organization_id(slug)?),
         };
         let invalid = AgentLoginFailure::InvalidResponse {

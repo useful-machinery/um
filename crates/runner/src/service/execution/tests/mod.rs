@@ -6,18 +6,18 @@ use std::sync::Arc;
 use super::*;
 use crate::service::lease_clock::{LeaseTimerRelease, controlled_lease_clock};
 use crate::service::test_support::{controlled_sleeper, sleep_request, with_watchdog};
-use um_execution::{
+use useful_execution::{
     CommitFailure, CommitFailureClass, ExecutionSettlement, ObservedExecutions,
     RecoveryFailureKind, SettledExecution, StartedExecution, StepFailureKind,
 };
-use um_runner_protocol::{MAXIMUM_ORDINARY_FRAME_BYTES, RunnerEnvelope, RunnerFrame};
+use useful_runner_protocol::{MAXIMUM_ORDINARY_FRAME_BYTES, RunnerEnvelope, RunnerFrame};
 
 #[test]
 fn git_capture_diagnostic_is_sibling_only_for_the_matching_failed_node() {
     let diagnostics = StepDiagnosticLog::default();
     diagnostics.record_git_capture_failure(
         "capture",
-        &um_execution::GitCaptureFailure::RequiredObjectsUnavailable,
+        &useful_execution::GitCaptureFailure::RequiredObjectsUnavailable,
     );
     let detail = json!({"phase": "output_capture", "code": "git_required_objects_unavailable", "output": "bundle"});
     let diagnostic = git_capture_diagnostic("capture", &detail, &diagnostics).unwrap();
@@ -52,7 +52,7 @@ fn git_capture_diagnostic_is_sibling_only_for_the_matching_failed_node() {
         "asn_01k0z6r1w8f4jy2m7q9v3x5abh".to_owned(),
         "atm_01k0z6r1w8f4jy2m7q9v3x5abk".to_owned(),
     );
-    let bytes = um_runner_protocol::encode_runner_frame(&frame).unwrap();
+    let bytes = useful_runner_protocol::encode_runner_frame(&frame).unwrap();
     let value: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(value["payload"]["diagnostic"]["stage"], "git_capture");
     assert!(
@@ -761,8 +761,8 @@ fn recovery_agent_allocation_failure_retains_harness_stderr_without_native_sessi
         RunEvent::default(),
     );
     let diagnostic = StepDiagnostic::from_streams(
-        um_execution::CapturedDiagnosticStream::from_parts(b"".as_slice(), 0, true),
-        um_execution::CapturedDiagnosticStream::from_parts(
+        useful_execution::CapturedDiagnosticStream::from_parts(b"".as_slice(), 0, true),
+        useful_execution::CapturedDiagnosticStream::from_parts(
             b"allocation failed".as_slice(),
             0,
             true,
@@ -1163,8 +1163,8 @@ fn invalid_result_publication_retains_the_original_command_failure() {
     .unwrap();
     let detail = serde_json::from_value(workflow_issue(&issue)["detail"].clone()).unwrap();
     let diagnostic = StepDiagnostic::from_streams(
-        um_execution::CapturedDiagnosticStream::from_parts(b"".as_slice(), 0, true),
-        um_execution::CapturedDiagnosticStream::from_parts(
+        useful_execution::CapturedDiagnosticStream::from_parts(b"".as_slice(), 0, true),
+        useful_execution::CapturedDiagnosticStream::from_parts(
             b"publication failed".as_slice(),
             0,
             true,

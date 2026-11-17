@@ -1,8 +1,8 @@
-//! The workflow mode of `um runner doctor` (REQ-CREDREADY-1 to REQ-CREDREADY-26): the
+//! The workflow mode of `useful runner doctor` (REQ-CREDREADY-1 to REQ-CREDREADY-26): the
 //! credentials a workflow tree declares, with what Cloud holds for the organization and a named
 //! project when `--readiness` asks and what the member holds of each provider when `--grants`
 //! asks, printed as a checklist or a JSON document. `--connect` first runs the grant flow of
-//! `um grant create --workflow` over the same derivation (INV-CLI-15).
+//! `useful grant create --workflow` over the same derivation (INV-CLI-15).
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -12,8 +12,8 @@ use serde::Serialize;
 
 use crate::cli::CommandFailure;
 use crate::exit_code::ExitCode;
-use um_human_auth::Deployment;
-use um_runner::{
+use useful_human_auth::Deployment;
+use useful_runner::{
     CredentialRequirement, CredentialSummary, Declaration, DeclarationKind, Node, NodeKind,
     OriginDeclaration, RepositorySource, UnknownDeclaration, WorkflowCredentials,
     read_workflow_credentials,
@@ -36,7 +36,7 @@ pub(super) fn execute(
     let roots = Roots::find(
         workflow_files,
         source_root,
-        "um runner doctor --workflow FILE --source-root ROOT",
+        "useful runner doctor --workflow FILE --source-root ROOT",
     )?;
     let format = Format::new(json, connect.is_some());
     // A named project, not the `origin` remote, names the repository's provider, so the project
@@ -195,7 +195,7 @@ const COMMAND_PATH: &[&str] = &["runner", "doctor"];
 const DEPLOYMENT_CONTEXT: &str = "configure the doctor's Cloud access";
 
 /// The credentials the tree under `source_root` needs, or `None` once the first file that does
-/// not resolve was rejected as `um workflow validate` rejects it (REQ-CREDREADY-2).
+/// not resolve was rejected as `useful workflow validate` rejects it (REQ-CREDREADY-2).
 pub(super) fn derive(
     source_root: &Path,
     workflow_files: &[PathBuf],

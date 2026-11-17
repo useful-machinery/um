@@ -204,7 +204,7 @@ impl QueuedWriter {
     fn stderr(dropped_count: Arc<AtomicU64>) -> Self {
         let (sender, receiver) = sync_channel::<QueueMessage>(EVENT_QUEUE_CAPACITY);
         let worker = thread::Builder::new()
-            .name("um-runner-events".to_owned())
+            .name("useful-runner-events".to_owned())
             .spawn(move || {
                 let mut stderr = FramedWriter::new(io::stderr());
                 while let Ok(message) = receiver.recv() {
@@ -504,7 +504,7 @@ impl EventSource {
             inner: Arc::new(EventInner {
                 context: Context::new().with_span(span),
                 source: self.clone(),
-                started_at: um_support::monotonic_now(),
+                started_at: useful_support::monotonic_now(),
                 state: Mutex::new(EventState {
                     fields,
                     completed: false,
@@ -588,7 +588,7 @@ impl Event {
     }
 
     pub(crate) fn elapsed_milliseconds(&self) -> i64 {
-        integer_u128(um_support::elapsed(self.inner.started_at).as_millis())
+        integer_u128(useful_support::elapsed(self.inner.started_at).as_millis())
     }
 
     pub(crate) fn finish(&self, outcome: Outcome) {

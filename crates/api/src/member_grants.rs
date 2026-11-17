@@ -370,7 +370,7 @@ impl MemberGrantApi {
         .map_err(classify_error)?;
         let mut organizations = Vec::new();
         for membership in page.items {
-            if !um_support::valid_typed_id(&membership.organization_id, "org_") {
+            if !useful_support::valid_typed_id(&membership.organization_id, "org_") {
                 return Err(invalid());
             }
             if membership.state == State::Active
@@ -474,7 +474,7 @@ impl MemberGrantApi {
             PROBLEMS.iter().chain(&ORGANIZATION_PROBLEMS),
         )?;
         // A slug is not checked: the grant names its organization by ID.
-        let named = !um_support::valid_typed_id(organization, "org_")
+        let named = !useful_support::valid_typed_id(organization, "org_")
             || grant.organization_id.as_deref() == Some(organization);
         if grant.provider != provider || !named || !valid_grant(&grant) {
             return Err(invalid());
@@ -540,9 +540,9 @@ impl Drop for MemberGrantApi {
 /// The prefix of an authorization of the grant `grant_id` names: `pga_` under an OAuth grant,
 /// `aga_` under a native one.
 fn authorization_prefix(grant_id: &str) -> Option<&'static str> {
-    if um_support::valid_typed_id(grant_id, "pgr_") {
+    if useful_support::valid_typed_id(grant_id, "pgr_") {
         Some("pga_")
-    } else if um_support::valid_typed_id(grant_id, "agl_") {
+    } else if useful_support::valid_typed_id(grant_id, "agl_") {
         Some("aga_")
     } else {
         None
@@ -587,12 +587,12 @@ fn valid_grant(value: &MemberGrant) -> bool {
         MemberGrantKind::GrantKindOAuth => value
             .identity_id
             .as_deref()
-            .is_some_and(|id| um_support::valid_typed_id(id, "idn_")),
+            .is_some_and(|id| useful_support::valid_typed_id(id, "idn_")),
         MemberGrantKind::GrantKindNative => {
             value
                 .organization_id
                 .as_deref()
-                .is_some_and(|id| um_support::valid_typed_id(id, "org_"))
+                .is_some_and(|id| useful_support::valid_typed_id(id, "org_"))
                 && value.state != MemberGrantState::GrantStateReconnectRequired
                 && value
                     .ended_authorizations
@@ -634,7 +634,7 @@ fn valid_authorization(value: &MemberGrantAuthorization, prefix: &str) -> bool {
         &value.created_at,
         value.delivery.as_deref(),
         value.report.as_deref(),
-    ) && um_support::valid_typed_id(&value.organization_id, "org_")
+    ) && useful_support::valid_typed_id(&value.organization_id, "org_")
 }
 
 #[derive(Debug)]

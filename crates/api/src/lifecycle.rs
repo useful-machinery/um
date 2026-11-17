@@ -430,7 +430,7 @@ fn execute_request(
         }
         earlier_attempt_unanswered = true;
         if attempt + 1 < MUTATION_ATTEMPTS {
-            um_support::sleep(um_support::short_retry_delay());
+            useful_support::sleep(useful_support::short_retry_delay());
         }
     }
     Ok(RequestExecution::Unreachable(last_failure))
@@ -816,7 +816,7 @@ fn valid_resource_id(id: &str, kind: LifecycleResourceKind) -> bool {
         LifecycleResourceKind::Principal => "prn_",
         LifecycleResourceKind::Organization => "org_",
     };
-    um_support::valid_typed_id(id, prefix)
+    useful_support::valid_typed_id(id, prefix)
 }
 
 fn parse_timestamp(value: &str) -> Option<OffsetDateTime> {

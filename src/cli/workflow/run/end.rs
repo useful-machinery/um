@@ -1,4 +1,4 @@
-//! `um workflow run withdraw`, `cancel` and `release` (REQ-LOCALRUN-186, REQ-LOCALRUN-187);
+//! `useful workflow run withdraw`, `cancel` and `release` (REQ-LOCALRUN-186, REQ-LOCALRUN-187);
 //! `release --cloud ORGANIZATION` releases a Cloud run's subject claim instead
 //! (REQ-CLOUDDEF-19).
 
@@ -8,7 +8,7 @@ use std::time::Duration;
 use anyhow::anyhow;
 use clap::Args;
 use rustix::process::{Pid, Signal, kill_process};
-use um_execution::{
+use useful_execution::{
     CANCELED_OUTCOME, CONTROL_CANCEL, CONTROL_RELEASE, CONTROL_WITHDRAW, LocalContinuationOpen,
     Mirror, PendingLocalContinuation, RetryIneligibilityReason, RunState, WITHDRAWN_OUTCOME,
     WaitInspection, WaitRecord, acquire_local_continuation, await_run_lock_gate, inspect_wait,
@@ -22,14 +22,14 @@ pub(super) const CANCEL_ABOUT: &str = "End a run, signalling the process that ru
 pub(super) const RELEASE_ABOUT: &str =
     "Record the release of an exited run, or release a Cloud run's claim with --cloud";
 pub(super) const RELEASE_AFTER_HELP: &str = "With --cloud ORGANIZATION, RUN is a Cloud run ID: the command asks Cloud, as an organization owner, to release the subject claim of that exited run under one request key, sent again if the response is lost. It reads and writes no local run.";
-const WITHDRAW_COMMAND: &str = "um workflow run withdraw";
-const CANCEL_COMMAND: &str = "um workflow run cancel";
-const RELEASE_COMMAND: &str = "um workflow run release";
+const WITHDRAW_COMMAND: &str = "useful workflow run withdraw";
+const CANCEL_COMMAND: &str = "useful workflow run cancel";
+const RELEASE_COMMAND: &str = "useful workflow run release";
 
 /// How long `cancel` and `interrupt` wait for the process they signalled to release the run
 /// (REQ-LOCALRUN-186, REQ-LOCALRUN-202): `RELEASE_POLLS` probes `RELEASE_POLL` apart, 60
 /// seconds at the production cadence. A `test-fixtures` build lets an end-to-end test
-/// shorten the cadence, and the wait with it (`um_support::poll_interval`).
+/// shorten the cadence, and the wait with it (`useful_support::poll_interval`).
 const RELEASE_POLL: Duration = Duration::from_millis(200);
 const RELEASE_POLLS: u32 = 300;
 
@@ -105,8 +105,8 @@ impl Command {
     }
 }
 
-/// Withdraws the run `target` opened, as `um workflow run withdraw` does (REQ-LOCALRUN-186);
-/// `um workflow run event` applies a control trigger's `withdraw` through it
+/// Withdraws the run `target` opened, as `useful workflow run withdraw` does (REQ-LOCALRUN-186);
+/// `useful workflow run event` applies a control trigger's `withdraw` through it
 /// (REQ-LOCALRUN-208). A run a live process holds goes to `withdraw_live`, and so does a
 /// `running` one found without a lock holder, which may be a process between the attempts it
 /// chains (REQ-LOCALRUN-214); anything else is ended as `end_unheld` does.
@@ -122,8 +122,8 @@ pub(super) fn withdraw_run(target: &ControlTarget) -> Result<Acted, ControlFailu
     }
 }
 
-/// Cancels the run `target` opened, as `um workflow run cancel` does (REQ-LOCALRUN-186);
-/// `um workflow run event` applies a control trigger's `cancel` through it
+/// Cancels the run `target` opened, as `useful workflow run cancel` does (REQ-LOCALRUN-186);
+/// `useful workflow run event` applies a control trigger's `cancel` through it
 /// (REQ-LOCALRUN-208): a live one through `cancel_live`, and otherwise as `end_unheld` does.
 pub(super) fn cancel_run(target: &ControlTarget) -> Result<Acted, ControlFailure> {
     match &target.inspection {
@@ -281,7 +281,7 @@ fn withdraw_live(target: &ControlTarget) -> Result<Acted, ControlFailure> {
     // A test seam between the inspection and the controls lock; nothing outside
     // `test-fixtures`.
     await_run_lock_gate()?;
-    let probe = inspect_wait(&target.run_directory, &um_execution::NoConditions)?;
+    let probe = inspect_wait(&target.run_directory, &useful_execution::NoConditions)?;
     let controls = probe.lock_controls()?;
     let current = super::control::open(&target.run_directory)?;
     if !matches!(current.inspection, WaitInspection::Locked(_)) {
@@ -340,15 +340,15 @@ pub(super) fn signal_and_await_release(
                 .into());
         }
     }
-    let poll = um_support::poll_interval(RELEASE_POLL);
-    let deadline = um_support::monotonic_now() + poll * RELEASE_POLLS;
+    let poll = useful_support::poll_interval(RELEASE_POLL);
+    let deadline = useful_support::monotonic_now() + poll * RELEASE_POLLS;
     loop {
         if lock_holder(run_directory)? != Some(pid) {
             return Ok(true);
         }
-        if um_support::monotonic_now() >= deadline {
+        if useful_support::monotonic_now() >= deadline {
             return Ok(false);
         }
-        um_support::sleep(poll);
+        useful_support::sleep(poll);
     }
 }

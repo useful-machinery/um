@@ -17,16 +17,16 @@ pub(in crate::service) enum ExecutionReport {
     /// owed to no run (REQ-RUNNERENROLL-88).
     TreeProgress {
         progress_sequence: u64,
-        progress: um_runner_protocol::TreeRootProgress,
+        progress: useful_runner_protocol::TreeRootProgress,
         steps_only: bool,
     },
     /// A tree run's application of one trigger delivery (REQ-TRIGGER-136).
     TriggerDeliveryApplied {
-        application: um_runner_protocol::TriggerDeliveryApplication,
+        application: useful_runner_protocol::TriggerDeliveryApplication,
     },
     /// A tree run's application of one authorized Cloud control (REQ-RUNNERENROLL-90).
     RunControlApplied {
-        application: um_runner_protocol::RunControlApplication,
+        application: useful_runner_protocol::RunControlApplication,
     },
     Finished {
         final_execution_event_sequence: u64,
@@ -42,7 +42,7 @@ pub(in crate::service) enum ExecutionReport {
         outcome: Value,
         artifact_delivery: Value,
         diagnostic: Option<Value>,
-        exit: um_runner_protocol::TreeExit,
+        exit: useful_runner_protocol::TreeExit,
     },
     Interrupted {
         final_execution_event_sequence: u64,
@@ -547,7 +547,7 @@ pub(in crate::service) struct AssignmentTriggerDelivery {
     pub(in crate::service) assignment_id: String,
     pub(in crate::service) run_id: String,
     pub(in crate::service) attempt_id: String,
-    pub(in crate::service) delivery: um_runner_protocol::TriggerDelivery,
+    pub(in crate::service) delivery: useful_runner_protocol::TriggerDelivery,
 }
 
 /// A `run_control` effect: one authorized Cloud control for the run an assignment holds
@@ -558,12 +558,12 @@ pub(in crate::service) struct AssignmentRunControl {
     pub(in crate::service) assignment_id: String,
     pub(in crate::service) run_id: String,
     pub(in crate::service) attempt_id: String,
-    pub(in crate::service) control: um_runner_protocol::RunControl,
+    pub(in crate::service) control: useful_runner_protocol::RunControl,
 }
 
 impl AssignmentManager {
     /// Hands a delivery for the assignment this manager holds to its tree run, which applies
-    /// it with `um workflow run event` and reports the application (REQ-TRIGGER-136).
+    /// it with `useful workflow run event` and reports the application (REQ-TRIGGER-136).
     pub(in crate::service) fn handle_trigger_delivery(
         &mut self,
         delivery: AssignmentTriggerDelivery,
@@ -580,7 +580,7 @@ impl AssignmentManager {
     }
 
     /// Hands a control for the assignment this manager holds to its tree run, which applies
-    /// it to the run's current wait with the `um workflow run` control command it names and
+    /// it to the run's current wait with the `useful workflow run` control command it names and
     /// reports the application (REQ-RUNNERENROLL-90).
     pub(in crate::service) fn handle_run_control(
         &mut self,

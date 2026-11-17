@@ -6,7 +6,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::exit_code::ExitCode;
-use um_execution::{
+use useful_execution::{
     ArchivedAttemptLoadError, ColorChoice, LocalRecoveryStatus, LocalRetryEligibility,
     LocalRunStatusSnapshot, LocalStatusError, LocalStatusResult, PresentationConfig,
     RequestedPresentationMode, RetryIneligibilityReason, TerminalCapabilities,
@@ -17,7 +17,7 @@ use um_execution::{
 
 pub(super) const ABOUT: &str = "Show local workflow run status";
 
-const COMMAND: &str = "um workflow run status";
+const COMMAND: &str = "useful workflow run status";
 const STYLE_ACTIVE: &str = "38;2;137;180;250";
 const STYLE_SUCCESS: &str = "38;2;166;227;161";
 const STYLE_FAILURE: &str = "38;2;243;139;168";
@@ -114,7 +114,7 @@ struct StatusSuccess<'a> {
     record: &'a Option<Value>,
     /// The root wait record `wait.json`, or null while the run does not wait
     /// (REQ-LOCALRUN-146).
-    wait: Option<&'a um_execution::WaitRecord>,
+    wait: Option<&'a useful_execution::WaitRecord>,
     recovery: RecoveryOutput<'a>,
     retry: RetryOutput,
     continuation: ContinuationOutput,

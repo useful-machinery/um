@@ -10,16 +10,16 @@ mod show;
 use clap::{Args, Subcommand};
 
 use crate::exit_code::ExitCode;
-use um_api::{AgentLoginApi, AgentLoginFailure};
-use um_human_auth::Deployment;
+use useful_api::{AgentLoginApi, AgentLoginFailure};
+use useful_human_auth::Deployment;
 
-// The Codex sign-in `import --login` and `reconnect --login` run is `um grant create`'s.
+// The Codex sign-in `import --login` and `reconnect --login` run is `useful grant create`'s.
 use crate::cli::grant::codex_login;
 use crate::cli::grant::confirmation::{Confirmation, Stated, Statement, state};
 use crate::cli::grant::parse_runner_id;
 
-// `um auth credential status` reports a failed read of the agent logins as
-// `um auth agent-login` does, and lists their ended authorizations as `show` does.
+// `useful auth credential status` reports a failed read of the agent logins as
+// `useful auth agent-login` does, and lists their ended authorizations as `show` does.
 pub(in crate::cli::auth) use output::{EndedAuthorizationView, ended_authorizations, failure};
 
 pub(super) const ABOUT: &str = "Manage your coding agent logins";
@@ -69,7 +69,7 @@ struct RunnerTarget {
         long = "runner",
         value_name = "RUNNER_ID",
         value_parser = parse_runner_id,
-        help = "Runner ID, as um runner list prints it"
+        help = "Runner ID, as useful runner list prints it"
     )]
     runner_id: String,
 }
@@ -109,12 +109,12 @@ impl Command {
 
 impl super::super::HumanSessionApi for AgentLoginApi {
     type Failure = AgentLoginFailure;
-    type BuildError = um_api::AgentLoginApiError;
+    type BuildError = useful_api::AgentLoginApiError;
 
     fn build(
         api_url: &str,
         token: &str,
-        policy: um_api::HttpTransportPolicy,
+        policy: useful_api::HttpTransportPolicy,
     ) -> Result<Self, Self::BuildError> {
         Self::new(api_url, token, policy)
     }
@@ -127,7 +127,7 @@ impl super::super::HumanSessionApi for AgentLoginApi {
         AgentLoginFailure::Unauthenticated
     }
 
-    fn unreachable(category: um_api::UnreachableCategory) -> AgentLoginFailure {
+    fn unreachable(category: useful_api::UnreachableCategory) -> AgentLoginFailure {
         AgentLoginFailure::Unreachable { category }
     }
 }

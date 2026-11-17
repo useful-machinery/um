@@ -11,7 +11,7 @@ use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 
 use time::OffsetDateTime;
-use um_execution::CLAUDE_CODE_LOGIN_VARIABLE;
+use useful_execution::CLAUDE_CODE_LOGIN_VARIABLE;
 use zeroize::Zeroizing;
 
 use super::cloud::Delivery;
@@ -24,7 +24,7 @@ use super::{
 /// The file a `/login` keeps in Claude Code's configuration directory.
 const CREDENTIALS_FILE: &str = ".credentials.json";
 /// The prefix of the temporary files the token file is written through.
-pub(crate) const TEMPORARY_PREFIX: &str = ".um-claude-code.token.tmp";
+pub(crate) const TEMPORARY_PREFIX: &str = ".useful-claude-code.token.tmp";
 
 /// Whether the service already has a Claude Code login of its own: it
 /// carries `CLAUDE_CODE_OAUTH_TOKEN`, or a credentials file is present in

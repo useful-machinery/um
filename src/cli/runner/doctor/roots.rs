@@ -1,5 +1,5 @@
-//! The roots that bound the files of `um runner doctor --workflow` and
-//! `um grant create --workflow` (REQ-CREDREADY-1, REQ-GRANT-76): `--source-root`, or the root of
+//! The roots that bound the files of `useful runner doctor --workflow` and
+//! `useful grant create --workflow` (REQ-CREDREADY-1, REQ-GRANT-76): `--source-root`, or the root of
 //! the Git repository that holds each file, with each root's derivation merged into one.
 
 use std::path::{Path, PathBuf};
@@ -9,8 +9,8 @@ use anyhow::anyhow;
 
 use crate::cli::CommandFailure;
 use crate::exit_code::ExitCode;
-use um_execution::{CommandProbeError, CommandRunner, SystemCommandRunner};
-use um_runner::{Declaration, RepositoryRootError, RepositorySource, WorkflowCredentials};
+use useful_execution::{CommandProbeError, CommandRunner, SystemCommandRunner};
+use useful_runner::{Declaration, RepositoryRootError, RepositorySource, WorkflowCredentials};
 
 /// The named workflow files grouped by the root that bounds them, in the order first named.
 pub(in crate::cli) struct Roots {
@@ -45,7 +45,7 @@ impl Roots {
 
     /// The credentials the named workflows and the workflows their `workflow` steps name need,
     /// or `None` once the first file that does not resolve was rejected as
-    /// `um workflow validate` rejects it. The files of one root are derived together under it,
+    /// `useful workflow validate` rejects it. The files of one root are derived together under it,
     /// each reading its repository's provider from `source`, and the derivations are merged by
     /// kind.
     pub(in crate::cli) fn derive(
@@ -84,7 +84,7 @@ fn again(source: &RepositorySource) -> RepositorySource {
 
 /// The files grouped by the root of the Git repository that holds each, in the order first
 /// named. A file whose directory does not exist is not in one: it is grouped under the working
-/// directory, whose derivation rejects it as `um workflow validate` does.
+/// directory, whose derivation rejects it as `useful workflow validate` does.
 fn by_repository(
     runner: &dyn CommandRunner,
     workflows: &[PathBuf],
@@ -97,7 +97,7 @@ fn by_repository(
             .filter(|parent| !parent.as_os_str().is_empty())
             .unwrap_or_else(|| Path::new("."));
         let root = if directory.is_dir() {
-            um_runner::repository_root(runner, directory)
+            useful_runner::repository_root(runner, directory)
                 .map_err(|error| refusal(file, directory, error, remedy))?
         } else {
             PathBuf::from(".")

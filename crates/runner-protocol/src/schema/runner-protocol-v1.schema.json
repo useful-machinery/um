@@ -638,7 +638,7 @@
     "TriggerDelivery": {
       "type": "object",
       "additionalProperties": false,
-      "description": "A control delivery Cloud pinned to the run's subject claim (REQ-TRIGGER-134), which the runner applies with `um workflow run event` (REQ-TRIGGER-136).",
+      "description": "A control delivery Cloud pinned to the run's subject claim (REQ-TRIGGER-134), which the runner applies with `useful workflow run event` (REQ-TRIGGER-136).",
       "properties": {
         "deliveryId": {"$ref": "#/$defs/triggerDeliveryId"},
         "claimId": {"$ref": "#/$defs/subjectClaimId"},
@@ -1428,7 +1428,7 @@
       "unevaluatedProperties": false
     },
     "RunnerTriggerDeliveryApplied": {
-      "description": "The runner's application of one trigger delivery to the run its assignment holds (REQ-TRIGGER-136): `applied` with the action `um workflow run event` took, or `refused` with its code, and the fresh issue read, null when the command refused before reading.",
+      "description": "The runner's application of one trigger delivery to the run its assignment holds (REQ-TRIGGER-136): `applied` with the action `useful workflow run event` took, or `refused` with its code, and the fresh issue read, null when the command refused before reading.",
       "allOf": [
         { "$ref": "#/$defs/RunnerEnvelope" },
         {

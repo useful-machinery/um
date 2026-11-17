@@ -1,7 +1,7 @@
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 
 use super::*;
-use um_execution::{
+use useful_execution::{
     CLAUDE_CODE_LOGIN_VARIABLE as TOKEN_VARIABLE, CODEX_LOGIN_VARIABLE as CODEX_HOME,
 };
 
@@ -969,8 +969,8 @@ const GRANT_NAMES: [(AgentLoginProvider, &str, &str); 3] = [
     ),
     (
         AgentLoginProvider::Linear,
-        "UM_LINEAR_ACCESS_TOKEN",
-        "UM_LINEAR_ACCESS_TOKEN_FILE",
+        "USEFUL_LINEAR_ACCESS_TOKEN",
+        "USEFUL_LINEAR_ACCESS_TOKEN_FILE",
     ),
 ];
 
@@ -980,8 +980,8 @@ const SERVICE_GRANT_VALUES: [(&str, &str); 6] = [
     ("GH_TOKEN_FILE", "/service/gh-token"),
     ("GITLAB_TOKEN", "service-gitlab-token"),
     ("GITLAB_TOKEN_FILE", "/service/gitlab-token"),
-    ("UM_LINEAR_ACCESS_TOKEN", "service-linear-token"),
-    ("UM_LINEAR_ACCESS_TOKEN_FILE", "/service/linear-token"),
+    ("USEFUL_LINEAR_ACCESS_TOKEN", "service-linear-token"),
+    ("USEFUL_LINEAR_ACCESS_TOKEN_FILE", "/service/linear-token"),
 ];
 
 /// A workflow that passes `variable` and `file_variable`: `kept` must see
@@ -1078,8 +1078,8 @@ async fn an_unselected_provider_leaves_the_services_gitlab_token_and_never_its_g
         r#"test "$GITLAB_TOKEN" = service-gitlab-token && test "$GITLAB_TOKEN_FILE" = /service/gitlab-token && test "$GH_TOKEN_FILE" = /service/gh-token && {}"#,
         unset(&[
             "GH_TOKEN",
-            "UM_LINEAR_ACCESS_TOKEN",
-            "UM_LINEAR_ACCESS_TOKEN_FILE"
+            "USEFUL_LINEAR_ACCESS_TOKEN",
+            "USEFUL_LINEAR_ACCESS_TOKEN_FILE"
         ])
     );
     let fixture = SettingUp::running(

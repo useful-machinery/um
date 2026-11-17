@@ -1,5 +1,5 @@
 [package]
-name = "um-test-support"
+name = "useful-test-support"
 version = "0.0.0-dev"
 edition.workspace = true
 rust-version.workspace = true

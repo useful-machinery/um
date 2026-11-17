@@ -1,7 +1,7 @@
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 use super::{Options, output, with_api};
 

@@ -1,5 +1,5 @@
-//! The Cloud reads of `um runner doctor --readiness` (REQ-CREDREADY-13 to REQ-CREDREADY-17,
-//! REQ-CREDREADY-21). They live in the command because `um-runner` reaches neither the API nor
+//! The Cloud reads of `useful runner doctor --readiness` (REQ-CREDREADY-13 to REQ-CREDREADY-17,
+//! REQ-CREDREADY-21). They live in the command because `useful-runner` reaches neither the API nor
 //! the human session. One `Session` serves every read of an invocation; a connection family
 //! supplies its API, its failure as a `FamilyFailure` and a pure function from what it lists to
 //! the requirement's code, and `read_for` names the read of each kind. A named project's
@@ -10,13 +10,13 @@ use std::fmt::{Debug, Display};
 
 use anyhow::{Context, anyhow};
 use serde_json::Value;
-use um_api::{
+use useful_api::{
     GitHubApi, GitHubFailure, GitHubInstallationState, GitLabApi, GitLabFailure, HttpClient,
     HttpTransportPolicy, LinearApi, LinearConnection, LinearFailure, ProjectApi, ProjectFailure,
     UnreachableCategory, linear_connection,
 };
-use um_human_auth::Deployment;
-use um_runner::{CredentialKind, ReadinessCode};
+use useful_human_auth::Deployment;
+use useful_runner::{CredentialKind, ReadinessCode};
 
 use crate::exit_code::{ExitCode, OutcomeClass};
 
@@ -249,7 +249,7 @@ impl Ending {
                 None,
                 authentication
                     .rejected_error(
-                        "error: the readiness check requires sign-in\n\nSign in first:\n  um auth login",
+                        "error: the readiness check requires sign-in\n\nSign in first:\n  useful auth login",
                     )
                     .to_owned(),
                 OutcomeClass::Unauthenticated,
@@ -262,7 +262,7 @@ impl Ending {
                     .to_owned(),
                 OutcomeClass::GeneralFailure,
             ),
-            // As `um project show` reports it.
+            // As `useful project show` reports it.
             Self::ProjectNotFound => (
                 "not_found",
                 None,
@@ -616,9 +616,9 @@ mod tests {
     use std::collections::HashSet;
 
     use serde_json::{Value, json};
-    use um_api::linear_connection::{RequiredScopes, Status};
-    use um_api::{GitHubInstallationState, LinearConnection};
-    use um_runner::ReadinessCode;
+    use useful_api::linear_connection::{RequiredScopes, Status};
+    use useful_api::{GitHubInstallationState, LinearConnection};
+    use useful_runner::ReadinessCode;
 
     use super::{Availability, Repository, github_code, gitlab_code, linear_code};
 
@@ -735,7 +735,7 @@ mod tests {
     #[test]
     fn a_project_repository_changes_only_a_code_its_connection_read_does_not_fail() {
         let repository = |availability| Repository {
-            kind: um_runner::CredentialKind::Github,
+            kind: useful_runner::CredentialKind::Github,
             availability,
         };
         let failing = [

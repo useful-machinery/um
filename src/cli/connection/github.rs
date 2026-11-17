@@ -4,8 +4,8 @@ use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
 
 use crate::exit_code::ExitCode;
-use um_api::{GitHubApi, GitHubFailure, HttpClient, HttpTransportPolicy};
-use um_human_auth::Deployment;
+use useful_api::{GitHubApi, GitHubFailure, HttpClient, HttpTransportPolicy};
+use useful_human_auth::Deployment;
 
 use super::super::{InstallationArg, OrganizationArg};
 use super::NAME;

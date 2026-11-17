@@ -4,7 +4,7 @@
     reason = "webhook secret redaction test uses Rust test assertions and fixture decoding"
 )]
 
-use um_api::{WebhookSubscription, WebhookSubscriptionList};
+use useful_api::{WebhookSubscription, WebhookSubscriptionList};
 
 #[test]
 fn subscription_and_page_debug_do_not_disclose_show_once_secret() {

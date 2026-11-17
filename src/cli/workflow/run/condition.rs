@@ -1,10 +1,10 @@
-//! The condition sources `um workflow run resume` evaluates an `external` wait's rule
+//! The condition sources `useful workflow run resume` evaluates an `external` wait's rule
 //! against (REQ-WFEXEC-65, REQ-CONTINUE-74): each `(source, event)` pair this CLI observes
 //! and how. Admission refuses an `external` wait on any other pair (REQ-WFEXEC-59).
 
 mod github;
 
-use um_execution::{ConditionError, ConditionSource, ExternalEvent, WaitRecord};
+use useful_execution::{ConditionError, ConditionSource, ExternalEvent, WaitRecord};
 
 type Observe = fn(&WaitRecord) -> Result<Vec<ExternalEvent>, ConditionError>;
 

@@ -1,19 +1,19 @@
 //! The member's view of a credential (REQ-GRANT-53): what Cloud's API returns for a grant's
 //! authorization, for an agent login's and for a provider grant, mapped to one availability
-//! and one next action, with the command or step that next action names. `um grant list` and
+//! and one next action, with the command or step that next action names. `useful grant list` and
 //! the earlier commands it replaces print it; Cloud's API carries the facts only.
 
 use std::io::{self, Write};
 
 use serde::Serialize;
 
-use um_api::{
+use useful_api::{
     AgentLogin, AgentLoginAuthorization, AgentLoginProvider, AgentLoginReportState,
     AgentLoginState, Grant, GrantReport, GrantState, MemberGrant, MemberGrantAuthorization,
     MemberGrantKind, MemberGrantState, provider_grant,
 };
-use um_runner::CredentialKind;
-use um_support::{Availability, CredentialStatus, NextAction};
+use useful_runner::CredentialKind;
+use useful_support::{Availability, CredentialStatus, NextAction};
 
 /// The status of an agent login's authorization in force, or of the agent login when it has
 /// none (`authorization` is `None`), as its owner reads it.
@@ -270,33 +270,33 @@ impl MemberStatus {
     }
 }
 
-/// The command or step a member's next action names, each a `um grant` or `um runner grant`
+/// The command or step a member's next action names, each a `useful grant` or `useful runner grant`
 /// command (REQ-GRANT-77). Waiting for a runner names none.
 fn member_step(next_action: NextAction, subject: Subject<'_>) -> Option<String> {
     match (next_action, subject) {
         (NextAction::Reconnect, Subject::AgentLogin { provider, .. }) => Some(format!(
-            "store a new sign-in with `um grant create {provider} --replace`"
+            "store a new sign-in with `useful grant create {provider} --replace`"
         )),
         (
             NextAction::Reconnect,
             Subject::Grant { provider } | Subject::OAuthGrant { provider, .. },
         ) => Some(format!(
-            "consent again with `um grant create {provider} --replace`"
+            "consent again with `useful grant create {provider} --replace`"
         )),
         (NextAction::Connect, Subject::Grant { provider }) => {
-            Some(format!("consent with `um grant create {provider}`"))
+            Some(format!("consent with `useful grant create {provider}`"))
         }
         (NextAction::Connect, Subject::CodingAgent { provider }) => {
-            Some(format!("sign in with `um grant create {provider}`"))
+            Some(format!("sign in with `useful grant create {provider}`"))
         }
         (
             NextAction::AuthorizeRunner,
             Subject::AgentLogin { id, .. } | Subject::OAuthGrant { id, .. },
         ) => Some(format!(
-            "authorize a runner with `um grant authorize {id} RUNNER --yes`"
+            "authorize a runner with `useful grant authorize {id} RUNNER --yes`"
         )),
         (NextAction::SyncRunner, _) => Some(
-            "on the runner's host, set grants up again with `um runner grant sync`"
+            "on the runner's host, set grants up again with `useful runner grant sync`"
                 .to_owned(),
         ),
         (NextAction::CheckTarget, _) => Some(
@@ -316,8 +316,8 @@ fn member_step(next_action: NextAction, subject: Subject<'_>) -> Option<String> 
 
 #[cfg(test)]
 mod tests {
-    use um_api::{AgentLogin, Grant, MemberGrant};
-    use um_support::{Availability, CredentialStatus, NextAction};
+    use useful_api::{AgentLogin, Grant, MemberGrant};
+    use useful_support::{Availability, CredentialStatus, NextAction};
 
     use super::{authorization_status, grant_authorization_status, grant_status};
 

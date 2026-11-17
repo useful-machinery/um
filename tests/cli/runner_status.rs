@@ -35,7 +35,7 @@ pub(super) fn write_status_config_at(config: &std::path::Path, socket_path: &std
     .unwrap();
 }
 
-/// The control socket request `um runner status` sends.
+/// The control socket request `useful runner status` sends.
 pub(super) const STATUS_REQUEST: &[u8] = b"{\"schemaVersion\":1,\"operation\":\"status\"}\n";
 
 /// A live runner's answer to a status request: connected, one assignment
@@ -349,7 +349,7 @@ fn runner_status_queries_only_the_configured_local_socket() {
     let output = run_with_env(
         &["runner", "status", "--config", &config],
         &[(
-            "UM_API_URL",
+            "USEFUL_API_URL",
             "https://cloud-status-must-not-be-read.example",
         )],
     );
@@ -388,7 +388,7 @@ fn terminal_authentication_remains_locally_inspectable() {
             .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n")
             .unwrap();
     });
-    let mut serve = Command::new(env!("CARGO_BIN_EXE_um"))
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_useful"))
         .args(["runner", "serve", "--config", &fixture.config])
         .env("OTEL_SDK_DISABLED", "true")
         .stdout(std::process::Stdio::null())
@@ -559,7 +559,7 @@ fn pending_handshake_preserves_contiguous_current_boot_sequences() {
                     .unwrap();
             });
     });
-    let mut serve = Command::new(env!("CARGO_BIN_EXE_um"))
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_useful"))
         .args(["runner", "serve", "--config", &fixture.config])
         .env("OTEL_SDK_DISABLED", "true")
         .stdout(std::process::Stdio::null())
@@ -638,7 +638,10 @@ fn runner_status_prints_each_provider_readiness_once_the_runner_has_set_up() {
     };
     assert!(line("github").contains("(generation 4)"), "{stdout}");
     assert!(line("gitlab").contains("sync_runner"), "{stdout}");
-    assert!(!line("gitlab").contains("um runner grant sync"), "{stdout}");
+    assert!(
+        !line("gitlab").contains("useful runner grant sync"),
+        "{stdout}"
+    );
     assert!(output.stderr.is_empty());
 }
 
@@ -710,7 +713,7 @@ fn runner_status_names_the_grant_to_reconnect_by_its_grant_provider() {
             .find(|line| line.starts_with(&format!("{provider} login:")))
             .unwrap();
         assert!(
-            line.contains(&format!("`um grant create {grant_provider} --replace`")),
+            line.contains(&format!("`useful grant create {grant_provider} --replace`")),
             "{stdout}"
         );
     }
@@ -753,10 +756,10 @@ fn runner_status_prints_the_availability_selection_and_last_use_give() {
         assert!(line.contains(next_action), "{line}");
         assert!(line.contains(agent_login_id), "{line}");
     }
-    // Its owner reconnects it with `um grant create` (REQ-GRANT-77).
+    // Its owner reconnects it with `useful grant create` (REQ-GRANT-77).
     let codex = stdout.lines().find(|line| line.starts_with("codex login:"));
     assert!(
-        codex.is_some_and(|line| line.contains("`um grant create codex --replace`")),
+        codex.is_some_and(|line| line.contains("`useful grant create codex --replace`")),
         "{stdout}"
     );
     assert!(output.stderr.is_empty());

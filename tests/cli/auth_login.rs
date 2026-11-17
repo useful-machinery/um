@@ -597,10 +597,10 @@ fn human_login_connection_failure_names_the_oauth_issuer_and_cause_on_stderr() {
     let credential_path = credential_path.to_str().unwrap();
     let environment = [
         (CREDENTIALS_FILE_VARIABLE, credential_path),
-        ("UM_API_URL", api_url),
-        ("UM_AUTH_ISSUER", issuer.as_str()),
-        ("UM_AUTH_AUDIENCE", "https://api.fixture.example"),
-        ("UM_AUTH_CLIENT_ID", "fixture-public-client"),
+        ("USEFUL_API_URL", api_url),
+        ("USEFUL_AUTH_ISSUER", issuer.as_str()),
+        ("USEFUL_AUTH_AUDIENCE", "https://api.fixture.example"),
+        ("USEFUL_AUTH_CLIENT_ID", "fixture-public-client"),
     ];
 
     let output = run_with_env(
@@ -778,10 +778,10 @@ fn local_login_failure_emits_no_auth_event_or_network_request() {
     let credential_path_string = credential_path.to_str().unwrap();
     let environment = [
         (CREDENTIALS_FILE_VARIABLE, credential_path_string),
-        ("UM_API_URL", api_url.as_str()),
-        ("UM_AUTH_ISSUER", issuer.as_str()),
-        ("UM_AUTH_AUDIENCE", "https://api.fixture.example"),
-        ("UM_AUTH_CLIENT_ID", "fixture-public-client"),
+        ("USEFUL_API_URL", api_url.as_str()),
+        ("USEFUL_AUTH_ISSUER", issuer.as_str()),
+        ("USEFUL_AUTH_AUDIENCE", "https://api.fixture.example"),
+        ("USEFUL_AUTH_CLIENT_ID", "fixture-public-client"),
     ];
 
     let output = run_with_env(
@@ -829,7 +829,7 @@ fn interrupting_login_emits_cancellation_and_exits_130() {
     let before = fs::read(&credential_path).unwrap();
     let credential_path_string = credential_path.to_str().unwrap();
     let environment = login_environment(&server, credential_path_string);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args([
             "auth",
@@ -848,7 +848,7 @@ fn interrupting_login_emits_cancellation_and_exits_130() {
         command.env(name, value);
     }
     // The interrupt must arrive during the production device-flow poll wait.
-    command.env_remove("UM_TEST_POLL_INTERVAL_MILLISECONDS");
+    command.env_remove("USEFUL_TEST_POLL_INTERVAL_MILLISECONDS");
     let mut child = command.spawn().expect("login process should start");
     let stdout = child.stdout.take().unwrap();
     let mut stdout = BufReader::new(stdout);
@@ -932,7 +932,7 @@ fn interrupt_after_persistence_does_not_report_cancellation() {
     let credential_path = credential_directory.path().join("credentials.json");
     let credential_path_string = credential_path.to_str().unwrap();
     let environment = login_environment(&server, credential_path_string);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args([
             "auth",

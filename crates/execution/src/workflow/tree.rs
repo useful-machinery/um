@@ -34,7 +34,7 @@ const ROOT_WORKFLOW: &str = "workflow.yaml";
 const TREE_DIGEST_DOMAIN: &[u8] = b"um.workflow.tree.v1\0";
 const MAX_TREE_BYTES: u64 = 64 * 1024 * 1024;
 
-/// A tree that passed validation, with what `um workflow definition validate` reports.
+/// A tree that passed validation, with what `useful workflow definition validate` reports.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedTree {
     /// The canonical tree root.
@@ -71,7 +71,7 @@ impl fmt::Debug for TreeFile {
     }
 }
 
-/// A trigger as `um workflow definition validate` reports it: a provider rule's source,
+/// A trigger as `useful workflow definition validate` reports it: a provider rule's source,
 /// event and `where`, or a schedule's timetable, and a start trigger's `subject`, `inputs`,
 /// `stopBefore` and `owner`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -264,7 +264,7 @@ impl fmt::Display for TreeLocation {
 }
 
 /// Whether `root` is a tree (REQ-WFDEF-8): a regular `workflow.yaml` sits directly under it.
-/// `um workflow run create --path` admits such a directory from the tree (REQ-LOCALRUN-169).
+/// `useful workflow run create --path` admits such a directory from the tree (REQ-LOCALRUN-169).
 pub fn is_workflow_tree(root: &Path) -> bool {
     fs::symlink_metadata(root.join(ROOT_WORKFLOW)).is_ok_and(|metadata| metadata.is_file())
 }

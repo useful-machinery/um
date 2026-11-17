@@ -1,8 +1,8 @@
 ```console
-$ um project show --help
+$ useful project show --help
 Show a project
 
-Usage: um project show [OPTIONS] <ORGANIZATION> <PROJECT>
+Usage: useful project show [OPTIONS] <ORGANIZATION> <PROJECT>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug

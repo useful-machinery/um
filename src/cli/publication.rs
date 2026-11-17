@@ -6,11 +6,11 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{
+use useful_api::{
     ExistingPublicationTarget, HttpTransportPolicy, Publication, PublicationApi,
     PublicationFailure, PublicationList, PublicationState,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 use super::OrganizationArg;
 
@@ -168,7 +168,7 @@ impl CreateCommand {
     fn execute(self, deployment: Deployment) -> super::CommandResult {
         let idempotency_key = match self.idempotency_key.clone() {
             Some(key) => key,
-            None => um_support::generate_idempotency_key()
+            None => useful_support::generate_idempotency_key()
                 .context("generate Cloud publication request identity")?,
         };
         if self.wait.wait {
@@ -683,7 +683,7 @@ fn terminal_publication_state(publication: &Publication) -> Option<TerminalPubli
 }
 
 fn parse_run_id(value: &str) -> Result<String, String> {
-    if um_support::valid_typed_id(value, "run_") {
+    if useful_support::valid_typed_id(value, "run_") {
         Ok(value.to_owned())
     } else {
         Err("must be an exact Run ID (run_ followed by 26 lowercase ULID characters)".to_owned())
@@ -691,7 +691,7 @@ fn parse_run_id(value: &str) -> Result<String, String> {
 }
 
 fn parse_publication_id(value: &str) -> Result<String, String> {
-    if um_support::valid_typed_id(value, "pub_") {
+    if useful_support::valid_typed_id(value, "pub_") {
         Ok(value.to_owned())
     } else {
         Err(
@@ -712,14 +712,14 @@ pub(super) fn parse_change_request(value: &str) -> Result<i64, String> {
 }
 
 pub(super) fn parse_expected_head(value: &str) -> Result<String, String> {
-    if !um_support::is_lowercase_hex(value, 40) {
+    if !useful_support::is_lowercase_hex(value, 40) {
         return Err("expected a lowercase 40-character Git commit hash".to_owned());
     }
     Ok(value.to_owned())
 }
 
 pub(super) fn parse_export_name(value: &str) -> Result<String, String> {
-    if um_support::is_identifier(value) {
+    if useful_support::is_identifier(value) {
         Ok(value.to_owned())
     } else {
         Err("must be a lower-camel identifier of at most 64 ASCII characters".to_owned())
@@ -1118,9 +1118,9 @@ fn write_failure(
             context
                 .authentication
                 .rejected_error(if context.dispatched {
-                    "error: Cloud publication access requires sign-in\n\nSign in first, then retry with the same --idempotency-key:\n  um auth login"
+                    "error: Cloud publication access requires sign-in\n\nSign in first, then retry with the same --idempotency-key:\n  useful auth login"
                 } else {
-                    "error: Cloud publication access requires sign-in\n\nSign in first:\n  um auth login"
+                    "error: Cloud publication access requires sign-in\n\nSign in first:\n  useful auth login"
                 })
                 .to_owned(),
             OutcomeClass::Unauthenticated,
@@ -1214,7 +1214,7 @@ fn write_read_failure(
             context
                 .authentication
                 .rejected_error(
-                    "error: Cloud publication access requires sign-in\n\nSign in first:\n  um auth login",
+                    "error: Cloud publication access requires sign-in\n\nSign in first:\n  useful auth login",
                 )
                 .to_owned(),
             OutcomeClass::Unauthenticated,
@@ -1460,7 +1460,7 @@ mod tests {
         const HASH: &str = "0123456789abcdef0123456789abcdef01234567";
         let publication = |extras: &[&str]| {
             let mut args = vec![
-                "um",
+                "useful",
                 "publication",
                 "create",
                 "acme-labs",
@@ -1503,7 +1503,7 @@ mod tests {
                 Ok(publication(PublicationState::Running)),
                 Ok(publication(terminal)),
             ]);
-            let clock = ControlledClock::new(um_support::monotonic_now());
+            let clock = ControlledClock::new(useful_support::monotonic_now());
 
             let result = observe(&api, None, &clock)
                 .expect("the scripted publication should reach terminal state");
@@ -1527,7 +1527,7 @@ mod tests {
             Ok(publication(PublicationState::Running)),
             Ok(publication(PublicationState::Running)),
         ]);
-        let clock = ControlledClock::new(um_support::monotonic_now());
+        let clock = ControlledClock::new(useful_support::monotonic_now());
 
         let result = observe(&api, Some(Duration::from_secs(5)), &clock)
             .expect("timeout should be a local observation result");
@@ -1539,9 +1539,9 @@ mod tests {
 
     #[test]
     fn wait_bounds_retryable_observation_failures() {
-        let failure = PublicationFailure::Unreachable(um_api::UnreachableCategory::Connection);
+        let failure = PublicationFailure::Unreachable(useful_api::UnreachableCategory::Connection);
         let api = ScriptedObservationApi::new([Err(failure), Err(failure)]);
-        let clock = ControlledClock::new(um_support::monotonic_now());
+        let clock = ControlledClock::new(useful_support::monotonic_now());
 
         let result = observe(&api, None, &clock);
 

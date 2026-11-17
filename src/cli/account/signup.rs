@@ -4,7 +4,7 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{HumanPrincipal, SignupError, SignupOutcome};
+use useful_api::{HumanPrincipal, SignupError, SignupOutcome};
 
 use super::super::principal::PrincipalResult;
 
@@ -98,7 +98,7 @@ fn write_human_result(deployment: &str, outcome: &SignupOutcome) -> anyhow::Resu
         }
         SignupOutcome::Unauthenticated => writeln!(
             stdout,
-            "! You're not signed in to Useful Machinery.\n\nSign in to create your account:\n  um auth login"
+            "! You're not signed in to Useful Machinery.\n\nSign in to create your account:\n  useful auth login"
         ),
         SignupOutcome::SignupNotPermitted => writeln!(
             stdout,
@@ -106,11 +106,11 @@ fn write_human_result(deployment: &str, outcome: &SignupOutcome) -> anyhow::Resu
         ),
         SignupOutcome::Forbidden => writeln!(
             stdout,
-            "! Useful Machinery refuses the account behind this sign-in: it may be suspended, deleted or scheduled for deletion.\n\nTo keep an account scheduled for deletion, cancel before its deadline:\n  um account deletion cancel"
+            "! Useful Machinery refuses the account behind this sign-in: it may be suspended, deleted or scheduled for deletion.\n\nTo keep an account scheduled for deletion, cancel before its deadline:\n  useful account deletion cancel"
         ),
         SignupOutcome::AlreadyProvisioned => writeln!(
             stdout,
-            "! This identity already has a Useful Machinery account.\n\nRun:\n  um auth status"
+            "! This identity already has a Useful Machinery account.\n\nRun:\n  useful auth status"
         ),
         SignupOutcome::IdempotencyConflict => writeln!(
             stdout,
@@ -118,7 +118,7 @@ fn write_human_result(deployment: &str, outcome: &SignupOutcome) -> anyhow::Resu
         ),
         SignupOutcome::Unreachable(category) => writeln!(
             stdout,
-            "! Couldn't confirm Useful Machinery account creation ({}).\n\nRun before trying again:\n  um auth status",
+            "! Couldn't confirm Useful Machinery account creation ({}).\n\nRun before trying again:\n  useful auth status",
             category.as_str()
         ),
     }

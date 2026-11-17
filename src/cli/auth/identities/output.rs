@@ -5,13 +5,13 @@ use serde::Serialize;
 use time::OffsetDateTime;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{
+use useful_api::{
     CommonIdentityFailure, IdentityKind, LinkIdentityOutcome, ListIdentitiesOutcome, OidcIdentity,
     RemoveIdentityOutcome, UnreachableCategory,
 };
-use um_human_auth::Deployment;
-use um_human_auth::DeviceAuthorization;
-use um_human_auth::LocalCredentialState;
+use useful_human_auth::Deployment;
+use useful_human_auth::DeviceAuthorization;
+use useful_human_auth::LocalCredentialState;
 
 pub(super) fn write_list(
     deployment: &str,
@@ -85,7 +85,7 @@ pub(super) fn write_remove(
             "reauthentication_required",
             None,
             authentication.rejected_notice(
-                "! Recent sign-in is required before removing a linked identity.\n\nSign in again with a linked identity that will remain:\n  um auth login --force",
+                "! Recent sign-in is required before removing a linked identity.\n\nSign in again with a linked identity that will remain:\n  useful auth login --force",
             ),
             OutcomeClass::Forbidden,
             json,
@@ -94,7 +94,7 @@ pub(super) fn write_remove(
             deployment,
             "not_found",
             None,
-            "! Linked identity not found or unavailable.\n\nList the identities attached to your account:\n  um auth identity list",
+            "! Linked identity not found or unavailable.\n\nList the identities attached to your account:\n  useful auth identity list",
             OutcomeClass::GeneralFailure,
             json,
         ),
@@ -166,7 +166,7 @@ impl LinkOutput {
     ) -> anyhow::Result<()> {
         // Keep identity-link presentation and its error context next to this command.
         if self.json {
-            let event = um_human_auth::activation_event(
+            let event = useful_human_auth::activation_event(
                 deployment,
                 authorization,
                 expires_at,
@@ -251,7 +251,7 @@ impl LinkOutput {
                     if service_authentication {
                         "! The service API key was rejected.\n\nUse a different active service API key."
                     } else {
-                        "! You must sign in before linking another identity.\n\nRun:\n  um auth login"
+                        "! You must sign in before linking another identity.\n\nRun:\n  useful auth login"
                     },
                     OutcomeClass::Unauthenticated,
                 ),
@@ -277,7 +277,7 @@ impl LinkOutput {
                         local_session_identity: "unchanged",
                     }
                     .with_credential_state(credential_state),
-                    "! The identity-link result is unknown.\n\nList linked identities before trying again:\n  um auth identity list",
+                    "! The identity-link result is unknown.\n\nList linked identities before trying again:\n  useful auth identity list",
                     super::super::super::unreachable_outcome_class(*category),
                 ),
             },
@@ -313,7 +313,7 @@ impl LinkOutput {
                 if service_authentication {
                     "! The workload identity quantity limit has been reached.\n\nRemove an unused workload identity or ask the deployment operator to raise the limit."
                 } else {
-                    "! This account has reached its limit on linked identities, memberships, delegations and invitations.\n\nRemove an unused identity, then start the linking flow again:\n  um auth identity list"
+                    "! This account has reached its limit on linked identities, memberships, delegations and invitations.\n\nRemove an unused identity, then start the linking flow again:\n  useful auth identity list"
                 },
                 OutcomeClass::GeneralFailure,
             ),
@@ -400,7 +400,7 @@ pub(super) fn write_common(
             "unauthenticated",
             None,
             authentication.rejected_notice(
-                "! You must sign in before managing linked identities.\n\nRun:\n  um auth login",
+                "! You must sign in before managing linked identities.\n\nRun:\n  useful auth login",
             ),
             OutcomeClass::Unauthenticated,
             json,

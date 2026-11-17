@@ -1,7 +1,7 @@
 use super::*;
 const ACTION: &str = "gda_01k0z6r1w8f4jy2m7q9v3x5abc";
 fn action() -> serde_json::Value {
-    serde_json::json!({"id":ACTION,"projectId":PROJECT_ID,"version":3,"createdAt":"2026-09-01T00:00:00Z","updatedAt":"2026-09-01T00:00:00Z","displayName":"Review","workflowPath":".um/workflows/review.yaml","definitionId":null,"enabled":true,"description":"","sortOrder":0,"inputBindings":{},"inputPresentation":{},"publication":null})
+    serde_json::json!({"id":ACTION,"projectId":PROJECT_ID,"version":3,"createdAt":"2026-09-01T00:00:00Z","updatedAt":"2026-09-01T00:00:00Z","displayName":"Review","workflowPath":".useful/workflows/review.yaml","definitionId":null,"enabled":true,"description":"","sortOrder":0,"inputBindings":{},"inputPresentation":{},"publication":null})
 }
 fn response(status: &str, body: serde_json::Value, mutation: bool) -> Vec<u8> {
     http_response_with_headers(
@@ -60,7 +60,7 @@ fn documented_example_is_accepted_by_the_create_route() {
 #[test]
 fn source_json_may_exceed_normalized_configuration_limit() {
     let source = format!(
-        "{{\"displayName\":\"Review\",\"workflowPath\":\".um/workflows/review.yaml\",\"enabled\":true{}}}",
+        "{{\"displayName\":\"Review\",\"workflowPath\":\".useful/workflows/review.yaml\",\"enabled\":true{}}}",
         " ".repeat(1024 * 1024)
     );
     let (_dir, path) = file(&source);
@@ -81,7 +81,7 @@ fn source_json_may_exceed_normalized_configuration_limit() {
 #[test]
 fn action_routes_and_closed_update() {
     let (_dir, path) = file(
-        r#"{"displayName":"Review","workflowPath":".um/workflows/review.yaml","enabled":false,"inputBindings":{"fixed":{"type":"literal","kind":"json","value":null}}}"#,
+        r#"{"displayName":"Review","workflowPath":".useful/workflows/review.yaml","enabled":false,"inputBindings":{"fixed":{"type":"literal","kind":"json","value":null}}}"#,
     );
     let (server, _credentials, credential) =
         prepared(vec![response("201 Created", action(), true)]);
@@ -287,7 +287,7 @@ fn reads_lifecycle_and_delete_observe_status_and_confirmation() {
 #[test]
 fn commands_ask_for_the_representation_they_decode() {
     let (_dir, path) = file(
-        r#"{"displayName":"Review","workflowPath":".um/workflows/review.yaml","enabled":true}"#,
+        r#"{"displayName":"Review","workflowPath":".useful/workflows/review.yaml","enabled":true}"#,
     );
     let (_patch_dir, patch) = file(r#"{"description":"new"}"#);
     let page = serde_json::json!({"items":[action()],"nextCursor":null});
@@ -453,7 +453,7 @@ fn definition_lines(output: &Output) -> Vec<String> {
 #[test]
 fn human_output_names_the_definition_only_when_the_action_has_one() {
     let (_dir, path) = file(&format!(
-        r#"{{"displayName":"Review","workflowPath":".um/workflows/review.yaml","definitionId":"{DEFINITION}","enabled":true}}"#
+        r#"{{"displayName":"Review","workflowPath":".useful/workflows/review.yaml","definitionId":"{DEFINITION}","enabled":true}}"#
     ));
     let mut named = action();
     named["definitionId"] = DEFINITION.into();
@@ -532,8 +532,8 @@ fn update_sends_a_definition_given_alone() {
 #[test]
 fn invalid_definition_is_rejected_before_any_request_without_echo() {
     for config in [
-        r#"{"displayName":"Review","workflowPath":".um/workflows/review.yaml","enabled":true,"definitionId":{"private":"secret-definition"}}"#,
-        r#"{"displayName":"Review","workflowPath":".um/workflows/review.yaml","enabled":true,"definitionId":"def_01k0z6r1w8f4jy2m7q9v3x5abc","publication":{"exportName":"secret-export"}}"#,
+        r#"{"displayName":"Review","workflowPath":".useful/workflows/review.yaml","enabled":true,"definitionId":{"private":"secret-definition"}}"#,
+        r#"{"displayName":"Review","workflowPath":".useful/workflows/review.yaml","enabled":true,"definitionId":"def_01k0z6r1w8f4jy2m7q9v3x5abc","publication":{"exportName":"secret-export"}}"#,
     ] {
         let (_dir, path) = file(config);
         let (server, _credentials, credential) = prepared(vec![]);
@@ -638,7 +638,7 @@ fn invalid_input_and_denial_do_not_leak_literals() {
 #[test]
 fn standard_input_conflict_is_rejected_before_authentication() {
     let config =
-        br#"{"displayName":"Review","workflowPath":".um/workflows/review.yaml","enabled":true}"#;
+        br#"{"displayName":"Review","workflowPath":".useful/workflows/review.yaml","enabled":true}"#;
     let (server, _credentials, credential) =
         prepared(vec![response("201 Created", action(), true)]);
     let environment = deployment_environment(&server.api_url, &credential);
@@ -690,7 +690,7 @@ fn standard_input_conflict_is_rejected_before_authentication() {
 #[test]
 fn lost_reply_retries_identical_body_and_key() {
     let (_dir, path) = file(
-        r#"{"displayName":"Review","workflowPath":".um/workflows/review.yaml","enabled":false}"#,
+        r#"{"displayName":"Review","workflowPath":".useful/workflows/review.yaml","enabled":false}"#,
     );
     let (server, _credentials, credential) =
         prepared(vec![Vec::new(), response("201 Created", action(), true)]);
@@ -715,7 +715,7 @@ fn lost_reply_retries_identical_body_and_key() {
 #[test]
 fn unresolved_reply_reports_key_without_configuration() {
     let (_dir, path) = file(
-        r#"{"displayName":"Review","workflowPath":".um/workflows/review.yaml","enabled":true,"inputBindings":{"x":{"type":"literal","kind":"text","value":"private-literal"}}}"#,
+        r#"{"displayName":"Review","workflowPath":".useful/workflows/review.yaml","enabled":true,"inputBindings":{"x":{"type":"literal","kind":"text","value":"private-literal"}}}"#,
     );
     let (server, _credentials, credential) = prepared(vec![Vec::new(), Vec::new()]);
     let output = run(
@@ -751,7 +751,7 @@ fn unresolved_reply_reports_key_without_configuration() {
 #[test]
 fn invalid_successful_replay_does_not_settle_a_lost_reply() {
     let (_dir, path) = file(
-        r#"{"displayName":"Review","workflowPath":".um/workflows/review.yaml","enabled":true}"#,
+        r#"{"displayName":"Review","workflowPath":".useful/workflows/review.yaml","enabled":true}"#,
     );
     let mut wrong = action();
     wrong["projectId"] = "other-project".into();
@@ -777,7 +777,7 @@ fn invalid_successful_replay_does_not_settle_a_lost_reply() {
 #[test]
 fn rejected_replay_does_not_settle_a_lost_create_reply() {
     let (_dir, path) = file(
-        r#"{"displayName":"Review","workflowPath":".um/workflows/review.yaml","enabled":true}"#,
+        r#"{"displayName":"Review","workflowPath":".useful/workflows/review.yaml","enabled":true}"#,
     );
     let denied = problem_http_response(
         "403 Forbidden",
@@ -867,7 +867,7 @@ fn action_refusal_is_named_only_by_its_reason() {
 #[test]
 fn rejected_replay_after_credential_refresh_stays_uncertain() {
     let (_dir, path) = file(
-        r#"{"displayName":"Review","workflowPath":".um/workflows/review.yaml","enabled":true}"#,
+        r#"{"displayName":"Review","workflowPath":".useful/workflows/review.yaml","enabled":true}"#,
     );
     let unauthorized = problem_http_response(
         "401 Unauthorized",
@@ -990,7 +990,7 @@ fn single_action_allows_wire_escaping_above_one_mebibyte() {
 #[test]
 fn refresh_preserves_mutation_identity() {
     let (_dir, path) = file(
-        r#"{"displayName":"Review","workflowPath":".um/workflows/review.yaml","enabled":true}"#,
+        r#"{"displayName":"Review","workflowPath":".useful/workflows/review.yaml","enabled":true}"#,
     );
     let denied = problem_http_response(
         "401 Unauthorized",

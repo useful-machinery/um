@@ -1,5 +1,5 @@
-//! `um runner serve --personal` and `--pool-id` on a host with no enrolled
-//! state: the real `um` against a scripted API, a scripted enrollment
+//! `useful runner serve --personal` and `--pool-id` on a host with no enrolled
+//! state: the real `useful` against a scripted API, a scripted enrollment
 //! endpoint and a connection witness for the runner endpoint.
 
 use super::*;
@@ -293,7 +293,9 @@ fn a_start_with_no_sign_in_exits_3_having_registered_and_written_nothing() {
 
     assert_eq!(exit.code(), Some(3), "{stderr}");
     assert!(
-        stderr.lines().any(|line| line.trim() == "um auth login"),
+        stderr
+            .lines()
+            .any(|line| line.trim() == "useful auth login"),
         "{stderr}"
     );
     assert!(!record_path(&host).exists());

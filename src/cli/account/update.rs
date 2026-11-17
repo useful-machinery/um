@@ -4,7 +4,7 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{PrincipalProfile, UpdateProfileError, UpdateProfileOutcome};
+use useful_api::{PrincipalProfile, UpdateProfileError, UpdateProfileOutcome};
 
 use super::super::principal::PrincipalResult;
 
@@ -162,7 +162,7 @@ fn write_human_result(
         ),
         UpdateProfileOutcome::Unauthenticated => writeln!(
             stdout,
-            "! You're not signed in to Useful Machinery.\n\nSign in to update your account:\n  um auth login"
+            "! You're not signed in to Useful Machinery.\n\nSign in to update your account:\n  useful auth login"
         ),
         UpdateProfileOutcome::Forbidden => writeln!(
             stdout,
@@ -182,7 +182,7 @@ fn write_human_result(
         ),
         UpdateProfileOutcome::Unreachable(category) => writeln!(
             stdout,
-            "! Your account display name update is unconfirmed ({}).\n\nCheck your account before trying again:\n  um auth status",
+            "! Your account display name update is unconfirmed ({}).\n\nCheck your account before trying again:\n  useful auth status",
             category.as_str()
         ),
     }

@@ -27,14 +27,14 @@ use std::process::Command;
 use serde_json::Value;
 
 const INTERNAL_PACKAGES: [&str; 8] = [
-    "um-cli",
-    "um-api",
-    "um-execution",
-    "um-human-auth",
-    "um-runner",
-    "um-runner-protocol",
-    "um-support",
-    "um-test-support",
+    "useful-cli",
+    "useful-api",
+    "useful-execution",
+    "useful-human-auth",
+    "useful-runner",
+    "useful-runner-protocol",
+    "useful-support",
+    "useful-test-support",
 ];
 
 // INV-SYSTEM-5
@@ -54,14 +54,17 @@ fn workspace_members_and_edges_match_final_graph() {
         .collect::<BTreeSet<_>>();
 
     let expected_manifests = BTreeMap::from([
-        ("um-cli", "Cargo.toml"),
-        ("um-api", "crates/api/Cargo.toml"),
-        ("um-execution", "crates/execution/Cargo.toml"),
-        ("um-human-auth", "crates/human-auth/Cargo.toml"),
-        ("um-runner", "crates/runner/Cargo.toml"),
-        ("um-runner-protocol", "crates/runner-protocol/Cargo.toml"),
-        ("um-support", "crates/support/Cargo.toml"),
-        ("um-test-support", "crates/test-support/Cargo.toml"),
+        ("useful-cli", "Cargo.toml"),
+        ("useful-api", "crates/api/Cargo.toml"),
+        ("useful-execution", "crates/execution/Cargo.toml"),
+        ("useful-human-auth", "crates/human-auth/Cargo.toml"),
+        ("useful-runner", "crates/runner/Cargo.toml"),
+        (
+            "useful-runner-protocol",
+            "crates/runner-protocol/Cargo.toml",
+        ),
+        ("useful-support", "crates/support/Cargo.toml"),
+        ("useful-test-support", "crates/test-support/Cargo.toml"),
     ]);
     let workspace_packages = packages
         .iter()
@@ -132,27 +135,27 @@ fn workspace_members_and_edges_match_final_graph() {
         }
     }
     let expected_edges = BTreeSet::from([
-        ("um-cli", "um-api", "normal"),
-        ("um-cli", "um-execution", "normal"),
-        ("um-cli", "um-execution", "dev"),
-        ("um-cli", "um-human-auth", "normal"),
-        ("um-cli", "um-runner", "normal"),
-        ("um-cli", "um-runner", "dev"),
-        ("um-cli", "um-support", "dev"),
-        ("um-cli", "um-support", "normal"),
-        ("um-cli", "um-test-support", "dev"),
-        ("um-api", "um-support", "normal"),
-        ("um-api", "um-test-support", "dev"),
-        ("um-human-auth", "um-api", "normal"),
-        ("um-human-auth", "um-support", "normal"),
-        ("um-human-auth", "um-test-support", "dev"),
-        ("um-execution", "um-support", "normal"),
-        ("um-execution", "um-test-support", "dev"),
-        ("um-runner", "um-execution", "normal"),
-        ("um-runner", "um-execution", "dev"),
-        ("um-runner", "um-runner-protocol", "normal"),
-        ("um-runner", "um-support", "normal"),
-        ("um-runner", "um-test-support", "dev"),
+        ("useful-cli", "useful-api", "normal"),
+        ("useful-cli", "useful-execution", "normal"),
+        ("useful-cli", "useful-execution", "dev"),
+        ("useful-cli", "useful-human-auth", "normal"),
+        ("useful-cli", "useful-runner", "normal"),
+        ("useful-cli", "useful-runner", "dev"),
+        ("useful-cli", "useful-support", "dev"),
+        ("useful-cli", "useful-support", "normal"),
+        ("useful-cli", "useful-test-support", "dev"),
+        ("useful-api", "useful-support", "normal"),
+        ("useful-api", "useful-test-support", "dev"),
+        ("useful-human-auth", "useful-api", "normal"),
+        ("useful-human-auth", "useful-support", "normal"),
+        ("useful-human-auth", "useful-test-support", "dev"),
+        ("useful-execution", "useful-support", "normal"),
+        ("useful-execution", "useful-test-support", "dev"),
+        ("useful-runner", "useful-execution", "normal"),
+        ("useful-runner", "useful-execution", "dev"),
+        ("useful-runner", "useful-runner-protocol", "normal"),
+        ("useful-runner", "useful-support", "normal"),
+        ("useful-runner", "useful-test-support", "dev"),
     ]);
     assert_eq!(
         actual_edges, expected_edges,
@@ -290,13 +293,13 @@ fn moved_sources_have_one_final_owner_and_private_generated_api() {
     for source in all_package_sources(&root) {
         let relative = source.strip_prefix(&root).unwrap();
         let text = read_source(&source);
-        if text.contains("crate::human_auth") || text.contains("um_human_auth::credentials::") {
+        if text.contains("crate::human_auth") || text.contains("useful_human_auth::credentials::") {
             violations.push(format!(
                 "{} bypasses the human-auth facade",
                 relative.display()
             ));
         }
-        if text.contains("um_api::generated") {
+        if text.contains("useful_api::generated") {
             violations.push(format!(
                 "{} names the private generated API module",
                 relative.display()
@@ -459,7 +462,7 @@ fn execution_facade_and_process_ownership_match_slice_two_b() {
             }
         }
         for module in EXECUTION_IMPLEMENTATION_MODULES {
-            let deep_path = format!("um_execution::{module}");
+            let deep_path = format!("useful_execution::{module}");
             if text.contains(&deep_path) {
                 violations.push(format!(
                     "{} names private execution module `{module}`",
@@ -508,9 +511,9 @@ fn execution_and_runner_receive_identity_without_reading_root_build_policy() {
             for forbidden in [
                 "crate::build_info",
                 "crate::exit_code",
-                "UM_VERSION",
-                "UM_BUILD_IDENTITY",
-                "UM_RELEASE_COMMIT",
+                "USEFUL_VERSION",
+                "USEFUL_BUILD_IDENTITY",
+                "USEFUL_RELEASE_COMMIT",
                 "CARGO_PKG_VERSION",
             ] {
                 let present = if forbidden.starts_with("crate::") {
@@ -801,7 +804,7 @@ fn runner_test_waits_hold_no_literal_real_time_bound() {
             if let Some(bound) = LITERAL_BOUNDS.iter().find(|bound| code.contains(*bound)) {
                 violations.push(format!(
                     "{relative_text}:{}: `{bound}` is a literal bound; use \
-                     `um_test_support::watchdog` on `FIXTURE_WAIT_BASE`",
+                     `useful_test_support::watchdog` on `FIXTURE_WAIT_BASE`",
                     line_number + 1
                 ));
             }
@@ -809,7 +812,7 @@ fn runner_test_waits_hold_no_literal_real_time_bound() {
                 violations.push(format!(
                     "{relative_text}:{}: `tokio::time::timeout(` belongs only to \
                      {PRODUCTION_TOKIO_TIMEOUT}; use `with_watchdog` or \
-                     `um_test_support::watchdog`",
+                     `useful_test_support::watchdog`",
                     line_number + 1
                 ));
             }

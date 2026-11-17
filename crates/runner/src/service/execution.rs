@@ -32,7 +32,7 @@ use super::lease_clock::{
 use super::tree_run::{TransportResult, TreeConclusion, TreeRun};
 use super::workspace::{RetentionReason, WorkspaceDisposition};
 use crate::telemetry;
-use um_execution::{
+use useful_execution::{
     ActionId, ActiveStepInvocation, AdmittedWorkflow, AgentDiagnosticSessionStore, AgentExecution,
     AgentInputStaging, AgentInputStagingFailure, ArtifactStaging, ArtifactStagingFailure,
     AuthenticatedProcessGroup, AuthenticatedSignalResult, CancellationReason, CancellationSource,
@@ -58,7 +58,7 @@ use um_execution::{
     summary_disposition_matches, terminate_authenticated_process_group,
 };
 #[cfg(test)]
-use um_execution::{
+use useful_execution::{
     BlockedDetail, FinalizationTrigger, Prerequisite, RecoveryRoundNumber, TransitionSequence,
     spawn_isolated_command_launch,
 };
@@ -323,7 +323,7 @@ impl GuardProcessControl for FixtureGuardProcessControl {
         }
         if self.alive.load(Ordering::Acquire) {
             ProcessIdentityObservation::Exact {
-                leader: um_execution::LeaderState::Running,
+                leader: useful_execution::LeaderState::Running,
             }
         } else {
             ProcessIdentityObservation::Absent

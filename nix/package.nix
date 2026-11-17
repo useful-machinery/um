@@ -37,7 +37,7 @@ let
       );
 
   commonArgs = {
-    pname = "um";
+    pname = "useful";
     inherit src;
     strictDeps = true;
   };
@@ -66,7 +66,7 @@ let
   # The test gate injects fixed values shaped like a rolling version and build
   # identity, so its result is independent of the package's identity. The tests
   # compare the binary with whichever values were injected, and the package's
-  # postInstall verifies the real ones. `checks.um-cli` in the flake requires
+  # postInstall verifies the real ones. `checks.useful-cli` in the flake requires
   # this derivation; the package itself does not.
   testVersion = "0.0.0-dev.0+rev.0000000000000000000000000000000000000000";
   testBuildIdentity = "0000000000000000000000000000000000000000";
@@ -78,8 +78,8 @@ let
       python3
     ];
     env = certificateEnv // {
-      UM_BUILD_IDENTITY = testBuildIdentity;
-      UM_VERSION = testVersion;
+      USEFUL_BUILD_IDENTITY = testBuildIdentity;
+      USEFUL_VERSION = testVersion;
     };
   };
 
@@ -108,7 +108,7 @@ let
       # internal workers need the ordinary executable supplied explicitly.
       preBuild = ''
         cargo build --locked --workspace --all-features --bins --example internal-worker
-        export UM_TEST_INTERNAL_WORKER_EXECUTABLE="$(realpath "''${CARGO_TARGET_DIR:-target}/debug/examples/internal-worker")"
+        export USEFUL_TEST_INTERNAL_WORKER_EXECUTABLE="$(realpath "''${CARGO_TARGET_DIR:-target}/debug/examples/internal-worker")"
       '';
     }
   );
@@ -122,8 +122,8 @@ craneLib.buildPackage (
     nativeBuildInputs = [ jq ];
 
     env = certificateEnv // {
-      UM_BUILD_IDENTITY = resolvedBuildIdentity;
-      UM_VERSION = version;
+      USEFUL_BUILD_IDENTITY = resolvedBuildIdentity;
+      USEFUL_VERSION = version;
     };
 
     passthru = {
@@ -131,9 +131,9 @@ craneLib.buildPackage (
     };
 
     postInstall = ''
-      expected="um ${version}"
+      expected="useful ${version}"
       for invocation in "version" "--version"; do
-        actual="$($out/bin/um "$invocation")"
+        actual="$($out/bin/useful "$invocation")"
         if [ "$actual" != "$expected" ]; then
           echo "unexpected version output for $invocation: $actual" >&2
           echo "expected: $expected" >&2
@@ -141,14 +141,14 @@ craneLib.buildPackage (
         fi
       done
 
-      json="$($out/bin/um version --json)"
+      json="$($out/bin/useful version --json)"
       if ! printf '%s\n' "$json" | jq --exit-status \
         --arg buildIdentity ${lib.escapeShellArg resolvedBuildIdentity} \
-        --arg executablePath "$out/bin/um" \
+        --arg executablePath "$out/bin/useful" \
         --arg version ${lib.escapeShellArg version} \
         '. == {
           "schemaVersion": 1,
-          "command": "um",
+          "command": "useful",
           "version": $version,
           "executablePath": $executablePath,
           "buildIdentity": $buildIdentity
@@ -161,7 +161,7 @@ craneLib.buildPackage (
     meta = {
       description = "Command-line interface and runner for Useful Machinery";
       license = lib.licenses.asl20;
-      mainProgram = "um";
+      mainProgram = "useful";
       platforms = lib.platforms.unix;
     };
   }

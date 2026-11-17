@@ -13,7 +13,7 @@ fn embedded_reference_is_emitted_unchanged_without_external_state() {
     let api_url = format!("http://{}/api", listener.local_addr().unwrap());
     let entries_before = directory_entries(working_directory.path());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_um"))
+    let output = Command::new(env!("CARGO_BIN_EXE_useful"))
         .env_clear()
         .current_dir(working_directory.path())
         .args(["workflow", "reference"])
@@ -22,12 +22,18 @@ fn embedded_reference_is_emitted_unchanged_without_external_state() {
             super::CREDENTIALS_FILE_VARIABLE,
             "/dev/null/workflow-reference-credentials.json",
         )
-        .env("UM_API_URL", &api_url)
-        .env("UM_AUTH_ISSUER", "http://auth.workflow-reference.invalid/")
-        .env("UM_AUTH_AUDIENCE", "https://api.workflow-reference.invalid")
-        .env("UM_AUTH_CLIENT_ID", "workflow-reference-client")
+        .env("USEFUL_API_URL", &api_url)
+        .env(
+            "USEFUL_AUTH_ISSUER",
+            "http://auth.workflow-reference.invalid/",
+        )
+        .env(
+            "USEFUL_AUTH_AUDIENCE",
+            "https://api.workflow-reference.invalid",
+        )
+        .env("USEFUL_AUTH_CLIENT_ID", "workflow-reference-client")
         .output()
-        .expect("um should run");
+        .expect("useful should run");
 
     assert!(output.status.success());
     assert_eq!(
@@ -73,7 +79,7 @@ fn embedded_reference_is_emitted_unchanged_without_external_state() {
         "https://docs.usefulmachinery.com/agent/workflow-authoring.md",
         "https://docs.usefulmachinery.com/reference/workflow-v1.md",
         "https://docs.usefulmachinery.com/schemas/workflow-v1.schema.json",
-        "um workflow schema",
+        "useful workflow schema",
         "workflow validate --json",
     ] {
         assert!(

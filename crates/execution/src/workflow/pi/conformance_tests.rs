@@ -44,11 +44,11 @@ const FAKE_PROVIDER_EXTENSION: &str = include_str!(concat!(
     "/src/workflow/pi-json-v1-extension/src/conformance/fake-provider.ts"
 ));
 const PINNED_TEST_WATCHDOG: Duration = Duration::from_secs(20);
-const MODEL_NAME: &str = "um-fake/conformance";
+const MODEL_NAME: &str = "useful-fake/conformance";
 
 fn conformance_executable() -> Option<PathBuf> {
     let expected_suffix = format!("-pi-{PI_JSON_V1_QUALIFICATION_VERSION}/bin/pi");
-    std::env::var_os("UM_PI_CONFORMANCE_EXECUTABLE")
+    std::env::var_os("USEFUL_PI_CONFORMANCE_EXECUTABLE")
         .map(PathBuf::from)
         .filter(|path| path.to_string_lossy().ends_with(&expected_suffix))
 }
@@ -56,7 +56,7 @@ fn conformance_executable() -> Option<PathBuf> {
 fn require_conformance_executable() -> PathBuf {
     conformance_executable().unwrap_or_else(|| {
         panic!(
-            "UM_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi {PI_JSON_V1_QUALIFICATION_VERSION} executable"
+            "USEFUL_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi {PI_JSON_V1_QUALIFICATION_VERSION} executable"
         )
     })
 }
@@ -331,23 +331,23 @@ impl RealPiFixture {
             (OsString::from("FORCE_COLOR"), OsString::from("0")),
             (OsString::from("NO_COLOR"), OsString::from("1")),
             (
-                OsString::from("UM_PI_FAKE_PROVIDER_SOCKET"),
+                OsString::from("USEFUL_PI_FAKE_PROVIDER_SOCKET"),
                 controller.socket_path.as_os_str().to_owned(),
             ),
             (
-                OsString::from("UM_PI_STUBBORN_FIXTURE_EXECUTABLE"),
+                OsString::from("USEFUL_PI_STUBBORN_FIXTURE_EXECUTABLE"),
                 std::env::current_exe().unwrap().into_os_string(),
             ),
         ]);
         if hold_settlement {
             environment.insert(
-                OsString::from("UM_PI_FAKE_HOLD_SETTLEMENT"),
+                OsString::from("USEFUL_PI_FAKE_HOLD_SETTLEMENT"),
                 OsString::from("1"),
             );
         }
         if bash_only_tools {
             environment.insert(
-                OsString::from("UM_PI_FAKE_BASH_ONLY_TOOLS"),
+                OsString::from("USEFUL_PI_FAKE_BASH_ONLY_TOOLS"),
                 OsString::from("1"),
             );
         }
@@ -2129,7 +2129,7 @@ async fn pinned_real_pi_05_cancellation_quiesces_model_tool_retry_validation_and
 fn stubborn_descendant_process_fixture() {
     let _interrupt = crate::workflow::test_support::process_fixture_interrupt_receiver();
     let mut ready = std::io::stdout().lock();
-    ready.write_all(b"UM_STUBBORN_READY").unwrap();
+    ready.write_all(b"USEFUL_STUBBORN_READY").unwrap();
     ready.flush().unwrap();
     loop {
         std::thread::park();

@@ -1,5 +1,5 @@
 [package]
-name = "um-cli"
+name = "useful-cli"
 version = "0.0.0-dev"
 edition = "2024"
 rust-version = "1.97"
@@ -9,7 +9,7 @@ repository = "https://github.com/useful-machinery/um"
 publish = false
 
 [[bin]]
-name = "um"
+name = "useful"
 path = "src/main.rs"
 
 [workspace]
@@ -84,13 +84,13 @@ ring = "0.17.14"
 rustix = { version = "1.1.4", features = ["fs", "net", "process", "termios"] }
 rustls = { version = "0.23.42", default-features = false, features = ["ring", "std"] }
 rustls-platform-verifier = "=0.7.0"
-um-api = { path = "crates/api" }
-um-execution = { path = "crates/execution" }
-um-human-auth = { path = "crates/human-auth" }
-um-runner = { path = "crates/runner" }
-um-runner-protocol = { path = "crates/runner-protocol" }
-um-support = { path = "crates/support" }
-um-test-support = { path = "crates/test-support" }
+useful-api = { path = "crates/api" }
+useful-execution = { path = "crates/execution" }
+useful-human-auth = { path = "crates/human-auth" }
+useful-runner = { path = "crates/runner" }
+useful-runner-protocol = { path = "crates/runner-protocol" }
+useful-support = { path = "crates/support" }
+useful-test-support = { path = "crates/test-support" }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = { version = "1.0.151", features = ["arbitrary_precision", "unbounded_depth"] }
 tempfile = "3.27.0"
@@ -118,11 +118,11 @@ libc.workspace = true
 nix.workspace = true
 ring.workspace = true
 rustix = { workspace = true, features = ["event", "pty"] }
-um-api.workspace = true
-um-execution.workspace = true
-um-human-auth.workspace = true
-um-runner.workspace = true
-um-support.workspace = true
+useful-api.workspace = true
+useful-execution.workspace = true
+useful-human-auth.workspace = true
+useful-runner.workspace = true
+useful-support.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
@@ -137,10 +137,10 @@ fs4.workspace = true
 futures-util.workspace = true
 jsonschema.workspace = true
 rustix = { workspace = true, features = ["event", "pty"] }
-um-execution = { workspace = true, features = ["test-fixtures"] }
-um-runner = { workspace = true, features = ["test-fixtures"] }
-um-support = { workspace = true, features = ["test-fixtures"] }
-um-test-support.workspace = true
+useful-execution = { workspace = true, features = ["test-fixtures"] }
+useful-runner = { workspace = true, features = ["test-fixtures"] }
+useful-support = { workspace = true, features = ["test-fixtures"] }
+useful-test-support.workspace = true
 trycmd.workspace = true
 tokio = { workspace = true, features = ["sync"] }
 tokio-tungstenite.workspace = true

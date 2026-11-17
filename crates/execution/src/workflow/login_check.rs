@@ -46,7 +46,7 @@ use crate::claude_code::ValidatedClaudeCodeInstallation;
 use crate::codex::ValidatedCodexInstallation;
 use crate::owned_tree::remove_open_tree_at;
 
-const CHECK_DIRECTORY_PREFIX: &str = "um-login-check-";
+const CHECK_DIRECTORY_PREFIX: &str = "useful-login-check-";
 const WORKING_DIRECTORY: &str = "work";
 const STAGING_DIRECTORY: &str = "staging";
 const CHECK_IDENTITY: &str = "login-check";

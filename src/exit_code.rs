@@ -51,13 +51,13 @@ impl ExitCode {
     }
 }
 
-impl From<um_execution::ExecutionOutcome> for ExitCode {
-    fn from(outcome: um_execution::ExecutionOutcome) -> Self {
+impl From<useful_execution::ExecutionOutcome> for ExitCode {
+    fn from(outcome: useful_execution::ExecutionOutcome) -> Self {
         match outcome {
-            um_execution::ExecutionOutcome::Succeeded => Self::Success,
-            um_execution::ExecutionOutcome::Failed => Self::GeneralFailure,
-            um_execution::ExecutionOutcome::Interrupted => Self::Interrupted,
-            um_execution::ExecutionOutcome::Terminated => Self::Terminated,
+            useful_execution::ExecutionOutcome::Succeeded => Self::Success,
+            useful_execution::ExecutionOutcome::Failed => Self::GeneralFailure,
+            useful_execution::ExecutionOutcome::Interrupted => Self::Interrupted,
+            useful_execution::ExecutionOutcome::Terminated => Self::Terminated,
         }
     }
 }
@@ -77,7 +77,7 @@ impl Termination for ExitCode {
 #[cfg(test)]
 mod tests {
     use super::{ExitCode, OutcomeClass};
-    use um_execution::ExecutionOutcome;
+    use useful_execution::ExecutionOutcome;
 
     // INV-CLI-11
     #[test]

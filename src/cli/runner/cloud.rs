@@ -4,11 +4,11 @@ use anyhow::{Context, anyhow};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{
+use useful_api::{
     HttpTransportPolicy, RunnerApi, RunnerDeletionBlocker, RunnerFailure, RunnerPool,
     RunnerPoolList, RunnerRegistration, RunnerRegistrationList,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 pub(super) fn with_api<T>(
     deployment: &Deployment,
@@ -32,7 +32,7 @@ pub(super) fn with_api_retrying_rejected_result<T>(
     mut operation: impl FnMut(&RunnerApi) -> Result<T, RunnerFailure>,
     result_credential_rejected: impl Fn(&T) -> bool,
 ) -> anyhow::Result<Result<T, RunnerFailure>> {
-    let client = um_api::HttpClient::new(transport_policy)
+    let client = useful_api::HttpClient::new(transport_policy)
         .map_err(|error| anyhow!(error))
         .context("prepare human session networking")?;
     super::super::execute_selected_api_operation_retrying_result(
@@ -79,8 +79,8 @@ pub(super) fn write_pool_create(
     )
 }
 
-/// A pool's waiting runs and runner counts as `um runner pool show` reports them
-/// (REQ-RUNNERPOOL-89). um-api does not name its pool-status model, so the JSON
+/// A pool's waiting runs and runner counts as `useful runner pool show` reports them
+/// (REQ-RUNNERPOOL-89). useful-api does not name its pool-status model, so the JSON
 /// document borrows it generically and the report takes its counts.
 pub(super) struct PoolStatus<'a, S> {
     pub(super) document: &'a S,
@@ -444,7 +444,7 @@ fn write_runner_human_to(
 
 fn write_assignment_to(
     output: &mut impl Write,
-    assignment: &um_api::RunnerCurrentAssignment,
+    assignment: &useful_api::RunnerCurrentAssignment,
     indent: &str,
 ) -> anyhow::Result<()> {
     writeln!(output, "{indent}Run:         {}", assignment.run_id)?;
@@ -587,7 +587,7 @@ pub(super) fn write_activation_failure(
     )
 }
 
-/// A failure of the human API during `um runner serve`'s signed-in
+/// A failure of the human API during `useful runner serve`'s signed-in
 /// registration: the closed outcome as a `code:` line, the sign-in advice of
 /// a runner start, and `progress`, what the start left and how to go on.
 pub(super) fn write_registration_failure(
@@ -608,18 +608,18 @@ pub(super) fn write_registration_failure(
 /// What the command that failed adds after the closed outcome's remedy.
 #[derive(Clone, Copy)]
 enum FollowUp<'a> {
-    /// `um runner create` registered `runner_id` and issued no activation.
+    /// `useful runner create` registered `runner_id` and issued no activation.
     Created {
         organization: &'a str,
         runner_id: &'a str,
     },
-    /// `um runner serve` stopped registering the host.
+    /// `useful runner serve` stopped registering the host.
     Registration { progress: &'a str },
 }
 
 const SIGN_IN_TO_ADMINISTER: &str =
-    "error: runner administration requires sign-in\n\nSign in first:\n  um auth login";
-const SIGN_IN_TO_REGISTER: &str = "error: runner registration requires sign-in\n\nSign in, then start the runner again with the same options:\n  um auth login\n\nOn a host with no sign-in, start the runner with a join key instead of --personal or --pool-id: --join-key-file PATH|-, --join-key or UM_RUNNER_JOIN_KEY.";
+    "error: runner administration requires sign-in\n\nSign in first:\n  useful auth login";
+const SIGN_IN_TO_REGISTER: &str = "error: runner registration requires sign-in\n\nSign in, then start the runner again with the same options:\n  useful auth login\n\nOn a host with no sign-in, start the runner with a join key instead of --personal or --pool-id: --join-key-file PATH|-, --join-key or USEFUL_RUNNER_JOIN_KEY.";
 
 fn write_failure_with_context(
     deployment: &str,
@@ -727,7 +727,7 @@ fn write_failure_with_context(
             "error: this account has no personal runner pool\n\nName a runner pool with --pool-id, or a member with --member.".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
-        // `um runner serve` names no member, so its remedy is a pool alone.
+        // `useful runner serve` names no member, so its remedy is a pool alone.
         RunnerFailure::PoolPersonalUnavailable | RunnerFailure::PersonalPoolNotFound => (
             "pool_personal_unavailable",
             None,
@@ -803,7 +803,7 @@ fn write_failure_with_context(
                 runner_id,
             }) => writeln!(
                 stderr,
-                "{human}\n\nRunner {runner_id} was created without an activation. Issue one without creating another runner:\n  um runner activation issue {organization} {runner_id} --activation-file <PATH>"
+                "{human}\n\nRunner {runner_id} was created without an activation. Issue one without creating another runner:\n  useful runner activation issue {organization} {runner_id} --activation-file <PATH>"
             )?,
             Some(FollowUp::Registration { progress }) => {
                 let (diagnostic, remedy) = human.split_once("\n\n").unwrap_or((&human, ""));

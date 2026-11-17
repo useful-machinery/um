@@ -376,7 +376,7 @@ impl fmt::Debug for OtlpHttpExporter {
 
 impl OtlpHttpExporter {
     fn new(settings: ExportSettings) -> Result<Self, ()> {
-        um_support::install_provider();
+        useful_support::install_provider();
         let client = Client::builder()
             .connect_timeout(settings.timeout)
             .timeout(settings.timeout)
@@ -547,7 +547,7 @@ impl SpanProcessor for ExportSpanProcessor {
         let (sender, receiver) = sync_channel(self.queue_capacity);
         let diagnostics = self.diagnostics.clone();
         match thread::Builder::new()
-            .name("um-runner-otlp".to_owned())
+            .name("useful-runner-otlp".to_owned())
             .spawn(move || export_worker(exporter, receiver, &diagnostics))
         {
             Ok(worker) => {
@@ -632,7 +632,7 @@ mod tests {
 
     use super::*;
     use crate::telemetry::{Outcome, Recorder, TestCapture, runner_resource};
-    use um_test_support::watchdog::{FIXTURE_WAIT_BASE, host_scaled_recv};
+    use useful_test_support::watchdog::{FIXTURE_WAIT_BASE, host_scaled_recv};
 
     fn outcome(values: &[(&str, &str)]) -> SettingsOutcome {
         let values = values
@@ -828,8 +828,8 @@ mod tests {
                             stream
                                 .set_nonblocking(false)
                                 .expect("make accepted OTLP connection blocking");
-                            let request = um_test_support::read_request(&mut stream);
-                            let (head, body) = um_test_support::split_request(&request)
+                            let request = useful_test_support::read_request(&mut stream);
+                            let (head, body) = useful_test_support::split_request(&request)
                                 .expect("OTLP request should have headers");
                             requests.push(CapturedRequest {
                                 head: String::from_utf8(head.to_vec())

@@ -1,6 +1,6 @@
 # Workflow V1 authoring reference
 
-Reference ID: `um.workflow.v1.authoring`
+Reference ID: `useful.workflow.v1.authoring`
 
 Language version: `1`
 
@@ -10,7 +10,7 @@ Full language reference: <https://docs.usefulmachinery.com/reference/workflow-v1
 
 Raw schema: <https://docs.usefulmachinery.com/schemas/workflow-v1.schema.json>
 
-Embedded in `um`: Workflow V1 authoring and validation, not execution or
+Embedded in `useful`: Workflow V1 authoring and validation, not execution or
 repository changes.
 
 ## Authoring loop
@@ -76,8 +76,8 @@ multiple YAML documents, `%YAML` and unknown directives, and floating-point numb
 Execution inherits only `PATH`, `HOME`, `USER`, `LOGNAME`, `LANG`, `LC_ALL`, `LC_CTYPE`,
 `TERM`, and `TMPDIR` from the launching process. Add others at the root:
 `environmentPassthrough: [MY_TOKEN]`. Names are unique shell variables; missing ones
-are unset. `UM_*`, `SCHERZO_*`, and Git, SSH, and GitHub credential/helper names cannot
-be passed, except `GH_TOKEN`, `UM_LINEAR_ACCESS_TOKEN`, and `UM_LINEAR_ACCESS_TOKEN_FILE`;
+are unset. `USEFUL_*`, `SCHERZO_*`, and Git, SSH, and GitHub credential/helper names cannot
+be passed, except `GH_TOKEN`, `USEFUL_LINEAR_ACCESS_TOKEN`, and `USEFUL_LINEAR_ACCESS_TOKEN_FILE`;
 a runner sets these only from a grant. The engine injects source revision metadata. A
 step, finalizer, or recovery handler may list root names in `environmentPassthrough`
 (else `environment_passthrough_undeclared`) to get only those, `[]` for none; a handler
@@ -89,9 +89,9 @@ The `cmd` and `agent` node kinds may declare `failurePolicy`, `recovery`, `depen
 or may be `advisory`. `recovery.retries` is 1 through 10. It either omits `handler` for
 an immediate unchanged target recheck, names one closed command handler, or names one
 fresh-agent handler with an existing profile and retained prompt. A command handler
-reads the bounded private Recovery Context Schema 1 path from `UM_RECOVERY_CONTEXT` and
+reads the bounded private Recovery Context Schema 1 path from `USEFUL_RECOVERY_CONTEXT` and
 writes exactly one closed, at-most-16-KiB `recheck` or `gave_up` decision document to
-the fresh private `UM_RECOVERY_RESULT` path. An agent handler's profile and compatible
+the fresh private `USEFUL_RECOVERY_RESULT` path. An agent handler's profile and compatible
 installed harness are admission and runner-placement requirements even when recovery
 never activates.
 
@@ -117,10 +117,10 @@ never activates.
 
 To call GitHub, GitLab.com, or Linear as the person who started the run, pass
 `GH_TOKEN` and `GH_TOKEN_FILE`, `GITLAB_TOKEN` and `GITLAB_TOKEN_FILE`, or
-`UM_LINEAR_ACCESS_TOKEN` and `UM_LINEAR_ACCESS_TOKEN_FILE` in the root
+`USEFUL_LINEAR_ACCESS_TOKEN` and `USEFUL_LINEAR_ACCESS_TOKEN_FILE` in the root
 `environmentPassthrough`; a step's own list, if any, must keep them. On a runner the token
-is the run's member's, issued only when that member holds a grant (`um grant create`) and
-authorized that runner (`um grant authorize`); a run acting for nobody, such as a service
+is the run's member's, issued only when that member holds a grant (`useful grant create`) and
+authorized that runner (`useful grant authorize`); a run acting for nobody, such as a service
 principal's or a schedule's, gets none. A local run takes them from its environment. The
 variable is fixed when the runner takes the run; the file stays current. Tokens live about
 8 hours (GitHub), 2 (GitLab.com), or 24 (Linear) and are replaced a fifth of that before
@@ -168,7 +168,7 @@ steps:
 The vector is passed directly to the operating system. There is no shell parsing,
 interpolation, glob expansion, redirection, pipeline construction, or implicit shell.
 Put complex shell behavior in a repository-owned script. Commands alone accept named
-`inputs`; each bound value is materialized under the run-time `UM_STEP_INPUTS`
+`inputs`; each bound value is materialized under the run-time `USEFUL_STEP_INPUTS`
 directory with a `manifest.json`.
 
 ## Paths and references
@@ -529,14 +529,14 @@ secret, environment-setting, or workspace field.
 Print the installed raw structural contract, unchanged and without network access:
 
 ```sh
-um workflow schema
+useful workflow schema
 ```
 
 The schema checks document structure only. Validate a complete materialized source
 bundle with the installed CLI:
 
 ```sh
-um workflow validate \
+useful workflow validate \
   --source-root <ROOT> \
   <WORKFLOW_FILE> \
   --json

@@ -1104,9 +1104,13 @@ async fn a_pass_first_removes_the_temporary_files_its_killed_writes_left() {
     // What a write killed between creating its temporary file and the
     // rename leaves, as `<prefix>.<pid>.<sequence>`.
     let leftovers = [
-        directory.codex_home().join(".um-auth.json.tmp.4242.0"),
-        directory.codex_home().join(".um-config.toml.tmp.4242.1"),
-        directory.path().join(".um-claude-code.token.tmp.4242.2"),
+        directory.codex_home().join(".useful-auth.json.tmp.4242.0"),
+        directory
+            .codex_home()
+            .join(".useful-config.toml.tmp.4242.1"),
+        directory
+            .path()
+            .join(".useful-claude-code.token.tmp.4242.2"),
         state.join(".runner-agent-logins.json.tmp.4242.3"),
     ];
     for leftover in &leftovers {
@@ -1116,13 +1120,15 @@ async fn a_pass_first_removes_the_temporary_files_its_killed_writes_left() {
     // a swept name are not the pass's to remove; the link is not followed.
     let outside = fixture.root.path().join("home/outside");
     write_private(&outside, b"outside");
-    let link = directory.path().join(".um-claude-code.token.tmp.4242.4");
+    let link = directory
+        .path()
+        .join(".useful-claude-code.token.tmp.4242.4");
     std::os::unix::fs::symlink(&outside, &link).unwrap();
     let kept = [
         state.join(".runner-state.tmp.4242.5"),
         state.join(".runner-agent-logins.json.tmp.notes"),
         directory.path().join("notes"),
-        directory.codex_home().join(".um-auth.json.tmp"),
+        directory.codex_home().join(".useful-auth.json.tmp"),
     ];
     for other in &kept {
         write_private(other, b"other");
@@ -1790,8 +1796,8 @@ async fn an_admissions_pass_waits_for_a_pass_in_flight_and_then_makes_its_own() 
 fn offered(provider: AgentLoginProvider, generation: u64) -> Vec<OfferedLogin> {
     vec![OfferedLogin {
         variable: match provider {
-            AgentLoginProvider::ClaudeCode => um_execution::CLAUDE_CODE_LOGIN_VARIABLE,
-            _ => um_execution::CODEX_LOGIN_VARIABLE,
+            AgentLoginProvider::ClaudeCode => useful_execution::CLAUDE_CODE_LOGIN_VARIABLE,
+            _ => useful_execution::CODEX_LOGIN_VARIABLE,
         },
         provider,
         agent_login_id: FAKE_AGENT_LOGIN_ID.to_owned(),
@@ -1806,7 +1812,7 @@ impl Fixture {
         self.setup
             .observer(offered(AgentLoginProvider::Codex, generation))
             .expect("an observer of what was offered")
-            .observe(um_execution::CODEX_LOGIN_VARIABLE, outcome);
+            .observe(useful_execution::CODEX_LOGIN_VARIABLE, outcome);
     }
 
     /// Moves the setup's clock `seconds` later.
@@ -1982,7 +1988,7 @@ async fn a_use_is_stated_to_cloud_only_beside_a_ready_install() {
         .observer(offered(AgentLoginProvider::ClaudeCode, 1))
         .unwrap()
         .observe(
-            um_execution::CLAUDE_CODE_LOGIN_VARIABLE,
+            useful_execution::CLAUDE_CODE_LOGIN_VARIABLE,
             HarnessLoginOutcome::Refused,
         );
     let asked = fixture.cloud.reports().len();
@@ -2006,7 +2012,7 @@ async fn a_use_is_stated_to_cloud_only_beside_a_ready_install() {
 }
 
 impl Fixture {
-    /// A setup `um runner grant sync` asked for.
+    /// A setup `useful runner grant sync` asked for.
     async fn sync(&self) -> SetupAnswer {
         self.setup.set_up(SetupCaller::Sync).await
     }

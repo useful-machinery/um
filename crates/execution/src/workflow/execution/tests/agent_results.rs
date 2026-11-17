@@ -194,7 +194,7 @@ async fn structured_agent_result_flows_only_through_its_explicit_command_binding
       result:
         ref: outputs.produce.result
     command:
-      argv: ["/bin/sh", "-c", "IFS= read -r value < \"$UM_STEP_INPUTS/values/result\" || true; printf '%s' \"$value\" > consumed.json"]
+      argv: ["/bin/sh", "-c", "IFS= read -r value < \"$USEFUL_STEP_INPUTS/values/result\" || true; printf '%s' \"$value\" > consumed.json"]
     outputs:
       consumed:
         kind: file

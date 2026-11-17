@@ -1,18 +1,18 @@
-//! `um workflow run stop` and `um workflow run lift` (REQ-LOCALRUN-185); with `--cloud
+//! `useful workflow run stop` and `useful workflow run lift` (REQ-LOCALRUN-185); with `--cloud
 //! ORGANIZATION`, the control is carried to the Cloud run's runner instead (REQ-LOCALRUN-210).
 
 use std::collections::BTreeSet;
 
 use clap::Args;
 use serde_json::{Map, Value};
-use um_execution::{CONTROL_LIFT, CONTROL_STOP, WaitKind, read_controls, stop_in_force};
+use useful_execution::{CONTROL_LIFT, CONTROL_STOP, WaitKind, read_controls, stop_in_force};
 
 use super::control::{Acted, ControlFailure, ControlTarget, Refusal};
 
 pub(super) const STOP_ABOUT: &str = "Park a run before a workflow step";
 pub(super) const LIFT_ABOUT: &str = "Lift a stop so the run may continue past it";
-const STOP_COMMAND: &str = "um workflow run stop";
-const LIFT_COMMAND: &str = "um workflow run lift";
+const STOP_COMMAND: &str = "useful workflow run stop";
+const LIFT_COMMAND: &str = "useful workflow run lift";
 
 #[derive(Debug, Args)]
 pub(super) struct Stop {
@@ -162,7 +162,7 @@ impl Lift {
                         wait.then == step
                     }
             })
-            .map(um_execution::WaitRecord::id);
+            .map(useful_execution::WaitRecord::id);
         let payload = Map::from_iter([
             ("before".to_owned(), Value::String(step.to_owned())),
             ("stop".to_owned(), Value::String(stop.at.clone())),

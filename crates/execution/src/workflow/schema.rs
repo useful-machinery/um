@@ -1300,7 +1300,7 @@ fn parse_workflow_step_reference(reference: &str) -> Option<ValueReference> {
         return Some(ValueReference::Item { field: None });
     }
     if let Some(field) = reference.strip_prefix("item.") {
-        return um_support::is_identifier(field).then(|| ValueReference::Item {
+        return useful_support::is_identifier(field).then(|| ValueReference::Item {
             field: Some(field.to_owned()),
         });
     }

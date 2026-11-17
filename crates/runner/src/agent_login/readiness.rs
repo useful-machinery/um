@@ -3,9 +3,9 @@
 //! of what the runner installed. It holds no login material
 //! (REQ-GRANT-38). A missing document means the
 //! runner has installed nothing. An entry for a provider this build does not
-//! know, which a newer `um` may have written, is kept as it was read.
+//! know, which a newer `useful` may have written, is kept as it was read.
 //! A coding agent's entry records whether its provider is selected; one an
-//! earlier `um` wrote without it reads as selected by its state. Beside an
+//! earlier `useful` wrote without it reads as selected by its state. Beside an
 //! install it records how the provider answered the login's last use
 //! (REQ-GRANT-52). Each OAuth provider's entry records what the last
 //! assignment the runner admitted was issued, the run of that assignment and,
@@ -122,12 +122,12 @@ impl GrantReadiness {
             && self.state.held_by_grant()
             && self.issued.is_some() == (self.state == AgentLoginState::Ready)
             && self.issued.as_ref().is_none_or(|issued| {
-                issued.generation >= 1 && um_support::valid_typed_id(&issued.grant_id, "pgr_")
+                issued.generation >= 1 && useful_support::valid_typed_id(&issued.grant_id, "pgr_")
             })
             && self
                 .run_id
                 .as_deref()
-                .is_none_or(|run_id| um_support::valid_typed_id(run_id, "run_"))
+                .is_none_or(|run_id| useful_support::valid_typed_id(run_id, "run_"))
             && (self.checked_at.is_some() || (self.run_id.is_none() && self.ended_at.is_none()))
     }
 
@@ -557,7 +557,7 @@ fn recorded_from_wire(entry: WireEntry) -> Option<Recorded> {
     if entry
         .agent_login_id
         .as_deref()
-        .is_some_and(|id| !um_support::valid_typed_id(id, "agl_"))
+        .is_some_and(|id| !useful_support::valid_typed_id(id, "agl_"))
         || entry.grant_id.is_some()
         || entry.expires_at.is_some()
         || entry.run_id.is_some()

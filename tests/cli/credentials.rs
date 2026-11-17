@@ -259,11 +259,11 @@ fn status_reports_every_grant_and_authorization_and_each_provider_not_connected(
     );
     // The earlier command names its replacement on standard error, and only that
     // (REQ-GRANT-77).
-    assert_eq!(after_notice(&output, "um grant list"), "");
+    assert_eq!(after_notice(&output, "useful grant list"), "");
     assert_no_secret_output(&output, &[SENTINEL, TOKEN]);
 
     assert_eq!(human.status.code(), Some(0));
-    assert_eq!(after_notice(&human, "um grant list"), "");
+    assert_eq!(after_notice(&human, "useful grant list"), "");
     assert_no_secret_output(&human, &[SENTINEL, TOKEN]);
     let text = String::from_utf8(human.stdout).unwrap();
     let (rows, ended) = text.split_once("ended authorizations: 1").unwrap();
@@ -275,7 +275,7 @@ fn status_reports_every_grant_and_authorization_and_each_provider_not_connected(
         "reconnect_required",
         "wait_for_runner",
         "not_connected",
-        "um grant create github",
+        "useful grant create github",
     ] {
         assert!(rows.contains(name), "missing {name:?} in\n{text}");
     }
@@ -388,7 +388,7 @@ fn organization_keeps_only_that_organizations_agent_logins() {
 // REQ-GRANT-77
 #[test]
 fn the_hidden_status_keeps_the_earlier_projection_for_an_active_oauth_grant_with_no_runner() {
-    // The grant `um grant list` reports `not_connected` with `authorize_runner`.
+    // The grant `useful grant list` reports `not_connected` with `authorize_runner`.
     let mut unauthorized = grant(GRANT_ID, "github", "active");
     unauthorized["kind"] = "oauth".into();
     unauthorized["generation"] = 1.into();

@@ -2,8 +2,8 @@ use anyhow::Context;
 use clap::{ArgMatches, Args};
 
 use crate::exit_code::ExitCode;
-use um_api::{MemberGrant, MemberGrantApi, MemberGrantFailure, MemberGrantKind};
-use um_human_auth::Deployment;
+use useful_api::{MemberGrant, MemberGrantApi, MemberGrantFailure, MemberGrantKind};
+use useful_human_auth::Deployment;
 
 use super::authorization::{Holder, ended_authorization_views, write_deauthorized};
 use super::confirmation::{Confirmation, NATIVE_DEAUTHORIZE, Stated, Statement};
@@ -15,7 +15,7 @@ use super::{
 
 pub(super) const ABOUT: &str = "End a runner's authorization for one of your grants";
 
-/// `um grant deauthorize GRANT [RUNNER]`; given no `RUNNER` it offers the runners the grant is
+/// `useful grant deauthorize GRANT [RUNNER]`; given no `RUNNER` it offers the runners the grant is
 /// authorized for instead (REQ-GRANT-81).
 #[derive(Debug, Args)]
 pub(in crate::cli) struct Command {
@@ -38,7 +38,7 @@ pub(in crate::cli) struct Command {
 /// runner's run (REQ-GRANT-48); for an OAuth grant, no further token, and no stop
 /// (REQ-GRANT-56).
 impl Stated for Command {
-    const COMMAND: &'static str = "um grant deauthorize";
+    const COMMAND: &'static str = "useful grant deauthorize";
     type Usage = Self;
     const STATEMENT: Statement = Statement::ByKind {
         oauth: &[
@@ -99,7 +99,7 @@ impl Command {
             }
         };
         let runner_id = runner.id.as_str();
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate grant deauthorization request key")?;
         state_then_act::<Self, _>(
             deployment,

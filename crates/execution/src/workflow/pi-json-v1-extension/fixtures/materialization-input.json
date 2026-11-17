@@ -1,6 +1,6 @@
 {
-  "toolName": "um_result_8f3c2a1d",
-  "socketPath": "/tmp/um/invocation-fixed/result-validation.sock",
+  "toolName": "useful_result_8f3c2a1d",
+  "socketPath": "/tmp/useful/invocation-fixed/result-validation.sock",
   "parameters": {
     "additionalProperties": false,
     "properties": {

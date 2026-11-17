@@ -143,7 +143,7 @@ pub enum WaitQuestions {
 /// `questions` is an array, each element by its string `id`, else its one-based position as
 /// a decimal string, and by its text, the element itself when it is a string, else its
 /// string `text`, else its string `question`; otherwise the one question of
-/// `WaitQuestions::Unlisted`. `um workflow run answer` and the runner's progress report
+/// `WaitQuestions::Unlisted`. `useful workflow run answer` and the runner's progress report
 /// read a wait's questions through this one function (REQ-RUNNERENROLL-119).
 pub fn wait_questions(payload: &Map<String, Value>) -> WaitQuestions {
     let Some(questions) = payload.get("questions").and_then(Value::as_array) else {
@@ -510,7 +510,7 @@ impl ControlEvent {
         wait: Option<String>,
         payload: Option<Map<String, Value>>,
     ) -> Result<Self, LocalRunDirectoryError> {
-        let at = super::schema_common::utc_timestamp(um_support::utc_now())
+        let at = super::schema_common::utc_timestamp(useful_support::utc_now())
             .map_err(|_| LocalRunDirectoryError::ControlEventInvalid)?;
         Some(Self {
             source: SOURCE.to_owned(),
@@ -907,7 +907,7 @@ impl<'a> ControlTrigger<'a> {
 }
 
 /// Whether a control's `when` is a rule `control_when_holds` can evaluate at the wait, the
-/// grammar `um workflow definition validate` holds it to (REQ-WFDEF-10): parsed by the
+/// grammar `useful workflow definition validate` holds it to (REQ-WFDEF-10): parsed by the
 /// evaluator itself over an empty event, so validation and evaluation cannot disagree.
 pub(crate) fn control_when_parses(clause: &str) -> bool {
     control_when_holds(clause, &Value::Null, &|_| None).is_ok()

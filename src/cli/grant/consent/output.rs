@@ -11,7 +11,7 @@ use super::super::super::ApiFailureReport;
 use super::super::projection::grant_provider;
 use super::Front;
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{
+use useful_api::{
     Grant, GrantFailure, GrantProvider, GrantSession, GrantSessionReason, GrantSessionStatus,
     GrantState,
 };
@@ -92,14 +92,14 @@ pub(in crate::cli) fn report(deployment: &str, failure: &GrantFailure) -> ApiFai
         GrantFailure::NotFound => ApiFailureReport::new(
             "not_found",
             "error: provider grant not found",
-            "List your grants:\n  um grant list",
+            "List your grants:\n  useful grant list",
             OutcomeClass::GeneralFailure,
         ),
         GrantFailure::IdempotencyConflict => ApiFailureReport::idempotency_conflict(SUBJECT),
         GrantFailure::ConsentInProgress => ApiFailureReport::new(
             "consent_in_progress",
             "error: a consent for this provider is already in progress",
-            "Finish that consent or wait for it to expire, then list your grants:\n  um grant list",
+            "Finish that consent or wait for it to expire, then list your grants:\n  useful grant list",
             OutcomeClass::GeneralFailure,
         ),
         GrantFailure::ProviderUnavailable => ApiFailureReport::new(
@@ -128,8 +128,8 @@ pub(in crate::cli) struct ConsentProvider {
 }
 
 impl ConsentProvider {
-    fn of_session(provider: um_api::provider_grant_session::Provider) -> Self {
-        use um_api::provider_grant_session::Provider;
+    fn of_session(provider: useful_api::provider_grant_session::Provider) -> Self {
+        use useful_api::provider_grant_session::Provider;
         match provider {
             Provider::ProviderGrantSessionProviderGithub => Self::GITHUB,
             Provider::ProviderGrantSessionProviderGitlabCom => Self::GITLAB_COM,
@@ -396,7 +396,8 @@ pub(super) fn write_consent_failure(
     match (failure, session_id) {
         (GrantFailure::NotFound, None) => {
             report.summary = "error: linked identity not found".to_owned();
-            "List your linked identities:\n  um auth identity list".clone_into(&mut report.remedy);
+            "List your linked identities:\n  useful auth identity list"
+                .clone_into(&mut report.remedy);
         }
         (GrantFailure::NotFound, Some(_)) => {
             report.summary = "error: provider grant consent not found".to_owned();

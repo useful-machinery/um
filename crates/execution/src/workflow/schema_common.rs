@@ -3,7 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use time::format_description::well_known::Rfc3339;
 use time::{OffsetDateTime, UtcOffset};
 
-pub(super) use um_support::{is_identifier, is_lowercase_hex, lowercase_hex};
+pub(super) use useful_support::{is_identifier, is_lowercase_hex, lowercase_hex};
 
 /// The prefix of a `sha256:<hex>` digest as the definition and run records carry it.
 pub(super) const DIGEST_PREFIX: &str = "sha256:";

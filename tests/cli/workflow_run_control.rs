@@ -22,7 +22,7 @@ use super::workflow_run_list::shown_plain;
 /// The login name every control command in these tests runs as (REQ-LOCALRUN-181).
 pub(super) const OPERATOR: &str = "control-operator";
 
-/// `um workflow run LEAF RUN ARGS --json` as `OPERATOR`, with `UM_HOME` set when `home` is.
+/// `useful workflow run LEAF RUN ARGS --json` as `OPERATOR`, with `USEFUL_HOME` set when `home` is.
 pub(super) fn run_control(
     home: Option<&Home>,
     leaf: &str,
@@ -46,7 +46,7 @@ pub(super) fn control_command(
         .arg("--json")
         .env("USER", OPERATOR);
     if let Some(home) = home {
-        command.env("UM_HOME", home.path());
+        command.env("USEFUL_HOME", home.path());
     }
     command
 }
@@ -72,7 +72,7 @@ pub(super) fn recorded_as(
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let document = json(output);
     assert_eq!(document["schemaVersion"], 1, "{document}");
-    assert_eq!(document["command"], format!("um workflow run {leaf}"));
+    assert_eq!(document["command"], format!("useful workflow run {leaf}"));
     assert_eq!(document["outcome"], outcome, "{document}");
     assert_eq!(document["exitStatus"], 0);
     assert_eq!(document["runDirectory"], run.to_str().unwrap());
@@ -89,7 +89,7 @@ pub(super) fn refused(output: &Output, leaf: &str, code: &str) -> serde_json::Va
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     let document = json(output);
     assert_eq!(document["schemaVersion"], 1, "{document}");
-    assert_eq!(document["command"], format!("um workflow run {leaf}"));
+    assert_eq!(document["command"], format!("useful workflow run {leaf}"));
     assert_eq!(document["outcome"], "refused", "{document}");
     assert_eq!(document["exitStatus"], 1);
     let diagnostics = document["diagnostics"].as_array().unwrap();
@@ -311,7 +311,7 @@ fn a_repair_wait_is_retried_by_the_retry_command() {
         .last()
         .unwrap();
     assert!(workflow_run_schema().is_valid(&last), "{last}");
-    assert_eq!(last["command"], "um workflow run retry", "{last}");
+    assert_eq!(last["command"], "useful workflow run retry", "{last}");
     assert_eq!(last["result"]["continuation"]["reason"], "retry", "{last}");
     assert_eq!(last["wait"]["kind"], "approval", "{last}");
     assert_eq!(partition_event(&output)["continuation"]["reason"], "retry");
@@ -603,14 +603,14 @@ fn withdraw_cancel_and_release_end_and_release_runs() {
     );
 }
 
-/// Kills the `um` process it holds if a test leaves it running, and lets a held step go.
+/// Kills the `useful` process it holds if a test leaves it running, and lets a held step go.
 pub(super) struct LiveRun {
     pub(super) process: Child,
     pub(super) release: PathBuf,
 }
 
 impl LiveRun {
-    /// Sends `signal` to the `um` process alone and returns its output once it exits.
+    /// Sends `signal` to the `useful` process alone and returns its output once it exits.
     pub(super) fn signal(&mut self, signal: Signal) -> Output {
         kill_process(self.pid(), signal).unwrap();
         self.output()
@@ -620,7 +620,7 @@ impl LiveRun {
         Pid::from_raw(i32::try_from(self.process.id()).unwrap()).unwrap()
     }
 
-    /// The `um` process's output once it exits.
+    /// The `useful` process's output once it exits.
     fn output(&mut self) -> Output {
         use std::io::Read as _;
         let stderr = self.process.stderr.take().map(|mut pipe| {
@@ -696,7 +696,7 @@ fn live_run_held_at_design(bundle: &TreeBundle, name: &str) -> (LiveRun, PathBuf
         "the live run's held step",
         || {
             execution.join("held-design").exists()
-                && um_execution::lock_holder(&destination).is_ok_and(|holder| holder.is_some())
+                && useful_execution::lock_holder(&destination).is_ok_and(|holder| holder.is_some())
         },
         |held| *held,
     );
@@ -971,7 +971,7 @@ fn a_withdrawal_recorded_while_a_canceled_attempt_finishes_is_spent() {
         &stub,
         "AUTO-1",
         "blocked",
-        Some(("UM_TEST_SETTLED_GATE", &gate)),
+        Some(("USEFUL_TEST_SETTLED_GATE", &gate)),
     );
     let settled = gate.with_extension("settled");
     let (cancel, run) = std::thread::scope(|scope| {
@@ -1026,7 +1026,7 @@ fn a_withdraw_waits_for_a_process_releasing_the_run_after_its_last_read() {
         &stub,
         "AUTO-1",
         "blocked",
-        Some(("UM_TEST_RELEASE_GATE", &gate)),
+        Some(("USEFUL_TEST_RELEASE_GATE", &gate)),
     );
     fs::write(&live.release, "").unwrap();
     poll_until(
@@ -1049,7 +1049,7 @@ fn a_withdraw_waits_for_a_process_releasing_the_run_after_its_last_read() {
         },
         |reached| *reached,
     );
-    um_support::sleep(std::time::Duration::from_millis(500));
+    useful_support::sleep(std::time::Duration::from_millis(500));
     assert!(
         withdraw.process.try_wait().unwrap().is_none(),
         "the withdraw did not wait for the release: {:?}",
@@ -1080,7 +1080,7 @@ fn a_withdrawal_honored_at_the_first_read_is_spent() {
         &stub,
         "AUTO-1",
         "blocked",
-        Some(("UM_TEST_SETTLED_GATE", &gate)),
+        Some(("USEFUL_TEST_SETTLED_GATE", &gate)),
     );
     fs::write(&live.release, "").unwrap();
     poll_until(
@@ -1192,7 +1192,7 @@ fn a_withdraw_refused_credentials_across_release_appends_nothing() {
         "AUTO-1".to_owned(),
         "--json".to_owned(),
     ]);
-    command.env("UM_HOME", tree.home.path());
+    command.env("USEFUL_HOME", tree.home.path());
     let output = stub
         .point(&mut command)
         .env("USER", OPERATOR)
@@ -1243,15 +1243,15 @@ fn a_withdraw_refused_at_the_run_lock_appends_nothing() {
     assert_eq!(run_record(&run)["state"], "waiting");
 }
 
-/// `um workflow run withdraw RUN` of the waiting run `run`, held between its inspection and
-/// the run lock (`UM_TEST_RUN_LOCK_GATE`) while `between` acts on the run: its output.
+/// `useful workflow run withdraw RUN` of the waiting run `run`, held between its inspection and
+/// the run lock (`USEFUL_TEST_RUN_LOCK_GATE`) while `between` acts on the run: its output.
 fn withdrawn_at_the_lock(bundle: &TreeBundle, run: &Path, between: impl FnOnce()) -> Output {
     let gate = bundle.result("withdraw-lock-gate");
     fs::create_dir_all(gate.parent().unwrap()).unwrap();
     let _ = fs::remove_file(&gate);
     let _ = fs::remove_file(gate.with_extension("inspected"));
     let withdraw = control_command(None, "withdraw", run, &[])
-        .env("UM_TEST_RUN_LOCK_GATE", &gate)
+        .env("USEFUL_TEST_RUN_LOCK_GATE", &gate)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1267,7 +1267,7 @@ fn withdrawn_at_the_lock(bundle: &TreeBundle, run: &Path, between: impl FnOnce()
     withdraw.wait_with_output().unwrap()
 }
 
-/// `um workflow run retry` of `run` in the tree's execution root, as `OPERATOR` pointed at
+/// `useful workflow run retry` of `run` in the tree's execution root, as `OPERATOR` pointed at
 /// `stub`: its terminal document.
 fn retried(tree: &EngineeringWaitTree, stub: &LinearStub, run: &Path) -> serde_json::Value {
     let execution_root = tree.bundle.execution_root();
@@ -1283,8 +1283,8 @@ fn retried(tree: &EngineeringWaitTree, stub: &LinearStub, run: &Path) -> serde_j
     ))
 }
 
-/// `um workflow run withdraw AUTO-1` of the run `live` holds, held after its inspection
-/// (`UM_TEST_RUN_LOCK_GATE`) while `live`'s held step is released and its process exits, with
+/// `useful workflow run withdraw AUTO-1` of the run `live` holds, held after its inspection
+/// (`USEFUL_TEST_RUN_LOCK_GATE`) while `live`'s held step is released and its process exits, with
 /// `LINEAR_API_KEY` set when `key` is; calls `released` with the run directory before opening
 /// the gate. The command's output and the run directory.
 fn withdrawn_across_release(
@@ -1322,9 +1322,9 @@ fn withdrawn_across_release(
     (withdraw.output(), run)
 }
 
-/// `um workflow run withdraw AUTO-1` spawned under the tree's home as `OPERATOR` pointed at
+/// `useful workflow run withdraw AUTO-1` spawned under the tree's home as `OPERATOR` pointed at
 /// `stub`, with `LINEAR_API_KEY` set when `key` is, held after its inspection until `gate`
-/// exists (`UM_TEST_RUN_LOCK_GATE`); dropping it opens the gate.
+/// exists (`USEFUL_TEST_RUN_LOCK_GATE`); dropping it opens the gate.
 fn withdraw_at_lock_gate(
     tree: &EngineeringWaitTree,
     stub: &LinearStub,
@@ -1339,8 +1339,8 @@ fn withdraw_at_lock_gate(
         "--json".to_owned(),
     ]);
     command
-        .env("UM_HOME", tree.home.path())
-        .env("UM_TEST_RUN_LOCK_GATE", gate)
+        .env("USEFUL_HOME", tree.home.path())
+        .env("USEFUL_TEST_RUN_LOCK_GATE", gate)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1354,7 +1354,7 @@ fn withdraw_at_lock_gate(
     }
 }
 
-/// `um workflow run withdraw AUTO-1` of the run a live process holds, once it answers
+/// `useful workflow run withdraw AUTO-1` of the run a live process holds, once it answers
 /// `recorded`: the run directory.
 fn withdrawn_live(tree: &EngineeringWaitTree, stub: &LinearStub) -> PathBuf {
     let output = poll_until(
@@ -1508,7 +1508,7 @@ fn a_withdraw_before_a_continuation_begins_ends_the_abandoned_run() {
 }
 
 /// `leaf` of the abandoned `run` with `args`, spawned with the begin gate `gate`
-/// (`UM_TEST_BEGIN_GATE`) and held there; a command that ends before it, refused while the
+/// (`USEFUL_TEST_BEGIN_GATE`) and held there; a command that ends before it, refused while the
 /// abandoned attempt's orphaned step process still runs, is spawned again.
 fn held_at_begin_gate(run: &Path, leaf: &str, args: &[&str], gate: &Path) -> LiveRun {
     fs::create_dir_all(gate.parent().unwrap()).unwrap();
@@ -1517,7 +1517,7 @@ fn held_at_begin_gate(run: &Path, leaf: &str, args: &[&str], gate: &Path) -> Liv
         &format!("the {leaf}'s begin gate"),
         || {
             let mut process = control_command(None, leaf, run, args)
-                .env("UM_TEST_BEGIN_GATE", gate)
+                .env("USEFUL_TEST_BEGIN_GATE", gate)
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
@@ -1550,7 +1550,7 @@ fn ended_withdrawn_unattempted(output: &Output, leaf: &str, run: &Path) {
     let terminal = completed(output);
     assert_eq!(
         terminal["command"],
-        format!("um workflow run {leaf}"),
+        format!("useful workflow run {leaf}"),
         "{terminal}"
     );
     assert_eq!(terminal["outcome"], "withdrawn", "{terminal}");
@@ -1579,7 +1579,7 @@ fn withdraw_ends_an_abandoned_run() {
     ends_an_abandoned_run("withdraw", "withdrawn");
 }
 
-/// Runs the wait tree until its `design` step holds, kills the `um` process, and ends the
+/// Runs the wait tree until its `design` step holds, kills the `useful` process, and ends the
 /// abandoned run with `leaf`, which records `control.<leaf>` and exits the run `outcome`.
 fn ends_an_abandoned_run(leaf: &str, outcome: &str) {
     let bundle = wait_tree();
@@ -1642,7 +1642,7 @@ fn fan_out_root(root: &str) -> String {
     root.replacen("schemaVersion: 1\n", "schemaVersion: 1\nname: fanout\n", 1)
 }
 
-/// The wait tree published as a definition under a fresh `um` home (REQ-WFDEF-17), with
+/// The wait tree published as a definition under a fresh `useful` home (REQ-WFDEF-17), with
 /// its execution root.
 pub(super) struct PublishedWaitTree {
     pub(super) home: Home,
@@ -1710,12 +1710,12 @@ impl PublishedWaitTree {
         (directory, id, terminal)
     }
 
-    /// `um workflow run create` of the definition with `args` as `OPERATOR`.
+    /// `useful workflow run create` of the definition with `args` as `OPERATOR`.
     pub(super) fn create(&self, args: &[&str]) -> Output {
         self.create_in(&self.definition, args)
     }
 
-    /// `um workflow run create` of `definition` under this home with `args` as `OPERATOR`.
+    /// `useful workflow run create` of `definition` under this home with `args` as `OPERATOR`.
     pub(super) fn create_in(&self, definition: &str, args: &[&str]) -> Output {
         self.create_command(definition, args).output().unwrap()
     }
@@ -1733,7 +1733,7 @@ impl PublishedWaitTree {
         ]);
         command
             .args(args)
-            .env("UM_HOME", self.home.path())
+            .env("USEFUL_HOME", self.home.path())
             .env("USER", OPERATOR);
         command
     }
@@ -1934,7 +1934,7 @@ fn control_command_usage_errors_exit_two() {
 
 /// A subject's waiting run restarted onto a changed revision (REQ-LOCALRUN-194): the wait
 /// tree published with `subject: ticket`, a run for `AUTO-1` waiting on `answer` after
-/// `design` on revision 1, revision 2 publishing a changed `review.yaml`, and `um workflow run
+/// `design` on revision 1, revision 2 publishing a changed `review.yaml`, and `useful workflow run
 /// restart <predecessor id> --at review --json` run to its `approval` wait.
 pub(super) struct RestartedSubject {
     pub(super) published: PublishedWaitTree,
@@ -2004,12 +2004,12 @@ fn run_directories(runs: &Path) -> usize {
 }
 
 /// A successor command `leaf` refused before anything was created: the document at `phase`
-/// naming `um workflow run <leaf>`.
+/// naming `useful workflow run <leaf>`.
 fn successor_command_refused(output: &Output, leaf: &str, phase: &str) -> serde_json::Value {
     let rejection = tree_rejection(output);
     assert_eq!(
         rejection["command"],
-        format!("um workflow run {leaf}"),
+        format!("useful workflow run {leaf}"),
         "{rejection}"
     );
     assert_eq!(rejection["phase"], phase, "{rejection}");
@@ -2050,7 +2050,10 @@ fn a_restart_moves_a_waiting_subject_to_the_current_revision() {
     let (predecessor_id, successor_id) = (&restarted.predecessor_id, &restarted.successor_id);
 
     let terminal = &restarted.terminal;
-    assert_eq!(terminal["command"], "um workflow run restart", "{terminal}");
+    assert_eq!(
+        terminal["command"], "useful workflow run restart",
+        "{terminal}"
+    );
     assert_eq!(terminal["outcome"], "waiting", "{terminal}");
     assert_eq!(terminal["wait"]["kind"], "approval", "{terminal}");
     assert_ne!(successor, predecessor);
@@ -2154,7 +2157,7 @@ fn a_restart_moves_a_waiting_subject_to_the_current_revision() {
         "the successor's held merge",
         || {
             execution.join("held-merge").exists()
-                && um_execution::lock_holder(successor).is_ok_and(|holder| holder.is_some())
+                && useful_execution::lock_holder(successor).is_ok_and(|holder| holder.is_some())
         },
         |held| *held,
     );
@@ -2223,7 +2226,10 @@ fn an_unfinished_move_is_completed_or_undone_by_the_successors_continuation() {
     unsupersede("running");
     let before = records(predecessor);
     let refusal = tree_rejection(&run_control(home, "resume", successor_id, &[]));
-    assert_eq!(refusal["command"], "um workflow run resume", "{refusal}");
+    assert_eq!(
+        refusal["command"], "useful workflow run resume",
+        "{refusal}"
+    );
     assert_eq!(refusal["phase"], "continuation", "{refusal}");
     assert_eq!(
         refusal["diagnostics"][0]["code"], "successor_abandoned",
@@ -2280,7 +2286,7 @@ fn a_superseded_predecessor_is_not_continued_or_retried() {
 
     let rejection = refused(
         &run_control(home, "resume", predecessor_id, &["--from", "review"]),
-        "um workflow run resume",
+        "useful workflow run resume",
         "continuation",
     );
     names_the_successor(&rejection);
@@ -2294,7 +2300,7 @@ fn a_superseded_predecessor_is_not_continued_or_retried() {
             predecessor_id,
             &["--execution-root", execution_root.path().to_str().unwrap()],
         ),
-        "um workflow run retry",
+        "useful workflow run retry",
         "retry",
     );
     names_the_successor(&rejection);
@@ -2302,7 +2308,7 @@ fn a_superseded_predecessor_is_not_continued_or_retried() {
 
     let rejection = refused(
         &run_control(home, "resume", predecessor_id, &[]),
-        "um workflow run resume",
+        "useful workflow run resume",
         "continuation",
     );
     names_the_successor(&rejection);
@@ -2382,7 +2388,7 @@ fn list_and_show_print_a_restarted_runs_lineage() {
                 .map(|arg| (*arg).to_owned())
                 .collect::<Vec<_>>(),
         )
-        .env("UM_HOME", home.path())
+        .env("USEFUL_HOME", home.path())
         .env("USER", OPERATOR)
         .output()
         .unwrap();
@@ -2515,7 +2521,7 @@ fn a_restart_sets_text_inputs_of_the_current_revision() {
         "ticket".to_owned(),
         "AUTO-2".to_owned(),
     ])
-    .env("UM_HOME", published.home.path())
+    .env("USEFUL_HOME", published.home.path())
     .env("USER", OPERATOR)
     .output()
     .unwrap();
@@ -2592,7 +2598,10 @@ fn an_upgrade_moves_a_waiting_subject_with_its_wait() {
     bundle.write_source("merge.yaml", &changed);
     assert_eq!(published.republish(&[])["revision"]["n"], 2);
     let document = completed(&run_control(home, "upgrade", &predecessor_id, &[]));
-    assert_eq!(document["command"], "um workflow run upgrade", "{document}");
+    assert_eq!(
+        document["command"], "useful workflow run upgrade",
+        "{document}"
+    );
     assert_eq!(document["outcome"], "upgraded", "{document}");
     assert_eq!(document["exitStatus"], 0);
     assert_eq!(document["predecessor"], predecessor_id.as_str());
@@ -2645,7 +2654,10 @@ fn an_upgrade_moves_a_waiting_subject_with_its_wait() {
     decide(bundle, "merge", "landed");
     let output = resume(&successor);
     let terminal = completed(&output);
-    assert_eq!(terminal["command"], "um workflow run resume", "{terminal}");
+    assert_eq!(
+        terminal["command"], "useful workflow run resume",
+        "{terminal}"
+    );
     let continuation = &partition_event(&output)["continuation"];
     assert_eq!(continuation["reason"], "resume", "{continuation}");
     assert_eq!(continuation["fromSteps"], serde_json::json!(["merge"]));
@@ -2757,7 +2769,7 @@ fn an_upgrade_refuses_a_wait_resolved_between_its_inspection_and_the_lock() {
     let gate = bundle.result("upgrade-lock-gate");
     fs::create_dir_all(gate.parent().unwrap()).unwrap();
     let upgrade = control_command(home, "upgrade", &id, &[])
-        .env("UM_TEST_RUN_LOCK_GATE", &gate)
+        .env("USEFUL_TEST_RUN_LOCK_GATE", &gate)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2927,14 +2939,17 @@ fn a_restart_at_a_fan_out_waiting_past_its_first_element_advises_upgrade() {
     };
     let restarted_at = |output: &Output, item: u64| {
         let terminal = completed(output);
-        assert_eq!(terminal["command"], "um workflow run restart", "{terminal}");
+        assert_eq!(
+            terminal["command"], "useful workflow run restart",
+            "{terminal}"
+        );
         assert_eq!(terminal["outcome"], "waiting", "{terminal}");
         let successor = PathBuf::from(terminal["runDirectory"].as_str().unwrap());
         waits_at_element(&successor, item);
         (successor, String::from_utf8(output.stderr.clone()).unwrap())
     };
     let restarted = |output: &Output| restarted_at(output, 2);
-    let advises = |stderr: &str| stderr.contains("um workflow run upgrade");
+    let advises = |stderr: &str| stderr.contains("useful workflow run upgrade");
     let terminal = completed(&published.create(&[]));
     let predecessor = PathBuf::from(terminal["runDirectory"].as_str().unwrap());
     waits_at_element(&predecessor, 2);
@@ -3209,18 +3224,18 @@ const STAGE_TREE_PROGRAM: &str = "#!/bin/sh
 set -eu
 count=$(($(cat \"count-$1\" 2>/dev/null || printf 0) + 1))
 printf '%s' \"$count\" > \"count-$1\"
-part=$(cat \"${UM_STEP_INPUTS:-/nonexistent}/values/part\" 2>/dev/null || true)
+part=$(cat \"${USEFUL_STEP_INPUTS:-/nonexistent}/values/part\" 2>/dev/null || true)
 suffix=${part:+-$part}
 case \"$1\" in
   read) printf 'read-%s' \"$count\" > read.txt ;;
   plan)
-    cat \"$UM_STEP_INPUTS/values/read\" > \"seen-read$suffix\"
+    cat \"$USEFUL_STEP_INPUTS/values/read\" > \"seen-read$suffix\"
     printf 'plan-%s' \"$count\" > plan.txt ;;
   route)
-    cat \"$UM_STEP_INPUTS/values/plan\" > \"seen-plan$suffix\"
-    test ! -e \"$UM_STEP_INPUTS/values/notes\" ||
-      cat \"$UM_STEP_INPUTS/values/notes\" > \"seen-notes$suffix\"
-    test \"$(cat \"$UM_STEP_INPUTS/values/findings\")\" = null
+    cat \"$USEFUL_STEP_INPUTS/values/plan\" > \"seen-plan$suffix\"
+    test ! -e \"$USEFUL_STEP_INPUTS/values/notes\" ||
+      cat \"$USEFUL_STEP_INPUTS/values/notes\" > \"seen-notes$suffix\"
+    test \"$(cat \"$USEFUL_STEP_INPUTS/values/findings\")\" = null
     grep -qx fenced \"plan$suffix.md\"
     printf planned > verdict.txt ;;
   effect) printf 'effect%s\\n' \"$suffix\" >> effects ;;
@@ -3895,7 +3910,7 @@ fn a_repair_retry_in_another_execution_root_starts_a_fresh_child() {
     );
 }
 
-/// `um workflow run resume RUN --json`.
+/// `useful workflow run resume RUN --json`.
 fn continue_command(run: &Path) -> Vec<String> {
     vec![
         "workflow".to_owned(),
@@ -4021,12 +4036,12 @@ impl EngineeringWaitTree {
         }
     }
 
-    /// `um workflow run ARGS` under the home as `OPERATOR`, pointed at `stub`.
+    /// `useful workflow run ARGS` under the home as `OPERATOR`, pointed at `stub`.
     fn run(&self, stub: &LinearStub, args: &[&str]) -> Output {
         let mut full = vec!["workflow".to_owned(), "run".to_owned()];
         full.extend(args.iter().map(|arg| (*arg).to_owned()));
         let mut command = isolated_command(&full);
-        command.env("UM_HOME", self.home.path());
+        command.env("USEFUL_HOME", self.home.path());
         stub.point(&mut command)
             .env("USER", OPERATOR)
             .output()
@@ -4097,7 +4112,7 @@ impl EngineeringWaitTree {
             "--json".to_owned(),
         ]);
         command
-            .env("UM_HOME", self.home.path())
+            .env("USEFUL_HOME", self.home.path())
             .env("USER", OPERATOR)
             .envs(seam)
             .stdin(Stdio::null())
@@ -4115,7 +4130,7 @@ impl EngineeringWaitTree {
         live
     }
 
-    /// `um workflow run event RUN --event FILE --claim FILE --json` for a departure of
+    /// `useful workflow run event RUN --event FILE --claim FILE --json` for a departure of
     /// `issue-1` from `Engineering` towards `to` at `updated_at`, under the claim admitted at
     /// `ADMITTED_AT` in `Engineering`.
     fn event(&self, stub: &LinearStub, run: &Path, updated_at: &str, to: &str) -> Output {
@@ -4189,12 +4204,12 @@ impl EngineeringWaitTree {
     }
 }
 
-/// The document of `um workflow run event` applying `action` with `outcome`, exit 0.
+/// The document of `useful workflow run event` applying `action` with `outcome`, exit 0.
 fn applied(output: &Output, run: &Path, action: &str, outcome: &str) -> serde_json::Value {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let document = json(output);
     assert_eq!(document["schemaVersion"], 1, "{document}");
-    assert_eq!(document["command"], "um workflow run event");
+    assert_eq!(document["command"], "useful workflow run event");
     assert_eq!(document["outcome"], "applied", "{document}");
     assert_eq!(document["exitStatus"], 0);
     assert_eq!(document["runDirectory"], run.to_str().unwrap());
@@ -4476,7 +4491,7 @@ fn held_stage(bundle: &TreeBundle, name: &str) -> (PathBuf, LiveRun) {
         "the stage's held step",
         || {
             execution.join("held-work").exists()
-                && um_execution::lock_holder(&destination).is_ok_and(|holder| holder.is_some())
+                && useful_execution::lock_holder(&destination).is_ok_and(|holder| holder.is_some())
         },
         |held| *held,
     );
@@ -4626,7 +4641,7 @@ fn a_signal_before_a_successor_exists_leaves_the_predecessor_waiting() {
     }
 }
 
-/// Spawns `command` held at the run lock gate `gate` (`UM_TEST_RUN_LOCK_GATE`); once it has
+/// Spawns `command` held at the run lock gate `gate` (`USEFUL_TEST_RUN_LOCK_GATE`); once it has
 /// inspected the run, calls `at_gate`, sends it `signal`, opens the gate and returns its
 /// output.
 fn signalled_at_lock_gate(
@@ -4637,14 +4652,14 @@ fn signalled_at_lock_gate(
 ) -> Output {
     signalled_at_gate(
         command,
-        ("UM_TEST_RUN_LOCK_GATE", "inspected"),
+        ("USEFUL_TEST_RUN_LOCK_GATE", "inspected"),
         gate,
         signal,
         at_gate,
     )
 }
 
-/// Spawns `command` held at the child start gate `gate` (`UM_TEST_CHILD_START_GATE`); once
+/// Spawns `command` held at the child start gate `gate` (`USEFUL_TEST_CHILD_START_GATE`); once
 /// its attempt is about to prepare a stage's child, calls `at_gate`, sends it `signal`, opens
 /// the gate and returns its output.
 pub(super) fn signalled_at_child_start_gate(
@@ -4655,7 +4670,7 @@ pub(super) fn signalled_at_child_start_gate(
 ) -> Output {
     signalled_at_gate(
         command,
-        ("UM_TEST_CHILD_START_GATE", "starting"),
+        ("USEFUL_TEST_CHILD_START_GATE", "starting"),
         gate,
         signal,
         at_gate,
@@ -4696,7 +4711,7 @@ fn signalled_at_gate(
     at_gate();
     kill_process(command.pid(), signal).unwrap();
     // The process is idle at the gate; give its observer time to take the signal.
-    um_support::sleep(std::time::Duration::from_millis(500));
+    useful_support::sleep(std::time::Duration::from_millis(500));
     fs::write(gate, "").unwrap();
     command.output()
 }
@@ -4972,7 +4987,7 @@ fn interrupt_parks_one_live_run_and_retry_continues_its_stage() {
     // The other run's process still holds it, running, with nothing recorded on it.
     assert_eq!(run_record(&other)["state"], "running");
     assert_eq!(
-        um_execution::lock_holder(&other).unwrap(),
+        useful_execution::lock_holder(&other).unwrap(),
         Some(other_live.pid())
     );
     assert_eq!(control_count(&other), 0);
@@ -5066,10 +5081,10 @@ fn interrupt_refuses_a_run_it_cannot_interrupt() {
 
 /// The test `LockHolder` launches.
 const LOCK_HOLDER_FIXTURE: &str = "workflow_run_control::run_lock_holder_fixture";
-const HELD_LOCKS_VARIABLE: &str = "UM_TEST_HELD_RUN_LOCKS";
-const HELD_LOCKS_RELEASE_VARIABLE: &str = "UM_TEST_HELD_RUN_LOCKS_RELEASE";
+const HELD_LOCKS_VARIABLE: &str = "USEFUL_TEST_HELD_RUN_LOCKS";
+const HELD_LOCKS_RELEASE_VARIABLE: &str = "USEFUL_TEST_HELD_RUN_LOCKS_RELEASE";
 
-/// A process that holds run locks and installs no signal handler, as a `um` that predates
+/// A process that holds run locks and installs no signal handler, as a `useful` that predates
 /// the wake-up does, until it is dropped.
 struct LockHolder {
     process: Child,
@@ -5096,8 +5111,9 @@ impl LockHolder {
         poll_until(
             "the fixture's run locks",
             || {
-                runs.iter()
-                    .all(|run| um_execution::lock_holder(run).is_ok_and(|held| held == Some(pid)))
+                runs.iter().all(|run| {
+                    useful_execution::lock_holder(run).is_ok_and(|held| held == Some(pid))
+                })
             },
             |held| *held,
         );
@@ -5112,14 +5128,14 @@ impl LockHolder {
 impl Drop for LockHolder {
     fn drop(&mut self) {
         let _ = fs::write(&self.release, "");
-        let deadline = um_support::monotonic_now() + std::time::Duration::from_secs(10);
+        let deadline = useful_support::monotonic_now() + std::time::Duration::from_secs(10);
         while self.process.try_wait().ok().flatten().is_none() {
-            if um_support::monotonic_now() >= deadline {
+            if useful_support::monotonic_now() >= deadline {
                 let _ = self.process.kill();
                 let _ = self.process.wait();
                 return;
             }
-            um_support::sleep(std::time::Duration::from_millis(10));
+            useful_support::sleep(std::time::Duration::from_millis(10));
         }
     }
 }
@@ -5133,7 +5149,7 @@ fn run_lock_holder_fixture() {
         .map(|path| hold_lock(path.parent().unwrap()))
         .collect::<Vec<_>>();
     while !release.exists() {
-        um_support::sleep(std::time::Duration::from_millis(10));
+        useful_support::sleep(std::time::Duration::from_millis(10));
     }
     drop(held);
 }
@@ -5153,7 +5169,7 @@ fn an_unanswered_interrupt_is_pending_and_no_later_attempt_acts_on_it() {
 
     // A shortened polling cadence shortens the wait for the release with it.
     let output = control_command(None, "interrupt", &run, &["--reason", "pausing"])
-        .env("UM_TEST_POLL_INTERVAL_MILLISECONDS", "10")
+        .env("USEFUL_TEST_POLL_INTERVAL_MILLISECONDS", "10")
         .output()
         .unwrap();
     refused(&output, "interrupt", "interrupt_pending");
@@ -5170,7 +5186,7 @@ fn an_unanswered_interrupt_is_pending_and_no_later_attempt_acts_on_it() {
     // so a later attempt holds at `work` again.
     let mut later = held_again(root, "resume", &run, &[]);
     kill_process(later.pid(), Signal::URG).unwrap();
-    um_support::sleep(std::time::Duration::from_millis(500));
+    useful_support::sleep(std::time::Duration::from_millis(500));
     fs::write(&later.release, "").unwrap();
     let output = later.output();
     let terminal = chained(&output).pop().unwrap();

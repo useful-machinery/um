@@ -3,8 +3,8 @@
 //! GitHub REST API with the first GitHub token the environment offers (`GH_TOKEN_FILE`'s file,
 //! `GH_TOKEN`, `GITHUB_TOKEN`, else `gh auth token`) and its queue entry from Mergify's, the
 //! repository's merge queue, with `MERGIFY_TOKEN` when the CLI's environment holds one and else
-//! with that GitHub token, through `um_api::provider_get`. `UM_GITHUB_API_URL` and
-//! `UM_MERGIFY_API_URL` override the two base URLs for development and tests, and admit
+//! with that GitHub token, through `useful_api::provider_get`. `USEFUL_GITHUB_API_URL` and
+//! `USEFUL_MERGIFY_API_URL` override the two base URLs for development and tests, and admit
 //! `http`.
 
 use std::process::Command;
@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use serde_json::{Map, Value};
 use time::format_description::well_known::Rfc3339;
-use um_api::{HttpTransportPolicy, provider_get};
-use um_execution::{ConditionError, ExternalEvent, WaitRecord};
+use useful_api::{HttpTransportPolicy, provider_get};
+use useful_execution::{ConditionError, ExternalEvent, WaitRecord};
 use zeroize::Zeroizing;
 
 pub(super) const SOURCE: &str = "github";
@@ -21,8 +21,8 @@ pub(super) const QUEUE_SETTLED: &str = "pull_request.queue_settled";
 
 const GITHUB_API: &str = "https://api.github.com";
 const MERGIFY_API: &str = "https://api.mergify.com";
-const GITHUB_API_VARIABLE: &str = "UM_GITHUB_API_URL";
-const MERGIFY_API_VARIABLE: &str = "UM_MERGIFY_API_URL";
+const GITHUB_API_VARIABLE: &str = "USEFUL_GITHUB_API_URL";
+const MERGIFY_API_VARIABLE: &str = "USEFUL_MERGIFY_API_URL";
 const TOKEN_FILE_VARIABLE: &str = "GH_TOKEN_FILE";
 const GRANT_VARIABLE: &str = "GH_TOKEN";
 const TOKEN_VARIABLE: &str = "GITHUB_TOKEN";
@@ -128,7 +128,7 @@ impl PullRequest {
 
     /// The pull request the wait's rule names in its `event.pullRequest == "<url>"` conjunct.
     fn of(wait: &WaitRecord) -> Result<Self, ConditionError> {
-        let url = um_execution::event_literal(&wait.rule.where_, &["pullRequest"])
+        let url = useful_execution::event_literal(&wait.rule.where_, &["pullRequest"])
             .ok()
             .flatten()
             .ok_or_else(|| {
@@ -341,7 +341,9 @@ fn event(pull_request: &PullRequest, state: &str, head_sha: &str) -> ExternalEve
     ExternalEvent {
         source: SOURCE.to_owned(),
         event: QUEUE_SETTLED.to_owned(),
-        at: um_support::utc_now().format(&Rfc3339).unwrap_or_default(),
+        at: useful_support::utc_now()
+            .format(&Rfc3339)
+            .unwrap_or_default(),
         payload,
     }
 }
@@ -351,7 +353,7 @@ mod tests {
     use std::cell::RefCell;
 
     use serde_json::json;
-    use um_execution::{WaitKind, WaitRule};
+    use useful_execution::{WaitKind, WaitRule};
 
     use super::*;
 

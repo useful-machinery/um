@@ -1,6 +1,6 @@
 use anyhow::Context;
 use clap::{Args, Subcommand};
-use um_api::RunnerFailure;
+use useful_api::RunnerFailure;
 
 use super::{
     CloudOptions, Deployment, ExitCode, OrganizationArg, PaginationArgs, PoolArg, cloud,

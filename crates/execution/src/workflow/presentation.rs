@@ -51,11 +51,11 @@ use super::wait::position_path;
 use crate::AgentHarnessInstallationFailure;
 use crate::harness_installation::UntestedHarnessAdvisory;
 
-const RUN_COMMAND: &str = "um workflow run create";
-const RETRY_COMMAND: &str = "um workflow run retry";
-const RESUME_COMMAND: &str = "um workflow run resume";
-const RESTART_COMMAND: &str = "um workflow run restart";
-const UPGRADE_COMMAND: &str = "um workflow run upgrade";
+const RUN_COMMAND: &str = "useful workflow run create";
+const RETRY_COMMAND: &str = "useful workflow run retry";
+const RESUME_COMMAND: &str = "useful workflow run resume";
+const RESTART_COMMAND: &str = "useful workflow run restart";
+const UPGRADE_COMMAND: &str = "useful workflow run upgrade";
 const EVENT_TOKEN_WIDTH: usize = 10;
 const MIN_INLINE_DETAIL_WIDTH: usize = 24;
 const STACKED_DETAIL_INDENT: usize = 2;
@@ -219,8 +219,8 @@ pub struct SystemObservationClock;
 impl ObservationClock for SystemObservationClock {
     fn sample(&self) -> ObservationTime {
         ObservationTime {
-            utc: um_support::utc_now(),
-            monotonic: um_support::monotonic_now(),
+            utc: useful_support::utc_now(),
+            monotonic: useful_support::monotonic_now(),
         }
     }
 }
@@ -354,7 +354,7 @@ where
         self
     }
 
-    /// The documents of `um workflow run restart` of the run at `run_directory`, the
+    /// The documents of `useful workflow run restart` of the run at `run_directory`, the
     /// predecessor until the successor exists (REQ-LOCALRUN-194).
     pub fn for_restart(mut self, run_directory: &Path) -> Self {
         self.command = RESTART_COMMAND;
@@ -362,7 +362,7 @@ where
         self
     }
 
-    /// The documents of `um workflow run upgrade` of the run at `run_directory`, the
+    /// The documents of `useful workflow run upgrade` of the run at `run_directory`, the
     /// predecessor until the successor exists (REQ-LOCALRUN-197).
     pub fn for_upgrade(mut self, run_directory: &Path) -> Self {
         self.command = UPGRADE_COMMAND;
@@ -552,7 +552,7 @@ where
         self.render_subject_rejection(code, message, definition, revision, None)
     }
 
-    /// A `um workflow run restart` or `upgrade` refused before the successor exists
+    /// A `useful workflow run restart` or `upgrade` refused before the successor exists
     /// (REQ-LOCALRUN-194, REQ-LOCALRUN-197): phase `successor` with the one `code`, its
     /// `message` and `run`, the predecessor's id when it has a run record.
     pub fn render_successor_refusal(
@@ -577,7 +577,7 @@ where
         )
     }
 
-    /// A `um workflow run upgrade` refused before the successor exists because the run's
+    /// A `useful workflow run upgrade` refused before the successor exists because the run's
     /// carried state does not resolve against the current revision (REQ-LOCALRUN-197): phase
     /// `successor` with one diagnostic per miss, each carrying its `code`, `message` and
     /// `run`, the predecessor's id.
@@ -801,7 +801,7 @@ where
         self.write_rejection(&terminal, &human)
     }
 
-    /// A `um workflow run resume` without `--from` refused at the run's latest attempt
+    /// A `useful workflow run resume` without `--from` refused at the run's latest attempt
     /// (REQ-CONTINUE-29, REQ-CONTINUE-74, REQ-CONTINUE-76): phase `continuation` and one
     /// diagnostic with `code`, `message` and the attempt.
     pub fn render_continuation_refusal(
@@ -1102,7 +1102,7 @@ struct TreeRejectionDiagnosticV1<'a> {
     message: String,
     location: TreeRejectionLocationV1<'a>,
     /// Where inside a workflow file a per-file resolution failure sits, as
-    /// `um workflow definition validate` reports it.
+    /// `useful workflow definition validate` reports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     workflow_location: Option<super::rejection::RejectionLocation<'a>>,
 }
@@ -1240,10 +1240,10 @@ fn human_retry_rejection(rejection: &LocalRetryRejection) -> String {
             "retry blocked: attempt {attempt} has an active execution owner\n\nWait for the current attempt to finish, then retry."
         ),
         RetryIneligibilityReason::LatestAttemptSucceeded => format!(
-            "cannot retry run: attempt {attempt} succeeded\n\nA succeeded run cannot be retried. Start a new run instead:\n  um workflow run create --path <DIR> --execution-root <PATH> --run-dir <NEW_DIR>"
+            "cannot retry run: attempt {attempt} succeeded\n\nA succeeded run cannot be retried. Start a new run instead:\n  useful workflow run create --path <DIR> --execution-root <PATH> --run-dir <NEW_DIR>"
         ),
         RetryIneligibilityReason::LatestAttemptRejected => format!(
-            "cannot retry run: attempt {attempt} was rejected\n\nStart a new run with a corrected workflow definition instead:\n  um workflow run create --path <DIR> --execution-root <PATH> --run-dir <NEW_DIR>"
+            "cannot retry run: attempt {attempt} was rejected\n\nStart a new run with a corrected workflow definition instead:\n  useful workflow run create --path <DIR> --execution-root <PATH> --run-dir <NEW_DIR>"
         ),
         RetryIneligibilityReason::OwnershipUnproven => format!(
             "retry blocked: process ownership for attempt {attempt} is unproven\n\nNo safe retry remedy is available for this run."

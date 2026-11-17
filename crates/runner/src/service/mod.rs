@@ -57,8 +57,8 @@ use control::{
     LiveStatus, ReloadRequest,
 };
 use lease_clock::{LeaseClock, LeaseClockError};
-use um_execution::MAXIMUM_CANCELLATION_GRACE;
-use um_execution::untested_harness_advisories;
+use useful_execution::MAXIMUM_CANCELLATION_GRACE;
+use useful_execution::untested_harness_advisories;
 
 type SleepFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 type ConnectionFuture<'a> =
@@ -162,7 +162,7 @@ impl Sleeper for TokioSleeper {
     }
 
     fn utc_now(&self) -> time::OffsetDateTime {
-        um_support::utc_now()
+        useful_support::utc_now()
     }
 
     #[expect(
@@ -1880,7 +1880,7 @@ mod tests {
     use crate::service::assignment::test_support::manager_with_dependencies as assignment_manager_with_dependencies;
     use crate::service::config::RepositoryUrlPolicy;
     use crate::telemetry::{TestCapture, test_recorder};
-    use um_execution::{
+    use useful_execution::{
         ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, ValidatedPiInstallation,
         resolve,
     };
@@ -4172,9 +4172,9 @@ mod tests {
     }
 
     const SERVING_OWNER_FIXTURE: &str = "service::tests::serving_owner_fixture";
-    const SERVING_OWNER_ENDPOINT: &str = "UM_TEST_SERVING_OWNER_ENDPOINT";
-    const SERVING_OWNER_SOURCE: &str = "UM_TEST_SERVING_OWNER_SOURCE";
-    const SERVING_OWNER_WORK_ROOT: &str = "UM_TEST_SERVING_OWNER_WORK_ROOT";
+    const SERVING_OWNER_ENDPOINT: &str = "USEFUL_TEST_SERVING_OWNER_ENDPOINT";
+    const SERVING_OWNER_SOURCE: &str = "USEFUL_TEST_SERVING_OWNER_SOURCE";
+    const SERVING_OWNER_WORK_ROOT: &str = "USEFUL_TEST_SERVING_OWNER_WORK_ROOT";
 
     /// The serving runner that `abrupt_serving_owner_death_terminates_guarded_processes`
     /// kills: the production connection loop, assignment manager and engine in a process
@@ -4226,7 +4226,7 @@ mod tests {
                 std::env::current_exe().expect("locate the runner test executable"),
             )
             .args(["--ignored", "--exact", SERVING_OWNER_FIXTURE, "--nocapture"])
-            .env("UM_TEST_INTERNAL_WORKER_EXECUTABLE", &worker)
+            .env("USEFUL_TEST_INTERNAL_WORKER_EXECUTABLE", &worker)
             .env(SERVING_OWNER_ENDPOINT, endpoint)
             .env(SERVING_OWNER_SOURCE, source)
             .env(SERVING_OWNER_WORK_ROOT, work)

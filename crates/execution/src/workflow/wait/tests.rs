@@ -1210,7 +1210,7 @@ fn a_stop_is_in_force_until_a_later_lift_for_the_same_step() {
     assert_eq!(stop_in_force(&build, "build"), Some(&build[0]));
 }
 
-// REQ-LOCALRUN-182, REQ-RUNNERENROLL-119: the questions `um workflow run answer` accepts
+// REQ-LOCALRUN-182, REQ-RUNNERENROLL-119: the questions `useful workflow run answer` accepts
 // and the runner reports are one derivation over the wait's payload.
 #[test]
 fn a_wait_payload_lists_its_questions_by_id_and_text_or_asks_one() {

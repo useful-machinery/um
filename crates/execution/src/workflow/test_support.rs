@@ -77,7 +77,7 @@ pub(super) async fn run_with_stalled_child_guard(
     let pid_path = isolated.path().join("stalled-worker.pid");
     let guard_executable = isolated
         .path()
-        .join(format!("um{}", std::env::consts::EXE_SUFFIX));
+        .join(format!("useful{}", std::env::consts::EXE_SUFFIX));
     fs::write(
         &guard_executable,
         "#!/bin/sh\nroot=${0%/*}\nprintf '%s\\n' \"$$\" > \"$root/stalled-worker.pid\"\nIFS= read -r _\n",
@@ -88,7 +88,7 @@ pub(super) async fn run_with_stalled_child_guard(
     tokio::process::Command::new(current_executable)
         .args(["--exact", test, "--ignored"])
         .env(worker_pid_variable, pid_path)
-        .env("UM_TEST_INTERNAL_WORKER_EXECUTABLE", guard_executable)
+        .env("USEFUL_TEST_INTERNAL_WORKER_EXECUTABLE", guard_executable)
         .kill_on_drop(true)
         .status()
         .await
@@ -98,15 +98,15 @@ pub(super) async fn run_with_stalled_child_guard(
 pub(super) async fn wait_for_stalled_child_guard(worker_pid_variable: &str) -> i32 {
     let pid_path = std::path::PathBuf::from(std::env::var_os(worker_pid_variable).unwrap());
     tokio::task::spawn_blocking(move || {
-        let started = um_support::monotonic_now();
+        let started = useful_support::monotonic_now();
         loop {
             if let Ok(pid) = fs::read_to_string(&pid_path)
                 && let Ok(pid) = pid.trim().parse::<i32>()
             {
                 return pid;
             }
-            assert!(um_support::elapsed(started) < Duration::from_secs(5));
-            um_support::sleep(Duration::from_millis(10));
+            assert!(useful_support::elapsed(started) < Duration::from_secs(5));
+            useful_support::sleep(Duration::from_millis(10));
         }
     })
     .await
@@ -252,8 +252,8 @@ pub(crate) use fixtures::{
     pi_validation, step_clock, validation_fixtures,
 };
 
-// The host-scaled watchdog lives in `um_test_support::watchdog` (INV-TESTING-18).
-pub(crate) use um_test_support::watchdog::{
+// The host-scaled watchdog lives in `useful_test_support::watchdog` (INV-TESTING-18).
+pub(crate) use useful_test_support::watchdog::{
     MAX_WATCHDOG_SCALE, host_load, host_scaled_watchdog, host_scaled_watchdog_with_diagnosis,
     watchdog_scale,
 };

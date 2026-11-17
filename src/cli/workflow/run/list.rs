@@ -1,4 +1,4 @@
-//! `um workflow run list` (REQ-LOCALRUN-188, REQ-LOCALRUN-203): the live runs under the `um`
+//! `useful workflow run list` (REQ-LOCALRUN-188, REQ-LOCALRUN-203): the live runs under the `useful`
 //! home, or every run under `--all`, read without taking a run lock or changing a directory.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -9,15 +9,15 @@ use anyhow::{Context, anyhow};
 use clap::Args;
 use serde::Serialize;
 use serde_json::Value;
-use um_execution::{
+use useful_execution::{
     ListedRun, LocalRunDirectoryError, RunState, WaitRecord, WorkflowHome, WorkflowRunRecord,
     list_runs, normalize_terminal_path, normalize_terminal_scalar, position_path, read_definition,
 };
 
 use crate::exit_code::ExitCode;
 
-pub(super) const ABOUT: &str = "List the local workflow runs under the um home";
-const COMMAND: &str = "um workflow run list";
+pub(super) const ABOUT: &str = "List the local workflow runs under the useful home";
+const COMMAND: &str = "useful workflow run list";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -65,14 +65,14 @@ impl Command {
                     None,
                     &super::control::Refusal::new(
                         error.code(),
-                        "The um home cannot be located: neither UM_HOME nor HOME is set.",
+                        "The useful home cannot be located: neither USEFUL_HOME nor HOME is set.",
                     ),
                     self.output.json,
                 );
             }
         };
         let listing = list_runs(&home)
-            .map_err(|error| anyhow!(error).context("list the runs under the um home"))?;
+            .map_err(|error| anyhow!(error).context("list the runs under the useful home"))?;
         write_unreadable(&listing.unreadable).with_context(|| format!("write {COMMAND} output"))?;
         let owner = self.owner.map(|owner| {
             if owner == "me" {

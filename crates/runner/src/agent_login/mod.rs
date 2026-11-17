@@ -21,7 +21,7 @@ use std::ffi::{OsStr, OsString};
 use std::io;
 
 use serde::{Deserialize, Serialize};
-use um_execution::{
+use useful_execution::{
     CLAUDE_CODE_LOGIN_VARIABLE, CODEX_LOGIN_VARIABLE, EnvironmentSnapshot,
     grant_token_environment_names,
 };
@@ -209,8 +209,8 @@ pub(crate) struct OfferedLogin {
 /// agent reads (`CODEX_HOME`, `CLAUDE_CODE_OAUTH_TOKEN`) where the service
 /// has no login of that agent's own, and the variable withheld instead where
 /// the runner keeps none of a selected provider's login (REQ-GRANT-51).
-/// The grant token names (`GH_TOKEN`, `UM_LINEAR_ACCESS_TOKEN`,
-/// `UM_LINEAR_ACCESS_TOKEN_FILE`) are never offered from the process
+/// The grant token names (`GH_TOKEN`, `USEFUL_LINEAR_ACCESS_TOKEN`,
+/// `USEFUL_LINEAR_ACCESS_TOKEN_FILE`) are never offered from the process
 /// environment, since a workflow may pass them to its steps and the service's
 /// own values of them stay private (REQ-WORKSPACE-18); an admission is offered
 /// its grant tokens through `offer_with_grant_tokens`. Any other variable the

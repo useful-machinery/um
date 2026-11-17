@@ -9,15 +9,15 @@ use std::time::Duration;
 use anyhow::{Context as _, anyhow, ensure};
 use ring::digest::{SHA256, digest};
 use time::OffsetDateTime;
-use um_execution::{CaptureCancellation, resolve};
-use um_runner_protocol::{
+use url::Url;
+use useful_execution::{CaptureCancellation, resolve};
+use useful_runner_protocol::{
     ArtifactRegistrationOutcome, ArtifactRegistrationResponse, ArtifactResultRegistrationOutcome,
     ArtifactResultRegistrationResponse, ExecutionCapacityV1RunnerProjection, ExecutionLeaseGrant,
     ExecutionLeasePolicy, ExecutionLimitsV1RunnerProjection,
     PrimaryWorkspaceSourceV1RunnerProjection, WorkflowDefinitionSourceV1RunnerProjection,
     WorkflowSourceClosureDigestV1RunnerProjection,
 };
-use url::Url;
 
 use super::*;
 use crate::credential::Credential;
@@ -43,7 +43,7 @@ pub(crate) async fn run_nested_workflow_delivery_failure_scenario(
     let workflow = format!(
         "schemaVersion: 1\nsteps:\n  nested:\n    kind: cmd\n    command:\n      argv: {nested_arguments}\n    outputs:\n      result:\n        kind: file\n        from: path\n        path: delivery-rounds/0001/nested-result.txt\n        mediaType: text/plain\nexports:\n  nestedResult:\n    ref: outputs.nested.result\n"
     );
-    let nested_workflow = "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"/bin/sh\", \"-c\", \"printf 'nested portable result' > nested.txt\"]\n    outputs:\n      result:\n        kind: file\n        from: path\n        path: nested.txt\n        mediaType: text/plain\n  consume:\n    kind: cmd\n    inputs:\n      payload:\n        ref: outputs.produce.result\n    command:\n      argv: [\"/bin/sh\", \"-c\", \"mkdir -p ../run/.private/workflow-retained/.inputs-retained; cp -a \\\"$UM_STEP_INPUTS\\\" ../run/.private/workflow-retained/.inputs-retained/view-retained\"]\nexports:\n  portable:\n    ref: outputs.produce.result\n";
+    let nested_workflow = "schemaVersion: 1\nsteps:\n  produce:\n    kind: cmd\n    command:\n      argv: [\"/bin/sh\", \"-c\", \"printf 'nested portable result' > nested.txt\"]\n    outputs:\n      result:\n        kind: file\n        from: path\n        path: nested.txt\n        mediaType: text/plain\n  consume:\n    kind: cmd\n    inputs:\n      payload:\n        ref: outputs.produce.result\n    command:\n      argv: [\"/bin/sh\", \"-c\", \"mkdir -p ../run/.private/workflow-retained/.inputs-retained; cp -a \\\"$USEFUL_STEP_INPUTS\\\" ../run/.private/workflow-retained/.inputs-retained/view-retained\"]\nexports:\n  portable:\n    ref: outputs.produce.result\n";
 
     let temporary = tempfile::tempdir().context("create nested workflow scenario root")?;
     let source = temporary.path().join("source");
@@ -181,7 +181,7 @@ pub(crate) async fn run_nested_workflow_delivery_failure_scenario(
     // the original Git baseline, without rerunning the nested CLI fixture.
     fs::write(
         source.join("workflow.yaml"),
-        "schemaVersion: 1\nsteps:\n  nested:\n    kind: cmd\n    command: {argv: [\"/bin/sh\", \"-c\", \"test -r \\\"$UM_CONTINUATION_CONTEXT\\\"; test -f delivery-rounds/0001/nested-result.txt; printf continued > continued.txt\"]}\n    outputs:\n      result: {kind: text, from: path, path: continued.txt}\n  follow:\n    kind: cmd\n    inputs:\n      payload: {ref: outputs.nested.result}\n    command: {argv: [\"/bin/sh\", \"-c\", \"test -r \\\"$UM_CONTINUATION_CONTEXT\\\"; IFS= read -r value < \\\"$UM_STEP_INPUTS/values/payload\\\" || [ -n \\\"$value\\\" ] || exit 1; printf '%s' \\\"$value\\\" > followed.txt\"]}\nfinalizers:\n  clean:\n    kind: cmd\n    command: {argv: [\"/bin/sh\", \"-c\", \"test -r \\\"$UM_CONTINUATION_CONTEXT\\\"; printf finalized > finalized.txt\"]}\nexports:\n  nestedResult: {ref: outputs.nested.result}\n",
+        "schemaVersion: 1\nsteps:\n  nested:\n    kind: cmd\n    command: {argv: [\"/bin/sh\", \"-c\", \"test -r \\\"$USEFUL_CONTINUATION_CONTEXT\\\"; test -f delivery-rounds/0001/nested-result.txt; printf continued > continued.txt\"]}\n    outputs:\n      result: {kind: text, from: path, path: continued.txt}\n  follow:\n    kind: cmd\n    inputs:\n      payload: {ref: outputs.nested.result}\n    command: {argv: [\"/bin/sh\", \"-c\", \"test -r \\\"$USEFUL_CONTINUATION_CONTEXT\\\"; IFS= read -r value < \\\"$USEFUL_STEP_INPUTS/values/payload\\\" || [ -n \\\"$value\\\" ] || exit 1; printf '%s' \\\"$value\\\" > followed.txt\"]}\nfinalizers:\n  clean:\n    kind: cmd\n    command: {argv: [\"/bin/sh\", \"-c\", \"test -r \\\"$USEFUL_CONTINUATION_CONTEXT\\\"; printf finalized > finalized.txt\"]}\nexports:\n  nestedResult: {ref: outputs.nested.result}\n",
     )?;
     run_git(&source, &["add", "workflow.yaml"])?;
     run_git(&source, &["commit", "--quiet", "-m", "replacement"])?;
@@ -217,7 +217,7 @@ pub(crate) async fn run_nested_workflow_delivery_failure_scenario(
     successor.attempt_id = "atm_01k0z6r1w8f4jy2m7q9v3x5abm".into();
     successor.attempt_number = 2;
     successor.execution_spec.execution_spec_id = "xsp_01k0z6r1w8f4jy2m7q9v3x5abm".into();
-    successor.continuation = Some(Box::new(um_runner_protocol::ContinuationOffer {
+    successor.continuation = Some(Box::new(useful_runner_protocol::ContinuationOffer {
         prior_assignment_id: offered.assignment_id.clone(),
         prior_attempt_id: offered.attempt_id.clone(),
         required_runner_boot_id: BOOT_ID.into(),
@@ -481,7 +481,7 @@ pub(crate) async fn run_nested_workflow_delivery_failure_scenario(
     third.attempt_id = "atm_01k0z6r1w8f4jy2m7q9v3x5abr".into();
     third.attempt_number = 3;
     third.execution_spec.execution_spec_id = "xsp_01k0z6r1w8f4jy2m7q9v3x5abr".into();
-    third.continuation = Some(Box::new(um_runner_protocol::ContinuationOffer {
+    third.continuation = Some(Box::new(useful_runner_protocol::ContinuationOffer {
         prior_assignment_id: successor.assignment_id.clone(),
         prior_attempt_id: successor.attempt_id.clone(),
         required_runner_boot_id: BOOT_ID.into(),
@@ -778,7 +778,7 @@ fn offer() -> AssignmentOffer {
         project_id: "prj_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
         attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abg".to_owned(),
         attempt_number: 1,
-        execution_spec: um_runner_protocol::ExecutionSpecV1RunnerProjection {
+        execution_spec: useful_runner_protocol::ExecutionSpecV1RunnerProjection {
             execution_spec_id: "xsp_01k0z6r1w8f4jy2m7q9v3x5abg".to_owned(),
             schema_version: 1,
             execution_limits: ExecutionLimitsV1RunnerProjection {

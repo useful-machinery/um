@@ -120,7 +120,7 @@ mod runner_http {
     use zeroize::{Zeroize as _, Zeroizing};
 
     use crate::credential::Credential;
-    use um_execution::CaptureCancellation;
+    use useful_execution::CaptureCancellation;
 
     pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
     const RESPONSE_LIMIT: usize = 128 * 1024;
@@ -184,7 +184,7 @@ mod runner_http {
         timeout: Duration,
         cancellation: Option<&CaptureCancellation>,
     ) -> Result<Response, Failure> {
-        um_support::install_provider();
+        useful_support::install_provider();
         let client = reqwest::Client::builder()
             .timeout(timeout)
             .build()
@@ -344,9 +344,9 @@ mod runner_http {
         /// Frames one request with the shared loopback reader
         /// (INV-TESTING-25) and splits it at its blank line.
         pub(crate) fn read_request(stream: &mut TcpStream) -> RecordedRequest {
-            let request = um_test_support::read_request(stream);
-            let (head, body) =
-                um_test_support::split_request(&request).expect("request head should be complete");
+            let request = useful_test_support::read_request(stream);
+            let (head, body) = useful_test_support::split_request(&request)
+                .expect("request head should be complete");
             RecordedRequest {
                 head: String::from_utf8(head.to_vec()).unwrap(),
                 body: String::from_utf8(body.to_vec()).unwrap(),

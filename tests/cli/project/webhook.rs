@@ -497,7 +497,7 @@ fn webhook_invalid_config_and_stdin_contention_make_no_requests() {
     assert!(help.status.success());
     assert!(
         String::from_utf8_lossy(&help.stdout)
-            .contains("Usage: um project webhook delivery [COMMAND]")
+            .contains("Usage: useful project webhook delivery [COMMAND]")
     );
     assert!(server.finish().is_empty());
     let server = ScriptedServer::respond(vec![]);

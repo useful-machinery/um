@@ -50,10 +50,10 @@ const CORRECTION_TURN_ID: &str = "turn-correction";
 const PLACEHOLDER_KEY: &str = "scherzo-loopback-placeholder";
 
 fn conformance_executable() -> PathBuf {
-    std::env::var_os("UM_CODEX_CONFORMANCE_EXECUTABLE")
+    std::env::var_os("USEFUL_CODEX_CONFORMANCE_EXECUTABLE")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            panic!("UM_CODEX_CONFORMANCE_EXECUTABLE must name the pinned Codex executable")
+            panic!("USEFUL_CODEX_CONFORMANCE_EXECUTABLE must name the pinned Codex executable")
         })
 }
 
@@ -1249,7 +1249,7 @@ fn codex_process_fixture() {
         std::fs::write(std::env::var_os("CODEX_FIXTURE_READY").unwrap(), b"ready\n").unwrap();
         let proceed = PathBuf::from(std::env::var_os("CODEX_FIXTURE_PROCEED").unwrap());
         while !proceed.is_file() {
-            um_support::sleep(Duration::from_millis(1));
+            useful_support::sleep(Duration::from_millis(1));
         }
         std::thread::spawn(move || {
             for id in 0..8_000_i64 {
@@ -1277,7 +1277,7 @@ fn codex_process_fixture() {
         let released =
             PathBuf::from(std::env::var_os("CODEX_FIXTURE_WRITE_DEADLINE_RELEASED").unwrap());
         while !released.is_file() {
-            um_support::sleep(Duration::from_millis(1));
+            useful_support::sleep(Duration::from_millis(1));
         }
         #[cfg(any(target_os = "android", target_os = "linux"))]
         let close_flags = rustix::event::PollFlags::HUP | rustix::event::PollFlags::RDHUP;
@@ -3240,7 +3240,7 @@ for line in sys.stdin:
             },
         })
         response = json.loads(sys.stdin.readline())
-        with open(os.environ["UM_MCP_CAPTURE"], "w", encoding="utf-8") as output:
+        with open(os.environ["USEFUL_MCP_CAPTURE"], "w", encoding="utf-8") as output:
             json.dump(response, output, separators=(",", ":"))
         send({
             "jsonrpc": "2.0",
@@ -3259,7 +3259,7 @@ for line in sys.stdin:
         let mut config = std::fs::read_to_string(&config_path).unwrap();
         config.push_str(&format!(
             "\n[mcp_servers.fixture]\ncommand = \"python3\"\nargs = [{}]\n\
-             [mcp_servers.fixture.env]\nUM_MCP_CAPTURE = {}\n",
+             [mcp_servers.fixture.env]\nUSEFUL_MCP_CAPTURE = {}\n",
             serde_json::to_string(script.to_str().unwrap()).unwrap(),
             serde_json::to_string(capture.to_str().unwrap()).unwrap(),
         ));

@@ -1,11 +1,11 @@
 ```console
-$ um workflow run show --help
+$ useful workflow run show --help
 Show a local workflow run from its records, or a Cloud run with --cloud
 
-Usage: um workflow run show [OPTIONS] <RUN>
+Usage: useful workflow run show [OPTIONS] <RUN>
 
 Arguments:
-  <RUN>  Run directory, or the id or subject of a run under the um home
+  <RUN>  Run directory, or the id or subject of a run under the useful home
 
 Options:
       --json                           Print the workflow result as JSON

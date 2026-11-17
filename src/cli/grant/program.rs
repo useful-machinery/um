@@ -1,5 +1,5 @@
 //! Running a provider's own program for a sign-in or a consent: finding it on `PATH` only and
-//! waiting for it while a signal that would stop `um` is passed to it instead (INV-CLI-13).
+//! waiting for it while a signal that would stop `useful` is passed to it instead (INV-CLI-13).
 
 use std::ffi::OsStr;
 use std::io;
@@ -27,11 +27,11 @@ pub(super) fn find(path: Option<&OsStr>, program: &str) -> Option<PathBuf> {
         })
 }
 
-/// How a program `um` waited for ended.
+/// How a program `useful` waited for ended.
 pub(super) enum End {
     Success,
     Exited(ExitStatus),
-    /// A signal that would have stopped `um` arrived and was passed to the program; the first
+    /// A signal that would have stopped `useful` arrived and was passed to the program; the first
     /// one says how.
     Interrupted(Stop),
 }
@@ -45,7 +45,7 @@ pub(in crate::cli) enum Stop {
 }
 
 impl Stop {
-    /// The stop a signal `um` passed to the program asked for: SIGINT interrupts, and SIGTERM,
+    /// The stop a signal `useful` passed to the program asked for: SIGINT interrupts, and SIGTERM,
     /// SIGHUP and SIGQUIT terminate.
     const fn passed(signal: Signal) -> Self {
         match signal {
@@ -72,7 +72,7 @@ impl Stop {
     }
 }
 
-/// The four signals that would stop `um`, observed from before the program starts until it
+/// The four signals that would stop `useful`, observed from before the program starts until it
 /// ends. Observing needs the Tokio runtime the wait runs on.
 pub(super) struct Signals {
     interrupt: tokio::signal::unix::Signal,
@@ -92,7 +92,7 @@ impl Signals {
     }
 
     /// Waits for `child` to end, passing it each observed signal instead of letting the signal
-    /// stop `um`, so that what `um` made for the program is still removed. Once a signal has
+    /// stop `useful`, so that what `useful` made for the program is still removed. Once a signal has
     /// been passed, the end is [`End::Interrupted`] whatever the program's status.
     pub(super) async fn wait(mut self, child: &mut tokio::process::Child) -> io::Result<End> {
         let mut interrupted = None;

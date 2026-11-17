@@ -1,4 +1,4 @@
-//! `um workflow definition cloud` (REQ-CLOUDDEF-15): lists, shows and changes the Cloud
+//! `useful workflow definition cloud` (REQ-CLOUDDEF-15): lists, shows and changes the Cloud
 //! workflow definitions of a project through the public API (REQ-CLOUDDEF-1), and lists and
 //! shows a definition's start evaluations, with the CLI's session handling and each
 //! refusal's problem type.
@@ -13,8 +13,10 @@ use super::super::super::{
     self as cli, CommonArgs, OrganizationArg, PaginationArgs, PrincipalAuthenticationArgs,
     ProjectArg, WorkflowJson,
 };
-use um_api::{HttpClient, WorkflowDefinition, WorkflowDefinitionApi, WorkflowDefinitionFailure};
-use um_human_auth::Deployment;
+use useful_api::{
+    HttpClient, WorkflowDefinition, WorkflowDefinitionApi, WorkflowDefinitionFailure,
+};
+use useful_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Manage Cloud workflow definitions";
 const COMMAND_PATH: &[&str] = &["workflow", "definition", "cloud"];
@@ -222,7 +224,7 @@ impl Target {
     /// Applies `change` under one fresh key, sent again once when the response is lost or is
     /// a transient problem (REQ-CLOUDDEF-25).
     fn change(&self, deployment: &Deployment, change: Change<'_>) -> cli::CommandResult {
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate Cloud workflow definition request identity")?;
         let changed = with_api(deployment, &self.options, |api| {
             resend_once(|| change.apply(api, self, &key))

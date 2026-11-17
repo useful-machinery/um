@@ -500,7 +500,7 @@ fn invitation_accept_name_gate_reports_a_recoverable_schema_one_failure() {
             assert!(output.stderr.is_empty());
         } else {
             let message = String::from_utf8(output.stderr).unwrap();
-            assert!(message.contains("um account update --display-name"));
+            assert!(message.contains("useful account update --display-name"));
         }
         let request = server.finish().pop().unwrap();
         assert_authenticated(&request);

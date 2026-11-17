@@ -761,7 +761,7 @@ impl AssignmentProcessGuards {
                     absent,
                 });
             }
-            um_support::sleep(std::time::Duration::from_millis(25));
+            useful_support::sleep(std::time::Duration::from_millis(25));
         }
         Err(ProcessGuardStoreError)
     }
@@ -882,7 +882,7 @@ mod tests {
     impl GuardProcessControl for CountingControl {
         fn observe(&self, _: &AuthenticatedProcessGroup) -> ProcessIdentityObservation {
             ProcessIdentityObservation::Exact {
-                leader: um_execution::LeaderState::Running,
+                leader: useful_execution::LeaderState::Running,
             }
         }
 
@@ -920,7 +920,7 @@ mod tests {
                 ProcessIdentityObservation::Unavailable
             } else if self.alive.load(Ordering::SeqCst) {
                 ProcessIdentityObservation::Exact {
-                    leader: um_execution::LeaderState::Running,
+                    leader: useful_execution::LeaderState::Running,
                 }
             } else {
                 ProcessIdentityObservation::Absent

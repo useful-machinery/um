@@ -1,5 +1,5 @@
 [package]
-name = "um-execution"
+name = "useful-execution"
 version = "0.0.0-dev"
 edition.workspace = true
 rust-version.workspace = true
@@ -28,7 +28,7 @@ ratatui.workspace = true
 regex.workspace = true
 ring.workspace = true
 rustix.workspace = true
-um-support.workspace = true
+useful-support.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
@@ -41,4 +41,4 @@ yaml-rust2.workspace = true
 
 [dev-dependencies]
 rustix = { workspace = true, features = ["event", "pty"] }
-um-test-support.workspace = true
+useful-test-support.workspace = true

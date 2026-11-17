@@ -1,8 +1,8 @@
 ```console
-$ um run continue --help
+$ useful run continue --help
 Continue a run from selected steps
 
-Usage: um run continue [OPTIONS] --from <STEP> <ORGANIZATION> <RUN>
+Usage: useful run continue [OPTIONS] --from <STEP> <ORGANIZATION> <RUN>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug

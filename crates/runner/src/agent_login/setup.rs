@@ -28,8 +28,8 @@ use std::time::Duration;
 
 use opentelemetry::KeyValue;
 use time::OffsetDateTime;
-use um_execution::{HarnessLoginObserver, HarnessLoginOutcome};
 use url::Url;
+use useful_execution::{HarnessLoginObserver, HarnessLoginOutcome};
 
 use super::check::{CHECK_ALLOWANCE, LoginCheck, LoginCheckOutcome};
 use super::claude_code;
@@ -121,7 +121,7 @@ impl AssignmentGate for Admitting {
 /// (REQ-GRANT-90).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SetupCaller {
-    /// `um runner grant sync`, through the control socket: every login the
+    /// `useful runner grant sync`, through the control socket: every login the
     /// pass leaves `ready` is checked.
     Sync,
     /// The schedule, at start and every interval: a login the pass
@@ -294,7 +294,7 @@ impl AgentLoginSetup {
     pub(crate) async fn set_up(self: &Arc<Self>, caller: SetupCaller) -> SetupAnswer {
         self.set_up_on(caller, |setup| {
             std::thread::Builder::new()
-                .name("um-agent-login-setup".to_owned())
+                .name("useful-agent-login-setup".to_owned())
                 .spawn(setup)
                 .map(|_detached| ())
         })

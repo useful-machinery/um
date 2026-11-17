@@ -1,26 +1,26 @@
 //! The run mirror's Linear target (REQ-LOCALRUN-192): `MirrorTarget` over Linear's GraphQL
 //! API with the Linear credential the environment holds when the target is made, through
-//! `um_api::provider_post_json`. The credential is the first of the token in the file
-//! `UM_LINEAR_ACCESS_TOKEN_FILE` names and `UM_LINEAR_ACCESS_TOKEN`, a runner's grant token
+//! `useful_api::provider_post_json`. The credential is the first of the token in the file
+//! `USEFUL_LINEAR_ACCESS_TOKEN_FILE` names and `USEFUL_LINEAR_ACCESS_TOKEN`, a runner's grant token
 //! sent as `Bearer`, and the operator's `LINEAR_API_KEY`, sent bare in `Authorization` as
 //! Linear's personal keys are; a target is made for each hook, so each reads the credential
-//! anew. `UM_LINEAR_API_URL` overrides the base URL for development and tests, and admits
+//! anew. `USEFUL_LINEAR_API_URL` overrides the base URL for development and tests, and admits
 //! `http`. Every request is one attempt: a comment is not idempotent, and a failed write is
-//! recorded for a person to see. `um workflow run event` reads an issue by its Linear id
+//! recorded for a person to see. `useful workflow run event` reads an issue by its Linear id
 //! through the same target (REQ-LOCALRUN-208).
 
 use std::cell::RefCell;
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use um_api::{HttpTransportPolicy, provider_post_json};
-use um_execution::{MirrorFailure, MirrorTarget};
+use useful_api::{HttpTransportPolicy, provider_post_json};
+use useful_execution::{MirrorFailure, MirrorTarget};
 use zeroize::Zeroizing;
 
 const LINEAR_API: &str = "https://api.linear.app";
-const API_VARIABLE: &str = "UM_LINEAR_API_URL";
-const TOKEN_FILE_VARIABLE: &str = "UM_LINEAR_ACCESS_TOKEN_FILE";
-const TOKEN_VARIABLE: &str = "UM_LINEAR_ACCESS_TOKEN";
+const API_VARIABLE: &str = "USEFUL_LINEAR_API_URL";
+const TOKEN_FILE_VARIABLE: &str = "USEFUL_LINEAR_ACCESS_TOKEN_FILE";
+const TOKEN_VARIABLE: &str = "USEFUL_LINEAR_ACCESS_TOKEN";
 const KEY_VARIABLE: &str = "LINEAR_API_KEY";
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// The most of Linear's error message a diagnostic carries.
@@ -74,7 +74,7 @@ struct Issue {
     states: Vec<(String, String)>,
 }
 
-/// An issue as `um workflow run event` reads it fresh (REQ-LOCALRUN-208): its team id, its
+/// An issue as `useful workflow run event` reads it fresh (REQ-LOCALRUN-208): its team id, its
 /// state's id and name, and its `updatedAt`, none when Linear's answer lacks them.
 pub(in super::super) struct IssueObservation {
     pub(in super::super) team: Option<String>,
@@ -95,7 +95,7 @@ pub(in super::super) struct LinearTarget {
 }
 
 impl LinearTarget {
-    /// The target the environment configures: `UM_LINEAR_API_URL` or Linear's API, and the
+    /// The target the environment configures: `USEFUL_LINEAR_API_URL` or Linear's API, and the
     /// Linear credential it holds now (`environment_authorization`).
     pub(in super::super) fn from_environment() -> Self {
         let overridden = std::env::var(API_VARIABLE)
@@ -327,7 +327,7 @@ impl LinearTarget {
 
 /// The `Authorization` value of the Linear credential the environment holds now
 /// (REQ-LOCALRUN-192): `Bearer` and the grant token `offered_token` reads from
-/// `UM_LINEAR_ACCESS_TOKEN_FILE` and `UM_LINEAR_ACCESS_TOKEN`, else `LINEAR_API_KEY` bare.
+/// `USEFUL_LINEAR_ACCESS_TOKEN_FILE` and `USEFUL_LINEAR_ACCESS_TOKEN`, else `LINEAR_API_KEY` bare.
 fn environment_authorization() -> Option<String> {
     match super::offered_token(TOKEN_FILE_VARIABLE, TOKEN_VARIABLE) {
         Some(token) => Some(format!("Bearer {}", token.as_str())),

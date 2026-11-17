@@ -545,7 +545,7 @@ impl ExecutionJob {
                 .workflow()
                 .agent_profile_replacement
                 .as_ref()
-                .map(um_execution::AgentProfileReplacementV1::from_resolved),
+                .map(useful_execution::AgentProfileReplacementV1::from_resolved),
             execution_root: admitted.execution().root().to_owned(),
             maximum_parallel_steps: admitted.execution().limits().maximum_parallel_steps(),
             maximum_retained_bytes_per_stream: admitted
@@ -579,7 +579,7 @@ impl ExecutionJob {
 
     pub(super) fn continuation_record(
         &self,
-    ) -> Result<Option<um_execution::ContinuationRecordV1>, RunnerResultFailure> {
+    ) -> Result<Option<useful_execution::ContinuationRecordV1>, RunnerResultFailure> {
         self.accepted
             .continuation
             .as_ref()

@@ -99,7 +99,7 @@ impl Tree {
     }
 }
 
-/// A temporary `um` home; the read-only tree copies are made writable again before the
+/// A temporary `useful` home; the read-only tree copies are made writable again before the
 /// directory is removed.
 struct Home {
     temporary: TempDir,
@@ -109,9 +109,9 @@ struct Home {
 impl Home {
     fn new() -> Self {
         let temporary = tempfile::tempdir().expect("temporary home should be created");
-        let root = temporary.path().join("um-home");
+        let root = temporary.path().join("useful-home");
         let home = WorkflowHome::from_lookup(|name| {
-            (name == "UM_HOME").then(|| root.clone().into_os_string())
+            (name == "USEFUL_HOME").then(|| root.clone().into_os_string())
         })
         .expect("home should resolve");
         Self { temporary, home }
@@ -215,30 +215,33 @@ fn lookup<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<OsStri
 
 // REQ-WFDEF-17
 #[test]
-fn home_is_um_home_when_set_and_not_empty_else_home_dot_um() {
-    let home = WorkflowHome::from_lookup(lookup(&[("UM_HOME", "/srv/um"), ("HOME", "/h")]))
-        .expect("UM_HOME should resolve");
-    assert_eq!(home.root(), Path::new("/srv/um"));
-    assert_eq!(home.workflows_directory(), Path::new("/srv/um/workflows"));
+fn home_is_useful_home_when_set_and_not_empty_else_home_dot_useful() {
+    let home = WorkflowHome::from_lookup(lookup(&[("USEFUL_HOME", "/srv/useful"), ("HOME", "/h")]))
+        .expect("USEFUL_HOME should resolve");
+    assert_eq!(home.root(), Path::new("/srv/useful"));
+    assert_eq!(
+        home.workflows_directory(),
+        Path::new("/srv/useful/workflows")
+    );
     assert_eq!(
         home.definition_directory("def_01jabcdefghjkmnpqrstvwxyz0"),
-        Path::new("/srv/um/workflows/def_01jabcdefghjkmnpqrstvwxyz0")
+        Path::new("/srv/useful/workflows/def_01jabcdefghjkmnpqrstvwxyz0")
     );
     let hex = "a".repeat(64);
     assert_eq!(
         home.tree_directory(&format!("sha256:{hex}")),
-        Some(PathBuf::from(format!("/srv/um/trees/sha256/{hex}")))
+        Some(PathBuf::from(format!("/srv/useful/trees/sha256/{hex}")))
     );
 
     for pairs in [
         &[("HOME", "/h")][..],
-        &[("UM_HOME", ""), ("HOME", "/h")][..],
+        &[("USEFUL_HOME", ""), ("HOME", "/h")][..],
     ] {
         let home = WorkflowHome::from_lookup(lookup(pairs)).expect("HOME should resolve");
-        assert_eq!(home.root(), Path::new("/h/.um"));
+        assert_eq!(home.root(), Path::new("/h/.useful"));
     }
 
-    for pairs in [&[][..], &[("UM_HOME", ""), ("HOME", "")][..]] {
+    for pairs in [&[][..], &[("USEFUL_HOME", ""), ("HOME", "")][..]] {
         let error = WorkflowHome::from_lookup(lookup(pairs)).expect_err("no home should resolve");
         assert_eq!(error.code(), "home_unavailable");
     }

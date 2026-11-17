@@ -1203,7 +1203,7 @@ impl ClaudeCodeStreamJsonV1Parser {
         // differs from Pi's session-header and agent-start boundaries.
         self.rejection_context.stage = ClaudeCodeStreamJsonV1ProtocolStage::FrameDecode;
         let value =
-            um_support::strict_json_from_slice(frame).map_err(|_| self.protocol_failure())?;
+            useful_support::strict_json_from_slice(frame).map_err(|_| self.protocol_failure())?;
         let Some(object) = value.as_object() else {
             return self.reject(
                 ClaudeCodeStreamJsonV1RejectionReason::FrameNotObject,
@@ -2071,7 +2071,7 @@ impl ClaudeCodeStreamJsonV1Parser {
         {
             if name.as_ref() == STRUCTURED_OUTPUT_TOOL_NAME {
                 let candidate = if input_delta_seen {
-                    let Ok(candidate) = um_support::strict_json_from_str(&input_json) else {
+                    let Ok(candidate) = useful_support::strict_json_from_str(&input_json) else {
                         return self.reject(
                             ClaudeCodeStreamJsonV1RejectionReason::ContentBlockCorrelationInvalid,
                             ClaudeCodeStreamJsonV1ProtocolStage::ContentBlockStop,

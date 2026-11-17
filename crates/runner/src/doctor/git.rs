@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::{CheckDescriptor, DoctorCheck, Outcome, Status};
-use um_execution::{CommandProbeError, CommandRequest, CommandRunner, SystemCommandRunner};
+use useful_execution::{CommandProbeError, CommandRequest, CommandRunner, SystemCommandRunner};
 
 const MINIMUM_VERSION: GitVersion = GitVersion(2, 29, 0);
 /// The bounds of every Git probe the doctor starts.
@@ -235,7 +235,7 @@ mod tests {
 
     use super::{GitCheck, GitVersion, MINIMUM_VERSION, parse_version};
     use crate::doctor::{DoctorCheck, Outcome, Status};
-    use um_execution::{CommandOutput, CommandProbeError, CommandRequest, CommandRunner};
+    use useful_execution::{CommandOutput, CommandProbeError, CommandRequest, CommandRunner};
 
     #[derive(Clone)]
     struct FakeRunner {

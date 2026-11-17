@@ -172,14 +172,14 @@ fn controlled_path_for(executable: &Path) -> tempfile::TempDir {
 }
 
 fn conformance_executable() -> Option<PathBuf> {
-    std::env::var_os("UM_PI_CONFORMANCE_EXECUTABLE")
+    std::env::var_os("USEFUL_PI_CONFORMANCE_EXECUTABLE")
         .map(PathBuf::from)
         .filter(|path| path.to_string_lossy().ends_with("-pi-1.3.0/bin/pi"))
 }
 
 fn require_conformance_executable() -> PathBuf {
     conformance_executable().unwrap_or_else(|| {
-        panic!("UM_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 1.3.0 executable")
+        panic!("USEFUL_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 1.3.0 executable")
     })
 }
 
@@ -651,7 +651,7 @@ fn pinned_real_pi_validation_does_not_read_trust_or_execute_project_extensions()
     .expect("saved trust should be written");
 
     let path = controlled_path_for(&executable);
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_um"))
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_useful"))
         .args(["runner", "doctor", "--check", PI_CHECK_ID, "--json"])
         .current_dir(project_directory.path())
         .env("PATH", path.path())

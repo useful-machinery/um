@@ -1,11 +1,11 @@
 ```console
-$ um workflow run resume --help
+$ useful workflow run resume --help
 Continue a local workflow run, or a Cloud run with --cloud
 
-Usage: um workflow run resume [OPTIONS] <RUN>
+Usage: useful workflow run resume [OPTIONS] <RUN>
 
 Arguments:
-  <RUN>  Run directory, or the id or subject of a run under the um home
+  <RUN>  Run directory, or the id or subject of a run under the useful home
 
 Options:
       --from <STEP>                    Ordinary step to reexecute (repeatable); without it, resume a waiting or abandoned run
@@ -23,6 +23,6 @@ Select one or more ordinary steps with --from. Their downstream ordinary depende
 
 Without --from, a waiting run continues once a control resolves its wait and otherwise reports the wait unchanged, and a run whose process died continues from the step it was running.
 
-With --cloud ORGANIZATION, RUN is a Cloud run ID: the command asks Cloud to continue that run under its own definition from the steps --from names, or with none from where its record stands, and reports the request as um run continue does. It reads and writes no local run.
+With --cloud ORGANIZATION, RUN is a Cloud run ID: the command asks Cloud to continue that run under its own definition from the steps --from names, or with none from where its record stands, and reports the request as useful run continue does. It reads and writes no local run.
 
 ```

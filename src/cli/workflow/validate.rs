@@ -7,14 +7,14 @@ use clap::Args;
 use serde::Serialize;
 
 use crate::exit_code::ExitCode;
-use um_execution::{
+use useful_execution::{
     CancellationSource, RejectionDiagnostic as Diagnostic, ReplacedAgentProfileV1,
     ReplacedHarnessV1, ResolutionFailure, ResolvedWorkflow, human_resolution_remedy,
     resolve_workflow_file_with_agent_profiles,
 };
 
 pub(super) const ABOUT: &str = "Validate a local workflow definition";
-const COMMAND_NAME: &str = "um workflow validate";
+const COMMAND_NAME: &str = "useful workflow validate";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -136,13 +136,13 @@ fn human_required_inputs(workflow: &ResolvedWorkflow) -> String {
         .join(", ")
 }
 
-fn input_kind(kind: um_execution::WorkflowValueType) -> &'static str {
+fn input_kind(kind: useful_execution::WorkflowValueType) -> &'static str {
     match kind {
-        um_execution::WorkflowValueType::Text => "text",
-        um_execution::WorkflowValueType::AttachmentCollection => "attachments",
-        um_execution::WorkflowValueType::Json => "json",
-        um_execution::WorkflowValueType::File => "file",
-        um_execution::WorkflowValueType::GitBranch => "git_branch",
+        useful_execution::WorkflowValueType::Text => "text",
+        useful_execution::WorkflowValueType::AttachmentCollection => "attachments",
+        useful_execution::WorkflowValueType::Json => "json",
+        useful_execution::WorkflowValueType::File => "file",
+        useful_execution::WorkflowValueType::GitBranch => "git_branch",
     }
 }
 

@@ -4,8 +4,8 @@
   ...
 }:
 let
-  certificateDirectory = "${pkgs.umCertificateBundle.hashed}/etc/ssl/certs";
-  certificateFile = "${pkgs.umCertificateBundle}/etc/ssl/certs/ca-bundle.crt";
+  certificateDirectory = "${pkgs.usefulCertificateBundle.hashed}/etc/ssl/certs";
+  certificateFile = "${pkgs.usefulCertificateBundle}/etc/ssl/certs/ca-bundle.crt";
 in
 {
   # Devenv 2.3.1 filters SSL_CERT_FILE from the generic Nix environment.
@@ -23,7 +23,7 @@ in
     # receives the same certificate policy without importing private files.
     overlays = [
       (final: prev: {
-        umCertificateBundle = final.callPackage ./nix/certificate-bundle.nix { };
+        usefulCertificateBundle = final.callPackage ./nix/certificate-bundle.nix { };
         nodejs_24 = final.callPackage ./nix/nodejs.nix {
           npmBuildPatch = builtins.head (
             builtins.filter (
@@ -35,7 +35,7 @@ in
       })
     ];
 
-    packages = [ pkgs.umCertificateBundle ];
+    packages = [ pkgs.usefulCertificateBundle ];
 
     env.SSL_CERT_FILE = certificateFile;
     env.SSL_CERT_DIR = certificateDirectory;

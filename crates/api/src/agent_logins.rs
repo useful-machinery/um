@@ -275,7 +275,7 @@ impl AgentLoginApi {
     ) -> Result<AgentLoginList, AgentLoginFailure> {
         #[allow(
             deprecated,
-            reason = "the earlier `um auth agent-login` commands keep this route for one release"
+            reason = "the earlier `useful auth agent-login` commands keep this route for one release"
         )]
         let page = apis::principals_api::list_agent_logins(&self.configuration, limit, cursor)
             .map_err(|error| classify_error(Operation::Other, error))?;
@@ -288,7 +288,7 @@ impl AgentLoginApi {
     pub fn get(&self, agent_login_id: &str) -> Result<AgentLogin, AgentLoginFailure> {
         #[allow(
             deprecated,
-            reason = "the earlier `um auth agent-login` commands keep this route for one release"
+            reason = "the earlier `useful auth agent-login` commands keep this route for one release"
         )]
         let login = apis::principals_api::get_agent_login(&self.configuration, agent_login_id)
             .map_err(|error| classify_error(Operation::Other, error))?;
@@ -331,7 +331,7 @@ impl AgentLoginApi {
             body?,
             StatusCode::CREATED,
         )?;
-        if um_support::wire_name(created.provider) != um_support::wire_name(login.provider)
+        if useful_support::wire_name(created.provider) != useful_support::wire_name(login.provider)
             || !valid_agent_login(&created)
         {
             return Err(invalid());
@@ -448,8 +448,8 @@ impl Drop for AgentLoginApi {
 }
 
 fn valid_agent_login(value: &AgentLogin) -> bool {
-    um_support::valid_typed_id(&value.id, "agl_")
-        && um_support::valid_typed_id(&value.organization_id, "org_")
+    useful_support::valid_typed_id(&value.id, "agl_")
+        && useful_support::valid_typed_id(&value.organization_id, "org_")
         && value.generation >= 1
         && value.record_schema_version >= 1
         && value.key_version >= 1
@@ -496,8 +496,8 @@ pub(crate) fn valid_ended_authorization(value: &AgentLoginEndedAuthorization) ->
 // A stop names the run asked to stop and the cancellation request made of it
 // (REQ-GRANT-48).
 fn valid_stop(value: &AgentLoginStop) -> bool {
-    um_support::valid_typed_id(&value.run_id, "run_")
-        && um_support::valid_typed_id(&value.cancellation_request_id, "cmd_")
+    useful_support::valid_typed_id(&value.run_id, "run_")
+        && useful_support::valid_typed_id(&value.cancellation_request_id, "cmd_")
         && !value.requested_at.is_empty()
 }
 
@@ -511,8 +511,8 @@ pub(crate) fn valid_authorization_record(
     delivery: Option<&models::AgentLoginDelivery>,
     report: Option<&AgentLoginReport>,
 ) -> bool {
-    um_support::valid_typed_id(id, prefix)
-        && um_support::valid_typed_id(runner_id, "rnr_")
+    useful_support::valid_typed_id(id, prefix)
+        && useful_support::valid_typed_id(runner_id, "rnr_")
         && !created_at.is_empty()
         && delivery
             .is_none_or(|delivery| delivery.generation >= 1 && !delivery.delivered_at.is_empty())

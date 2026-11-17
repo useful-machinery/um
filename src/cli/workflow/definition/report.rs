@@ -1,4 +1,4 @@
-//! Reports shared by the `um workflow definition` leaves: an invalid tree exactly as
+//! Reports shared by the `useful workflow definition` leaves: an invalid tree exactly as
 //! `validate` prints it (REQ-WFDEF-15) and a refused definition command (REQ-WFDEF-27).
 
 use std::io::{self, Write};
@@ -7,7 +7,7 @@ use std::path::Path;
 use anyhow::Context;
 use serde::Serialize;
 
-use um_execution::{
+use useful_execution::{
     DefinitionError, RejectionLocation, TreeDiagnostic, TreeLocation, normalize_terminal_scalar,
 };
 

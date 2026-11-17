@@ -17,15 +17,15 @@ use reqwest::header::{
 use ring::digest::{SHA256, digest};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{mpsc, oneshot};
-use um_support::lowercase_hex;
+use useful_support::lowercase_hex;
 
 use super::Sleeper;
 use super::assignment::{
     ArtifactRequest, ArtifactRequestKind, AssignmentObservation, ObservationOutbox, OutboxFailure,
 };
 use super::backoff::Backoff;
-use um_execution::{ArtifactStaging, CloudCarrierBody, CloudResultCarrier, StagedCarrier};
-use um_runner_protocol::{
+use useful_execution::{ArtifactStaging, CloudCarrierBody, CloudResultCarrier, StagedCarrier};
+use useful_runner_protocol::{
     ArtifactConfirmationOutcome, ArtifactConfirmationResponse, ArtifactRegistrationOutcome,
     ArtifactRegistrationResponse, ArtifactResultConfirmationOutcome,
     ArtifactResultConfirmationResponse, ArtifactResultRegistrationOutcome,
@@ -1372,7 +1372,7 @@ impl UploadWork {
             let value = HeaderValue::from_str(value).map_err(|_| ())?;
             headers.insert(name, value);
         }
-        um_support::install_provider();
+        useful_support::install_provider();
         // This runs inside a blocking task, so the PUT gets its own
         // current-thread runtime and polls its body there (see `UploadBody`).
         // The client is built and dropped inside that runtime's context, which
@@ -1593,7 +1593,7 @@ mod tests {
     /// its body bytes.
     fn split_put(request: &[u8]) -> (String, &[u8]) {
         let (head, body) =
-            um_test_support::split_request(request).expect("PUT closed before its head");
+            useful_test_support::split_request(request).expect("PUT closed before its head");
         (String::from_utf8_lossy(head).to_ascii_lowercase(), body)
     }
 
@@ -1612,7 +1612,7 @@ mod tests {
                 // Wait for the entire PUT, not just its first TCP segment. Closing
                 // with an unread body can reset the connection before reqwest sees
                 // the status line, making the status case a transport failure.
-                let request = um_test_support::read_request(&mut stream);
+                let request = useful_test_support::read_request(&mut stream);
                 let (head, body) = split_put(&request);
                 assert!(head.contains("content-length: 2\r\n"));
                 assert_eq!(body, b"{}");
@@ -1637,7 +1637,7 @@ mod tests {
             }
         }
 
-        let refused = um_test_support::RefusedPort::hold();
+        let refused = useful_test_support::RefusedPort::hold();
         let diagnostic = loopback_upload(&spec, refused.address())
             .run()
             .unwrap()
@@ -1672,7 +1672,7 @@ mod tests {
             // This PUT is past the shared 128 KiB bound on purpose: the whole
             // multi-chunk body plus 4096 bytes for its head of a few hundred.
             let request =
-                um_test_support::try_read_request_within(&mut stream, expected.len() + 4096)
+                useful_test_support::try_read_request_within(&mut stream, expected.len() + 4096)
                     .unwrap();
             let (head, body) = split_put(&request);
             let length = format!("content-length: {}\r\n", expected.len());
@@ -1692,7 +1692,7 @@ mod tests {
     #[test]
     fn refused_upload_is_classified_as_connect_failed_every_time() {
         let spec = result_spec();
-        let refused = um_test_support::RefusedPort::hold();
+        let refused = useful_test_support::RefusedPort::hold();
         for attempt in 0..200 {
             let diagnostic = loopback_upload(&spec, refused.address())
                 .run()

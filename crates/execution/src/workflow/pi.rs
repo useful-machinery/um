@@ -570,7 +570,7 @@ impl PiJsonV1Parser {
     fn parse_frame_inner(&mut self, frame: &[u8]) -> Result<(), AgentFailureCause> {
         self.rejection_context.stage = PiJsonV1ProtocolStage::FrameDecode;
         let value =
-            um_support::strict_json_from_slice(frame).map_err(|_| self.protocol_failure())?;
+            useful_support::strict_json_from_slice(frame).map_err(|_| self.protocol_failure())?;
         let Some(object) = value.as_object() else {
             return self.reject(
                 PiJsonV1RejectionReason::FrameNotObject,

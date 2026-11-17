@@ -3,7 +3,7 @@ use std::ffi::OsStr;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::sync::Arc;
 
-use um_execution::EnvironmentSnapshot;
+use useful_execution::EnvironmentSnapshot;
 
 use super::*;
 use crate::agent_login::cloud::{

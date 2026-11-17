@@ -229,10 +229,10 @@ impl HostScaledBound {
         reason = "real time is used only as an anti-hang watchdog, never as success evidence"
     )]
     fn expired(&self, case: &str, diagnosis: Option<&str>) -> WatchdogExpired {
-        let schedule = std::env::var_os("UM_REPO_CHECK_SCHEDULE")
+        let schedule = std::env::var_os("USEFUL_REPO_CHECK_SCHEDULE")
             .and_then(|path| fs::read_to_string(path).ok());
         let own_step =
-            std::env::var_os("UM_REPO_CHECK_STEP").and_then(|step| step.into_string().ok());
+            std::env::var_os("USEFUL_REPO_CHECK_STEP").and_then(|step| step.into_string().ok());
         WatchdogExpired {
             message: watchdog_expiry_message(&WatchdogExpiry {
                 case,

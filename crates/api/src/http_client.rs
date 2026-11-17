@@ -25,15 +25,15 @@ use super::http_util;
 
 static USER_AGENT: OnceLock<String> = OnceLock::new();
 
-/// Names this `um` release in the `User-Agent` of every Cloud API request as
-/// `um/<version>`. The root records its resolved version once before dispatch;
+/// Names this `useful` release in the `User-Agent` of every Cloud API request as
+/// `useful/<version>`. The root records its resolved version once before dispatch;
 /// a later call keeps the first.
 pub fn identify_client(version: &str) {
-    USER_AGENT.get_or_init(|| format!("um/{version}"));
+    USER_AGENT.get_or_init(|| format!("useful/{version}"));
 }
 
 pub(super) fn user_agent() -> &'static str {
-    USER_AGENT.get().map_or("um", String::as_str)
+    USER_AGENT.get().map_or("useful", String::as_str)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -105,7 +105,7 @@ pub struct HttpClient {
 
 impl HttpClient {
     pub fn new(transport_policy: HttpTransportPolicy) -> Result<Self, HttpClientError> {
-        um_support::install_provider();
+        useful_support::install_provider();
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -332,7 +332,7 @@ pub(super) fn generated_configuration(
     transport_policy: HttpTransportPolicy,
     timeout: Duration,
 ) -> Result<apis::configuration::Configuration, reqwest::Error> {
-    um_support::install_provider();
+    useful_support::install_provider();
     let client = blocking_client_builder(transport_policy, timeout).build()?;
     let mut configuration = apis::configuration::Configuration::new();
     configuration.base_path = api_url.trim_end_matches('/').to_owned();

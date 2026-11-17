@@ -1,4 +1,4 @@
-//! What the `um workflow definition cloud` leaves print (REQ-CLOUDDEF-15): with `--json`, one
+//! What the `useful workflow definition cloud` leaves print (REQ-CLOUDDEF-15): with `--json`, one
 //! document naming the command, the organization and project, the `outcome` and the result,
 //! or for a failure the failure name with a refusal's status, problem slug and `workflow`
 //! safe facts or an invalid response's `diagnostic` (REQ-CLOUDDEF-28); without it, a plain
@@ -16,7 +16,7 @@ use super::super::publish::{
 };
 use super::super::report::{display, display_members, write_json};
 use crate::exit_code::ExitCode;
-use um_api::{
+use useful_api::{
     WorkflowDefinition, WorkflowDefinitionFailure, WorkflowDefinitionRevision,
     WorkflowProblemDetail,
 };
@@ -31,7 +31,7 @@ pub(super) struct Scope<'a> {
 
 impl Scope<'_> {
     fn command(&self) -> String {
-        format!("um workflow definition cloud {}", self.leaf)
+        format!("useful workflow definition cloud {}", self.leaf)
     }
 
     pub(super) fn write<B: Serialize>(&self, outcome: &str, body: B) -> anyhow::Result<()> {
@@ -280,7 +280,7 @@ fn failed(scope: &Scope<'_>, failure: &WorkflowDefinitionFailure) -> anyhow::Res
 
 /// A wire enumeration value by its published name.
 pub(super) fn wire(value: impl Serialize) -> String {
-    um_support::wire_name(value).unwrap_or_default()
+    useful_support::wire_name(value).unwrap_or_default()
 }
 
 /// A bound value as `show` prints it: a string, or a `members` array as `["a", "b"]`.

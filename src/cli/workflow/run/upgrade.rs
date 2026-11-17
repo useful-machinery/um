@@ -1,4 +1,4 @@
-//! `um workflow run upgrade RUN` (REQ-LOCALRUN-197).
+//! `useful workflow run upgrade RUN` (REQ-LOCALRUN-197).
 
 use clap::Args;
 

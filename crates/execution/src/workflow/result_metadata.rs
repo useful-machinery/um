@@ -7,7 +7,7 @@ use serde::de::{Error as _, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
-use um_support::{is_diagnostic_slug, valid_typed_id};
+use useful_support::{is_diagnostic_slug, valid_typed_id};
 
 use super::MAXIMUM_PARALLEL_STEPS;
 use super::document::FailurePolicy;

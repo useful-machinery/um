@@ -32,7 +32,7 @@ RUN_NAMED_TEST = "./scripts/run-named-test"
 RELEASE_BUILD = "cargo build --locked --release"
 PACKAGE_RELEASE_ARCHIVE = "./scripts/package-release-archive"
 CARGO_COMMAND = re.compile(r"""(?:^|[\s;&|(`"'/])cargo(?=[\s"']|$)""")
-REPOSITORY_NAME = "fixture/um-cli"
+REPOSITORY_NAME = "fixture/useful-cli"
 
 
 def fail(message: str) -> None:
@@ -121,22 +121,38 @@ def commit_tree(
     ).stdout.decode("ascii").strip()
 
 
-def legacy_asset_names(version: str) -> list[str]:
+RELEASE_TARGETS = (
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+)
+LEGACY_TARGET = "x86_64-apple-darwin"
+
+
+def asset_names(prefix: str, version: str, *targets: str) -> list[str]:
     return sorted(
-        [
-            "SHA256SUMS",
-            f"scherzo-cloud-{version}-aarch64-apple-darwin.tar.gz",
-            f"scherzo-cloud-{version}-aarch64-unknown-linux-gnu.tar.gz",
-            f"scherzo-cloud-{version}-x86_64-apple-darwin.tar.gz",
-            f"scherzo-cloud-{version}-x86_64-unknown-linux-gnu.tar.gz",
-        ],
+        [*(f"{prefix}-{version}-{target}.tar.gz" for target in targets), "SHA256SUMS"],
         key=os.fsencode,
     )
 
 
-def release_document(tag: str, commit: str, body: str, identifier: int) -> dict[str, object]:
+def legacy_asset_names(version: str) -> list[str]:
+    return asset_names("scherzo-cloud", version, *RELEASE_TARGETS, LEGACY_TARGET)
+
+
+def release_document(
+    tag: str,
+    commit: str,
+    body: str,
+    identifier: int,
+    *,
+    names: Sequence[str] | None = None,
+    title: str = "Scherzo Cloud CLI",
+) -> dict[str, object]:
+    if names is None:
+        names = legacy_asset_names(tag.removeprefix("v"))
     assets = []
-    for index, name in enumerate(legacy_asset_names(tag.removeprefix("v")), start=1):
+    for index, name in enumerate(names, start=1):
         value = f"prior-{name}".encode("ascii")
         assets.append(
             {
@@ -151,7 +167,7 @@ def release_document(tag: str, commit: str, body: str, identifier: int) -> dict[
         "id": identifier,
         "tag_name": tag,
         "target_commitish": commit,
-        "name": f"Scherzo Cloud CLI {tag}",
+        "name": f"{title} {tag}",
         "body": body,
         "published_at": "2026-09-01T00:00:00Z",
         "draft": False,
@@ -207,7 +223,7 @@ class Fixture:
             **os.environ,
             "PATH": f"{self.fake_bin}:{os.environ['PATH']}",
             "GH_TOKEN": "fixture-token",
-            "UM_MOCK_GH_STATE": os.fspath(self.state_path),
+            "USEFUL_MOCK_GH_STATE": os.fspath(self.state_path),
         }
 
     def state(self) -> dict[str, object]:
@@ -340,7 +356,7 @@ from pathlib import Path
 import subprocess
 import sys
 
-state_path = Path(os.environ["UM_MOCK_GH_STATE"])
+state_path = Path(os.environ["USEFUL_MOCK_GH_STATE"])
 state = json.loads(state_path.read_text())
 args = sys.argv[1:]
 
@@ -533,7 +549,7 @@ def make_dist(root: Path, version: str = "0.25.0") -> Path:
         "aarch64-unknown-linux-gnu",
         "x86_64-unknown-linux-gnu",
     ):
-        package = f"um-{version}-{target}"
+        package = f"useful-{version}-{target}"
         path = dist / f"{package}.tar.gz"
         with path.open("wb") as output:
             with gzip.GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
@@ -547,7 +563,7 @@ def make_dist(root: Path, version: str = "0.25.0") -> Path:
                     for name, value, mode in (
                         ("LICENSE", b"fixture license\n", 0o644),
                         ("README.md", b"fixture readme\n", 0o644),
-                        ("um", f"binary-{target}\n".encode("ascii"), 0o755),
+                        ("useful", f"binary-{target}\n".encode("ascii"), 0o755),
                     ):
                         member = tarfile.TarInfo(f"{package}/{name}")
                         member.size = len(value)
@@ -627,7 +643,7 @@ def prove_named_tests(workflow: str) -> None:
     for description, mutated in (
         ("a bare cargo test", f"{workflow}\n          cargo test --locked some_test\n"),
         ("no named test", workflow.replace(RUN_NAMED_TEST, "./scripts/other")),
-        ("an unknown package", f"{workflow}\n  {RUN_NAMED_TEST} um-absent {test_path}\n"),
+        ("an unknown package", f"{workflow}\n  {RUN_NAMED_TEST} useful-absent {test_path}\n"),
         ("a renamed test", f"{workflow}\n  {RUN_NAMED_TEST} {package} {test_path}_renamed\n"),
         (
             "a moved test",
@@ -638,8 +654,8 @@ def prove_named_tests(workflow: str) -> None:
             fail(f"named-test contract accepted {description}")
 
 
-# Any Cargo command that builds a `um-cli` test target rebuilds `um` with the root
-# package's dev-dependency features and copies it over `target/<target>/release/um`; a
+# Any Cargo command that builds a `useful-cli` test target rebuilds `useful` with the root
+# package's dev-dependency features and copies it over `target/<target>/release/useful`; a
 # later `cargo build --release` copies the production build back. The rule is by
 # position, not by package, so it holds whichever crate a later test lives in.
 def release_order_violation(workflow: str) -> str | None:
@@ -689,7 +705,7 @@ def prove_release_order(workflow: str) -> None:
         (
             "a named test before packaging",
             after_release_build(
-                workflow, f"{RUN_NAMED_TEST} um-execution some::test --release"
+                workflow, f"{RUN_NAMED_TEST} useful-execution some::test --release"
             ),
         ),
         ("a cargo check before packaging", after_release_build(workflow, "cargo check --locked")),
@@ -716,10 +732,10 @@ def prove_workflow_contract() -> None:
         "./scripts/verify-release-candidate",
         "environment: cli-release",
         "ref: ${{ needs.verify_release.outputs.candidate_mirror }}",
-        'binary="target/${{ matrix.target }}/release/um"',
-        'test "$("$binary" --version)" = "um $EXPECTED_VERSION"',
-        '"command": "um",',
-        '--binary "target/$TARGET/release/um"',
+        'binary="target/${{ matrix.target }}/release/useful"',
+        'test "$("$binary" --version)" = "useful $EXPECTED_VERSION"',
+        '"command": "useful",',
+        '--binary "target/$TARGET/release/useful"',
     )
     for text in required:
         if text not in workflow:
@@ -743,9 +759,78 @@ def prove_workflow_contract() -> None:
 
 
 # REQ-ONBOARD-1
+def prove_release_asset_names(module: ModuleType) -> None:
+    """The candidate publishes `useful-` archives; a prior release keeps the name it shipped."""
+    if module.expected_asset_names("0.60.0") != asset_names("useful", "0.60.0", *RELEASE_TARGETS):
+        fail("candidate release assets are not the three useful- archives and SHA256SUMS")
+
+    def complete(version: str, names: Sequence[str]) -> bool:
+        tag = f"v{version}"
+        title = "Scherzo Cloud CLI" if version == "0.53.0" else "Useful Machinery CLI"
+        document = release_document(
+            tag, "c" * 40, "Prior fixture release.\n", 20, names=names, title=title
+        )
+        try:
+            module.normalize_latest_release(tag, "c" * 40, document)
+        except module.VerificationError:
+            return False
+        return True
+
+    after, historical = "0.60.0", "0.53.0"
+    mixed = sorted(
+        {
+            *asset_names("useful", after, *RELEASE_TARGETS[:2]),
+            *asset_names("um", after, *RELEASE_TARGETS[2:]),
+        },
+        key=os.fsencode,
+    )
+    for description, version, names, expected in (
+        ("useful- after 0.53.0", after, asset_names("useful", after, *RELEASE_TARGETS), True),
+        ("um- after 0.53.0", after, asset_names("um", after, *RELEASE_TARGETS), True),
+        (
+            "legacy um- after 0.53.0",
+            after,
+            asset_names("um", after, *RELEASE_TARGETS, LEGACY_TARGET),
+            True,
+        ),
+        (
+            "scherzo-cloud- at 0.53.0",
+            historical,
+            asset_names("scherzo-cloud", historical, *RELEASE_TARGETS),
+            True,
+        ),
+        ("legacy scherzo-cloud- at 0.53.0", historical, legacy_asset_names(historical), True),
+        ("mixed useful- and um- after 0.53.0", after, mixed, False),
+        (
+            "legacy useful- after 0.53.0",
+            after,
+            asset_names("useful", after, *RELEASE_TARGETS, LEGACY_TARGET),
+            False,
+        ),
+        (
+            "scherzo-cloud- after 0.53.0",
+            after,
+            asset_names("scherzo-cloud", after, *RELEASE_TARGETS),
+            False,
+        ),
+        (
+            "useful- at 0.53.0",
+            historical,
+            asset_names("useful", historical, *RELEASE_TARGETS),
+            False,
+        ),
+        ("um- at 0.53.0", historical, asset_names("um", historical, *RELEASE_TARGETS), False),
+    ):
+        if complete(version, names) is not expected:
+            state = "incomplete" if expected else "complete"
+            fail(f"prior release with {description} archives was judged {state}")
+
+
+# REQ-ONBOARD-1
 def main() -> int:
     module = load_verifier()
     prove_workflow_contract()
+    prove_release_asset_names(module)
     with tempfile.TemporaryDirectory(prefix="cli-release-candidate-fixture.") as temporary:
         fixture = build_fixture(module, Path(temporary))
         run_verifier(fixture)

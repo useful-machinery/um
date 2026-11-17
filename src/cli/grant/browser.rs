@@ -43,7 +43,7 @@ pub(super) fn open(url: &str) {
     else {
         return;
     };
-    // Without a thread the opener is left unreaped until `um` exits, which loses nothing.
+    // Without a thread the opener is left unreaped until `useful` exits, which loses nothing.
     let _ignored = std::thread::Builder::new()
         .name("browser-opener".to_owned())
         .spawn(move || child.wait());

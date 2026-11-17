@@ -1,14 +1,14 @@
 use std::io::{self, Write as _};
 use std::time::{Duration, Instant};
 
-use um_api::{
+use useful_api::{
     Publication, PublicationApi, PublicationFailure, PublicationState, RunCancellationEnvelope,
     RunCancellationReceiptState, RunCancellationResolutionKind, RunFailure,
     RunPublicationHandoffState, RunRead, RunState,
 };
 
 use super::{CloudSnapshot, RunOptions, TerminalRunState, terminal_run_state};
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 fn publication_failure(failure: PublicationFailure) -> RunFailure {
     match failure {
@@ -443,7 +443,7 @@ mod tests {
 
     #[test]
     fn stop_between_run_and_publication_reads_prevents_second_request() {
-        let started = um_support::monotonic_now();
+        let started = useful_support::monotonic_now();
         let clock = ControlledObservationClock::new(started);
         let control = OperationControl::new(());
         let mut requests = Vec::new();
@@ -480,7 +480,7 @@ mod tests {
 
     #[test]
     fn publication_read_respects_expiry_and_allows_active_observation() {
-        let started = um_support::monotonic_now();
+        let started = useful_support::monotonic_now();
         let clock = ControlledObservationClock::new(started);
         let control = OperationControl::new(());
         for (elapsed, expected) in [

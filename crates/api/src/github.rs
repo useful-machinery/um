@@ -319,7 +319,7 @@ impl TryFrom<models::GitHubInstallation> for GitHubInstallation {
     type Error = &'static str;
 
     fn try_from(value: models::GitHubInstallation) -> Result<Self, Self::Error> {
-        if !um_support::valid_typed_id(&value.id, "ghi_") {
+        if !useful_support::valid_typed_id(&value.id, "ghi_") {
             return Err("the installation binding ID is invalid");
         }
         if !valid_provider_id(&value.provider_installation_id) {
@@ -367,7 +367,7 @@ impl TryFrom<models::GitHubSetupSession> for GitHubSetupSession {
     fn try_from(value: models::GitHubSetupSession) -> Result<Self, Self::Error> {
         let setup_url =
             Url::parse(&value.setup_url).map_err(|_| "the GitHub setup URL is invalid")?;
-        if !um_support::valid_typed_id(&value.id, "ghs_") {
+        if !useful_support::valid_typed_id(&value.id, "ghs_") {
             return Err("the GitHub setup session ID is invalid");
         }
         if value.expires_at.is_empty() {

@@ -6,9 +6,9 @@
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use um_api::{GoogleDocsBinding, GoogleDocsPresentation, PatchGoogleDocsActionRequest};
+use useful_api::{GoogleDocsBinding, GoogleDocsPresentation, PatchGoogleDocsActionRequest};
 
-// The released decoder of `um` 0.73.0 (source revision bd12fae18c8c37e9ad05511df47ea61d22a58375)
+// The released decoder of `useful` 0.73.0 (source revision bd12fae18c8c37e9ad05511df47ea61d22a58375)
 // and 0.72.1 (d84ce7c3212633b3f4d8b5cfb1304f83e15d9ab9), copied rather than imported so the
 // model in this tree may move on: `GoogleDocsAction` and `GoogleDocsActionList` from
 // `cli/crates/api/src/generated/models/google_docs_action.rs` and `google_docs_action_list.rs`,
@@ -69,7 +69,7 @@ const RELEASED_PAGE: &str = include_str!("fixtures/list-google-docs-actions-200.
 const REPRESENTATION_2_PAGE: &str =
     include_str!("fixtures/list-google-docs-actions-representation-2-200.json");
 
-/// REQ-DOCSACTION-123, REQ-COMPAT-20: a published `um` reads Cloud's default action answer,
+/// REQ-DOCSACTION-123, REQ-COMPAT-20: a published `useful` reads Cloud's default action answer,
 /// whether or not an action names a definition, and refuses one that carries `definitionId`.
 #[test]
 fn released_decoder_reads_default_representation_and_refuses_representation_2() {

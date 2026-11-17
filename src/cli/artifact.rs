@@ -6,8 +6,8 @@ mod validate;
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
 
-use um_api::{ArtifactApi, ArtifactApiError, HttpClient, HttpTransportPolicy};
-use um_human_auth::Deployment;
+use useful_api::{ArtifactApi, ArtifactApiError, HttpClient, HttpTransportPolicy};
+use useful_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Work with portable workflow artifacts";
 const NAME: &str = "artifact";

@@ -13,12 +13,12 @@ use super::workflow_definition::Home;
 use super::workflow_run::{isolated_command, run_record};
 use super::workflow_run_control::{LiveRun, OPERATOR, PublishedWaitTree, refused, run_control};
 
-/// `um workflow run list ARGS` as `OPERATOR` against `home`.
+/// `useful workflow run list ARGS` as `OPERATOR` against `home`.
 fn list(home: &Home, args: &[&str]) -> Output {
     list_at(Path::new(home.path()), args)
 }
 
-/// `um workflow run list ARGS` as `OPERATOR` against the home at `home`, as that path spells it.
+/// `useful workflow run list ARGS` as `OPERATOR` against the home at `home`, as that path spells it.
 fn list_at(home: &Path, args: &[&str]) -> Output {
     isolated_command(
         &["workflow", "run", "list"]
@@ -27,28 +27,28 @@ fn list_at(home: &Path, args: &[&str]) -> Output {
             .map(str::to_owned)
             .collect::<Vec<_>>(),
     )
-    .env("UM_HOME", home)
+    .env("USEFUL_HOME", home)
     .env("USER", OPERATOR)
     .output()
     .unwrap()
 }
 
-/// The `um workflow run list ARGS --json` document, checked.
+/// The `useful workflow run list ARGS --json` document, checked.
 fn document(home: &Home, args: &[&str]) -> Value {
     let output = list(home, &[args, &["--json"]].concat());
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let document: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(document["schemaVersion"], 1, "{document}");
-    assert_eq!(document["command"], "um workflow run list");
+    assert_eq!(document["command"], "useful workflow run list");
     document
 }
 
-/// The runs `um workflow run list ARGS --json` lists.
+/// The runs `useful workflow run list ARGS --json` lists.
 fn listed(home: &Home, args: &[&str]) -> Vec<Value> {
     document(home, args)["runs"].as_array().unwrap().clone()
 }
 
-/// The ids `um workflow run list ARGS --json` lists and the exited runs it says it left out
+/// The ids `useful workflow run list ARGS --json` lists and the exited runs it says it left out
 /// (REQ-LOCALRUN-203).
 fn selected(home: &Home, args: &[&str]) -> (Vec<String>, u64) {
     let document = document(home, args);
@@ -59,7 +59,7 @@ fn selected(home: &Home, args: &[&str]) -> (Vec<String>, u64) {
     (ids, document["exitedHidden"].as_u64().unwrap())
 }
 
-/// `um workflow run list ARGS`'s plain output, which exits 0.
+/// `useful workflow run list ARGS`'s plain output, which exits 0.
 fn plain(home: &Home, args: &[&str]) -> String {
     let output = list(home, args);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
@@ -392,7 +392,7 @@ fn shown(home: &PublishedWaitTree, run: impl AsRef<std::ffi::OsStr>) -> Value {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     let document: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(document["schemaVersion"], 1, "{document}");
-    assert_eq!(document["command"], "um workflow run show");
+    assert_eq!(document["command"], "useful workflow run show");
     assert_eq!(document["outcome"], "shown");
     assert_eq!(document["exitStatus"], 0);
     document
@@ -486,7 +486,7 @@ fn show_prints_a_run_with_its_children_and_controls() {
     assert!(refusal.get("runDirectory").is_none(), "{refusal}");
 }
 
-/// `um workflow run show RUN` without `--json`, which exits 0.
+/// `useful workflow run show RUN` without `--json`, which exits 0.
 pub(super) fn shown_plain(run: &Path) -> String {
     let output = isolated_command(&[
         "workflow".to_owned(),

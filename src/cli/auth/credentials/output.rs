@@ -4,7 +4,7 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::exit_code::ExitCode;
-use um_api::{AgentLogin, AgentLoginAuthorization, AgentLoginState, Grant, GrantState};
+use useful_api::{AgentLogin, AgentLoginAuthorization, AgentLoginState, Grant, GrantState};
 
 use super::super::agent_logins::{EndedAuthorizationView, ended_authorizations};
 use crate::cli::grant::projection::{
@@ -129,7 +129,7 @@ impl<'a> CredentialView<'a> {
 }
 
 /// An ended authorization of one of the member's agent logins, revoked ones included, with its
-/// removal state and stop as `um auth agent-login show` prints it (REQ-GRANT-55).
+/// removal state and stop as `useful auth agent-login show` prints it (REQ-GRANT-55).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct EndedView<'a> {

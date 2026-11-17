@@ -167,13 +167,16 @@ fn validate_with_arguments(
                 CREDENTIALS_FILE_VARIABLE,
                 "/dev/null/workflow-validation-credentials.json",
             ),
-            ("UM_API_URL", &api_url),
-            ("UM_AUTH_ISSUER", "http://auth.workflow-validation.invalid/"),
+            ("USEFUL_API_URL", &api_url),
             (
-                "UM_AUTH_AUDIENCE",
+                "USEFUL_AUTH_ISSUER",
+                "http://auth.workflow-validation.invalid/",
+            ),
+            (
+                "USEFUL_AUTH_AUDIENCE",
                 "https://api.workflow-validation.invalid",
             ),
-            ("UM_AUTH_CLIENT_ID", "workflow-validation-client"),
+            ("USEFUL_AUTH_CLIENT_ID", "workflow-validation-client"),
         ],
     );
 
@@ -278,7 +281,7 @@ fn valid_bundle_reports_provenance_without_executing_or_exposing_static_sources(
     let report: serde_json::Value =
         serde_json::from_slice(&json.stdout).expect("validation output should be JSON");
     assert_eq!(report["schemaVersion"], 1);
-    assert_eq!(report["command"], "um workflow validate");
+    assert_eq!(report["command"], "useful workflow validate");
     assert_eq!(report["outcome"], "valid");
     assert_eq!(report["workflow"]["path"], WORKFLOW_PATH);
     assert_eq!(report["digest"]["algorithm"], "sha256");
@@ -735,7 +738,7 @@ fn relative_workflow_file_is_cwd_relative_without_root_relative_fallback() {
     let bundle = WorkflowBundle::valid();
     let initial_cwd = bundle.root.parent().unwrap();
     let execute = |workflow_file: &str| {
-        std::process::Command::new(env!("CARGO_BIN_EXE_um"))
+        std::process::Command::new(env!("CARGO_BIN_EXE_useful"))
             .current_dir(initial_cwd)
             .args([
                 "workflow",
@@ -773,7 +776,7 @@ fn absolute_workflow_paths_do_not_require_a_named_current_directory() {
             "cd \"$1\" && rmdir \"$1\" && exec \"$2\" workflow validate --source-root \"$3\" \"$4\" --json",
             "sh",
             removed_cwd.to_str().unwrap(),
-            env!("CARGO_BIN_EXE_um"),
+            env!("CARGO_BIN_EXE_useful"),
             bundle.root_argument(),
             bundle.workflow_path().to_str().unwrap(),
         ])

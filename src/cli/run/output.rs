@@ -2,11 +2,11 @@ use std::io::{self, Write};
 
 use anyhow::Context;
 use serde::Serialize;
-use um_api::{
+use useful_api::{
     ProjectReadinessBlocker, Publication, PublicationState, Run, RunArtifactDelivery,
     RunCancellationReceipt, RunObservation, RunPublicationHandoffState,
 };
-use um_execution::visible_text;
+use useful_execution::visible_text;
 
 use crate::exit_code::ExitCode;
 
@@ -227,12 +227,11 @@ pub(super) fn write_cloud(
         )?;
     } else {
         if let Some(run) = snapshot.run.as_deref() {
-            let publication_failed =
-                run.publication.as_deref().is_some_and(|handoff| {
-                    handoff.state == um_api::RunPublicationHandoffState::Failed
-                }) || snapshot.publication.as_deref().is_some_and(|publication| {
-                    publication.state == um_api::PublicationState::Failed
-                });
+            let publication_failed = run.publication.as_deref().is_some_and(|handoff| {
+                handoff.state == useful_api::RunPublicationHandoffState::Failed
+            }) || snapshot.publication.as_deref().is_some_and(
+                |publication| publication.state == useful_api::PublicationState::Failed,
+            );
             super::write_run_human(
                 deployment,
                 if publication_failed {
@@ -255,7 +254,7 @@ pub(super) fn write_cloud(
             writeln!(
                 io::stdout().lock(),
                 "  export: {}",
-                um_execution::visible_text(&publication.export_name)
+                useful_execution::visible_text(&publication.export_name)
             )?;
             writeln!(
                 io::stdout().lock(),
@@ -333,7 +332,7 @@ pub(super) fn write_cloud(
         {
             writeln!(
                 io::stdout().lock(),
-                "\nInspect the failed attempt with um publication show. After resolving the failure, review provider effects before creating another publication for this Run and export."
+                "\nInspect the failed attempt with useful publication show. After resolving the failure, review provider effects before creating another publication for this Run and export."
             )?;
         } else if snapshot
             .run
@@ -343,7 +342,7 @@ pub(super) fn write_cloud(
         {
             writeln!(
                 io::stdout().lock(),
-                "\nInspect the failed automatic publication handoff. After resolving the failure, check for an existing attempt before using um publication create for this Run and export."
+                "\nInspect the failed automatic publication handoff. After resolving the failure, check for an existing attempt before using useful publication create for this Run and export."
             )?;
         }
         if let Some(replayed) = snapshot.replayed {
@@ -354,7 +353,7 @@ pub(super) fn write_cloud(
             )?;
         }
         if let Some(receipt) = snapshot.cancellation_request.as_deref() {
-            let mode = if receipt.mode == um_api::RunCancellationReceiptMode::Force {
+            let mode = if receipt.mode == useful_api::RunCancellationReceiptMode::Force {
                 "force"
             } else {
                 "graceful"
@@ -396,7 +395,7 @@ fn write_cancel_context(
 ) -> anyhow::Result<()> {
     if let Some(receipt) = snapshot.cancellation_request.as_deref() {
         let requested_mode = mode.unwrap_or_else(|| {
-            if receipt.mode == um_api::RunCancellationReceiptMode::Force {
+            if receipt.mode == useful_api::RunCancellationReceiptMode::Force {
                 "force"
             } else {
                 "graceful"
@@ -557,7 +556,7 @@ pub(crate) fn write_rejection(out: &mut impl Write, run: &Run) -> io::Result<()>
         }
     }
     if let Some(reason) = rejection.recovery_reason {
-        let reason = um_support::wire_name(reason).ok_or_else(|| {
+        let reason = useful_support::wire_name(reason).ok_or_else(|| {
             io::Error::other("Cloud run recovery reason is not a contracted string")
         })?;
         writeln!(out, "  recovery reason: {}", visible_text(&reason))?;

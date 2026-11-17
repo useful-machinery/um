@@ -622,7 +622,7 @@ fn find_named_resource<T>(
     list_page: impl FnMut(Option<&str>) -> Result<(Vec<T>, Option<String>), RunnerFailure>,
     name: impl Fn(&T) -> &str,
 ) -> Result<T, RunnerFailure> {
-    if um_support::valid_typed_id(resource_ref, id_prefix) {
+    if useful_support::valid_typed_id(resource_ref, id_prefix) {
         return get_by_id();
     }
     find_listed(

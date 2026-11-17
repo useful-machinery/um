@@ -21,11 +21,11 @@ use zeroize::Zeroize as _;
 use crate::credential::Credential;
 use crate::runner_http::{self, SensitiveString};
 use crate::service::config::RepositoryUrlPolicy;
-use um_execution::ManagedProcessGroup;
-use um_execution::{
+use useful_execution::ManagedProcessGroup;
+use useful_execution::{
     CaptureCancellation, CloudGitCaptureProjection, EnvironmentSnapshot, ResolvedWorkflow, resolve,
 };
-use um_runner_protocol::ExecutionSpecV1RunnerProjection;
+use useful_runner_protocol::ExecutionSpecV1RunnerProjection;
 
 const PROVIDER_RETRY_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const GIT_OPERATION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -107,14 +107,14 @@ impl ProviderRetryWaiter for SystemProviderRetryWaiter {
         retry_after: Duration,
         cancellation: &CaptureCancellation,
     ) -> Result<(), CredentialBrokerFailure> {
-        let started = um_support::monotonic_now();
+        let started = useful_support::monotonic_now();
         loop {
             ensure_broker_current(cancellation)?;
-            let remaining = retry_after.saturating_sub(um_support::elapsed(started));
+            let remaining = retry_after.saturating_sub(useful_support::elapsed(started));
             if remaining.is_zero() {
                 return Ok(());
             }
-            um_support::sleep(remaining.min(PROVIDER_RETRY_POLL_INTERVAL));
+            useful_support::sleep(remaining.min(PROVIDER_RETRY_POLL_INTERVAL));
         }
     }
 }
@@ -418,7 +418,9 @@ impl HttpSourceCredentialBroker {
         let expires_at = OffsetDateTime::parse(&expires_at, &Rfc3339)
             .ok()
             .filter(|value| {
-                utc_spelling && value.offset() == UtcOffset::UTC && *value > um_support::utc_now()
+                utc_spelling
+                    && value.offset() == UtcOffset::UTC
+                    && *value > useful_support::utc_now()
             })
             .ok_or(CredentialBrokerFailure::InvalidResponse)?;
         let repository_url = validate_repository_url(&repository_url, self.repository_url_policy)?;
@@ -434,7 +436,7 @@ impl HttpSourceCredentialBroker {
                 // the exact assignment-scoped Cloud path on a TLS origin.
                 let read_endpoint =
                     Url::parse(&read_url).map_err(|_| CredentialBrokerFailure::InvalidResponse)?;
-                if !um_support::valid_typed_id(assignment_id, "asn_")
+                if !useful_support::valid_typed_id(assignment_id, "asn_")
                     || (read_endpoint.scheme() != "https"
                         && !(read_endpoint.scheme() == "http"
                             && crate::is_loopback(&read_endpoint)
@@ -522,7 +524,9 @@ impl HttpSourceCredentialBroker {
             .ok()
             .filter(|value| utc_spelling && value.offset() == UtcOffset::UTC)
             .ok_or(CredentialBrokerFailure::InvalidResponse)?;
-        if parsed.schema_version != 1 || !um_support::valid_typed_id(&parsed.issuance_id, "gti_") {
+        if parsed.schema_version != 1
+            || !useful_support::valid_typed_id(&parsed.issuance_id, "gti_")
+        {
             return Err(CredentialBrokerFailure::InvalidResponse);
         }
         Ok(WorkflowGitRevocation::GitHub {
@@ -664,7 +668,7 @@ fn run_broker_worker<T: Send + 'static>(
                 return result;
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => {
-                um_support::sleep(PROCESS_POLL_INTERVAL);
+                useful_support::sleep(PROCESS_POLL_INTERVAL);
             }
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 return Err(CredentialBrokerFailure::Unavailable);
@@ -967,7 +971,7 @@ fn renew_preparation_grant(
         .last()
         .ok_or(MaterializationFailure::ProviderUnavailable)?;
     if canonical_origin.is_none()
-        || current.expires_at > um_support::utc_now() + time::Duration::seconds(30)
+        || current.expires_at > useful_support::utc_now() + time::Duration::seconds(30)
     {
         return Ok(());
     }
@@ -1227,10 +1231,10 @@ impl PreparationGit<'_> {
             .stderr(Stdio::null());
         let mut child = ManagedProcessGroup::spawn(&mut command)
             .map_err(|_| MaterializationFailure::EnvironmentUnavailable)?;
-        let started = um_support::monotonic_now();
+        let started = useful_support::monotonic_now();
         loop {
             ensure_current(self.cancellation)?;
-            if um_support::elapsed(started) >= GIT_OPERATION_TIMEOUT {
+            if useful_support::elapsed(started) >= GIT_OPERATION_TIMEOUT {
                 return Err(MaterializationFailure::ProviderUnavailable);
             }
             if let Some(status) = child
@@ -1262,7 +1266,7 @@ impl PreparationGit<'_> {
                     .ok_or(MaterializationFailure::ProviderUnavailable)?;
                 self.askpass.replace_token(&current.token.0)?;
             }
-            um_support::sleep(Duration::from_millis(100));
+            useful_support::sleep(Duration::from_millis(100));
         }
     }
 }
@@ -1691,17 +1695,17 @@ fn run_managed_git(
     cancellation: Option<&CaptureCancellation>,
 ) -> Result<ExitStatus, ManagedGitFailure> {
     let mut child = ManagedProcessGroup::spawn(command).map_err(|_| ManagedGitFailure::Spawn)?;
-    let started = um_support::monotonic_now();
+    let started = useful_support::monotonic_now();
     loop {
         if cancellation.is_some_and(CaptureCancellation::is_cancelled) {
             return Err(ManagedGitFailure::Cancelled);
         }
-        if um_support::elapsed(started) >= GIT_OPERATION_TIMEOUT {
+        if useful_support::elapsed(started) >= GIT_OPERATION_TIMEOUT {
             return Err(ManagedGitFailure::Timeout);
         }
         match child.try_wait().map_err(|_| ManagedGitFailure::Wait)? {
             Some(status) => return Ok(status),
-            None => um_support::sleep(PROCESS_POLL_INTERVAL),
+            None => useful_support::sleep(PROCESS_POLL_INTERVAL),
         }
     }
 }
@@ -1720,7 +1724,7 @@ struct EphemeralAskpass {
 
 impl EphemeralAskpass {
     fn create(parent: &Path, token: &[u8]) -> Result<Self, MaterializationFailure> {
-        let script = b"#!/bin/sh\ncase \"${1-}\" in\n  *[Uu]sername*) printf '%s\\n' 'x-access-token' ;;\n  *) IFS= read -r token < \"$UM_SOURCE_TOKEN_FIFO\"; printf '%s\\n' \"$token\"; unset token; printf '1' > \"$UM_SOURCE_TOKEN_ACK\" ;;\nesac\n";
+        let script = b"#!/bin/sh\ncase \"${1-}\" in\n  *[Uu]sername*) printf '%s\\n' 'x-access-token' ;;\n  *) IFS= read -r token < \"$USEFUL_SOURCE_TOKEN_FIFO\"; printf '%s\\n' \"$token\"; unset token; printf '1' > \"$USEFUL_SOURCE_TOKEN_ACK\" ;;\nesac\n";
         let mut helper = tempfile::Builder::new()
             .prefix("source-askpass-")
             .tempfile_in(parent)
@@ -1800,7 +1804,7 @@ impl EphemeralAskpass {
                         let mut received = [0u8; 1];
                         match ack.read(&mut received) {
                             Ok(1) if received[0] == b'1' => break,
-                            Ok(0) | Err(_) => um_support::sleep(Duration::from_millis(10)),
+                            Ok(0) | Err(_) => useful_support::sleep(Duration::from_millis(10)),
                             _ => return,
                         }
                     }
@@ -1838,8 +1842,8 @@ impl EphemeralAskpass {
         command
             .env("GIT_ASKPASS", self.helper_path())
             .env("GIT_ASKPASS_REQUIRE", "force")
-            .env("UM_SOURCE_TOKEN_FIFO", &self.fifo)
-            .env("UM_SOURCE_TOKEN_ACK", &self.acknowledgment);
+            .env("USEFUL_SOURCE_TOKEN_FIFO", &self.fifo)
+            .env("USEFUL_SOURCE_TOKEN_ACK", &self.acknowledgment);
     }
 }
 
@@ -2041,14 +2045,16 @@ mod tests {
     use crate::credential::test_credential;
     use crate::runner_http::test_server::{self, RecordedRequest};
     use crate::telemetry::test_recorder;
-    use um_execution::{
+    use useful_execution::{
         ArtifactStaging, CancellationPolicy, CancellationSource, CapturedDiagnosticStream,
         CapturedValue, CloudCarrierBody, ExecutionContext, ExportValue, FailurePolicy,
         ResolvedInputs, RunOutcome, StepDiagnostic, StepState, WorkflowNodeRole, WorkflowRunResult,
         WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTiming, WorkflowStepTiming,
         admit_runner_workflow, default_execution_policy_limits, prepare_cloud_workflow_result,
     };
-    use um_test_support::watchdog::{FIXTURE_WAIT_BASE, host_scaled_duration, host_scaled_recv};
+    use useful_test_support::watchdog::{
+        FIXTURE_WAIT_BASE, host_scaled_duration, host_scaled_recv,
+    };
 
     use super::test_support::{fixture_credential, materialize};
 
@@ -2544,7 +2550,7 @@ mod tests {
     }
 
     fn fixture_git_command() -> Command {
-        um_test_support::fixture_git_command("git")
+        useful_test_support::fixture_git_command("git")
     }
 
     fn run_fixture_git(repository: &Path, arguments: &[&str]) {
@@ -3099,17 +3105,17 @@ mod tests {
         );
         assert!(
             workflow_environment
-                .variable(OsStr::new("UM_SOURCE_TOKEN_FD"))
+                .variable(OsStr::new("USEFUL_SOURCE_TOKEN_FD"))
                 .is_none()
         );
         assert!(
             workflow_environment
-                .variable(OsStr::new("UM_SOURCE_TOKEN_FIFO"))
+                .variable(OsStr::new("USEFUL_SOURCE_TOKEN_FIFO"))
                 .is_none()
         );
         assert!(
             workflow_environment
-                .variable(OsStr::new("UM_SOURCE_TOKEN_ACK"))
+                .variable(OsStr::new("USEFUL_SOURCE_TOKEN_ACK"))
                 .is_none()
         );
         let context = ExecutionContext::new(
@@ -3169,7 +3175,7 @@ mod tests {
                     .workflow()
                     .agent_profile_replacement
                     .as_ref()
-                    .map(um_execution::AgentProfileReplacementV1::from_resolved),
+                    .map(useful_execution::AgentProfileReplacementV1::from_resolved),
                 execution_root: admitted.execution().root().to_owned(),
                 maximum_parallel_steps: admitted.execution().limits().maximum_parallel_steps(),
                 maximum_retained_bytes_per_stream: admitted
@@ -3309,9 +3315,11 @@ mod tests {
                 CloudCarrierBody::Bytes(bytes) => fs::write(destination, bytes).unwrap(),
             }
         }
-        let validation =
-            um_execution::validate_portable_artifact_set(portable.path(), &AtomicBool::new(false))
-                .unwrap();
+        let validation = useful_execution::validate_portable_artifact_set(
+            portable.path(),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
         assert!(validation.is_valid());
         assert_eq!(
             broker.calls.lock().unwrap().as_slice(),
@@ -3794,7 +3802,7 @@ mod tests {
                 expected
                     .set_path("/v1/runner/git-read/asn_01k0z6r1w8f4jy2m7q9v3x5abd/repository.git");
             }
-            let expires = (um_support::utc_now() + time::Duration::minutes(5))
+            let expires = (useful_support::utc_now() + time::Duration::minutes(5))
                 .format(&Rfc3339)
                 .unwrap();
             let response = format!(
@@ -4189,8 +4197,8 @@ mod tests {
         let (request_sender, request_receiver) = std::sync::mpsc::sync_channel(1);
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let request = um_test_support::read_request(&mut stream);
-            if um_test_support::split_request(&request).is_none() {
+            let request = useful_test_support::read_request(&mut stream);
+            if useful_test_support::split_request(&request).is_none() {
                 return;
             }
             let _ = request_sender.send(());

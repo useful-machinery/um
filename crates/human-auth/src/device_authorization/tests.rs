@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use super::*;
 use anyhow::Context as _;
-use um_api::MAX_RESPONSE_BODY_BYTES;
-use um_test_support::{ScriptedHttpServer, read_request};
+use useful_api::MAX_RESPONSE_BODY_BYTES;
+use useful_test_support::{ScriptedHttpServer, read_request};
 
 fn deployment(server: &ScriptedHttpServer) -> anyhow::Result<Deployment> {
     let issuer = format!(

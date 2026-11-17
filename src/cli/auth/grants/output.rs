@@ -5,7 +5,7 @@ use serde::Serialize;
 
 use crate::cli::grant::consent::{GrantView, report};
 use crate::exit_code::ExitCode;
-use um_api::{GrantFailure, GrantList, GrantUse, GrantUseList};
+use useful_api::{GrantFailure, GrantList, GrantUse, GrantUseList};
 
 type Stdout = io::StdoutLock<'static>;
 
@@ -23,7 +23,7 @@ struct UseView<'a> {
 
 impl<'a> UseView<'a> {
     fn new(value: &'a GrantUse) -> Self {
-        use um_api::provider_grant_use::Provider;
+        use useful_api::provider_grant_use::Provider;
         Self {
             id: &value.id,
             grant_id: &value.grant_id,

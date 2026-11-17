@@ -19,25 +19,25 @@ use rustix::io::{Errno, fcntl_dupfd_cloexec};
 
 use super::execution::{AssignmentProcessGuards, RetainedQuiescence};
 use super::workflow_git::{WorkflowGitAuthority, WorkflowGitTeardownReport};
-use um_execution::{
+use useful_execution::{
     CloudContinuationSnapshot, RemovalError, open_directory_at, open_regular_file_at,
     remove_open_tree_at,
 };
 
-const LOCK_FILE_NAME: &str = ".um-runner-serve.lock";
-const OWNERSHIP_MARKER_NAME: &str = ".um-runner-serve-owner-v1";
-const ATTEMPT_RECORD_NAME: &str = ".um-runner-serve-attempt-v1";
-const CLAIM_RECORD_NAME: &str = ".um-runner-serve-claim-v1";
-const RETAINED_PARENT_NAME: &str = ".um-runner-serve-retained-parent-v1";
-const ATTEMPT_RECORD_STAGING_PREFIX: &str = ".um-runner-serve-attempt-staging-";
-const ATTEMPT_RECORD_HEADER: &str = "um-runner-serve/attempt/v1";
-const CLEANUP_AUTHORITY_PREFIX: &str = ".um-runner-serve-cleanup-v1-";
-const CLEANUP_AUTHORITY_STAGING_PREFIX: &str = ".um-runner-serve-cleanup-staging-";
-const CLEANUP_AUTHORITY_HEADER: &str = "um-runner-serve/cleanup-authority/v1";
-const CLEANUP_IDENTITY_ATTRIBUTE: &str = "user.um.runner-cleanup-v1";
+const LOCK_FILE_NAME: &str = ".useful-runner-serve.lock";
+const OWNERSHIP_MARKER_NAME: &str = ".useful-runner-serve-owner-v1";
+const ATTEMPT_RECORD_NAME: &str = ".useful-runner-serve-attempt-v1";
+const CLAIM_RECORD_NAME: &str = ".useful-runner-serve-claim-v1";
+const RETAINED_PARENT_NAME: &str = ".useful-runner-serve-retained-parent-v1";
+const ATTEMPT_RECORD_STAGING_PREFIX: &str = ".useful-runner-serve-attempt-staging-";
+const ATTEMPT_RECORD_HEADER: &str = "useful-runner-serve/attempt/v1";
+const CLEANUP_AUTHORITY_PREFIX: &str = ".useful-runner-serve-cleanup-v1-";
+const CLEANUP_AUTHORITY_STAGING_PREFIX: &str = ".useful-runner-serve-cleanup-staging-";
+const CLEANUP_AUTHORITY_HEADER: &str = "useful-runner-serve/cleanup-authority/v1";
+const CLEANUP_IDENTITY_ATTRIBUTE: &str = "user.useful.runner-cleanup-v1";
 const CLEANUP_IDENTITY_BYTES: usize = 32;
-const BOOT_MARKER: &[u8] = b"um-runner-serve/boot-root/v1\n";
-const ASSIGNMENT_MARKER: &[u8] = b"um-runner-serve/assignment-root/v1\n";
+const BOOT_MARKER: &[u8] = b"useful-runner-serve/boot-root/v1\n";
+const ASSIGNMENT_MARKER: &[u8] = b"useful-runner-serve/assignment-root/v1\n";
 // Historical boots are diagnostic-only. Never rewrite their evidence or use
 // this descriptor to authorize a current-boot claim or cleanup.
 #[derive(Clone, Copy)]
@@ -612,9 +612,9 @@ pub(super) struct AttemptRecord {
 
 impl AttemptRecord {
     fn new(assignment_id: &str, run_id: &str, attempt_id: &str) -> Result<Self, ()> {
-        if !um_runner_protocol::valid_assignment_id(assignment_id)
-            || !um_runner_protocol::valid_run_id(run_id)
-            || !um_runner_protocol::valid_attempt_id(attempt_id)
+        if !useful_runner_protocol::valid_assignment_id(assignment_id)
+            || !useful_runner_protocol::valid_run_id(run_id)
+            || !useful_runner_protocol::valid_attempt_id(attempt_id)
         {
             return Err(());
         }
@@ -749,11 +749,11 @@ fn validate_cleanup_target(relative_path: &str) -> Result<(), ()> {
 }
 
 fn valid_boot_id(value: &str) -> bool {
-    um_runner_protocol::valid_boot_id(value)
+    useful_runner_protocol::valid_boot_id(value)
 }
 
 fn valid_assignment_id(value: &str) -> bool {
-    um_runner_protocol::valid_assignment_id(value)
+    useful_runner_protocol::valid_assignment_id(value)
 }
 
 struct CleanupAuthorityProof {
@@ -892,7 +892,7 @@ impl CleanupEngine {
         }
         let recovery_record = statat(
             &self.authority.shared.directory_lock,
-            ".um-recovery-root-v1.json",
+            ".useful-recovery-root-v1.json",
             AtFlags::SYMLINK_NOFOLLOW,
         );
         if !matches!(recovery_record, Err(Errno::NOENT)) && self.recovery.get().is_none() {
@@ -1631,7 +1631,7 @@ impl WorkRootLease {
             let Some(name) = name.to_str() else {
                 continue;
             };
-            if !um_runner_protocol::valid_boot_id(name) {
+            if !useful_runner_protocol::valid_boot_id(name) {
                 continue;
             }
             let path = work_root.join(name);
@@ -1762,8 +1762,8 @@ impl WorkRootLease {
             prior_attempt_id,
             recorded_root,
         } = request;
-        if !um_runner_protocol::valid_assignment_id(prior_assignment_id)
-            || !um_runner_protocol::valid_assignment_id(assignment_id)
+        if !useful_runner_protocol::valid_assignment_id(prior_assignment_id)
+            || !useful_runner_protocol::valid_assignment_id(assignment_id)
             || root.attempt_record.assignment_id != assignment_id
             || root.attempt_record.run_id != run_id
             || root.attempt_record.attempt_id != attempt_id
@@ -1816,7 +1816,7 @@ impl WorkRootLease {
                             .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?;
                     let name = std::str::from_utf8(&bytes)
                         .map_err(|_| AssignmentRootCreationError::OwnershipUnproven)?;
-                    if !um_runner_protocol::valid_assignment_id(name) {
+                    if !useful_runner_protocol::valid_assignment_id(name) {
                         return Err(AssignmentRootCreationError::OwnershipUnproven);
                     }
                     Some(name.to_owned())
@@ -2808,7 +2808,7 @@ mod tests {
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use um_test_support::watchdog::{FIXTURE_WAIT_BASE, host_scaled_recv};
+    use useful_test_support::watchdog::{FIXTURE_WAIT_BASE, host_scaled_recv};
 
     use super::*;
 
@@ -3824,9 +3824,11 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let environment =
-            um_execution::EnvironmentSnapshot::new([("PATH", std::env::var_os("PATH").unwrap())]);
-        let cancellation = um_execution::CaptureCancellation::default();
+        let environment = useful_execution::EnvironmentSnapshot::new([(
+            "PATH",
+            std::env::var_os("PATH").unwrap(),
+        )]);
+        let cancellation = useful_execution::CaptureCancellation::default();
         let authority = super::super::workflow_git::WorkflowGitAuthority::install(
             super::super::workflow_git::WorkflowGitInstall {
                 broker: super::super::source::test_support::unavailable_source_broker(),

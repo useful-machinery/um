@@ -13,7 +13,7 @@ fn embedded_schema_is_emitted_unchanged_without_external_state() {
     let api_url = format!("http://{}/api", listener.local_addr().unwrap());
     let entries_before = directory_entries(working_directory.path());
 
-    let output = Command::new(env!("CARGO_BIN_EXE_um"))
+    let output = Command::new(env!("CARGO_BIN_EXE_useful"))
         .env_clear()
         .current_dir(working_directory.path())
         .args(["workflow", "schema"])
@@ -22,12 +22,15 @@ fn embedded_schema_is_emitted_unchanged_without_external_state() {
             super::CREDENTIALS_FILE_VARIABLE,
             "/dev/null/workflow-schema-credentials.json",
         )
-        .env("UM_API_URL", &api_url)
-        .env("UM_AUTH_ISSUER", "http://auth.workflow-schema.invalid/")
-        .env("UM_AUTH_AUDIENCE", "https://api.workflow-schema.invalid")
-        .env("UM_AUTH_CLIENT_ID", "workflow-schema-client")
+        .env("USEFUL_API_URL", &api_url)
+        .env("USEFUL_AUTH_ISSUER", "http://auth.workflow-schema.invalid/")
+        .env(
+            "USEFUL_AUTH_AUDIENCE",
+            "https://api.workflow-schema.invalid",
+        )
+        .env("USEFUL_AUTH_CLIENT_ID", "workflow-schema-client")
         .output()
-        .expect("um should run");
+        .expect("useful should run");
 
     assert!(output.status.success());
     assert_eq!(

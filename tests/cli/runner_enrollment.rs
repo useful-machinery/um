@@ -347,7 +347,7 @@ fn reports_cloud_enrollment_separately_when_runner_serve_is_unreachable() {
 
 const JOIN_KEY_ID: &str = "rjk_01k0z6r1w8f4jy2m7q9v3x5abc";
 const JOIN_SECRET: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
-pub(super) const JOIN_KEY_VARIABLE: &str = "UM_RUNNER_JOIN_KEY";
+pub(super) const JOIN_KEY_VARIABLE: &str = "USEFUL_RUNNER_JOIN_KEY";
 const JOINED_CREDENTIAL_IDS: [&str; 3] = [
     "rrc_01k0z6r1w8f4jy2m7q9v3x5ab1",
     "rrc_01k0z6r1w8f4jy2m7q9v3x5ab2",
@@ -530,7 +530,7 @@ impl JoinHost {
     }
 }
 
-/// What `um runner serve` reads as its standard input.
+/// What `useful runner serve` reads as its standard input.
 pub(super) enum StandardInput<'a> {
     Null,
     /// A pipe the text is written to and then closed.
@@ -545,10 +545,10 @@ pub(super) fn write_private_json(path: &Path, document: &serde_json::Value) {
     fs::set_permissions(path, Permissions::from_mode(0o600)).unwrap();
 }
 
-/// `um runner serve ARGUMENTS` with telemetry off and no join key inherited
+/// `useful runner serve ARGUMENTS` with telemetry off and no join key inherited
 /// from the suite's environment.
 pub(super) fn serve_command(arguments: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args(["runner", "serve"])
         .args(arguments)
@@ -560,7 +560,7 @@ pub(super) fn serve_command(arguments: &[&str]) -> Command {
     command
 }
 
-/// A running `um runner serve`, killed when dropped.
+/// A running `useful runner serve`, killed when dropped.
 pub(super) struct ServeProcess {
     child: Child,
     stderr: Option<thread::JoinHandle<String>>,
@@ -888,7 +888,7 @@ fn an_enrolled_host_serves_with_its_state_and_sends_no_join() {
 
 /// A test-only variable given to Runner Serve beside its join key: seeing it
 /// proves the observation read the serving process's environment.
-const ENVIRONMENT_WITNESS: &str = "UM_TEST_ENVIRONMENT_WITNESS";
+const ENVIRONMENT_WITNESS: &str = "USEFUL_TEST_ENVIRONMENT_WITNESS";
 
 /// The raw environment block of the running process `pid`: on Linux its
 /// `/proc` entry; elsewhere the output of `ps`, which prints the arguments and

@@ -60,7 +60,7 @@ impl DoctorCheck for AgentLoginsCheck {
         let Some(config) = &self.config else {
             return Outcome::fail(
                 "config_required",
-                "This check reads the runner's recorded readiness; set UM_HOME or HOME to locate the runner home, or name the runner operator configuration with --config PATH.",
+                "This check reads the runner's recorded readiness; set USEFUL_HOME or HOME to locate the runner home, or name the runner operator configuration with --config PATH.",
                 BTreeMap::new(),
             );
         };
@@ -76,7 +76,7 @@ impl DoctorCheck for AgentLoginsCheck {
             Ok(None) => {
                 return Outcome::fail(
                     "readiness_unknown",
-                    "The runner has recorded no agent-login readiness; start `um runner serve` or run `um runner grant sync`.",
+                    "The runner has recorded no agent-login readiness; start `useful runner serve` or run `useful runner grant sync`.",
                     BTreeMap::new(),
                 );
             }

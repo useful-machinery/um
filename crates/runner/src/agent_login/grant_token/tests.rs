@@ -865,7 +865,7 @@ fn run_with(environment: &EnvironmentSnapshot, script: &str) -> String {
 /// `$GH_TOKEN_FILE`; the first, empty `credential.helper` clears the
 /// host's own helpers.
 fn git_credential_password(environment: &EnvironmentSnapshot) -> String {
-    let mut fill = um_test_support::fixture_git_command("git");
+    let mut fill = useful_test_support::fixture_git_command("git");
     fill.envs(environment.variables())
         .args([
             "-c",

@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_runner::RequestFailure;
-use um_runner::{ControlError, Operation, Response};
-use um_runner::{EnrollmentOutcome, EnrollmentResponse, ReplacementDisposition, enroll};
+use useful_runner::RequestFailure;
+use useful_runner::{ControlError, Operation, Response};
+use useful_runner::{EnrollmentOutcome, EnrollmentResponse, ReplacementDisposition, enroll};
 
 pub(super) const ABOUT: &str = "Enroll a runner credential";
 
@@ -39,7 +39,7 @@ pub(super) struct Command {
     #[arg(
         long,
         value_name = "PATH",
-        help = "Read the closed runner operator configuration; the runner home under the um home is the default, created where it is missing"
+        help = "Read the closed runner operator configuration; the runner home under the useful home is the default, created where it is missing"
     )]
     config: Option<PathBuf>,
 
@@ -63,9 +63,9 @@ impl Command {
             self.resume,
         )
         .map_err(|error| match error {
-            // A staged join is resolved by `um runner serve` with its key, never by --resume;
+            // A staged join is resolved by `useful runner serve` with its key, never by --resume;
             // the error itself names the journal and the remedy.
-            um_runner::EnrollmentError::UnresolvedJoin { .. } => {
+            useful_runner::EnrollmentError::UnresolvedJoin { .. } => {
                 anyhow::anyhow!("runner enrollment did not complete: {error}")
             }
             error => anyhow::anyhow!(
@@ -312,10 +312,10 @@ impl PromotionFailure {
 }
 
 fn promote_replacement(config: &Path, enrollment: &ReplacementEnrollment) -> PromotionOutcome {
-    let Ok(socket) = um_runner::load_control_socket_path(config) else {
+    let Ok(socket) = useful_runner::load_control_socket_path(config) else {
         return PromotionOutcome::Incomplete(PromotionFailure::StateUnavailable);
     };
-    match um_runner::request(&socket, Operation::ReloadCredential) {
+    match useful_runner::request(&socket, Operation::ReloadCredential) {
         Ok(Response::Reloaded { credential_id }) if credential_id == enrollment.credential_id => {
             PromotionOutcome::Promoted
         }
@@ -327,7 +327,7 @@ fn promote_replacement(config: &Path, enrollment: &ReplacementEnrollment) -> Pro
             PromotionOutcome::Incomplete(PromotionFailure::InvalidControlResponse)
         }
         Err(RequestFailure::NotReachable) => {
-            match um_runner::replacement_disposition(
+            match useful_runner::replacement_disposition(
                 config,
                 &enrollment.runner_id,
                 &enrollment.credential_id,

@@ -1,4 +1,4 @@
-//! What `um grant authorize` and `um grant deauthorize` offer when given no `RUNNER`
+//! What `useful grant authorize` and `useful grant deauthorize` offer when given no `RUNNER`
 //! (REQ-GRANT-81): the runners they read, in the order they offer them, and the outcome when
 //! there is none to offer; and the runner they act on, named by `RUNNER` or chosen from the
 //! list where the command can prompt (REQ-GRANT-82, INV-CLI-16), or all of them chosen as
@@ -9,11 +9,11 @@ use std::collections::BTreeSet;
 use anyhow::Context;
 
 use crate::exit_code::ExitCode;
-use um_api::{
+use useful_api::{
     MemberGrant, MemberGrantFailure, MemberGrantKind, MemberGrantProvider, RunnerFailure,
     RunnerRegistration,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 use super::super::PrincipalAuthenticationArgs;
 use super::runner_picker::{self, Picked};
@@ -46,8 +46,8 @@ impl Runner {
         let state = |name: Option<String>| name.context("runner state is not a contracted string");
         Ok(Self {
             registration: Some(Registration {
-                connectivity: state(um_support::wire_name(&registration.connectivity.state))?,
-                mode: state(um_support::wire_name(&registration.administration.mode))?,
+                connectivity: state(useful_support::wire_name(&registration.connectivity.state))?,
+                mode: state(useful_support::wire_name(&registration.administration.mode))?,
                 name: registration.name,
                 pool: registration.runner_pool.name,
             }),

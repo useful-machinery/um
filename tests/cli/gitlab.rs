@@ -690,7 +690,7 @@ fn terminal_review_requires_exact_identity_and_dedication_before_activation() {
         let mut command = Command::new("python3");
         command.args(["-c", "import os,sys; os.setsid(); fd=os.open(sys.argv[1], os.O_RDWR); os.dup2(fd, 0); os.write(1, b'R'); os.execv(sys.argv[2], sys.argv[2:])"])
             .arg(peer.to_str().unwrap())
-            .arg(env!("CARGO_BIN_EXE_um"))
+            .arg(env!("CARGO_BIN_EXE_useful"))
             .args(["connection", "gitlab", "credential", "activate", ORG,
                 CONNECTION, CANDIDATE, "--allow-insecure-http"])
             .stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -1422,7 +1422,7 @@ fn signal_after_dispatch_reports_replay_key_without_secret() {
         let token = directory.path().join("token");
         fs::write(&token, SECRET).unwrap();
         fs::set_permissions(&token, Permissions::from_mode(0o600)).unwrap();
-        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
         command
             .args([
                 "connection",

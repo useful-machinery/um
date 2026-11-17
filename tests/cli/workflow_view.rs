@@ -208,7 +208,7 @@ fn automatic_and_explicit_plain_and_json_are_complete_frozen_snapshots() {
         serde_json::from_slice(&fs::read(selected_result).unwrap()).unwrap();
     assert!(workflow_view_schema().is_valid(&view));
     assert_eq!(view["schemaVersion"], 1);
-    assert_eq!(view["command"], "um workflow run view");
+    assert_eq!(view["command"], "useful workflow run view");
     assert_eq!(view["outcome"], "view");
     assert_eq!(view["exitStatus"], 0);
     assert_eq!(view["currentAttemptNumber"], 1);
@@ -381,14 +381,14 @@ fn json_view_refuses_an_unknown_run_id_with_its_error_document() {
         Path::new("run_7zzzzzzzzzzzzzzzzzzzzzzzzz"),
         &["--json"],
     ))
-    .env("UM_HOME", home.path())
+    .env("USEFUL_HOME", home.path())
     .output()
     .unwrap();
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
     let error: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(workflow_view_schema().is_valid(&error), "{error}");
-    assert_eq!(error["command"], "um workflow run view");
+    assert_eq!(error["command"], "useful workflow run view");
     assert_eq!(error["outcome"], "error");
     assert_eq!(error["error"]["code"], "run_not_found", "{error}");
     assert!(error.get("runDirectory").is_none(), "{error}");

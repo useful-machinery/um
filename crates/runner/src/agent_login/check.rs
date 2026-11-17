@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use um_execution::{
+use useful_execution::{
     CLAUDE_CODE_LOGIN_VARIABLE, CODEX_LOGIN_VARIABLE, CoordinatorClock, EnvironmentSnapshot,
     HarnessLoginCheck, HarnessLoginCheckCause, MINIMUM_CANCELLATION_GRACE,
     ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, check_claude_code_login,

@@ -176,7 +176,7 @@ impl GrantApi {
         )
         .map_err(classify_error)?;
         let session = validate_session(session, None)?;
-        if um_support::wire_name(session.provider) != um_support::wire_name(provider) {
+        if useful_support::wire_name(session.provider) != useful_support::wire_name(provider) {
             return Err(invalid());
         }
         Ok(session)
@@ -190,7 +190,7 @@ impl GrantApi {
     ) -> Result<GrantSession, GrantFailure> {
         #[allow(
             deprecated,
-            reason = "the earlier `um auth grant` commands keep this route for one release"
+            reason = "the earlier `useful auth grant` commands keep this route for one release"
         )]
         let session = apis::principals_api::create_identity_grant_session(
             &self.configuration,
@@ -285,8 +285,8 @@ impl Drop for GrantApi {
 }
 
 fn valid_grant(value: &Grant) -> bool {
-    um_support::valid_typed_id(&value.id, "pgr_")
-        && um_support::valid_typed_id(&value.identity_id, "idn_")
+    useful_support::valid_typed_id(&value.id, "pgr_")
+        && useful_support::valid_typed_id(&value.identity_id, "idn_")
         && !value.created_at.is_empty()
         && [
             &value.last_used_at,
@@ -298,7 +298,7 @@ fn valid_grant(value: &Grant) -> bool {
 }
 
 fn valid_use(value: &GrantUse, grant_id: &str) -> bool {
-    um_support::valid_typed_id(&value.id, "pgu_")
+    useful_support::valid_typed_id(&value.id, "pgu_")
         && value.grant_id == grant_id
         && !value.run_id.is_empty()
         && !value.assignment_id.is_empty()
@@ -309,7 +309,7 @@ fn valid_use(value: &GrantUse, grant_id: &str) -> bool {
 fn validate_session(value: GrantSession, id: Option<&str>) -> Result<GrantSession, GrantFailure> {
     let pending = value.status == GrantSessionStatus::ProviderGrantSessionStatusPending;
     let completed = value.status == GrantSessionStatus::ProviderGrantSessionStatusCompleted;
-    if !um_support::valid_typed_id(&value.id, "pgs_")
+    if !useful_support::valid_typed_id(&value.id, "pgs_")
         || id.is_some_and(|id| value.id != id)
         || value.created_at.is_empty()
         || value.expires_at.is_empty()
@@ -369,7 +369,7 @@ impl std::error::Error for GrantApiError {}
 mod tests {
     use super::*;
     use crate::resource::classify_problem;
-    use um_test_support::ScriptedHttpServer;
+    use useful_test_support::ScriptedHttpServer;
 
     fn observe(response: &str) -> Result<GrantSession, GrantFailure> {
         let _ = rustls::crypto::ring::default_provider().install_default();

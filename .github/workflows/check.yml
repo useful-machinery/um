@@ -187,8 +187,8 @@ jobs:
       - name: Build release binary
         shell: bash
         env:
-          UM_RELEASE_COMMIT: ${{ needs.verify_release.outputs.candidate_mirror }}
-          UM_VERSION: ${{ needs.verify_release.outputs.version }}
+          USEFUL_RELEASE_COMMIT: ${{ needs.verify_release.outputs.candidate_mirror }}
+          USEFUL_VERSION: ${{ needs.verify_release.outputs.version }}
         run: |
           set -euo pipefail
           cargo build --locked --release --target "${{ matrix.target }}"
@@ -199,8 +199,8 @@ jobs:
           EXPECTED_VERSION: ${{ needs.verify_release.outputs.version }}
         run: |
           set -euo pipefail
-          binary="target/${{ matrix.target }}/release/um"
-          test "$("$binary" --version)" = "um $EXPECTED_VERSION"
+          binary="target/${{ matrix.target }}/release/useful"
+          test "$("$binary" --version)" = "useful $EXPECTED_VERSION"
           version_json=$("$binary" version --json)
           python3 - "$version_json" "$EXPECTED_VERSION" "$EXPECTED_BUILD_IDENTITY" <<'PY'
           import json
@@ -209,7 +209,7 @@ jobs:
           document = json.loads(sys.argv[1])
           expected = {
               "schemaVersion": 1,
-              "command": "um",
+              "command": "useful",
               "version": sys.argv[2],
               "buildIdentity": sys.argv[3],
           }
@@ -230,7 +230,7 @@ jobs:
           test ! -e "$release_dist"
           archive=$(
             ./scripts/package-release-archive \
-              --binary "target/$TARGET/release/um" \
+              --binary "target/$TARGET/release/useful" \
               --output "$release_dist" \
               --target "$TARGET" \
               --version "$VERSION"
@@ -245,11 +245,11 @@ jobs:
         if: matrix.target == 'aarch64-apple-darwin'
         shell: bash
         env:
-          UM_RELEASE_COMMIT: ${{ needs.verify_release.outputs.candidate_mirror }}
-          UM_VERSION: ${{ needs.verify_release.outputs.version }}
+          USEFUL_RELEASE_COMMIT: ${{ needs.verify_release.outputs.candidate_mirror }}
+          USEFUL_VERSION: ${{ needs.verify_release.outputs.version }}
         run: |
           set -euo pipefail
-          ./scripts/run-named-test um-execution \
+          ./scripts/run-named-test useful-execution \
             workflow::step_runtime::tests::command_uses_contained_cwd_literal_argv_and_isolates_parent_environment \
             --release --target "${{ matrix.target }}"
       - name: Upload release archive

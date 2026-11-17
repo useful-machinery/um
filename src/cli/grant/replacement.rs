@@ -1,4 +1,4 @@
-//! Settling, before any sign-in starts, whether `um grant create` may replace a grant the
+//! Settling, before any sign-in starts, whether `useful grant create` may replace a grant the
 //! member already holds (REQ-GRANT-73): asked on a terminal, refused without one unless
 //! `--replace` is given, and for a native provider refused when several are held in the
 //! organization. With `--workflow`, a grant that needs reconnecting is settled the same way,
@@ -8,11 +8,11 @@ use anyhow::anyhow;
 
 use crate::cli::CommandFailure;
 use crate::exit_code::ExitCode;
-use um_api::{
+use useful_api::{
     MEMBER_GRANT_PAGE, MemberGrant, MemberGrantApi, MemberGrantFailure, MemberGrantProvider,
     MemberGrantState,
 };
-use um_support::Availability;
+use useful_support::Availability;
 
 use super::{confirmation, projection};
 
@@ -146,7 +146,7 @@ pub(super) fn native_target(
             anyhow!(
                 "you hold several {} grants for this organization: {ids}\n\n\
                  Revoke the ones you no longer use, then run the command again:\n  \
-                 um grant revoke GRANT --yes",
+                 useful grant revoke GRANT --yes",
                 provider.as_str()
             ),
             ExitCode::UsageError,

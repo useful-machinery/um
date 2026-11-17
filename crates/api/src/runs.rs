@@ -17,7 +17,7 @@ use super::http_util::{self, BoundedBodyError, BufferedBlockingResponse};
 use super::problem::{self, BAD_REQUEST, FORBIDDEN, JSON_MEDIA_TYPE, NOT_FOUND, UNAUTHORIZED};
 use super::projects::ProjectReadinessBlocker;
 use super::{HttpTransportPolicy, UnreachableCategory, classify_reqwest_error};
-use um_support::wire_name;
+use useful_support::wire_name;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const CREATE_ATTEMPTS: usize = 2;
@@ -40,9 +40,9 @@ pub type RunCreationAcceptance = models::RunCreationAcceptance;
 pub type RunCreationPending = models::RunCreationPending;
 pub type RunDefinitionSelection = models::RunDefinitionSelection;
 pub type RunArtifactDelivery = models::RunArtifactDelivery;
-/// A violation a refused continuation names, as `um` reports it: a code of the
+/// A violation a refused continuation names, as `useful` reports it: a code of the
 /// contract's `ContinuationAdmissionViolation` list, or a definition-backed run's
-/// refusal, which Cloud answers under a problem type of its own and `um` reports by
+/// refusal, which Cloud answers under a problem type of its own and `useful` reports by
 /// the code of the same name (REQ-CONTINUE-83, REQ-CONTINUE-84, REQ-COMPAT-20).
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -88,7 +88,7 @@ fn listed_violation_code(code: models::continuation_admission_violation::Code) -
     }
 }
 
-/// The code `um` reports a definition-backed run's refusal by, keyed by the
+/// The code `useful` reports a definition-backed run's refusal by, keyed by the
 /// problem type Cloud answers it under (REQ-CONTINUE-83, REQ-CONTINUE-84).
 fn definition_run_refusal_code(problem_type: &str) -> Option<&'static str> {
     match problem_type {
@@ -359,7 +359,7 @@ impl<'a> RunApi<'a> {
                         )
                     {
                         ambiguous_attempt = true;
-                        um_support::sleep(um_support::short_retry_delay());
+                        useful_support::sleep(useful_support::short_retry_delay());
                         continue;
                     }
                     return Err((RunFailure::Unreachable(category), ambiguous_attempt));
@@ -390,7 +390,7 @@ impl<'a> RunApi<'a> {
                     last_transport_failure = category;
                     if http_util::can_retry_ambiguous_mutation(attempt, CREATE_ATTEMPTS, category) {
                         ambiguous_attempt = true;
-                        um_support::sleep(um_support::short_retry_delay());
+                        useful_support::sleep(useful_support::short_retry_delay());
                         continue;
                     }
                     return Err((RunFailure::Unreachable(category), ambiguous_attempt));
@@ -683,9 +683,9 @@ impl<'a> RunApi<'a> {
             .is_none_or(|cursor| !cursor.is_empty() && cursor.len() <= 2048);
         if valid_cursor
             && list.items.iter().all(|delivery| {
-                um_support::valid_typed_id(&delivery.id, "wtd_")
-                    && um_support::valid_typed_id(&delivery.definition_id, "def_")
-                    && um_support::valid_typed_id(&delivery.claim.claim_id, "wsc_")
+                useful_support::valid_typed_id(&delivery.id, "wtd_")
+                    && useful_support::valid_typed_id(&delivery.definition_id, "def_")
+                    && useful_support::valid_typed_id(&delivery.claim.claim_id, "wsc_")
                     && delivery.revision >= 1
             })
         {
@@ -746,7 +746,7 @@ impl<'a> RunApi<'a> {
         require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
         let claim: RunSubjectClaim =
             serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
-        if um_support::valid_typed_id(&claim.claim_id, "wsc_")
+        if useful_support::valid_typed_id(&claim.claim_id, "wsc_")
             && claim.state == RunSubjectClaimState::RunSubjectClaimReleased
         {
             Ok(RunClaimRelease::Released(Box::new(claim)))
@@ -818,7 +818,7 @@ impl<'a> RunApi<'a> {
         require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
         let control: RunControl =
             serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
-        if um_support::valid_typed_id(&control.id, "rct_")
+        if useful_support::valid_typed_id(&control.id, "rct_")
             && control.run_id == run_id
             && control.kind == request.kind
         {
@@ -946,8 +946,8 @@ impl<'a> RunApi<'a> {
             serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
         if list.items.len() > 100
             || list.items.iter().any(|item| {
-                !um_support::valid_typed_id(&item.id, "run_")
-                    || !um_support::valid_typed_id(&item.project_id, "prj_")
+                !useful_support::valid_typed_id(&item.id, "run_")
+                    || !useful_support::valid_typed_id(&item.project_id, "prj_")
             })
         {
             return Err(RunFailure::protocol(false));
@@ -1158,7 +1158,7 @@ fn classify_retry_failure(response: &ReceivedResponse) -> RunFailure {
                         .workflow
                         .as_ref()
                         .and_then(|detail| detail.holder_run_id.clone())
-                        .filter(|id| um_support::valid_typed_id(id, "run_"))
+                        .filter(|id| useful_support::valid_typed_id(id, "run_"))
                 };
                 match problem.r#type.as_str() {
                     "https://api.usefulmachinery.com/problems/run-retry-pending" => {
@@ -1302,11 +1302,11 @@ fn validate_continuation_envelope(
     submitted: Option<&RunContinuationRequest>,
 ) -> Result<(), RunFailure> {
     let receipt = &envelope.request;
-    if !um_support::valid_typed_id(&receipt.request_id, "cmd_")
+    if !useful_support::valid_typed_id(&receipt.request_id, "cmd_")
         || request_id.is_some_and(|id| id != receipt.request_id)
-        || !um_support::valid_typed_id(&receipt.organization_id, "org_")
+        || !useful_support::valid_typed_id(&receipt.organization_id, "org_")
         || receipt.run_id != run_id
-        || !um_support::valid_typed_id(&receipt.attempt_id, "atm_")
+        || !useful_support::valid_typed_id(&receipt.attempt_id, "atm_")
         || receipt.attempt_number < 2
         || !valid_timestamp(&receipt.accepted_at)
         || envelope.run.id != run_id
@@ -1337,17 +1337,17 @@ fn validate_continuation_envelope(
 }
 
 fn validate_retry_receipt(receipt: &RunRetryReceipt, run_id: &str) -> Result<(), RunFailure> {
-    let valid = um_support::valid_typed_id(&receipt.id, "cmd_")
-        && um_support::valid_typed_id(&receipt.organization_id, "org_")
+    let valid = useful_support::valid_typed_id(&receipt.id, "cmd_")
+        && useful_support::valid_typed_id(&receipt.organization_id, "org_")
         && receipt.run_id == run_id
-        && um_support::valid_typed_id(run_id, "run_")
+        && useful_support::valid_typed_id(run_id, "run_")
         && receipt.observed_version >= 0
         && valid_timestamp(&receipt.accepted_at)
         && receipt.resolved_at.as_deref().is_none_or(valid_timestamp)
         && receipt
             .attempt_id
             .as_deref()
-            .is_none_or(|id| um_support::valid_typed_id(id, "atm_"))
+            .is_none_or(|id| useful_support::valid_typed_id(id, "atm_"))
         && receipt.attempt_number.is_none_or(|number| number > 0)
         && receipt.run_version.is_none_or(|version| version > 0)
         && match receipt.state {
@@ -1399,7 +1399,7 @@ fn valid_retry_failure(failure: &models::RunRetryFailure) -> bool {
         .diagnostic
         .error_type
         .as_deref()
-        .is_some_and(um_support::is_diagnostic_slug)
+        .is_some_and(useful_support::is_diagnostic_slug)
 }
 
 fn decode_create_response(
@@ -1440,7 +1440,7 @@ fn decode_get_response(
             let pending: RunCreationPending =
                 serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
             if pending.run_id == requested_run_id
-                && um_support::valid_typed_id(&pending.run_id, "run_")
+                && useful_support::valid_typed_id(&pending.run_id, "run_")
             {
                 Ok(RunRead::Pending(pending))
             } else {
@@ -1641,7 +1641,7 @@ fn source_admission_rejection(
         .request_ids
         .iter()
         .filter_map(|value| value.to_str().ok())
-        .find(|value| um_support::valid_typed_id(value, "req_"))
+        .find(|value| useful_support::valid_typed_id(value, "req_"))
         .map(str::to_owned);
     let blockers = if problem_type == "project-not-ready" {
         readiness_blockers(problem.blockers.unwrap_or_default())
@@ -1703,7 +1703,7 @@ fn validate_acceptance(
     organization: &str,
     locations: &[HeaderValue],
 ) -> Result<RunCreationAcceptance, RunFailure> {
-    if !um_support::valid_typed_id(&acceptance.run_id, "run_") {
+    if !useful_support::valid_typed_id(&acceptance.run_id, "run_") {
         return Err(RunFailure::protocol(false));
     }
     let expected_location = format!(
@@ -1725,13 +1725,13 @@ fn validate_cancellation_envelope(
     use models::run_cancellation_resolution::Kind;
     let receipt = &envelope.request;
     let resolution = receipt.resolution.as_deref();
-    let valid = um_support::valid_typed_id(&receipt.id, "cmd_")
-        && um_support::valid_typed_id(&receipt.organization_id, "org_")
+    let valid = useful_support::valid_typed_id(&receipt.id, "cmd_")
+        && useful_support::valid_typed_id(&receipt.organization_id, "org_")
         && receipt.run_id == run_id
         && receipt
             .attempt_id
             .as_deref()
-            .is_none_or(|id| um_support::valid_typed_id(id, "atm_"))
+            .is_none_or(|id| useful_support::valid_typed_id(id, "atm_"))
         && valid_timestamp(&receipt.accepted_at)
         && mode.is_none_or(|expected| {
             serde_json::to_value(expected).ok() == serde_json::to_value(receipt.mode).ok()
@@ -1742,7 +1742,7 @@ fn validate_cancellation_envelope(
                 && resolution
                     .effective_request_id
                     .as_deref()
-                    .is_none_or(|id| um_support::valid_typed_id(id, "cmd_"))
+                    .is_none_or(|id| useful_support::valid_typed_id(id, "cmd_"))
                 && resolution.run_version.is_none_or(|version| version > 0)
         })
         && status.is_none_or(|status| match status {
@@ -1795,11 +1795,11 @@ fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {
     let workspace_source = &run.primary_workspace_source;
     let inputs = &run.inputs;
     let valid = run.id == requested_run_id
-        && um_support::valid_typed_id(&run.id, "run_")
-        && um_support::valid_typed_id(&run.organization_id, "org_")
-        && um_support::valid_typed_id(&run.project_id, "prj_")
-        && um_support::valid_typed_id(&run.execution_spec_id, "xsp_")
-        && um_support::valid_typed_id(&run.current_attempt_id, "atm_")
+        && useful_support::valid_typed_id(&run.id, "run_")
+        && useful_support::valid_typed_id(&run.organization_id, "org_")
+        && useful_support::valid_typed_id(&run.project_id, "prj_")
+        && useful_support::valid_typed_id(&run.execution_spec_id, "xsp_")
+        && useful_support::valid_typed_id(&run.current_attempt_id, "atm_")
         && run.version >= 1
         && run.current_attempt_number >= 1
         && valid_bounded_string(&run.source_branch, 1, 1024)
@@ -1807,11 +1807,11 @@ fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {
             .display_name
             .as_deref()
             .is_none_or(|name| valid_bounded_string(name, 1, 200))
-        && um_support::valid_typed_id(&workflow_source.repository_connection_id, "rpc_")
+        && useful_support::valid_typed_id(&workflow_source.repository_connection_id, "rpc_")
         && lowercase_hex(&workflow_source.commit_oid, 40)
         && valid_canonical_workflow_path(&workflow_source.workflow_path)
         && lowercase_hex(&workflow_source.workflow_source_closure_digest.value, 64)
-        && um_support::valid_typed_id(&workspace_source.repository_connection_id, "rpc_")
+        && useful_support::valid_typed_id(&workspace_source.repository_connection_id, "rpc_")
         && lowercase_hex(&workspace_source.commit_oid, 40)
         && workflow_source.repository_connection_id == workspace_source.repository_connection_id
         && (match &run.workspace_membership {
@@ -1868,7 +1868,7 @@ fn validate_run(run: Run, requested_run_id: &str) -> Result<Run, RunFailure> {
         && inputs
             .input_set_id
             .as_deref()
-            .is_none_or(|id| um_support::valid_typed_id(id, "ris_"))
+            .is_none_or(|id| useful_support::valid_typed_id(id, "ris_"))
         && (0..=256).contains(&inputs.attachment_count)
         && (0..=268_435_456).contains(&inputs.aggregate_bytes)
         && valid_integration_context(
@@ -1965,7 +1965,7 @@ fn valid_run_actor(actor: &models::RunActor) -> bool {
         models::run_actor::Kind::Member => actor
             .requester_principal_id
             .as_deref()
-            .is_some_and(|id| um_support::valid_typed_id(id, "prn_")),
+            .is_some_and(|id| useful_support::valid_typed_id(id, "prn_")),
     }
 }
 
@@ -2039,18 +2039,18 @@ fn valid_cancellation(cancellation: Option<&models::RunCancellation>) -> bool {
             cancellation
                 .graceful_request_id
                 .as_deref()
-                .is_some_and(|id| um_support::valid_typed_id(id, "cmd_"))
+                .is_some_and(|id| useful_support::valid_typed_id(id, "cmd_"))
                 && cancellation.force_request_id.is_none()
         }
         models::run_cancellation::Mode::Force => {
             cancellation
                 .force_request_id
                 .as_deref()
-                .is_some_and(|id| um_support::valid_typed_id(id, "cmd_"))
+                .is_some_and(|id| useful_support::valid_typed_id(id, "cmd_"))
                 && cancellation
                     .graceful_request_id
                     .as_deref()
-                    .is_none_or(|id| um_support::valid_typed_id(id, "cmd_"))
+                    .is_none_or(|id| useful_support::valid_typed_id(id, "cmd_"))
         }
     }
 }
@@ -2109,10 +2109,10 @@ fn valid_staged_continuation(run: &Run) -> bool {
     let workspace = &continuation.workspace;
     if let Some(recovery) = workspace.recovery.as_deref() {
         if continuation.schema_version != Some(models::run_continuation::SchemaVersion::Variant2)
-            || !um_support::valid_typed_id(&recovery.workspace_id, "rws_")
-            || !um_support::valid_typed_id(&recovery.work_root_id, "rwr_")
-            || !um_support::valid_typed_id(&recovery.runner_id, "rnr_")
-            || !um_support::valid_typed_id(&recovery.origin_runner_boot_id, "rbt_")
+            || !useful_support::valid_typed_id(&recovery.workspace_id, "rws_")
+            || !useful_support::valid_typed_id(&recovery.work_root_id, "rwr_")
+            || !useful_support::valid_typed_id(&recovery.runner_id, "rnr_")
+            || !useful_support::valid_typed_id(&recovery.origin_runner_boot_id, "rbt_")
         {
             return false;
         }
@@ -2122,11 +2122,11 @@ fn valid_staged_continuation(run: &Run) -> bool {
             || recovery
                 .target_runner_boot_id
                 .as_deref()
-                .is_some_and(|id| !um_support::valid_typed_id(id, "rbt_"))
+                .is_some_and(|id| !useful_support::valid_typed_id(id, "rbt_"))
             || recovery
                 .claiming_assignment_id
                 .as_deref()
-                .is_some_and(|id| !um_support::valid_typed_id(id, "asn_"))
+                .is_some_and(|id| !useful_support::valid_typed_id(id, "asn_"))
             || recovery
                 .claim_generation
                 .is_some_and(|generation| !(1..=9_007_199_254_740_991).contains(&generation))
@@ -2432,8 +2432,8 @@ fn validate_linear_lifecycle_update(update: &RunLinearLifecycleUpdate) -> bool {
         return false;
     }
     let nonempty = |value: &Option<String>| value.as_deref().is_none_or(|value| !value.is_empty());
-    um_support::valid_typed_id(&update.id, "llu_")
-        && um_support::valid_typed_id(&update.attempt_id, "atm_")
+    useful_support::valid_typed_id(&update.id, "llu_")
+        && useful_support::valid_typed_id(&update.attempt_id, "atm_")
         && update.attempt_number >= 1
         && !update.event_id.is_empty()
         && update.event_sequence >= 1
@@ -2458,8 +2458,8 @@ fn validate_linear_lifecycle_update(update: &RunLinearLifecycleUpdate) -> bool {
         && nonempty(&update.confirmed_state_id)
         && update.blocking_update.as_deref().is_none_or(|blocking| {
             code.as_deref() == Some("outcome_unresolved")
-                && um_support::valid_typed_id(&blocking.run_id, "run_")
-                && um_support::valid_typed_id(&blocking.update_id, "llu_")
+                && useful_support::valid_typed_id(&blocking.run_id, "run_")
+                && useful_support::valid_typed_id(&blocking.update_id, "llu_")
         })
         && update.diagnostic.as_deref().is_none_or(|facts| {
             let nonempty_text =
@@ -2516,22 +2516,22 @@ fn validate_linear_lifecycle(view: &RunLinearLifecycle) -> bool {
                 | LifecycleEvent::StepNotRun
         )
     };
-    um_support::valid_typed_id(&view.trigger_id, "trg_")
+    useful_support::valid_typed_id(&view.trigger_id, "trg_")
         && view.configuration_version >= 1
-        && um_support::valid_typed_id(&view.connection_id, "lcn_")
+        && useful_support::valid_typed_id(&view.connection_id, "lcn_")
         && !view.workspace_id.is_empty()
         && !view.issue_id.is_empty()
         && valid_linear_lifecycle_reason(view.ownership_state, view.reason_code)
         && match (view.attempt_id.as_deref(), view.attempt_number) {
             (None, None) => true,
             (Some(attempt_id), Some(number)) => {
-                um_support::valid_typed_id(attempt_id, "atm_") && number >= 1
+                useful_support::valid_typed_id(attempt_id, "atm_") && number >= 1
             }
             _ => false,
         }
         && view.controlling_run_id.as_deref().is_none_or(|run_id| {
             view.ownership_state == LifecycleState::Superseded
-                && um_support::valid_typed_id(run_id, "run_")
+                && useful_support::valid_typed_id(run_id, "run_")
         })
         && view
             .latest_update
@@ -2541,7 +2541,7 @@ fn validate_linear_lifecycle(view: &RunLinearLifecycle) -> bool {
             !event.event_id.is_empty()
                 && event.sequence >= 1
                 && valid_timestamp(&event.occurred_at)
-                && um_support::valid_typed_id(&event.attempt_id, "atm_")
+                && useful_support::valid_typed_id(&event.attempt_id, "atm_")
                 && event.attempt_number >= 1
                 && event
                     .node
@@ -3151,7 +3151,7 @@ mod recovery_read_tests {
         )
         .into_bytes();
         response.extend_from_slice(body);
-        let server = um_test_support::ScriptedHttpServer::respond_in_sequence(vec![
+        let server = useful_test_support::ScriptedHttpServer::respond_in_sequence(vec![
             response.clone(),
             response,
         ]);
@@ -3270,7 +3270,7 @@ mod recovery_read_tests {
 
     /// An API client whose one request is answered `409` under a problem type this
     /// release does not name.
-    fn unnamed_conflict_server() -> (um_test_support::ScriptedHttpServer, HttpClient) {
+    fn unnamed_conflict_server() -> (useful_test_support::ScriptedHttpServer, HttpClient) {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let body = br#"{"type":"https://api.usefulmachinery.com/problems/a-conflict-from-a-later-release","title":"Refused","status":409}"#;
         let mut response = format!(
@@ -3279,7 +3279,7 @@ mod recovery_read_tests {
         )
         .into_bytes();
         response.extend_from_slice(body);
-        let server = um_test_support::ScriptedHttpServer::respond_in_sequence(vec![response]);
+        let server = useful_test_support::ScriptedHttpServer::respond_in_sequence(vec![response]);
         let storage = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
         (server, storage)
     }
@@ -3360,7 +3360,7 @@ mod recovery_read_tests {
         )
         .into_bytes();
         response.extend_from_slice(&body);
-        let server = um_test_support::ScriptedHttpServer::respond(response);
+        let server = useful_test_support::ScriptedHttpServer::respond(response);
         let storage = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
         let api = RunApi::new(
             &server.api_url,
@@ -3430,7 +3430,7 @@ fn valid_artifact_delivery(delivery: Option<&models::RunArtifactDelivery>) -> bo
     match delivery {
         None => true,
         Some(models::RunArtifactDelivery::RunArtifactDeliverySucceeded(succeeded)) => {
-            um_support::valid_typed_id(&succeeded.artifact_set_id, "ats_")
+            useful_support::valid_typed_id(&succeeded.artifact_set_id, "ats_")
         }
         Some(models::RunArtifactDelivery::RunArtifactDeliveryRegistrationFailed(_))
         | Some(models::RunArtifactDelivery::RunArtifactDeliveryUploadFailed(_))

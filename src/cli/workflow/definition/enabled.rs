@@ -1,4 +1,4 @@
-//! `um workflow definition enable` and `disable` (REQ-WFDEF-24): one command whose
+//! `useful workflow definition enable` and `disable` (REQ-WFDEF-24): one command whose
 //! target value the leaf supplies.
 
 use std::io::{self, Write};
@@ -7,7 +7,7 @@ use clap::Args;
 use serde::Serialize;
 
 use super::report::{display, write_json};
-use um_execution::{EnabledChange, WorkflowHome, set_enabled};
+use useful_execution::{EnabledChange, WorkflowHome, set_enabled};
 
 pub(super) const ENABLE_ABOUT: &str = "Enable a local workflow definition";
 pub(super) const DISABLE_ABOUT: &str = "Disable a local workflow definition";
@@ -32,7 +32,7 @@ struct Leaf {
 
 const ENABLE: Leaf = Leaf {
     enabled: true,
-    command: "um workflow definition enable",
+    command: "useful workflow definition enable",
     outcome: "enabled",
     refused: "Enable refused.",
     done: "Enabled",
@@ -40,7 +40,7 @@ const ENABLE: Leaf = Leaf {
 
 const DISABLE: Leaf = Leaf {
     enabled: false,
-    command: "um workflow definition disable",
+    command: "useful workflow definition disable",
     outcome: "disabled",
     refused: "Disable refused.",
     done: "Disabled",

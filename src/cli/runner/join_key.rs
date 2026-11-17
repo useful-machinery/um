@@ -9,16 +9,16 @@ use super::{
     CloudOptions, OrganizationArg, PaginationArgs, PoolArg, cloud, completed_cloud_result,
 };
 use crate::exit_code::ExitCode;
-use um_human_auth::Deployment;
-use um_runner::ArtifactDestination;
-use um_support::generate_idempotency_key;
+use useful_human_auth::Deployment;
+use useful_runner::ArtifactDestination;
+use useful_support::generate_idempotency_key;
 
 pub(super) const ABOUT: &str = "Manage runner pool join keys";
 const COMMAND_PATH: &[&str] = &["runner", "join-key"];
 // Largest unit first, so a removal time prints as it is usually written.
 const DURATION_UNITS: [(&str, u32); 3] = [("d", 86_400), ("h", 3_600), ("m", 60)];
 
-// um-api does not name its join-key models, so these documents borrow them generically.
+// useful-api does not name its join-key models, so these documents borrow them generically.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JoinKeyResult<'a, K> {
@@ -394,7 +394,7 @@ fn duration_text(seconds: i32) -> String {
 }
 
 fn parse_join_key_id(value: &str) -> Result<String, String> {
-    if um_support::valid_typed_id(value, "rjk_") {
+    if useful_support::valid_typed_id(value, "rjk_") {
         Ok(value.to_owned())
     } else {
         Err("must be an exact runner join key ID".to_owned())

@@ -4,7 +4,7 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{
+use useful_api::{
     AuditActor, AuditProjectionWarning, AuditProjectionWarningReason, CommonOrganizationFailure,
     CreateOrganizationOutcome, CurrentPrincipalMembership, DirectoryPrincipalState,
     GetOrganizationOutcome, ListCurrentPrincipalMembershipsOutcome,
@@ -52,7 +52,7 @@ pub(super) fn write_create(
             if authentication == super::super::PrincipalAuthenticationKind::ServiceApiKey {
                 "! The nominated human owner needs a display name.\n\nAsk them to set their account display name, then retry."
             } else {
-                "! Your account needs a display name.\n\nSet it with um account update --display-name, then retry."
+                "! Your account needs a display name.\n\nSet it with useful account update --display-name, then retry."
             },
             OutcomeClass::GeneralFailure,
             json,
@@ -518,14 +518,14 @@ struct CommonFailurePresentation {
 }
 
 const AUDIT_FAILURE_PRESENTATION: CommonFailurePresentation = CommonFailurePresentation {
-    unauthenticated: "error: organization audit records require sign-in\n\nSign in first:\n  um auth login",
+    unauthenticated: "error: organization audit records require sign-in\n\nSign in first:\n  useful auth login",
     forbidden: "error: organization audit records unavailable for this account\n\nUse an active organization owner account.",
     invalid_input_subject: "organization audit request",
     invalid_input_remedy: "Check the organization reference, limit, and cursor, then try again.",
 };
 
 const MEMBERSHIP_FAILURE_PRESENTATION: CommonFailurePresentation = CommonFailurePresentation {
-    unauthenticated: "error: organization membership management requires sign-in\n\nSign in first:\n  um auth login",
+    unauthenticated: "error: organization membership management requires sign-in\n\nSign in first:\n  useful auth login",
     forbidden: "error: organization membership operation not permitted\n\nUse an active organization owner account.",
     invalid_input_subject: "organization membership input",
     invalid_input_remedy: "Check the organization reference, membership ID, and cursor, then try again.",
@@ -646,7 +646,7 @@ fn write_common_organization_operation_failure(
 
 fn organization_operation_unreachable(
     deployment: &str,
-    category: um_api::UnreachableCategory,
+    category: useful_api::UnreachableCategory,
 ) -> (&'static str, Option<&'static str>, String, OutcomeClass) {
     (
         "unreachable",
@@ -748,7 +748,7 @@ fn write_common(
             None,
             None,
             authentication.rejected_notice(
-                "! You must sign in before managing Useful Machinery organizations.\n\nRun:\n  um auth login",
+                "! You must sign in before managing Useful Machinery organizations.\n\nRun:\n  useful auth login",
             ),
             OutcomeClass::Unauthenticated,
             json,
@@ -912,7 +912,7 @@ fn write_members_list_json(
 
 fn write_linked_emails(
     output: &mut impl Write,
-    links: Option<&Vec<um_api::LinkedEmail>>,
+    links: Option<&Vec<useful_api::LinkedEmail>>,
 ) -> io::Result<()> {
     if let Some(links) = links {
         for link in links {
@@ -1014,7 +1014,7 @@ fn write_current_membership_failure(
             None,
             authentication
                 .rejected_error(
-                    "error: organization membership history requires sign-in\n\nSign in first:\n  um auth login",
+                    "error: organization membership history requires sign-in\n\nSign in first:\n  useful auth login",
                 )
                 .to_owned(),
             OutcomeClass::Unauthenticated,

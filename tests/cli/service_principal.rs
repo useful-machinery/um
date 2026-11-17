@@ -63,14 +63,14 @@ fn human_credentials_for(server: &ScriptedServer, directory: &tempfile::TempDir)
     path.to_string_lossy().into_owned()
 }
 
-/// Runs `um` with a zero file-size limit so writing the one-time key to a file fails after the
+/// Runs `useful` with a zero file-size limit so writing the one-time key to a file fails after the
 /// server has committed it, while JSON results on the standard-output pipe still succeed.
 fn run_with_failing_key_file(args: &[&str], environment: &[(&str, &str)]) -> Output {
     let mut command = Command::new("/bin/sh");
     command
         .arg("-c")
         .arg("ulimit -f 0 && trap '' XFSZ && exec \"$0\" \"$@\"")
-        .arg(env!("CARGO_BIN_EXE_um"))
+        .arg(env!("CARGO_BIN_EXE_useful"))
         .args(args)
         .stdin(Stdio::null())
         .env_remove(CREDENTIALS_FILE_VARIABLE);
@@ -80,7 +80,7 @@ fn run_with_failing_key_file(args: &[&str], environment: &[(&str, &str)]) -> Out
     for (name, value) in environment {
         command.env(name, value);
     }
-    command.output().expect("um should run")
+    command.output().expect("useful should run")
 }
 
 // REQ-SERVICEPRINCIPAL-3
@@ -323,7 +323,7 @@ fn issuance_delivers_the_committed_key_when_interrupted_after_dispatch() {
     let missing_human_credentials = directory.path().join("human.json");
     let environment =
         service_environment(&server.api_url, missing_human_credentials.to_str().unwrap());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args([
             "service-principal",

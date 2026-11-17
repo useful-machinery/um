@@ -1,7 +1,7 @@
 use clap::{Args, ValueEnum};
 
 use crate::cli::grant::consent::{Consent, ConsentProvider, Front, Options};
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Create a provider grant through the provider's consent";
 
@@ -55,7 +55,7 @@ impl GrantProviderArg {
 }
 
 fn parse_identity_id(value: &str) -> Result<String, String> {
-    if um_support::valid_typed_id(value, "idn_") {
+    if useful_support::valid_typed_id(value, "idn_") {
         Ok(value.to_owned())
     } else {
         Err("must be an exact linked identity ID".to_owned())

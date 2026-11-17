@@ -1,5 +1,5 @@
 [package]
-name = "um-runner"
+name = "useful-runner"
 version = "0.0.0-dev"
 edition.workspace = true
 rust-version.workspace = true
@@ -30,9 +30,9 @@ prost.workspace = true
 reqwest.workspace = true
 ring.workspace = true
 rustix.workspace = true
-um-execution.workspace = true
-um-runner-protocol.workspace = true
-um-support.workspace = true
+useful-execution.workspace = true
+useful-runner-protocol.workspace = true
+useful-support.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
@@ -47,5 +47,5 @@ zeroize.workspace = true
 [dev-dependencies]
 jsonschema.workspace = true
 rustix = { workspace = true, features = ["event", "pty"] }
-um-execution = { workspace = true, features = ["test-fixtures"] }
-um-test-support.workspace = true
+useful-execution = { workspace = true, features = ["test-fixtures"] }
+useful-test-support.workspace = true

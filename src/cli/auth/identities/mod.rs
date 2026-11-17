@@ -7,12 +7,12 @@ use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
 
 use crate::exit_code::ExitCode;
-use um_api::{
+use useful_api::{
     CommonIdentityFailure, HttpClient, IdentityApiError, LinkIdentityOutcome,
     ListIdentitiesOutcome, RemoveIdentityOutcome, UnreachableCategory,
 };
-use um_human_auth::Deployment;
-use um_human_auth::{
+use useful_human_auth::Deployment;
+use useful_human_auth::{
     self, BoundRequiredOperation, LocalCredentialState, RequiredOperationWithBinding,
     SessionBinding,
 };
@@ -156,7 +156,7 @@ fn with_human_session_binding<O>(
 where
     O: HumanIdentityOutcome,
 {
-    match um_human_auth::execute_required_with_binding(
+    match useful_human_auth::execute_required_with_binding(
         client,
         deployment,
         |access_token| operation(access_token.expose()),
@@ -191,7 +191,7 @@ fn with_bound_human_session<O>(
 where
     O: HumanIdentityOutcome,
 {
-    match um_human_auth::execute_bound_required(
+    match useful_human_auth::execute_bound_required(
         client,
         deployment,
         binding,

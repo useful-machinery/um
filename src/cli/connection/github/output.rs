@@ -4,7 +4,7 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{
+use useful_api::{
     GitHubAccountType, GitHubFailure, GitHubInstallation, GitHubInstallationState,
     GitHubRepository, GitHubRepositoryList, GitHubSetupSession,
 };
@@ -55,7 +55,7 @@ pub(super) fn write_setup_begin(
                 )?;
                 writeln!(
                     output,
-                    "\nThe Useful Machinery page GitHub returns to shows the installation ID and this command.\nThen run it with that installation ID:\n  um connection github setup complete {organization} {} --provider-installation-id <INSTALLATION_ID>",
+                    "\nThe Useful Machinery page GitHub returns to shows the installation ID and this command.\nThen run it with that installation ID:\n  useful connection github setup complete {organization} {} --provider-installation-id <INSTALLATION_ID>",
                     session.id
                 )?;
             }
@@ -284,7 +284,7 @@ fn write_failure(
             None,
             authentication
                 .rejected_error(
-                    "error: GitHub connection management requires sign-in\n\nSign in first:\n  um auth login",
+                    "error: GitHub connection management requires sign-in\n\nSign in first:\n  useful auth login",
                 )
                 .to_owned(),
             OutcomeClass::Unauthenticated,
@@ -364,7 +364,7 @@ impl FailureAction {
     const fn conflict_message(self) -> &'static str {
         match self {
             Self::CompleteSetup => {
-                "error: GitHub setup conflicts with the current source connection\n\nCheck that the setup session is still pending and that the GitHub installation belongs to this organization. If the earlier session expired, begin a new one:\n  um connection github setup begin <ORGANIZATION>"
+                "error: GitHub setup conflicts with the current source connection\n\nCheck that the setup session is still pending and that the GitHub installation belongs to this organization. If the earlier session expired, begin a new one:\n  useful connection github setup begin <ORGANIZATION>"
             }
             Self::DisconnectInstallation => {
                 "error: GitHub installation is unavailable for disconnection\n\nList installation bindings. Reconnect a disconnected binding through browser setup; a revoked installation requires a new GitHub installation."

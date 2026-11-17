@@ -69,10 +69,10 @@
         },
         "command": {
           "enum": [
-            "um workflow run create",
-            "um workflow run retry",
-            "um workflow run resume",
-            "um workflow run restart"
+            "useful workflow run create",
+            "useful workflow run retry",
+            "useful workflow run resume",
+            "useful workflow run restart"
           ]
         },
         "outcome": {
@@ -153,8 +153,8 @@
         },
         "command": {
           "enum": [
-            "um workflow run resume",
-            "um workflow run retry"
+            "useful workflow run resume",
+            "useful workflow run retry"
           ]
         },
         "outcome": {
@@ -351,11 +351,11 @@
         },
         "command": {
           "enum": [
-            "um workflow run create",
-            "um workflow run retry",
-            "um workflow run resume",
-            "um workflow run restart",
-            "um workflow run upgrade"
+            "useful workflow run create",
+            "useful workflow run retry",
+            "useful workflow run resume",
+            "useful workflow run restart",
+            "useful workflow run upgrade"
           ]
         },
         "outcome": {
@@ -384,7 +384,7 @@
       "if": {
         "properties": {
           "command": {
-            "const": "um workflow run create"
+            "const": "useful workflow run create"
           }
         },
         "required": [
@@ -422,9 +422,9 @@
         },
         "command": {
           "enum": [
-            "um workflow run create",
-            "um workflow run restart",
-            "um workflow run upgrade"
+            "useful workflow run create",
+            "useful workflow run restart",
+            "useful workflow run upgrade"
           ]
         },
         "outcome": {
@@ -582,8 +582,8 @@
         },
         "command": {
           "enum": [
-            "um workflow run create",
-            "um workflow run retry"
+            "useful workflow run create",
+            "useful workflow run retry"
           ]
         },
         "outcome": {
@@ -617,7 +617,7 @@
       "if": {
         "properties": {
           "command": {
-            "const": "um workflow run retry"
+            "const": "useful workflow run retry"
           }
         },
         "required": [
@@ -686,10 +686,10 @@
         },
         "command": {
           "enum": [
-            "um workflow run retry",
-            "um workflow run resume",
-            "um workflow run restart",
-            "um workflow run upgrade"
+            "useful workflow run retry",
+            "useful workflow run resume",
+            "useful workflow run restart",
+            "useful workflow run upgrade"
           ]
         },
         "outcome": {
@@ -740,7 +740,7 @@
         {
           "properties": {
             "command": {
-              "const": "um workflow run retry"
+              "const": "useful workflow run retry"
             },
             "phase": {
               "const": "retry"
@@ -751,9 +751,9 @@
           "properties": {
             "command": {
               "enum": [
-                "um workflow run resume",
-                "um workflow run restart",
-                "um workflow run upgrade"
+                "useful workflow run resume",
+                "useful workflow run restart",
+                "useful workflow run upgrade"
               ]
             },
             "phase": {
@@ -899,8 +899,8 @@
         },
         "command": {
           "enum": [
-            "um workflow run restart",
-            "um workflow run upgrade"
+            "useful workflow run restart",
+            "useful workflow run upgrade"
           ]
         },
         "outcome": {
@@ -945,7 +945,7 @@
       }
     },
     "UpgradedRun": {
-      "description": "A successor um workflow run upgrade created on the definition's current revision, waiting on its predecessor's wait; no attempt was started.",
+      "description": "A successor useful workflow run upgrade created on the definition's current revision, waiting on its predecessor's wait; no attempt was started.",
       "type": "object",
       "additionalProperties": false,
       "required": [
@@ -963,7 +963,7 @@
           "const": 1
         },
         "command": {
-          "const": "um workflow run upgrade"
+          "const": "useful workflow run upgrade"
         },
         "outcome": {
           "const": "upgraded"
@@ -1006,9 +1006,9 @@
         },
         "command": {
           "enum": [
-            "um workflow run resume",
-            "um workflow run restart",
-            "um workflow run upgrade"
+            "useful workflow run resume",
+            "useful workflow run restart",
+            "useful workflow run upgrade"
           ]
         },
         "outcome": {

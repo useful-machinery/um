@@ -13,7 +13,7 @@ use super::authorize::{MOVE_CODEX_GRANT, Outcome};
 use super::projection::{MemberStatus, PROVIDERS, grant_authorization_status, grant_subject};
 use super::runner_choice::{Nothing, Runner};
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{GrantUse, MemberGrant, MemberGrantFailure, MemberGrantKind};
+use useful_api::{GrantUse, MemberGrant, MemberGrantFailure, MemberGrantKind};
 
 /// The names the member's other reads give a grant's account: each linked identity's, and
 /// each organization's slug, by ID.
@@ -63,7 +63,7 @@ impl<'a> AccountView<'a> {
     }
 }
 
-/// A grant as `um grant list` presents it (REQ-GRANT-64): the model's named fields only, enums
+/// A grant as `useful grant list` presents it (REQ-GRANT-64): the model's named fields only, enums
 /// as their wire strings, so nothing a response adds beyond the model reaches output
 /// (REQ-GRANT-4, REQ-GRANT-14). The members after `status` are those `list GRANT` adds.
 #[derive(Serialize)]
@@ -86,7 +86,7 @@ struct GrantView<'a> {
     detail: Option<DetailView<'a>>,
 }
 
-/// What `um grant list GRANT` adds for each kind: an OAuth grant's scopes, last use, expiries
+/// What `useful grant list GRANT` adds for each kind: an OAuth grant's scopes, last use, expiries
 /// and the tokens issued from it; a native grant's record, import and ended authorizations.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -510,18 +510,18 @@ pub(super) fn write_nothing_offered(
         Nothing::RunnerNotFound => refused(
             "runner_not_found",
             "error: no runner found in the organizations the command can act in",
-            "Register a runner in the organization, then run the command again. List an organization's runners:\n  um runner list ORGANIZATION",
+            "Register a runner in the organization, then run the command again. List an organization's runners:\n  useful runner list ORGANIZATION",
         ),
         Nothing::AlreadyAuthorized => refused(
             "already_authorized",
             "error: this grant is already authorized for every runner it can serve",
-            "Show the grant's authorizations:\n  um grant list GRANT",
+            "Show the grant's authorizations:\n  useful grant list GRANT",
         ),
         Nothing::AuthorizedElsewhere => authorized_elsewhere(),
         Nothing::AuthorizationNotFound => refused(
             "authorization_not_found",
             "error: this grant is authorized for no runner",
-            "Authorize a runner for it first:\n  um grant authorize GRANT",
+            "Authorize a runner for it first:\n  useful grant authorize GRANT",
         ),
     }
     .write(deployment, json)
@@ -577,7 +577,7 @@ pub(super) fn write_revoke(
             Some(ended) if !ended.is_empty() => write_revoked_runners(&mut stdout, ended)?,
             None if after.is_none() => writeln!(
                 stdout,
-                "\nTo see which runners have confirmed removing it:\n  um grant list {}",
+                "\nTo see which runners have confirmed removing it:\n  useful grant list {}",
                 grant.id
             )?,
             _ => {}
@@ -784,12 +784,12 @@ pub(super) fn report(deployment: &str, failure: &MemberGrantFailure) -> ApiFailu
         MemberGrantFailure::GrantNotFound => refused(
             "grant_not_found",
             "error: grant not found among your unrevoked grants",
-            "List your grants:\n  um grant list",
+            "List your grants:\n  useful grant list",
         ),
         MemberGrantFailure::OrganizationNotFound => refused(
             "organization_not_found",
             "error: organization not found among your active memberships",
-            "List your organizations:\n  um organization list",
+            "List your organizations:\n  useful organization list",
         ),
         MemberGrantFailure::MaterialInvalid => refused(
             "material_invalid",
@@ -799,17 +799,17 @@ pub(super) fn report(deployment: &str, failure: &MemberGrantFailure) -> ApiFailu
         MemberGrantFailure::LimitReached => refused(
             "limit_reached",
             "error: you hold the most grants of coding agents this organization allows",
-            "Revoke one you no longer use:\n  um grant revoke GRANT --yes",
+            "Revoke one you no longer use:\n  useful grant revoke GRANT --yes",
         ),
         MemberGrantFailure::RunnerNotFound => refused(
             "runner_not_found",
             "error: runner not found in an organization this grant can serve",
-            "List the organization's runners and use a runner ID:\n  um runner list ORGANIZATION",
+            "List the organization's runners and use a runner ID:\n  useful runner list ORGANIZATION",
         ),
         MemberGrantFailure::RunnerHoldsLogin => refused(
             "runner_holds_login",
             "error: that runner already holds a login of this coding agent",
-            "The owner of the login that runner holds must end its authorization first:\n  um grant deauthorize GRANT RUNNER --yes",
+            "The owner of the login that runner holds must end its authorization first:\n  useful grant deauthorize GRANT RUNNER --yes",
         ),
         MemberGrantFailure::AlreadyAuthorized => refused(
             "already_authorized",
@@ -819,7 +819,7 @@ pub(super) fn report(deployment: &str, failure: &MemberGrantFailure) -> ApiFailu
         MemberGrantFailure::AuthorizationNotFound => refused(
             "authorization_not_found",
             "error: that runner holds no authorization of this grant",
-            "Show the grant's authorizations:\n  um grant list GRANT",
+            "Show the grant's authorizations:\n  useful grant list GRANT",
         ),
         MemberGrantFailure::RateLimited { retry_after } => {
             ApiFailureReport::rate_limited(SUBJECT, *retry_after)
@@ -831,7 +831,7 @@ pub(super) fn report(deployment: &str, failure: &MemberGrantFailure) -> ApiFailu
     }
 }
 
-/// Reports a grant operation's failure with the remedy a member can act on; `um runner doctor
+/// Reports a grant operation's failure with the remedy a member can act on; `useful runner doctor
 /// --grants` ends with it too (REQ-CREDREADY-22).
 pub(in crate::cli) fn failure(
     deployment: &str,
@@ -841,7 +841,7 @@ pub(in crate::cli) fn failure(
     report(deployment, failure).write(deployment, json)
 }
 
-/// The one event `um grant create` prints for a coding agent's login: the grant it imported
+/// The one event `useful grant create` prints for a coding agent's login: the grant it imported
 /// or replaced, or the refusal that stored nothing.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -872,7 +872,7 @@ impl<'a> ImportEvent<'a> {
     }
 }
 
-/// Writes the native grant `um grant create` imported, or stored as the next generation of
+/// Writes the native grant `useful grant create` imported, or stored as the next generation of
 /// the grant it `replaced` (REQ-GRANT-70, REQ-GRANT-73), naming its organization by `slug` when
 /// that is known.
 pub(super) fn write_imported(
@@ -928,11 +928,11 @@ pub(super) fn write_import_refusal(
     Ok(report.class.exit_code())
 }
 
-/// The outcome of a coding agent `um grant create` without `PROVIDER` passes over because no
+/// The outcome of a coding agent `useful grant create` without `PROVIDER` passes over because no
 /// organization was resolved for its grant (REQ-GRANT-75).
 pub(super) const ORGANIZATION_REQUIRED: &str = "organization_required";
 
-/// The outcome of a provider `um grant create --workflow` passes over because every grant the
+/// The outcome of a provider `useful grant create --workflow` passes over because every grant the
 /// member holds of it needs reconnecting and its replacement was not settled (REQ-GRANT-79).
 pub(super) const RECONNECT_REQUIRED: &str = "reconnect_required";
 
@@ -953,7 +953,7 @@ pub(super) fn write_organization_required(
     Ok(())
 }
 
-/// Names on standard error the provider whose sign-in `um grant create` runs next, so the
+/// Names on standard error the provider whose sign-in `useful grant create` runs next, so the
 /// member knows whose prompt follows (REQ-GRANT-75), and in a report parts it from the one
 /// `after` another provider's sign-in printed.
 pub(super) fn write_provider_heading(
@@ -972,14 +972,14 @@ pub(super) fn write_provider_heading(
     Ok(())
 }
 
-/// One provider's entry in the summary of `um grant create` without a provider.
+/// One provider's entry in the summary of `useful grant create` without a provider.
 #[derive(Serialize)]
 struct CreateOutcome {
     provider: &'static str,
     outcome: &'static str,
 }
 
-/// The event that ends `um grant create` without a provider: how the command ended and one
+/// The event that ends `useful grant create` without a provider: how the command ended and one
 /// outcome per provider it signed in to, or the refusal that started none.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1009,7 +1009,7 @@ impl<'a> CreateSummary<'a> {
     }
 }
 
-/// The providers `um grant create` without `PROVIDER` chose among, and the command that ran
+/// The providers `useful grant create` without `PROVIDER` chose among, and the command that ran
 /// the choice, as its report names them.
 #[derive(Clone, Copy)]
 pub(in crate::cli) enum Scope {
@@ -1017,7 +1017,7 @@ pub(in crate::cli) enum Scope {
     Every,
     /// Those the `--workflow` files call for (REQ-GRANT-76).
     Workflows,
-    /// Those the `--workflow` files call for, from `um runner doctor --connect`
+    /// Those the `--workflow` files call for, from `useful runner doctor --connect`
     /// (REQ-CREDREADY-24).
     Doctor,
 }
@@ -1034,18 +1034,18 @@ impl Scope {
 
     const fn again(self) -> &'static str {
         match self {
-            Self::Every => "um grant create",
-            Self::Workflows => "um grant create --workflow FILE",
-            Self::Doctor => "um runner doctor --workflow FILE --connect",
+            Self::Every => "useful grant create",
+            Self::Workflows => "useful grant create --workflow FILE",
+            Self::Doctor => "useful runner doctor --workflow FILE --connect",
         }
     }
 
     pub(super) const fn organization(self) -> &'static str {
         match self {
-            Self::Every => "um grant create --organization ORGANIZATION",
-            Self::Workflows => "um grant create --workflow FILE --organization ORGANIZATION",
+            Self::Every => "useful grant create --organization ORGANIZATION",
+            Self::Workflows => "useful grant create --workflow FILE --organization ORGANIZATION",
             Self::Doctor => {
-                "um runner doctor --workflow FILE --connect --organization-id ORGANIZATION"
+                "useful runner doctor --workflow FILE --connect --organization-id ORGANIZATION"
             }
         }
     }
@@ -1056,20 +1056,20 @@ impl Scope {
 fn native_remedy(provider: &str) -> Option<&'static str> {
     match provider {
         "codex" => Some(
-            "When codex is not on your PATH, install Codex so that it is, or import an auth.json:\n  um grant create codex --from-file PATH",
+            "When codex is not on your PATH, install Codex so that it is, or import an auth.json:\n  useful grant create codex --from-file PATH",
         ),
         "claude_code" => Some(
-            "When claude is not on your PATH, install Claude Code so that it is, or import the token claude setup-token printed:\n  um grant create claude_code --token-file PATH",
+            "When claude is not on your PATH, install Claude Code so that it is, or import the token claude setup-token printed:\n  useful grant create claude_code --token-file PATH",
         ),
         _ => None,
     }
 }
 
-/// Prints one outcome per provider `um grant create` signed in to or passed over, after their
+/// Prints one outcome per provider `useful grant create` signed in to or passed over, after their
 /// own output, as the last JSON event or a report on standard output; `code` is the command's
 /// exit status (REQ-GRANT-75). The report's verdict claims each grant made only when every
 /// provider ended with one, created or `replaced`, and its remedies name what each other
-/// outcome present leaves to do, `um grant create PROVIDER --replace` for each provider passed
+/// outcome present leaves to do, `useful grant create PROVIDER --replace` for each provider passed
 /// over as `reconnect_required` (REQ-GRANT-79).
 pub(super) fn write_create_summary(
     deployment: &str,
@@ -1131,7 +1131,7 @@ pub(super) fn write_create_summary(
     if !started.is_empty() {
         writeln!(
             stdout,
-            "\nStarted, not yet approved: {}. Approve each at the URL printed for it to make its grant, then see your grants:\n  um grant list",
+            "\nStarted, not yet approved: {}. Approve each at the URL printed for it to make its grant, then see your grants:\n  useful grant list",
             started.join(", ")
         )?;
     }
@@ -1157,7 +1157,7 @@ pub(super) fn write_create_summary(
             reconnect.join(", ")
         )?;
         for provider in &reconnect {
-            writeln!(stdout, "  um grant create {provider} --replace")?;
+            writeln!(stdout, "  useful grant create {provider} --replace")?;
         }
     }
     for remedy in failed.iter().filter_map(|provider| native_remedy(provider)) {
@@ -1180,7 +1180,7 @@ pub(super) fn write_create_summary(
     Ok(())
 }
 
-/// Reports a failure that ended `um grant create` without a provider before any sign-in: as
+/// Reports a failure that ended `useful grant create` without a provider before any sign-in: as
 /// its summary event, or on standard error with its remedy.
 pub(super) fn write_create_refusal(
     deployment: &str,

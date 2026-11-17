@@ -8,13 +8,13 @@
 //! naming every failed cell, so one run reports the whole matrix. Two environment variables
 //! narrow a developer's run; the qualification gate sets neither:
 //!
-//! - `UM_CLAUDE_CODE_LIFECYCLE_CELLS`: comma-separated name fragments; only cells whose name
+//! - `USEFUL_CLAUDE_CODE_LIFECYCLE_CELLS`: comma-separated name fragments; only cells whose name
 //!   contains one of them run.
-//! - `UM_CLAUDE_CODE_CONFORMANCE_SKIP_SLOW_CELLS=1`: the slow tier (any `ScheduleWakeup`,
+//! - `USEFUL_CLAUDE_CODE_CONFORMANCE_SKIP_SLOW_CELLS=1`: the slow tier (any `ScheduleWakeup`,
 //!   a subagent's two-minute promotion) prints `skipped` instead of running.
 //!
 //! A failed cell's native transcript, observations and rejection are retained under
-//! `UM_CLAUDE_CODE_LIFECYCLE_RETAIN_DIR` when that variable is set, which the qualification
+//! `USEFUL_CLAUDE_CODE_LIFECYCLE_RETAIN_DIR` when that variable is set, which the qualification
 //! script does so that a CI job can upload them, otherwise under the temporary directory.
 
 use std::collections::VecDeque;
@@ -56,9 +56,9 @@ use crate::workflow::agent::{
 use crate::workflow::process_group::process_group_is_quiescent;
 use crate::workflow::test_support::{MAX_WATCHDOG_SCALE, host_load, watchdog_scale};
 
-const CELL_FILTER: &str = "UM_CLAUDE_CODE_LIFECYCLE_CELLS";
-const SKIP_SLOW_CELLS: &str = "UM_CLAUDE_CODE_CONFORMANCE_SKIP_SLOW_CELLS";
-const RETAIN_DIRECTORY: &str = "UM_CLAUDE_CODE_LIFECYCLE_RETAIN_DIR";
+const CELL_FILTER: &str = "USEFUL_CLAUDE_CODE_LIFECYCLE_CELLS";
+const SKIP_SLOW_CELLS: &str = "USEFUL_CLAUDE_CODE_CONFORMANCE_SKIP_SLOW_CELLS";
+const RETAIN_DIRECTORY: &str = "USEFUL_CLAUDE_CODE_LIFECYCLE_RETAIN_DIR";
 /// Claude Code's foreground-to-background promotion timeout. 2.1.310 reads it for the main
 /// agent only and floors it at 2000 ms, so only a main-thread promotion is fast.
 const PROMOTION_TIMEOUT: (&str, &str) = ("CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS", "2000");
@@ -3383,14 +3383,14 @@ fn retain_failure(
     directory
 }
 
-/// Where failed cells are retained: the directory `UM_CLAUDE_CODE_LIFECYCLE_RETAIN_DIR` names
+/// Where failed cells are retained: the directory `USEFUL_CLAUDE_CODE_LIFECYCLE_RETAIN_DIR` names
 /// when `configured`, so that the qualification script can keep a CI job's evidence as its
-/// artifacts (AUTO-90), otherwise `um-claude-code-lifecycle-matrix` under the temporary
+/// artifacts (AUTO-90), otherwise `useful-claude-code-lifecycle-matrix` under the temporary
 /// directory. An empty value is unset.
 fn retention_root(configured: Option<&OsStr>) -> PathBuf {
     match configured {
         Some(directory) if !directory.is_empty() => PathBuf::from(directory),
-        _ => std::env::temp_dir().join("um-claude-code-lifecycle-matrix"),
+        _ => std::env::temp_dir().join("useful-claude-code-lifecycle-matrix"),
     }
 }
 
@@ -3523,7 +3523,7 @@ fn retention_root_prefers_the_retain_directory_variable() {
         retention_root(Some(configured.as_os_str())),
         configured.to_path_buf()
     );
-    let fallback = std::env::temp_dir().join("um-claude-code-lifecycle-matrix");
+    let fallback = std::env::temp_dir().join("useful-claude-code-lifecycle-matrix");
     assert_eq!(retention_root(None), fallback);
     assert_eq!(retention_root(Some(OsStr::new(""))), fallback);
 }

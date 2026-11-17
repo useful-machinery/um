@@ -1,11 +1,11 @@
 ```console
-$ um workflow run release --help
+$ useful workflow run release --help
 Record the release of an exited run, or release a Cloud run's claim with --cloud
 
-Usage: um workflow run release [OPTIONS] <RUN>
+Usage: useful workflow run release [OPTIONS] <RUN>
 
 Arguments:
-  <RUN>  Run directory, or the id or subject of a run under the um home
+  <RUN>  Run directory, or the id or subject of a run under the useful home
 
 Options:
       --json                           Print the workflow result as JSON

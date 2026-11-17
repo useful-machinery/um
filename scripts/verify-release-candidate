@@ -134,38 +134,39 @@ def digest_manifest(entries: Mapping[str, bytes]) -> bytes:
     )
 
 
-def expected_asset_names(version: str) -> list[str]:
+RELEASE_TARGETS = (
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+)
+LEGACY_TARGET = "x86_64-apple-darwin"
+
+
+def release_asset_names(prefix: str, version: str, *targets: str) -> list[str]:
     return sorted(
-        [
-            f"um-{version}-aarch64-apple-darwin.tar.gz",
-            f"um-{version}-aarch64-unknown-linux-gnu.tar.gz",
-            f"um-{version}-x86_64-unknown-linux-gnu.tar.gz",
-            "SHA256SUMS",
-        ],
+        [*(f"{prefix}-{version}-{target}.tar.gz" for target in targets), "SHA256SUMS"],
         key=os.fsencode,
     )
 
 
-def prior_release_asset_inventories(version: str) -> tuple[list[str], list[str]]:
-    historical = tag_version(f"v{version}", "latest stable release") <= (0, 53, 0)
-    prefix = "scherzo-cloud" if historical else "um"
-    current = sorted(
-        [
-            f"{prefix}-{version}-aarch64-apple-darwin.tar.gz",
-            f"{prefix}-{version}-aarch64-unknown-linux-gnu.tar.gz",
-            f"{prefix}-{version}-x86_64-unknown-linux-gnu.tar.gz",
-            "SHA256SUMS",
-        ],
-        key=os.fsencode,
+def expected_asset_names(version: str) -> list[str]:
+    return release_asset_names("useful", version, *RELEASE_TARGETS)
+
+
+def prior_release_asset_inventories(version: str) -> tuple[list[str], ...]:
+    # Every archive of one release carries the one name it was published with. No version
+    # marks the second rename, so a release after 0.53.0 may carry either later name; the
+    # legacy x86_64-apple-darwin archive predates the second one.
+    if tag_version(f"v{version}", "latest stable release") <= (0, 53, 0):
+        return (
+            release_asset_names("scherzo-cloud", version, *RELEASE_TARGETS),
+            release_asset_names("scherzo-cloud", version, *RELEASE_TARGETS, LEGACY_TARGET),
+        )
+    return (
+        release_asset_names("um", version, *RELEASE_TARGETS),
+        release_asset_names("um", version, *RELEASE_TARGETS, LEGACY_TARGET),
+        release_asset_names("useful", version, *RELEASE_TARGETS),
     )
-    legacy = sorted(
-        [
-            *current,
-            f"{prefix}-{version}-x86_64-apple-darwin.tar.gz",
-        ],
-        key=os.fsencode,
-    )
-    return current, legacy
 
 
 @dataclass(frozen=True)
@@ -308,7 +309,7 @@ class GitHub:
             "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
             "LC_ALL": "C",
         }
-        for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_HOST", "GH_CONFIG_DIR", "UM_MOCK_GH_STATE"):
+        for name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_HOST", "GH_CONFIG_DIR", "USEFUL_MOCK_GH_STATE"):
             if name in os.environ:
                 environment[name] = os.environ[name]
         result = subprocess.run(

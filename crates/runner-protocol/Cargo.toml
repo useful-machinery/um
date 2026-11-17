@@ -1,5 +1,5 @@
 [package]
-name = "um-runner-protocol"
+name = "useful-runner-protocol"
 version = "0.0.0-dev"
 edition.workspace = true
 rust-version.workspace = true

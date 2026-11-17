@@ -131,7 +131,7 @@ fn account_deletion_request_schedules_thirty_days_and_removes_the_local_session(
                 "local credential: removed\n",
                 "deployment: {}\n\n",
                 "Cancel before the deadline with fresh browser proof:\n",
-                "  um account deletion cancel\n"
+                "  useful account deletion cancel\n"
             ),
             PRINCIPAL_ID, server.api_url
         )
@@ -278,7 +278,7 @@ fn account_deletion_preserves_a_concurrently_replaced_credential_pair() {
         credential_path.to_str().unwrap(),
     );
     let empty_path = tempfile::tempdir().unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args([
             "account",
@@ -668,8 +668,8 @@ fn account_deletion_reports_acceptance_unknown_when_the_repeat_of_a_lost_reply_i
     assert_eq!(output.status.code(), Some(4));
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("um auth status"));
-    assert!(stderr.contains("um account deletion cancel"));
+    assert!(stderr.contains("useful auth status"));
+    assert!(stderr.contains("useful account deletion cancel"));
     assert_eq!(requests.len(), 2);
 
     let (output, api_url, requests) = request(

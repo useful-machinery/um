@@ -2,8 +2,8 @@ use anyhow::anyhow;
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use um_api::{create_organization, create_organization_with_delegator};
-use um_human_auth::Deployment;
+use useful_api::{create_organization, create_organization_with_delegator};
+use useful_human_auth::Deployment;
 
 use super::{LeafOptions, output};
 
@@ -75,7 +75,7 @@ impl Command {
 }
 
 fn parse_principal_id(value: &str) -> Result<String, String> {
-    if um_support::valid_typed_id(value, "prn_") {
+    if useful_support::valid_typed_id(value, "prn_") {
         Ok(value.to_owned())
     } else {
         Err("must be an exact human principal ID".to_owned())

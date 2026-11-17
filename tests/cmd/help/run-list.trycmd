@@ -1,8 +1,8 @@
 ```console
-$ um run list --help
+$ useful run list --help
 List Useful Machinery runs
 
-Usage: um run list [OPTIONS] <ORGANIZATION>
+Usage: useful run list [OPTIONS] <ORGANIZATION>
 
 Arguments:
   <ORGANIZATION>  Organization ID or exact slug

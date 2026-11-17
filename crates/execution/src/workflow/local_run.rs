@@ -253,7 +253,7 @@ pub enum LocalRunDirectoryError {
     WaitRecordInvalid,
     ControlEventInvalid,
     MirrorWriteInvalid,
-    /// No run under the `um` home has the id (REQ-LOCALRUN-180): `run_not_found`.
+    /// No run under the `useful` home has the id (REQ-LOCALRUN-180): `run_not_found`.
     RunNotFound,
     /// A parent's commit refused because one of its child runs failed to commit its own
     /// state (REQ-LOCALRUN-207, INV-ENGINE-33); it classifies as the child's failure and
@@ -1259,7 +1259,7 @@ pub(super) enum AttemptStepStateV1 {
 
 impl AttemptStepStateV1 {
     /// Whether a node in this state has started and not ended: the states that record a
-    /// node's `startedAt` (REQ-LOCALRUN-201) and that `um workflow run show` reports as a
+    /// node's `startedAt` (REQ-LOCALRUN-201) and that `useful workflow run show` reports as a
     /// running child's in-flight nodes (REQ-LOCALRUN-189).
     pub(super) const fn is_in_flight(self) -> bool {
         matches!(
@@ -1698,11 +1698,11 @@ pub enum ContinuationDefinitionMode {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SuccessorCarry {
     /// Nothing more: the successor's record reads `running` and its first own attempt
-    /// begins at once (`um workflow run restart`).
+    /// begins at once (`useful workflow run restart`).
     Continue,
     /// The predecessor's root wait record, copied as the successor's own: the successor's
     /// record reads `waiting` and its first own attempt is the continuation a control
-    /// recorded on it admits (`um workflow run upgrade`).
+    /// recorded on it admits (`useful workflow run upgrade`).
     Wait,
 }
 
@@ -1778,7 +1778,7 @@ impl PendingLocalContinuation {
     /// the run lock (REQ-LOCALRUN-197): a command that inspected the run before locking it
     /// asks again here, since a control recorded in between resolves nothing once copied to a
     /// successor (REQ-LOCALRUN-195). `None` when no control does, for a rule on a source other
-    /// than `um` (controls never resolve an external wait, REQ-WFEXEC-65), as for a rule
+    /// than `useful` (controls never resolve an external wait, REQ-WFEXEC-65), as for a rule
     /// outside the matcher's grammar, and for a run without a record.
     pub fn resolving_control(
         &self,
@@ -2834,7 +2834,7 @@ impl PendingLocalContinuation {
             AttemptTriggerV1::Continuation,
             Some(prior.attempt_number),
             definition,
-            timestamp(um_support::utc_now())?,
+            timestamp(useful_support::utc_now())?,
         )?;
         attempt.continuation = Some(record);
         for (entry, original) in inherited_steps {
@@ -3742,7 +3742,7 @@ impl StateStore {
         })
         .transpose()?;
         self.update(|state| {
-            let now = timestamp(um_support::utc_now())?;
+            let now = timestamp(useful_support::utc_now())?;
             let attempt_number = state.current_attempt_number;
             {
                 let attempt = current_attempt_mut(state)?;
@@ -4106,7 +4106,7 @@ fn publish_run_directory<Kept>(
     let run = LocalRunV1 {
         schema_version: 1,
         local_run_id: generate_uuid()?,
-        created_at: timestamp(um_support::utc_now())?,
+        created_at: timestamp(useful_support::utc_now())?,
         workflow_digest: admitted_workflow_digest(admitted),
         workflow_manifest_digest: DigestV1::sha256(&manifest_bytes),
         git_baseline: git_baseline(),
@@ -6356,7 +6356,7 @@ fn settle_interrupted_attempt(
                 AttemptFinalizationV1::Complete(complete) => complete.cancellation.is_some(),
             });
     attempt.state = AttemptStateV1::Interrupted;
-    attempt.settled_at = Some(timestamp(um_support::utc_now())?);
+    attempt.settled_at = Some(timestamp(useful_support::utc_now())?);
     attempt.settlement_snapshot = settlement_snapshot;
     attempt.interruption = Some(AttemptInterruptionV1 {
         cause,
@@ -6755,7 +6755,7 @@ pub(super) fn read_attempt_wait_record(
     }
 }
 
-/// What `um workflow run resume RUN_DIR` without `--from` finds before it takes the run
+/// What `useful workflow run resume RUN_DIR` without `--from` finds before it takes the run
 /// lock (REQ-CONTINUE-74, REQ-CONTINUE-76).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum WaitInspection {
@@ -6791,7 +6791,7 @@ pub enum WaitInspection {
 }
 
 /// What resolved a wait (REQ-CONTINUE-74): a control under `controls/` for a rule on source
-/// `um`, or an event a condition source observed for a rule on any other source.
+/// `useful`, or an event a condition source observed for a rule on any other source.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ResolvedBy {
     Control(ControlEvent),
@@ -6833,7 +6833,7 @@ impl WaitProbe {
 
 /// The first control under `run_directory`'s `controls/`, in ordinal order, that `wait`'s
 /// rule matches for the run `run_id` (REQ-CONTINUE-74), `Ok(None)` when none does and
-/// `Ok(None)` without reading the controls for a rule on a source other than `um`
+/// `Ok(None)` without reading the controls for a rule on a source other than `useful`
 /// (REQ-WFEXEC-65); a rule outside the grammar is `Err(RuleError)`.
 fn control_resolution(
     run_directory: &Path,
@@ -7040,7 +7040,7 @@ fn spend_withdrawals_in(
     if !later {
         return Ok(());
     }
-    let now = timestamp(um_support::utc_now())?;
+    let now = timestamp(useful_support::utc_now())?;
     store.update(|state| {
         current_attempt_mut(state)?.settled_at = Some(now);
         Ok(())
@@ -7637,7 +7637,7 @@ pub fn locate_run(home: &WorkflowHome, id: &str) -> Result<PathBuf, LocalRunDire
     Err(LocalRunDirectoryError::RunNotFound)
 }
 
-/// One root run under the `um` home, as `list_runs` reads it.
+/// One root run under the `useful` home, as `list_runs` reads it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ListedRun {
     pub directory: PathBuf,
@@ -7658,7 +7658,7 @@ impl ListedRun {
     }
 }
 
-/// Every root run under the `um` home in `id` order, and each `runs/` entry that is not a
+/// Every root run under the `useful` home in `id` order, and each `runs/` entry that is not a
 /// readable run directory with the reason.
 #[derive(Debug)]
 pub struct RunListing {
@@ -8036,7 +8036,7 @@ pub fn acquire_local_retry(requested: &Path) -> Result<LocalRetryOpen, LocalRunD
 }
 
 /// A seam for the end-to-end tests of a command that inspects a run and then takes its lock
-/// (feature `test-fixtures`): when `UM_TEST_RUN_LOCK_GATE` names a path, the command calls
+/// (feature `test-fixtures`): when `USEFUL_TEST_RUN_LOCK_GATE` names a path, the command calls
 /// this before the lock, which writes `<path>.inspected` and returns once `<path>` exists,
 /// so a test can act on the run between the inspection and the lock; a gate not opened within
 /// `TEST_GATE_TIMEOUT` is a `File` error, never a hung command. Without the feature, or
@@ -8052,7 +8052,7 @@ pub fn await_run_lock_gate() -> Result<(), LocalRunDirectoryError> {
 }
 
 /// A seam for the end-to-end tests of an attempt interrupted before its stage's child is
-/// prepared (feature `test-fixtures`, REQ-WFEXEC-72): when `UM_TEST_CHILD_START_GATE` names a
+/// prepared (feature `test-fixtures`, REQ-WFEXEC-72): when `USEFUL_TEST_CHILD_START_GATE` names a
 /// path, the child dispatcher calls this before it prepares a child, which writes
 /// `<path>.starting` and returns once `<path>` exists, with `await_run_lock_gate`'s timeout.
 /// Without the feature, or the variable, it returns at once.
@@ -8067,7 +8067,7 @@ pub fn await_child_start_gate() -> Result<(), LocalRunDirectoryError> {
 }
 
 /// A seam for the end-to-end tests of a withdrawal recorded while a settled attempt finishes
-/// (feature `test-fixtures`, REQ-LOCALRUN-211): when `UM_TEST_SETTLED_GATE` names a path, an
+/// (feature `test-fixtures`, REQ-LOCALRUN-211): when `USEFUL_TEST_SETTLED_GATE` names a path, an
 /// attempt that is not a quiet child calls this once its execution returned and before its
 /// first read of the withdrawals, which writes `<path>.settled` and returns once `<path>`
 /// exists, with `await_run_lock_gate`'s timeout. Without the feature, or the variable, it
@@ -8083,7 +8083,7 @@ pub fn await_settled_gate() -> Result<(), LocalRunDirectoryError> {
 }
 
 /// A seam for the end-to-end tests of a `withdraw` that meets an attempt ending its run
-/// (feature `test-fixtures`, REQ-LOCALRUN-211): when `UM_TEST_RELEASE_GATE` names a path, an
+/// (feature `test-fixtures`, REQ-LOCALRUN-211): when `USEFUL_TEST_RELEASE_GATE` names a path, an
 /// attempt that ends the run calls this while it holds the run's controls lock, after its last
 /// read and its spend and before its final record, which writes `<path>.releasing` and returns
 /// once `<path>` exists, with `await_run_lock_gate`'s timeout. Without the feature, or the
@@ -8100,7 +8100,7 @@ pub fn await_release_gate() -> Result<(), LocalRunDirectoryError> {
 
 /// A seam for the end-to-end tests of a withdrawal recorded while a `retry` or `resume` holds a
 /// run before its attempt begins (feature `test-fixtures`, REQ-LOCALRUN-213): when
-/// `UM_TEST_BEGIN_GATE` names a path, a command that begins an attempt not continuing an edge
+/// `USEFUL_TEST_BEGIN_GATE` names a path, a command that begins an attempt not continuing an edge
 /// calls this on its blocking thread before it takes the controls lock to ask again for an
 /// unhonored withdrawal and begin, which writes `<path>.beginning` and returns once `<path>`
 /// exists, with `await_run_lock_gate`'s timeout. Without the feature, or the variable, it
@@ -8133,30 +8133,30 @@ fn await_test_gate(
         operation: "write",
         source,
     })?;
-    let deadline = um_support::monotonic_now() + TEST_GATE_TIMEOUT;
+    let deadline = useful_support::monotonic_now() + TEST_GATE_TIMEOUT;
     while !gate.exists() {
-        if um_support::monotonic_now() >= deadline {
+        if useful_support::monotonic_now() >= deadline {
             return Err(LocalRunDirectoryError::File {
                 path: gate,
                 operation: "await",
                 source: io::Error::new(io::ErrorKind::TimedOut, timed_out),
             });
         }
-        um_support::sleep(TEST_GATE_POLL_INTERVAL);
+        useful_support::sleep(TEST_GATE_POLL_INTERVAL);
     }
     Ok(())
 }
 
 #[cfg(feature = "test-fixtures")]
-const RUN_LOCK_GATE: &str = "UM_TEST_RUN_LOCK_GATE";
+const RUN_LOCK_GATE: &str = "USEFUL_TEST_RUN_LOCK_GATE";
 #[cfg(feature = "test-fixtures")]
-const CHILD_START_GATE: &str = "UM_TEST_CHILD_START_GATE";
+const CHILD_START_GATE: &str = "USEFUL_TEST_CHILD_START_GATE";
 #[cfg(feature = "test-fixtures")]
-const SETTLED_GATE: &str = "UM_TEST_SETTLED_GATE";
+const SETTLED_GATE: &str = "USEFUL_TEST_SETTLED_GATE";
 #[cfg(feature = "test-fixtures")]
-const RELEASE_GATE: &str = "UM_TEST_RELEASE_GATE";
+const RELEASE_GATE: &str = "USEFUL_TEST_RELEASE_GATE";
 #[cfg(feature = "test-fixtures")]
-const BEGIN_GATE: &str = "UM_TEST_BEGIN_GATE";
+const BEGIN_GATE: &str = "USEFUL_TEST_BEGIN_GATE";
 #[cfg(feature = "test-fixtures")]
 const TEST_GATE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 #[cfg(feature = "test-fixtures")]
@@ -8444,7 +8444,7 @@ fn authenticate_retained_output_producers(
                 .ok_or(LocalRunDirectoryError::StateInvalid)?;
             let bytes =
                 read_regular_file_bounded(&carrier.parent, name, MAXIMUM_RETAINED_FILE_BYTES)?;
-            let value = um_support::strict_json_from_slice(&bytes)
+            let value = useful_support::strict_json_from_slice(&bytes)
                 .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
             if !schema.is_valid(&value) {
                 return Err(LocalRunDirectoryError::StateInvalid);
@@ -9292,7 +9292,7 @@ fn verify_retained_output(
             std::str::from_utf8(&bytes).map_err(|_| LocalRunDirectoryError::StateInvalid)?;
         }
         (RetainedOutputV1::Json { .. }, Some(bytes)) => {
-            let value = um_support::strict_json_from_slice(&bytes)
+            let value = useful_support::strict_json_from_slice(&bytes)
                 .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
             let canonical = super::canonical_json::to_bounded_bytes(&value, carrier.size_bytes)
                 .map_err(|_| LocalRunDirectoryError::StateInvalid)?;
@@ -10064,7 +10064,7 @@ impl LocalQuiescenceAuthority for SystemLocalRecoveryAuthority {
     }
 
     fn wait_for_process_change(&self) {
-        um_support::sleep(QUIESCENCE_POLL_INTERVAL);
+        useful_support::sleep(QUIESCENCE_POLL_INTERVAL);
     }
 }
 
@@ -10214,7 +10214,7 @@ fn retry_attempt(
         AttemptTriggerV1::ExplicitRetry,
         Some(prior_attempt_number),
         definition,
-        timestamp(um_support::utc_now())?,
+        timestamp(useful_support::utc_now())?,
     )
 }
 
@@ -10352,7 +10352,7 @@ fn quiesce_run(
     let recorded =
         u64::try_from(guards.len()).map_err(|_| process_inspection_unproven(Vec::new()))?;
     if guards.is_empty() {
-        let proven_at = timestamp(um_support::utc_now())
+        let proven_at = timestamp(useful_support::utc_now())
             .map_err(|_| process_inspection_unproven(Vec::new()))?;
         return Ok(super::publication::ContinuationQuiescenceV1 {
             groups_recorded: 0,
@@ -10391,8 +10391,8 @@ fn quiesce_run(
         return Err(process_inspection_unproven(unproven));
     }
     prove_groups_absent(&terminated, authority)?;
-    let proven_at =
-        timestamp(um_support::utc_now()).map_err(|_| process_inspection_unproven(Vec::new()))?;
+    let proven_at = timestamp(useful_support::utc_now())
+        .map_err(|_| process_inspection_unproven(Vec::new()))?;
     Ok(super::publication::ContinuationQuiescenceV1 {
         groups_recorded: recorded,
         groups_terminated: u64::try_from(terminated.len())
@@ -12156,7 +12156,7 @@ fn retained_output_set_valid(
     let mut names = BTreeSet::new();
     outputs.iter().all(|output| {
         let name = output.name();
-        um_support::is_identifier(name)
+        useful_support::is_identifier(name)
             && names.insert(name)
             && retained_output_valid(role, node, output)
     })

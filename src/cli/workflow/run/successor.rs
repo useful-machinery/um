@@ -16,7 +16,7 @@ use std::io::Write as _;
 
 use anyhow::{Context, anyhow};
 use serde::Serialize;
-use um_execution::{
+use useful_execution::{
     AdmittedWorkflow, CancellationSource, InitialLocalRun, LocalContinuationOpen, NoConditions,
     PendingLocalContinuation, PresentationConfig, PresentationMode, ResolvedInput,
     RetryIneligibilityReason, RunState, SubjectClaim, SubjectError, SuccessorCarry, WaitInspection,
@@ -160,7 +160,7 @@ impl fmt::Display for RestartedElement {
         };
         write!(
             formatter,
-            "! Step {step} runs again from its first element, {rerun} included. To keep a waiting run at element {} instead, run um workflow run upgrade RUN and resolve its wait there.",
+            "! Step {step} runs again from its first element, {rerun} included. To keep a waiting run at element {} instead, run useful workflow run upgrade RUN and resolve its wait there.",
             self.element
         )
     }
@@ -174,7 +174,7 @@ struct Upgraded {
     wait: WaitRecord,
 }
 
-/// The `--json` document of `um workflow run upgrade` (REQ-LOCALRUN-197).
+/// The `--json` document of `useful workflow run upgrade` (REQ-LOCALRUN-197).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct UpgradedDocument<'a> {
@@ -858,7 +858,7 @@ pub(super) fn reconcile(run_directory: &Path) -> Result<Lineage, anyhow::Error> 
     if previous.successor.as_deref() == Some(record.id.as_str()) {
         return Ok(Lineage::Settled);
     }
-    let home = WorkflowHome::from_environment().context("resolve the um home")?;
+    let home = WorkflowHome::from_environment().context("resolve the useful home")?;
     let slot_holder = |subject: &str| -> Result<Option<String>, anyhow::Error> {
         Ok(subject_slot(&home, &definition, subject)
             .map_err(anyhow::Error::new)?

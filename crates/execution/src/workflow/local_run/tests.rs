@@ -1478,7 +1478,7 @@ async fn waiting_tree_run_on(
             &wait,
             None,
             payload.as_object().unwrap().clone(),
-            um_support::utc_now(),
+            useful_support::utc_now(),
             &ResolvedInputs::default(),
             &BTreeMap::new(),
         )
@@ -1898,7 +1898,7 @@ fn spending_withdrawals_takes_settled_at_again_only_for_a_later_withdrawal() {
     assert!(!retried.withdrawal_pending().unwrap());
 }
 
-/// A `control.withdraw` naming no wait recorded at `at`, as `um workflow run withdraw` of a run
+/// A `control.withdraw` naming no wait recorded at `at`, as `useful workflow run withdraw` of a run
 /// that does not wait appends it.
 fn withdrawal_at(at: &str) -> crate::workflow::wait::ControlEvent {
     crate::workflow::wait::ControlEvent {
@@ -3438,7 +3438,7 @@ fn a_run_id_locates_its_run_under_the_home_and_the_home_lists_every_run() {
     let fixture = tree_fixture();
     let home_root = fixture.run_path("home");
     let home = WorkflowHome::from_lookup(|name| {
-        (name == "UM_HOME").then(|| home_root.clone().into_os_string())
+        (name == "USEFUL_HOME").then(|| home_root.clone().into_os_string())
     })
     .unwrap();
     assert_eq!(
@@ -3588,10 +3588,10 @@ fn child_runs_lists_every_child_by_step_then_ordinal() {
     assert_eq!(children, expected);
 }
 
-const LOCK_HOLDER_RUN: &str = "UM_TEST_LOCK_HOLDER_RUN";
+const LOCK_HOLDER_RUN: &str = "USEFUL_TEST_LOCK_HOLDER_RUN";
 
 /// The process fixture of `lock_holder_names_the_process_that_holds_the_run_lock`: holds
-/// the lock of the run at `$UM_TEST_LOCK_HOLDER_RUN` through `acquire_local_retry`, creates
+/// the lock of the run at `$USEFUL_TEST_LOCK_HOLDER_RUN` through `acquire_local_retry`, creates
 /// `<run>.held` once it does, and keeps the lock until standard input closes.
 #[test]
 #[ignore = "process fixture of lock_holder_names_the_process_that_holds_the_run_lock"]
@@ -3629,14 +3629,14 @@ async fn lock_holder_names_the_process_that_holds_the_run_lock() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    let started = um_support::monotonic_now();
+    let started = useful_support::monotonic_now();
     while !ready.exists() {
         assert!(
             holder.try_wait().unwrap().is_none(),
             "the holder exited early"
         );
-        assert!(um_support::elapsed(started) < Duration::from_secs(10));
-        um_support::sleep(Duration::from_millis(10));
+        assert!(useful_support::elapsed(started) < Duration::from_secs(10));
+        useful_support::sleep(Duration::from_millis(10));
     }
     let holder_pid = rustix::process::Pid::from_raw(i32::try_from(holder.id()).unwrap());
     assert_eq!(lock_holder(&run_path), Ok(holder_pid));
@@ -4528,7 +4528,7 @@ fn a_failed_nodes_diagnostic_reads_back_and_is_refused_anywhere_else() {
     let step = "/attempts/0/progress/steps/0";
     let finalizer = "/attempts/0/finalization/finalizers/0";
 
-    // A state an earlier `um` wrote carries no diagnostic anywhere and still reads.
+    // A state an earlier `useful` wrote carries no diagnostic anywhere and still reads.
     let mut earlier = failed.clone();
     for node in [step, finalizer] {
         earlier
@@ -4711,7 +4711,7 @@ fn a_nodes_start_reads_back_and_is_refused_where_the_node_never_started() {
     assert_eq!(failed.pointer(step).unwrap()["startedAt"], started);
     assert_eq!(decode_state(&json_bytes(failed.clone())).unwrap(), state);
 
-    // A state an earlier `um` wrote records no start and still reads.
+    // A state an earlier `useful` wrote records no start and still reads.
     let mut earlier = failed.clone();
     earlier
         .pointer_mut(step)
@@ -4994,7 +4994,7 @@ fn retained_output_carriers_are_verified_and_orphans_are_removed() {
 #[tokio::test]
 async fn cloud_continuation_recovers_unexported_output_across_three_attempts() {
     let fixture = AdmittedFixture::from_source(
-        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"true\"]}\n    outputs:\n      message: {kind: text, from: path, path: message.txt}\n      unused: {kind: text, from: path, path: unused.txt}\n  second:\n    kind: cmd\n    inputs:\n      prompt: {ref: outputs.first.message}\n    command: {argv: [\"/bin/sh\", \"-c\", \"IFS= read -r value < \\\"$UM_STEP_INPUTS/values/prompt\\\" || exit 1; printf '%s\\\\n' \\\"$value\\\" > consumed.txt\"]}\n",
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"true\"]}\n    outputs:\n      message: {kind: text, from: path, path: message.txt}\n      unused: {kind: text, from: path, path: unused.txt}\n  second:\n    kind: cmd\n    inputs:\n      prompt: {ref: outputs.first.message}\n    command: {argv: [\"/bin/sh\", \"-c\", \"IFS= read -r value < \\\"$USEFUL_STEP_INPUTS/values/prompt\\\" || exit 1; printf '%s\\\\n' \\\"$value\\\" > consumed.txt\"]}\n",
     );
     let root = fixture.run_path("cloud-private-chain");
     fs::create_dir_all(&root).unwrap();
@@ -5150,7 +5150,7 @@ async fn cloud_continuation_recovers_unexported_output_across_three_attempts() {
             .admitted
             .execution()
             .environment()
-            .variable(std::ffi::OsStr::new("UM_CONTINUATION_CONTEXT"))
+            .variable(std::ffi::OsStr::new("USEFUL_CONTINUATION_CONTEXT"))
             .is_none()
     );
     let digest = super::super::publication::DigestV1 {
@@ -5184,7 +5184,7 @@ async fn cloud_continuation_recovers_unexported_output_across_three_attempts() {
     let path = bound
         .execution()
         .environment()
-        .variable(std::ffi::OsStr::new("UM_CONTINUATION_CONTEXT"))
+        .variable(std::ffi::OsStr::new("USEFUL_CONTINUATION_CONTEXT"))
         .unwrap();
     assert_eq!(
         bound
@@ -5382,7 +5382,7 @@ fn inherited_seed_loads_required_values_and_preserves_full_durable_references() 
         AttemptTriggerV1::Continuation,
         Some(1),
         attempt_definition_for_run(&run_metadata),
-        timestamp(um_support::utc_now()).unwrap(),
+        timestamp(useful_support::utc_now()).unwrap(),
     )
     .unwrap();
     second.progress.steps[0].state = AttemptStepStateV1::Inherited;
@@ -5404,7 +5404,7 @@ fn inherited_seed_loads_required_values_and_preserves_full_durable_references() 
         AttemptTriggerV1::Continuation,
         Some(2),
         attempt_definition_for_run(&run_metadata),
-        timestamp(um_support::utc_now()).unwrap(),
+        timestamp(useful_support::utc_now()).unwrap(),
     )
     .unwrap();
     third.progress.steps[0].state = AttemptStepStateV1::Inherited;
@@ -5554,7 +5554,7 @@ steps:
         AttemptTriggerV1::ExplicitRetry,
         Some(1),
         attempt_definition_for_run(&run_metadata),
-        timestamp(um_support::utc_now()).unwrap(),
+        timestamp(useful_support::utc_now()).unwrap(),
     )
     .unwrap();
     let second_settled = second.created_at.clone();
@@ -5587,7 +5587,7 @@ steps:
         AttemptTriggerV1::Continuation,
         Some(2),
         attempt_definition_for_run(&run_metadata),
-        timestamp(um_support::utc_now()).unwrap(),
+        timestamp(useful_support::utc_now()).unwrap(),
     )
     .unwrap();
     third.progress.steps[0].state = AttemptStepStateV1::Inherited;
@@ -9142,7 +9142,7 @@ fn archived_attempt_rejects_symlinks_and_does_not_adopt_replacements() {
 #[tokio::test]
 async fn cloud_step_is_readable_while_a_real_downstream_command_is_running() {
     let fixture = AdmittedFixture::from_source(
-        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"/bin/sh\", \"-c\", \"printf private-evidence > message.txt\"]}\n    outputs:\n      message: {kind: text, from: path, path: message.txt}\n  second:\n    kind: cmd\n    inputs:\n      prompt: {ref: outputs.first.message}\n    command: {argv: [\"/bin/sh\", \"-c\", \"printf ready > ready; read x < gate; IFS= read -r value < \\\"$UM_STEP_INPUTS/values/prompt\\\"; printf '%s' \\\"$value\\\" > consumed.txt\"]}\n",
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"/bin/sh\", \"-c\", \"printf private-evidence > message.txt\"]}\n    outputs:\n      message: {kind: text, from: path, path: message.txt}\n  second:\n    kind: cmd\n    inputs:\n      prompt: {ref: outputs.first.message}\n    command: {argv: [\"/bin/sh\", \"-c\", \"printf ready > ready; read x < gate; IFS= read -r value < \\\"$USEFUL_STEP_INPUTS/values/prompt\\\"; printf '%s' \\\"$value\\\" > consumed.txt\"]}\n",
     );
     let root = fs::canonicalize(&fixture.execution_root).unwrap();
     nix::unistd::mkfifo(

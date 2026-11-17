@@ -5,7 +5,7 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use time::OffsetDateTime;
 
-use um_api::{HttpClient, HttpTransportPolicy, UnreachableCategory};
+use useful_api::{HttpClient, HttpTransportPolicy, UnreachableCategory};
 
 use super::credentials::{CredentialError, CredentialStore, StoredCredential};
 use super::deployment::Deployment;
@@ -156,7 +156,7 @@ pub fn execute_required_until<T, E>(
 fn remaining(deadline: Option<Instant>) -> Result<Option<Duration>, SessionError> {
     match deadline {
         Some(end) => end
-            .checked_duration_since(um_support::monotonic_now())
+            .checked_duration_since(useful_support::monotonic_now())
             .filter(|duration| !duration.is_zero())
             .map(Some)
             .ok_or(SessionError::RefreshUnreachable(
@@ -373,7 +373,7 @@ fn credential_for_use_until(
         .selected_until(deployment.fingerprint(), deadline)
         .map_err(|error| deadline_store_error(error, deadline))?;
     match credential {
-        Some(credential) if credential.needs_refresh(um_support::utc_now()) => {
+        Some(credential) if credential.needs_refresh(useful_support::utc_now()) => {
             coordinated_refresh_until(store, client, deployment, RefreshReason::Expiring, deadline)
         }
         credential => Ok(credential),
@@ -436,10 +436,10 @@ fn coordinated_refresh_under_authority_until(
     };
 
     let should_refresh = match reason {
-        RefreshReason::Expiring => current.needs_refresh(um_support::utc_now()),
+        RefreshReason::Expiring => current.needs_refresh(useful_support::utc_now()),
         RefreshReason::Rejected(rejected) => {
             current.access_token().expose() == rejected.expose()
-                || current.needs_refresh(um_support::utc_now())
+                || current.needs_refresh(useful_support::utc_now())
         }
     };
     if !should_refresh {
@@ -495,7 +495,7 @@ fn remove_rejected_credential(
 }
 
 fn deadline_store_error(error: CredentialError, deadline: Option<Instant>) -> SessionError {
-    if deadline.is_some_and(|end| um_support::monotonic_now() >= end) {
+    if deadline.is_some_and(|end| useful_support::monotonic_now() >= end) {
         SessionError::RefreshUnreachable(UnreachableCategory::Timeout)
     } else {
         SessionError::CredentialStore(error)
@@ -556,7 +556,7 @@ fn exchange_refresh_token_until(
                         UnreachableCategory::Connection | UnreachableCategory::Timeout
                     ) =>
             {
-                let delay = um_support::short_retry_delay();
+                let delay = useful_support::short_retry_delay();
                 let budget = match remaining(deadline) {
                     Ok(budget) => budget,
                     Err(_) => {
@@ -565,7 +565,7 @@ fn exchange_refresh_token_until(
                         ));
                     }
                 };
-                um_support::sleep(budget.map_or(delay, |budget| delay.min(budget)));
+                useful_support::sleep(budget.map_or(delay, |budget| delay.min(budget)));
                 continue;
             }
             Err(AuthorizationError::Unreachable(category)) => {
@@ -644,7 +644,7 @@ fn map_protocol_error(error: AuthorizationError) -> RefreshExchangeError {
 
 fn expiration_after(duration: std::time::Duration) -> Option<OffsetDateTime> {
     let seconds = i64::try_from(duration.as_secs()).ok()?;
-    um_support::utc_now().checked_add(time::Duration::seconds(seconds))
+    useful_support::utc_now().checked_add(time::Duration::seconds(seconds))
 }
 
 #[derive(Deserialize)]

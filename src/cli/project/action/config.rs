@@ -5,7 +5,7 @@ use std::{
     io::{self, Read},
     path::Path,
 };
-use um_api::{CreateGoogleDocsActionRequest, PatchGoogleDocsActionRequest};
+use useful_api::{CreateGoogleDocsActionRequest, PatchGoogleDocsActionRequest};
 
 fn object<'a>(
     value: &'a Value,
@@ -175,7 +175,7 @@ pub(super) fn read(
     if bytes.len() as u64 > MAX_SOURCE_BYTES {
         return Err(anyhow!("configuration exceeds 2 MiB"));
     }
-    let mut value: Value = um_support::strict_json_from_slice(&bytes)
+    let mut value: Value = useful_support::strict_json_from_slice(&bytes)
         .map_err(|_| anyhow!("configuration must be strict JSON without duplicate fields"))?;
     validate(&value, patch)?;
     if patch {

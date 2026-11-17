@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::anyhow;
 use clap::Args;
 
-use um_execution::{
+use useful_execution::{
     CONTROL_RETRY, CancellationSource, LocalRetryBeginError, LocalRetryOpen, PendingLocalRetry,
     WITHDRAWN_OUTCOME, WaitInspection, WaitKind, WorkflowRunOutput, acquire_local_retry,
     admit_local_workflow, await_begin_gate, await_run_lock_gate,
@@ -34,7 +34,7 @@ retry for its current wait to the runner executing it, which retries the run as 
 retries a local run. It takes no --execution-root or --agent-profiles. Cloud's acceptance is
 not the runner's application. It reads and writes no local run.";
 
-const COMMAND: &str = "um workflow run retry";
+const COMMAND: &str = "useful workflow run retry";
 
 // Run, retry, and status intentionally compose different subsets of shared workflow options.
 #[derive(Debug, Args)]
@@ -335,7 +335,7 @@ impl Command {
         &self,
         run_directory: &Path,
         target: Result<ControlTarget, Refusal>,
-        config: um_execution::PresentationConfig,
+        config: useful_execution::PresentationConfig,
     ) -> super::super::super::CommandResult {
         let json = self.presentation.output.json;
         let refuse = |run_directory: &Path, refusal: &Refusal| {
@@ -442,7 +442,7 @@ fn replacement_payload(
 async fn end_withdrawn(
     pending: PendingLocalRetry,
     signal_task: &super::create::SignalObservation,
-    config: &um_execution::PresentationConfig,
+    config: &useful_execution::PresentationConfig,
 ) -> super::super::super::CommandResult {
     let attempt_number = match pending.prior_attempt_number() {
         Ok(attempt_number) => attempt_number,
@@ -471,8 +471,8 @@ async fn end_withdrawn(
 }
 
 fn render_retry_rejection(
-    config: um_execution::PresentationConfig,
-    rejection: &um_execution::LocalRetryRejection,
+    config: useful_execution::PresentationConfig,
+    rejection: &useful_execution::LocalRetryRejection,
 ) -> super::super::super::CommandResult {
     let output = WorkflowRunOutput::new(config, io::stdout(), io::stderr())
         .for_retry(rejection.run_directory());

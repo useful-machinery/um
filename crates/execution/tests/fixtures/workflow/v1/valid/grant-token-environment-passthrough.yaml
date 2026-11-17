@@ -1,5 +1,5 @@
 schemaVersion: 1
-environmentPassthrough: [GH_TOKEN, UM_LINEAR_ACCESS_TOKEN, UM_LINEAR_ACCESS_TOKEN_FILE]
+environmentPassthrough: [GH_TOKEN, USEFUL_LINEAR_ACCESS_TOKEN, USEFUL_LINEAR_ACCESS_TOKEN_FILE]
 steps:
   publish:
     kind: cmd
@@ -8,6 +8,6 @@ steps:
       argv: ["./publish"]
   track:
     kind: cmd
-    environmentPassthrough: [UM_LINEAR_ACCESS_TOKEN_FILE]
+    environmentPassthrough: [USEFUL_LINEAR_ACCESS_TOKEN_FILE]
     command:
       argv: ["./track"]

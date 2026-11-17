@@ -1,15 +1,15 @@
 //! The tree-run job (REQ-RUNNERENROLL-91): an offer whose spec carries `workflowTree`
-//! runs the published tree with this runner's own `um` release. Preparation downloads
+//! runs the published tree with this runner's own `useful` release. Preparation downloads
 //! and verifies the tree's files, publishes them with the revision's bindings into a
 //! run-scoped home under the assignment's private directory, checks the digest the
 //! local publish reports against the spec's and writes the revision's resolution record
-//! beside the published snapshot (REQ-WFDEF-32); execution runs `um workflow run create`
+//! beside the published snapshot (REQ-WFDEF-32); execution runs `useful workflow run create`
 //! under the assignment's lease, resumes the run through its waits and attempts
 //! (`resume_loop`), reporting its root progress and the step states of the run and its
 //! child runs (`steps`, REQ-RUNNERENROLL-88), and reports the record's exit once
-//! (REQ-RUNNERENROLL-99). It applies each trigger delivery for the assignment with `um
+//! (REQ-RUNNERENROLL-99). It applies each trigger delivery for the assignment with `useful
 //! workflow run event`, those the offer carries before the run's first step
-//! (REQ-TRIGGER-136), and each authorized Cloud control with the `um workflow run` control
+//! (REQ-TRIGGER-136), and each authorized Cloud control with the `useful workflow run` control
 //! command it names (REQ-RUNNERENROLL-90). A continuation attempt adopts the run an earlier
 //! attempt created instead (`adopt`, REQ-RUNNERENROLL-89): it downloads and publishes
 //! nothing, keeps the resolution record the first attempt wrote and drives the run directory
@@ -25,11 +25,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use tokio::sync::Notify;
-use um_execution::{
+use useful_execution::{
     CancellationPolicy, CancellationSource, CaptureCancellation, EnvironmentSnapshot,
     ResolvedInput, ResolvedInputs,
 };
-use um_runner_protocol::{
+use useful_runner_protocol::{
     AssignmentDecline, ExecutionSpecInvalidReason, ExecutionSpecV1RunnerProjection, RunControl,
     RunnerUnableReason, TriggerDelivery, ValidationFacts, WorkflowTreeV1RunnerProjection,
 };
@@ -49,7 +49,7 @@ pub(super) use download::{HttpTreeBroker, TreeBroker, is_safe_tree_path};
 pub(super) use records::{TransportResult, TreeConclusion};
 pub(super) use resume_loop::{DriveFailure, ReportSink, TreeEnd};
 
-use command::{PublishFailure, RunLog, UmCommand};
+use command::{PublishFailure, RunLog, UsefulCommand};
 use download::{TreeDownloadFailure, TreeRequest};
 use resume_loop::ResumeIntervals;
 
@@ -58,14 +58,14 @@ const RESOLUTION_FILE: &str = "resolution.json";
 /// The binding kinds whose resolved provider ids the mirror uses (REQ-WFDEF-32).
 const RESOLVED_KINDS: [&str; 2] = ["linear.team", "linear.state"];
 
-/// The executable a tree run supervises: this runner's own `um` release.
-pub(super) type UmExecutable = Arc<dyn Fn() -> std::io::Result<PathBuf> + Send + Sync>;
+/// The executable a tree run supervises: this runner's own `useful` release.
+pub(super) type UsefulExecutable = Arc<dyn Fn() -> std::io::Result<PathBuf> + Send + Sync>;
 
 /// What the runner needs to execute published trees.
 #[derive(Clone)]
 pub(super) struct TreeRunDependencies {
     broker: Option<Arc<dyn TreeBroker>>,
-    executable: UmExecutable,
+    executable: UsefulExecutable,
     intervals: ResumeIntervals,
     command_bound: Duration,
     deliveries: Inbox<TriggerDelivery>,
@@ -96,7 +96,7 @@ impl TreeRunDependencies {
         self.controls.push(assignment_id, control);
     }
 
-    /// Supervises `executable` in place of the running `um` executable.
+    /// Supervises `executable` in place of the running `useful` executable.
     #[cfg(test)]
     pub(super) fn with_executable(mut self, executable: PathBuf) -> Self {
         self.executable = Arc::new(move || Ok(executable.clone()));
@@ -110,7 +110,7 @@ impl TreeRunDependencies {
         self
     }
 
-    /// Abandons each short `um` command once `bound` passes.
+    /// Abandons each short `useful` command once `bound` passes.
     #[cfg(test)]
     pub(super) fn with_command_bound(mut self, bound: Duration) -> Self {
         self.command_bound = bound;
@@ -227,7 +227,7 @@ pub(super) fn tree_home(private: &Path) -> PathBuf {
 
 /// How a tree run's first command starts it.
 enum TreeStart {
-    /// `um workflow run create` with these arguments (REQ-RUNNERENROLL-91), the root
+    /// `useful workflow run create` with these arguments (REQ-RUNNERENROLL-91), the root
     /// workflow's first step, and, when the offer carries pending deliveries, how they meet
     /// the run: before that step, behind a stop of the runner's own, on an edge-scheduled
     /// root, or once `create` returns on any other.
@@ -255,14 +255,14 @@ struct TreeOffer<'a> {
 pub(super) struct TreeRun {
     cancellation: CancellationPolicy,
     sleeper: Arc<dyn Sleeper>,
-    um: UmCommand,
+    useful: UsefulCommand,
     start: TreeStart,
     runs: PathBuf,
     documents: PathBuf,
     intervals: ResumeIntervals,
     assignment_id: String,
     deliveries: Inbox<TriggerDelivery>,
-    /// The Cloud controls for the run; a wait whose rule source is `um` is evaluated again
+    /// The Cloud controls for the run; a wait whose rule source is `useful` is evaluated again
     /// only once one is applied.
     controls: Inbox<RunControl>,
     /// The deliveries the offer carried, applied before the run's first step: after
@@ -271,13 +271,13 @@ pub(super) struct TreeRun {
 }
 
 impl TreeRun {
-    /// The run `start` begins for `offer` in the home `um` names, its runs under `runs`
+    /// The run `start` begins for `offer` in the home `useful` names, its runs under `runs`
     /// and the assignment's documents in `documents`.
     fn new(
         dependencies: &TreeRunDependencies,
         offer: &TreeOffer<'_>,
         sleeper: &Arc<dyn Sleeper>,
-        um: UmCommand,
+        useful: UsefulCommand,
         start: TreeStart,
         runs: PathBuf,
         documents: PathBuf,
@@ -293,7 +293,7 @@ impl TreeRun {
                 ),
             ),
             sleeper: Arc::clone(sleeper),
-            um,
+            useful,
             start,
             runs,
             documents,
@@ -309,7 +309,7 @@ impl TreeRun {
         &self.cancellation
     }
 
-    /// Runs `um workflow run create`, or adopts the home's run, and resumes the run until
+    /// Runs `useful workflow run create`, or adopts the home's run, and resumes the run until
     /// its record reads `exited` or the assignment's cancellation ends it, applying the
     /// cancellation to each process and each trigger delivery and control to the run, and
     /// queuing each new root progress and step report and each application through `reports`. The
@@ -373,7 +373,7 @@ pub(super) fn prepare(
         stage_inputs(&layout.inputs, inputs)
     })()
     .map_err(|_| environment_decline("workflow_tree_publication"))?;
-    let um = UmCommand {
+    let useful = UsefulCommand {
         executable: (dependencies.executable)()
             .map_err(|_| environment_decline("workflow_tree_publication"))?,
         environment: preparation.environment.clone(),
@@ -390,7 +390,7 @@ pub(super) fn prepare(
         return Err(fenced());
     }
     let published = command::publish(
-        &um,
+        &useful,
         &layout.tree,
         &layout.bindings,
         preparation.cancellation,
@@ -476,7 +476,7 @@ pub(super) fn prepare(
             pending: &preparation.tree.pending_deliveries,
         },
         &preparation.sleeper,
-        um,
+        useful,
         TreeStart::Create {
             arguments: create_arguments,
             first,
@@ -505,7 +505,7 @@ pub(super) struct TreeAdoption<'a> {
 /// Adopts the run in `adoption.home`, on the calling blocking worker: its runs are those
 /// of the home's only definition, which must hold exactly one run, or the offer is
 /// declined `retained_workspace_unavailable`. Its commands run with the adopting
-/// attempt's environment and that home as `UM_HOME`, their output in the adopting
+/// attempt's environment and that home as `USEFUL_HOME`, their output in the adopting
 /// assignment's own log and documents; the runner itself writes nothing in the home.
 pub(super) fn adopt(
     dependencies: &TreeRunDependencies,
@@ -519,7 +519,7 @@ pub(super) fn adopt(
                 .diagnosed("workflow_tree_adoption", "tree_run_directory_unavailable")
         })?;
     let layout = TreeLayout::under(adoption.private);
-    let um = UmCommand {
+    let useful = UsefulCommand {
         executable: (dependencies.executable)()
             .map_err(|_| environment_decline("workflow_tree_adoption"))?,
         environment: adoption.environment.clone(),
@@ -536,7 +536,7 @@ pub(super) fn adopt(
             pending: adoption.pending_deliveries,
         },
         &adoption.sleeper,
-        um,
+        useful,
         TreeStart::Adopt(adoption.steps.to_vec()),
         runs,
         layout.documents,
@@ -556,14 +556,14 @@ struct FirstStep {
 /// with pending deliveries stops before it, earlier than any step the start names, and a
 /// refused `create` names it as the step that did not start.
 fn first_step(tree: &Path, workflow_path: &str) -> Result<FirstStep, AssignmentDecline> {
-    um_execution::resolve_workflow_file(tree, &tree.join(workflow_path))
+    useful_execution::resolve_workflow_file(tree, &tree.join(workflow_path))
         .ok()
         .and_then(|workflow| {
             Some(FirstStep {
                 step: workflow.definition.source_order.first().cloned()?,
                 edge_scheduled: matches!(
                     workflow.definition.scheduling,
-                    um_execution::Scheduling::Edges { .. }
+                    useful_execution::Scheduling::Edges { .. }
                 ),
             })
         })
@@ -603,7 +603,7 @@ fn resolution_record(resolution: &serde_json::Value) -> serde_json::Value {
     serde_json::Value::Object(record)
 }
 
-/// `um workflow run create` for the run: the run inputs, the start's owner, the stop step,
+/// `useful workflow run create` for the run: the run inputs, the start's owner, the stop step,
 /// and the Cloud run page as `external.url` (REQ-LOCALRUN-209). The stop step is the
 /// start's own as named, which the runtime refuses when it cannot hold before it, or, on an
 /// edge-scheduled root with pending deliveries, the runner's own before the first step.

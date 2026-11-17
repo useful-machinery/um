@@ -227,13 +227,13 @@ impl WorkflowTree {
     }
 }
 
-/// Runs `um` from the source root with the environment that proves no deployment or
+/// Runs `useful` from the source root with the environment that proves no deployment or
 /// credential file is loaded (REQ-RUNNERENROLL-45).
 fn run_in_source_root(root: &Path, arguments: &[&str]) -> Output {
     run_with_env_from(
         arguments,
         &[
-            ("UM_API_URL", "partial-override-is-ignored"),
+            ("USEFUL_API_URL", "partial-override-is-ignored"),
             (CREDENTIALS_FILE_VARIABLE, "/dev/null/credentials.json"),
         ],
         Some(root),
@@ -281,7 +281,7 @@ fn runner_doctor_workflow_reports_tree_credentials_as_json() {
     assert!(!stdout.contains("CARGO_TARGET_DIR"));
     let report: Value = serde_json::from_str(&stdout).expect("report should be JSON");
     assert_eq!(report["schemaVersion"], 1);
-    assert_eq!(report["command"], "um runner doctor");
+    assert_eq!(report["command"], "useful runner doctor");
     assert_eq!(report["deployment"], Value::Null);
     assert!(report.get("checks").is_none());
     assert_eq!(report["workflows"], json!(["main.yaml", "stage.yaml"]));
@@ -582,7 +582,7 @@ fn runner_doctor_workflow_bounds_its_files_by_their_git_repository() {
         run_with_env_from(
             &arguments,
             &[
-                ("UM_API_URL", "partial-override-is-ignored"),
+                ("USEFUL_API_URL", "partial-override-is-ignored"),
                 (CREDENTIALS_FILE_VARIABLE, "/dev/null/credentials.json"),
                 ("PATH", git_path(&git.0)),
             ],
@@ -649,7 +649,7 @@ fn scenario_doctor(json: bool) -> Output {
     run_with_env_from(
         &arguments,
         &[
-            ("UM_API_URL", "partial-override-is-ignored"),
+            ("USEFUL_API_URL", "partial-override-is-ignored"),
             (CREDENTIALS_FILE_VARIABLE, "/dev/null/credentials.json"),
             (
                 "PATH",
@@ -1077,7 +1077,7 @@ fn runner_doctor_readiness_reports_a_linear_connection_that_is_not_ready() {
         assert_eq!(linear["cloud"], state, "{linear}");
         assert!(
             next_action(linear).contains(&format!(
-                "um connection linear authorization create {ORGANIZATION}"
+                "useful connection linear authorization create {ORGANIZATION}"
             )),
             "{linear}"
         );
@@ -1162,7 +1162,7 @@ fn runner_doctor_readiness_reports_a_refused_read_as_not_permitted() {
     assert_eq!(linear["state"], "unverified");
     assert_eq!(linear["code"], "not_permitted");
     assert_eq!(linear["cloud"], "unverified");
-    assert!(!next_action(linear).contains("um "), "{linear}");
+    assert!(!next_action(linear).contains("useful "), "{linear}");
     assert_eq!(deployment.linear_list_requests().len(), 1);
 }
 
@@ -1187,7 +1187,9 @@ fn runner_doctor_readiness_ends_without_a_report_when_cloud_cannot_answer() {
     assert!(human.stdout.is_empty(), "{human:?}");
     let stderr = String::from_utf8(human.stderr).expect("error should be UTF-8");
     assert!(
-        stderr.lines().any(|line| line.trim() == "um auth login"),
+        stderr
+            .lines()
+            .any(|line| line.trim() == "useful auth login"),
         "{stderr}"
     );
     assert!(signed_out.server.finish().is_empty());
@@ -1306,7 +1308,7 @@ fn runner_doctor_workflow_without_readiness_names_it_and_asks_nothing() {
     assert_eq!(linear["cloud"], "not_checked");
     assert!(next_action(linear).contains("--readiness"), "{linear}");
     assert!(
-        next_action(linear).contains("um connection linear list"),
+        next_action(linear).contains("useful connection linear list"),
         "{linear}"
     );
     assert!(requirement(&report, "claude_code").get("cloud").is_none());
@@ -1336,7 +1338,7 @@ fn rate_limited() -> Vec<u8> {
     )
 }
 
-// REQ-CREDREADY-14. The Linear read alone: the GitLab and GitHub clients of `um-api` know no
+// REQ-CREDREADY-14. The Linear read alone: the GitLab and GitHub clients of `useful-api` know no
 // rate-limited answer, and the public contract lists none for their lists.
 #[test]
 fn runner_doctor_readiness_ends_without_a_report_when_cloud_rate_limits_the_linear_read() {
@@ -1376,7 +1378,7 @@ fn runner_doctor_readiness_reports_a_gitlab_connection_that_is_not_ready() {
             vec![],
             "missing",
             "not_connected",
-            "um connection gitlab create",
+            "useful connection gitlab create",
         ),
         (
             vec![gitlab_connection(
@@ -1385,13 +1387,13 @@ fn runner_doctor_readiness_reports_a_gitlab_connection_that_is_not_ready() {
             )],
             "missing",
             "not_connected",
-            "um connection gitlab create",
+            "useful connection gitlab create",
         ),
         (
             vec![gitlab_connection("credential_required", Some("expired"))],
             "reconnect_required",
             "credential_expired",
-            "um connection gitlab credential create",
+            "useful connection gitlab credential create",
         ),
         (
             vec![gitlab_connection(
@@ -1400,13 +1402,13 @@ fn runner_doctor_readiness_reports_a_gitlab_connection_that_is_not_ready() {
             )],
             "reconnect_required",
             "connection_inactive",
-            "um connection gitlab credential create",
+            "useful connection gitlab credential create",
         ),
         (
             vec![gitlab_connection("disconnected", None)],
             "reconnect_required",
             "connection_inactive",
-            "um connection gitlab credential create",
+            "useful connection gitlab credential create",
         ),
     ] {
         let tree = gitlab_tree();
@@ -1491,7 +1493,7 @@ fn runner_doctor_readiness_reports_github_installations() {
                 "github",
                 state,
                 code,
-                "um connection github setup begin",
+                "useful connection github setup begin",
             );
         }
         let requests = deployment.requests();
@@ -1542,7 +1544,7 @@ fn runner_doctor_readiness_finds_an_expired_gitlab_credential_beside_a_ready_lin
         "gitlab",
         "reconnect_required",
         "credential_expired",
-        "um connection gitlab credential create",
+        "useful connection gitlab credential create",
     );
     let report = json_report(&output);
     let linear = requirement(&report, "linear");
@@ -1743,7 +1745,7 @@ fn runner_doctor_readiness_reports_an_unavailable_project_repository() {
         assert_eq!(github["code"], "repository_unavailable", "{github}");
         assert!(
             next_action(github).contains(&format!(
-                "um project repository show {ORGANIZATION} {PROJECT_ID}"
+                "useful project repository show {ORGANIZATION} {PROJECT_ID}"
             )),
             "{github}"
         );
@@ -1770,7 +1772,7 @@ fn runner_doctor_readiness_reports_an_unavailable_project_repository() {
     assert_eq!(gitlab["code"], "provider_unavailable", "{gitlab}");
     assert_eq!(gitlab["cloud"], "unverified", "{gitlab}");
     assert!(
-        next_action(gitlab).contains("um project repository show"),
+        next_action(gitlab).contains("useful project repository show"),
         "{gitlab}"
     );
     let requests = deployment.requests();
@@ -1983,7 +1985,7 @@ fn runner_doctor_grants_shows_the_members_grants_beside_each_requirement() {
         OAUTH_GRANT_ID,
         NATIVE_GRANT_ID,
         RUNNER_ID,
-        "um grant create linear",
+        "useful grant create linear",
         deployment.server.api_url.as_str(),
     ] {
         assert!(
@@ -2226,7 +2228,7 @@ fn runner_doctor_require_grants_fails_on_a_grant_the_runner_cannot_use() {
         "missing",
         "grant_not_authorized",
         "authorize_runner",
-        &format!("um grant authorize {LINEAR_GRANT_ID}"),
+        &format!("useful grant authorize {LINEAR_GRANT_ID}"),
     );
     assert_grant_fails(
         &report,
@@ -2234,7 +2236,7 @@ fn runner_doctor_require_grants_fails_on_a_grant_the_runner_cannot_use() {
         "missing",
         "grant_not_connected",
         "connect",
-        "um grant create claude_code",
+        "useful grant create claude_code",
     );
     // The grants beside each requirement are those `--grants` shows.
     assert_eq!(held(&report, "linear")["nextAction"], "authorize_runner");
@@ -2287,7 +2289,7 @@ fn runner_doctor_require_grants_fails_on_a_grant_that_needs_reconnecting_or_is_n
             "reconnect_required",
             "grant_reconnect_required",
             "reconnect",
-            "um grant create linear --replace",
+            "useful grant create linear --replace",
         ),
         (
             vec![
@@ -2299,7 +2301,7 @@ fn runner_doctor_require_grants_fails_on_a_grant_that_needs_reconnecting_or_is_n
             "missing",
             "grant_not_ready",
             "sync_runner",
-            "um runner grant sync",
+            "useful runner grant sync",
         ),
         // The runner's service has a login of its own, which a step would run on.
         (
@@ -2326,7 +2328,7 @@ fn runner_doctor_require_grants_fails_on_a_grant_that_needs_reconnecting_or_is_n
             "missing",
             "grant_not_ready",
             "sync_runner",
-            "um runner grant sync",
+            "useful runner grant sync",
         ),
     ];
     for (grants, kind, state, code, next_action, command) in cases {
@@ -2419,7 +2421,7 @@ fn runner_doctor_require_grants_keeps_a_failing_readiness_code() {
     assert_eq!(linear["state"], "missing");
     assert_eq!(linear["code"], "not_connected");
     assert!(
-        next_action(linear).contains("um connection linear authorization create"),
+        next_action(linear).contains("useful connection linear authorization create"),
         "{linear}"
     );
     assert_eq!(
@@ -2497,11 +2499,11 @@ fn runner_doctor_workflow_names_the_grant_commands_for_each_coding_agent() {
     for kind in ["claude_code", "codex"] {
         let next_action = next_action(requirement(&report, kind));
         assert!(
-            next_action.contains(&format!("um grant create {kind}")),
+            next_action.contains(&format!("useful grant create {kind}")),
             "{kind}: {next_action}"
         );
         assert!(
-            next_action.contains("um grant authorize"),
+            next_action.contains("useful grant authorize"),
             "{kind}: {next_action}"
         );
     }

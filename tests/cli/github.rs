@@ -116,7 +116,7 @@ fn setup_begin_and_complete_preserve_the_browser_handoff() {
     assert!(human.contains(&format!("  Setup session: {SETUP_SESSION}\n")));
     assert!(human.contains(&format!("  {setup_url}\n")));
     assert!(human.contains(&format!(
-        "um connection github setup complete {ORGANIZATION} {SETUP_SESSION} --provider-installation-id <INSTALLATION_ID>"
+        "useful connection github setup complete {ORGANIZATION} {SETUP_SESSION} --provider-installation-id <INSTALLATION_ID>"
     )));
     // The callback page erases its query string, so the hint points at the page, not the URL.
     assert!(human.contains("installation ID"));
@@ -533,7 +533,7 @@ fn setup_conflict_is_actionable_on_standard_error_without_problem_prose() {
     let diagnostic = String::from_utf8(output.stderr).unwrap();
     assert!(diagnostic.starts_with("error: "));
     assert!(diagnostic.contains("\n\n"));
-    assert!(diagnostic.contains("um connection github setup begin <ORGANIZATION>"));
+    assert!(diagnostic.contains("useful connection github setup begin <ORGANIZATION>"));
     assert!(!diagnostic.contains("private-github"));
     assert!(!diagnostic.contains(TOKEN));
     assert_eq!(server.finish().len(), 1);

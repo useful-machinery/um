@@ -42,7 +42,7 @@ fn environment_retry_bundle() -> RunBundle {
     let argv = serde_json::to_string(&[
         "sh",
         "-c",
-        "set -eu; test -z \"${UM_CONTINUATION_CONTEXT:-}\"; printf '%s\\n' \"$RETRY_PHASE\" >> phases; test \"$RETRY_PHASE\" = retry",
+        "set -eu; test -z \"${USEFUL_CONTINUATION_CONTEXT:-}\"; printf '%s\\n' \"$RETRY_PHASE\" >> phases; test \"$RETRY_PHASE\" = retry",
     ])
     .unwrap();
     RunBundle::new(&format!(
@@ -128,7 +128,7 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
     assert!(rejected.stderr.is_empty());
     let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
     assert!(workflow_run_schema().is_valid(&rejected), "{rejected}");
-    assert_eq!(rejected["command"], "um workflow run retry");
+    assert_eq!(rejected["command"], "useful workflow run retry");
     assert_eq!(rejected["phase"], "admission");
     assert_eq!(
         rejected["diagnostics"][0]["code"],
@@ -157,7 +157,7 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
     );
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
-    assert_eq!(terminal["command"], "um workflow run retry");
+    assert_eq!(terminal["command"], "useful workflow run retry");
     assert_eq!(terminal["outcome"], "succeeded");
     assert_eq!(terminal["attemptNumber"], 2);
     assert_eq!(terminal["result"]["attemptNumber"], 2);
@@ -197,7 +197,7 @@ fn retry_uses_the_immutable_bundle_current_environment_and_fresh_attempt() {
     assert!(rejected.stderr.is_empty());
     let rejected: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
     assert!(workflow_run_schema().is_valid(&rejected), "{rejected}");
-    assert_eq!(rejected["command"], "um workflow run retry");
+    assert_eq!(rejected["command"], "useful workflow run retry");
     assert_eq!(rejected["phase"], "retry");
     assert_eq!(rejected["attemptNumber"], 2);
     assert_eq!(
@@ -233,9 +233,9 @@ steps:
         - -c
         - >-
           set -eu;
-          test "$(cat "$UM_STEP_INPUTS/values/request")" = retained-request;
-          { cat "$UM_STEP_INPUTS/collections/evidence/000000";
-            cat "$UM_STEP_INPUTS/collections/evidence/000001"; } > observed;
+          test "$(cat "$USEFUL_STEP_INPUTS/values/request")" = retained-request;
+          { cat "$USEFUL_STEP_INPUTS/collections/evidence/000000";
+            cat "$USEFUL_STEP_INPUTS/collections/evidence/000001"; } > observed;
           test "$RETRY_PHASE" = retry
 "#,
     );
@@ -329,7 +329,7 @@ fn finalizer_retry_reruns_both_graphs_with_a_fresh_attempt() {
         String::from_utf8_lossy(&retried.stderr)
     );
     let retried: serde_json::Value = serde_json::from_slice(&retried.stdout).unwrap();
-    assert_eq!(retried["command"], "um workflow run retry");
+    assert_eq!(retried["command"], "useful workflow run retry");
     assert_eq!(retried["attemptNumber"], 2);
     assert_eq!(retried["result"]["finalization"]["trigger"], "failed");
     assert_eq!(
@@ -760,7 +760,7 @@ fn retry_git_capture_keeps_the_recorded_baseline_after_head_advances() {
 // REQ-LOCALRUN-171
 #[test]
 fn a_retry_of_a_tree_run_rejects_a_modified_copy() {
-    let script = "#!/bin/sh\nset -eu\nprintf '%s' \"$UM_WORKFLOW_ROOT\" > workflow-root\ntest \"$RETRY_PHASE\" = retry\n";
+    let script = "#!/bin/sh\nset -eu\nprintf '%s' \"$USEFUL_WORKFLOW_ROOT\" > workflow-root\ntest \"$RETRY_PHASE\" = retry\n";
     let bundle = TreeBundle::new(
         "schemaVersion: 1\nenvironmentPassthrough: [RETRY_PHASE]\nprograms: [bin]\nsteps:\n  report:\n    kind: cmd\n    command:\n      argv: [\"report\"]\n",
     );
@@ -795,7 +795,7 @@ fn a_retry_of_a_tree_run_rejects_a_modified_copy() {
     assert_eq!(rejected.status.code(), Some(1));
     let rejection: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
     assert!(workflow_run_schema().is_valid(&rejection), "{rejection}");
-    assert_eq!(rejection["command"], "um workflow run retry");
+    assert_eq!(rejection["command"], "useful workflow run retry");
     assert_eq!(rejection["phase"], "tree");
     assert_eq!(rejection["diagnostics"][0]["code"], "tree_copy_modified");
     assert_eq!(rejection["runDirectory"], run_directory.to_str().unwrap());
@@ -941,7 +941,7 @@ fn resuming_an_abandoned_parent_adopts_its_exited_child() {
 
 /// REQ-LOCALRUN-143: a failed state commit's standard error has a diagnostic line naming the
 /// write, `exchange state`, its file and the operating system's message for a missing file, a
-/// `class:` field, and after an empty line ends with the indented `um workflow run resume` for
+/// `class:` field, and after an empty line ends with the indented `useful workflow run resume` for
 /// `run_directory`.
 fn assert_state_commit_failure(stderr: &[u8], state_file: &Path, run_directory: &Path) {
     let stderr = String::from_utf8_lossy(stderr);
@@ -972,7 +972,7 @@ fn assert_state_commit_failure(stderr: &[u8], state_file: &Path, run_directory: 
     );
     assert_eq!(
         lines[remedy].trim(),
-        format!("um workflow run resume {}", run_directory.display()),
+        format!("useful workflow run resume {}", run_directory.display()),
         "{stderr}"
     );
     assert!(lines[remedy].starts_with(char::is_whitespace), "{stderr}");
@@ -1139,7 +1139,7 @@ fn retry_and_resume_refuse_an_unknown_run_id_on_stderr_only() {
         resume_args(unknown),
     ] {
         let output = isolated_command(&args)
-            .env("UM_HOME", home.path())
+            .env("USEFUL_HOME", home.path())
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(1), "{args:?}: {output:?}");

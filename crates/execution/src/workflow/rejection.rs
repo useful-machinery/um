@@ -898,7 +898,7 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
         ),
         ValidationFailureKind::WaitRuleInvalid => (
             "wait_rule_invalid",
-            "Name a provider other than um, and write where as equalities joined by and.",
+            "Name a provider other than useful, and write where as equalities joined by and.",
         ),
         ValidationFailureKind::WaitRuleReferenceInvalid => (
             "wait_rule_reference_invalid",

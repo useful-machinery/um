@@ -11,8 +11,8 @@ import {
 } from "../fixtures/generated/pi-json-v1-extension.ts";
 
 const fixedConfig: PiJsonV1ExtensionConfig = {
-  toolName: "um_result_unit_fixed",
-  socketPath: "/tmp/um/unit-fixed/result.sock",
+  toolName: "useful_result_unit_fixed",
+  socketPath: "/tmp/useful/unit-fixed/result.sock",
   parameters: {
     type: "object",
     properties: {

@@ -3,7 +3,7 @@ use std::time::Duration;
 use super::*;
 use crate::HttpTransportPolicy;
 use crate::http_util::MAX_RESPONSE_BODY_BYTES;
-use um_test_support::ScriptedHttpServer;
+use useful_test_support::ScriptedHttpServer;
 
 #[test]
 fn accepts_only_action_ids_for_action_audit_subjects() {

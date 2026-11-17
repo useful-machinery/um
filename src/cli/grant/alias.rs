@@ -1,30 +1,30 @@
-//! The earlier commands `um grant` and `um runner grant` replace (REQ-GRANT-77). Each stays for
+//! The earlier commands `useful grant` and `useful runner grant` replace (REQ-GRANT-77). Each stays for
 //! one release, absent from help, with its arguments, output and exit statuses unchanged; an
 //! invocation of one first prints a line on standard error naming the command that replaces it.
 
 use std::io::{self, Write};
 
-/// Each earlier leaf, by its path under `um`, with the command that replaces it.
+/// Each earlier leaf, by its path under `useful`, with the command that replaces it.
 pub(in crate::cli) const EARLIER: [(&str, &str); 13] = [
-    ("auth agent-login authorize", "um grant authorize"),
-    ("auth agent-login deauthorize", "um grant deauthorize"),
-    ("auth agent-login import", "um grant create PROVIDER"),
-    ("auth agent-login list", "um grant list"),
+    ("auth agent-login authorize", "useful grant authorize"),
+    ("auth agent-login deauthorize", "useful grant deauthorize"),
+    ("auth agent-login import", "useful grant create PROVIDER"),
+    ("auth agent-login list", "useful grant list"),
     (
         "auth agent-login reconnect",
-        "um grant create PROVIDER --replace",
+        "useful grant create PROVIDER --replace",
     ),
-    ("auth agent-login revoke", "um grant revoke"),
-    ("auth agent-login show", "um grant list GRANT"),
-    ("auth credential status", "um grant list"),
-    ("auth grant create", "um grant create PROVIDER"),
-    ("auth grant list", "um grant list"),
-    ("auth grant revoke", "um grant revoke"),
-    ("auth grant uses", "um grant list GRANT"),
-    ("runner agent-login sync", "um runner grant sync"),
+    ("auth agent-login revoke", "useful grant revoke"),
+    ("auth agent-login show", "useful grant list GRANT"),
+    ("auth credential status", "useful grant list"),
+    ("auth grant create", "useful grant create PROVIDER"),
+    ("auth grant list", "useful grant list"),
+    ("auth grant revoke", "useful grant revoke"),
+    ("auth grant uses", "useful grant list GRANT"),
+    ("runner agent-login sync", "useful runner grant sync"),
 ];
 
-/// The earlier leaf an invocation named, by its path under `um`.
+/// The earlier leaf an invocation named, by its path under `useful`.
 #[derive(Debug, Clone, Copy)]
 pub(in crate::cli) struct Earlier {
     path: &'static str,
@@ -46,7 +46,7 @@ impl Earlier {
         let mut stderr = io::stderr().lock();
         let _ = writeln!(
             stderr,
-            "warning: `um {}` is replaced by `{}` and will be removed in a later release",
+            "warning: `useful {}` is replaced by `{}` and will be removed in a later release",
             self.path, self.replacement
         );
     }

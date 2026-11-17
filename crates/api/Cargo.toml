@@ -1,5 +1,5 @@
 [package]
-name = "um-api"
+name = "useful-api"
 version = "0.0.0-dev"
 edition.workspace = true
 rust-version.workspace = true
@@ -22,7 +22,7 @@ ring.workspace = true
 rustls.workspace = true
 # Pin the patched native verifier shared by reqwest and hyper-rustls.
 rustls-platform-verifier.workspace = true
-um-support.workspace = true
+useful-support.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
@@ -32,4 +32,4 @@ zeroize.workspace = true
 serde_repr = "0.1.20"
 
 [dev-dependencies]
-um-test-support.workspace = true
+useful-test-support.workspace = true

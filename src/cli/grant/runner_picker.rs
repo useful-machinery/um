@@ -1,4 +1,4 @@
-//! The list `um grant authorize` and `um grant deauthorize` given no `RUNNER` show on a
+//! The list `useful grant authorize` and `useful grant deauthorize` given no `RUNNER` show on a
 //! terminal to choose the runner from (REQ-GRANT-82, REQ-GRANT-83, INV-CLI-16). It is the only
 //! source that names the prompt crate (INV-CLI-3), which draws on standard error, so that
 //! standard output carries only the result, and leaves the terminal as it found it before it

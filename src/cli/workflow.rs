@@ -46,43 +46,47 @@ pub(super) struct PresentationOptions {
 pub(super) struct ExistingLocalRun {
     #[arg(
         value_name = "RUN",
-        help = "Run directory, or the id or subject of a run under the um home"
+        help = "Run directory, or the id or subject of a run under the useful home"
     )]
     pub(super) run_dir: PathBuf,
 }
 
 impl ExistingLocalRun {
     /// The run directory `RUN` names (REQ-LOCALRUN-180): a single component of a run id's
-    /// form is the run with that id under the `um` home; a single component of a subject's
+    /// form is the run with that id under the `useful` home; a single component of a subject's
     /// form that names no existing path is the run the home's subject index holds for it;
     /// anything else is the directory itself.
     pub(super) fn resolve(&self) -> Result<PathBuf, RunAddressError> {
         let Some(value) = self.run_dir.to_str() else {
             return Ok(self.run_dir.clone());
         };
-        if um_execution::is_run_id(value) {
+        if useful_execution::is_run_id(value) {
             return locate_by_id(&home()?, value);
         }
-        if um_execution::is_subject(value) && std::fs::symlink_metadata(&self.run_dir).is_err() {
+        if useful_execution::is_subject(value) && std::fs::symlink_metadata(&self.run_dir).is_err()
+        {
             return locate_by_subject(&home()?, value);
         }
         Ok(self.run_dir.clone())
     }
 }
 
-fn home() -> Result<um_execution::WorkflowHome, RunAddressError> {
-    um_execution::WorkflowHome::from_environment().map_err(|error| {
+fn home() -> Result<useful_execution::WorkflowHome, RunAddressError> {
+    useful_execution::WorkflowHome::from_environment().map_err(|error| {
         RunAddressError::new(
             error.code(),
-            "The um home cannot be located: neither UM_HOME nor HOME is set.",
+            "The useful home cannot be located: neither USEFUL_HOME nor HOME is set.",
         )
     })
 }
 
-fn locate_by_id(home: &um_execution::WorkflowHome, id: &str) -> Result<PathBuf, RunAddressError> {
-    um_execution::locate_run(home, id).map_err(|error| match error {
-        um_execution::LocalRunDirectoryError::RunNotFound => {
-            RunAddressError::new(RUN_NOT_FOUND, "No run under the um home has this id.")
+fn locate_by_id(
+    home: &useful_execution::WorkflowHome,
+    id: &str,
+) -> Result<PathBuf, RunAddressError> {
+    useful_execution::locate_run(home, id).map_err(|error| match error {
+        useful_execution::LocalRunDirectoryError::RunNotFound => {
+            RunAddressError::new(RUN_NOT_FOUND, "No run under the useful home has this id.")
         }
         other => RunAddressError::unavailable(other),
     })
@@ -91,14 +95,20 @@ fn locate_by_id(home: &um_execution::WorkflowHome, id: &str) -> Result<PathBuf, 
 /// The run the one definition's slot for `subject` names; `subject_ambiguous` with the ids
 /// when several do.
 fn locate_by_subject(
-    home: &um_execution::WorkflowHome,
+    home: &useful_execution::WorkflowHome,
     subject: &str,
 ) -> Result<PathBuf, RunAddressError> {
-    let not_found =
-        || RunAddressError::new(RUN_NOT_FOUND, "No run under the um home has this subject.");
+    let not_found = || {
+        RunAddressError::new(
+            RUN_NOT_FOUND,
+            "No run under the useful home has this subject.",
+        )
+    };
     let mut holders =
-        um_execution::SlotHolder::of_subject(home, subject).map_err(|error| match error {
-            um_execution::SubjectError::Unavailable(source) => RunAddressError::unavailable(source),
+        useful_execution::SlotHolder::of_subject(home, subject).map_err(|error| match error {
+            useful_execution::SubjectError::Unavailable(source) => {
+                RunAddressError::unavailable(source)
+            }
             // `of_subject` refuses only a value outside the subject form, which `resolve`
             // never passes, and reads no slot as busy or settled.
             _ => not_found(),
@@ -109,7 +119,7 @@ fn locate_by_subject(
         _ => Err(RunAddressError::new(
             SUBJECT_AMBIGUOUS,
             format!(
-                "Several runs under the um home hold this subject: {}.",
+                "Several runs under the useful home hold this subject: {}.",
                 holders
                     .iter()
                     .map(|holder| holder.run.as_str())
@@ -124,7 +134,7 @@ const RUN_NOT_FOUND: &str = "run_not_found";
 const RUN_DIRECTORY_UNAVAILABLE: &str = "run_directory_unavailable";
 const SUBJECT_AMBIGUOUS: &str = "subject_ambiguous";
 
-/// A run id or subject `RUN` the `um` home does not answer (REQ-LOCALRUN-180): `code` is
+/// A run id or subject `RUN` the `useful` home does not answer (REQ-LOCALRUN-180): `code` is
 /// `run_not_found`, `subject_ambiguous` (the message names the runs), `home_unavailable`, or
 /// `run_directory_unavailable` when the home's runs cannot be read, with that failure as its
 /// source.
@@ -132,7 +142,7 @@ const SUBJECT_AMBIGUOUS: &str = "subject_ambiguous";
 pub(super) struct RunAddressError {
     pub(super) code: &'static str,
     pub(super) message: String,
-    source: Option<um_execution::LocalRunDirectoryError>,
+    source: Option<useful_execution::LocalRunDirectoryError>,
 }
 
 impl RunAddressError {
@@ -144,10 +154,10 @@ impl RunAddressError {
         }
     }
 
-    fn unavailable(source: um_execution::LocalRunDirectoryError) -> Self {
+    fn unavailable(source: useful_execution::LocalRunDirectoryError) -> Self {
         Self {
             code: RUN_DIRECTORY_UNAVAILABLE,
-            message: "The runs under the um home could not be read.".to_owned(),
+            message: "The runs under the useful home could not be read.".to_owned(),
             source: Some(source),
         }
     }
@@ -244,11 +254,11 @@ enum WorkflowCommand {
 }
 
 /// The run record's state as `run.json` spells it.
-pub(super) const fn state_name(state: um_execution::RunState) -> &'static str {
+pub(super) const fn state_name(state: useful_execution::RunState) -> &'static str {
     match state {
-        um_execution::RunState::Running => "running",
-        um_execution::RunState::Waiting => "waiting",
-        um_execution::RunState::Exited => "exited",
+        useful_execution::RunState::Running => "running",
+        useful_execution::RunState::Waiting => "waiting",
+        useful_execution::RunState::Exited => "exited",
     }
 }
 

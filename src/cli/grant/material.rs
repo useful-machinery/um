@@ -1,6 +1,6 @@
 //! Reading a coding agent's login: a Codex `auth.json` or a Claude Code token, from a file or
-//! stream the member names or from the private home of a sign-in `um` ran (REQ-GRANT-12,
-//! REQ-GRANT-32, REQ-GRANT-33, INV-CLI-13). `um grant create` and the earlier agent-login
+//! stream the member names or from the private home of a sign-in `useful` ran (REQ-GRANT-12,
+//! REQ-GRANT-32, REQ-GRANT-33, INV-CLI-13). `useful grant create` and the earlier agent-login
 //! commands read through these alike.
 
 use std::path::Path;

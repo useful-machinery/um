@@ -1,8 +1,8 @@
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use um_api::list_identities;
-use um_human_auth::Deployment;
+use useful_api::list_identities;
+use useful_human_auth::Deployment;
 
 use super::{OutputOptions, output, with_principal_credential};
 use crate::cli::PaginationArgs;

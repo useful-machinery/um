@@ -63,7 +63,7 @@ def package_archive(
     sources = (
         ("LICENSE", regular_file(public_root / "LICENSE", "CLI license"), 0o644),
         ("README.md", regular_file(public_root / "README.md", "CLI README"), 0o644),
-        ("um", regular_file(binary, "release binary", executable=True), 0o755),
+        ("useful", regular_file(binary, "release binary", executable=True), 0o755),
     )
 
     if not VERSION_RE.fullmatch(version):
@@ -76,7 +76,7 @@ def package_archive(
         fail(f"output path is not a regular directory: {output}")
     output.mkdir(parents=True, exist_ok=True)
 
-    package = f"um-{version}-{target}"
+    package = f"useful-{version}-{target}"
     destination = output / f"{package}.tar.gz"
     if destination.exists() or destination.is_symlink():
         fail(f"release archive already exists: {destination}")

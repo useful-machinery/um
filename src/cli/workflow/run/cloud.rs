@@ -1,10 +1,10 @@
-//! `um workflow run show RUN --cloud ORGANIZATION`, `um workflow run release RUN --cloud
+//! `useful workflow run show RUN --cloud ORGANIZATION`, `useful workflow run release RUN --cloud
 //! ORGANIZATION` (REQ-LOCALRUN-189, REQ-LOCALRUN-187) and the control leaves `answer`,
 //! `approve`, `hand-back`, `lift`, `stop` and `retry` with `--cloud` (REQ-LOCALRUN-210): the
 //! Cloud run `RUN` names, as typed, read with its identity, observations and trigger
 //! deliveries (REQ-RUN-96, REQ-RUN-87 and REQ-RUN-88), its subject claim released by an owner
 //! (REQ-CLOUDDEF-19), or a control for its current wait carried to its runner (REQ-RUN-91),
-//! through the public API under the CLI's session handling. Nothing under the `um` home is
+//! through the public API under the CLI's session handling. Nothing under the `useful` home is
 //! read or written.
 
 use std::io::{self, Write};
@@ -12,20 +12,20 @@ use std::io::{self, Write};
 use anyhow::{Context, anyhow};
 use serde::Serialize;
 use serde_json::Value;
-use um_api::{
+use useful_api::{
     HttpClient, Run, RunApi, RunClaimRelease, RunControl, RunControlAnswer, RunControlKind,
     RunControlRequest, RunControlSubmission, RunControlWait, RunFailure, RunRead, RunSubjectClaim,
     RunTriggerDelivery,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 use super::super::super::{
     self as cli, CommandFailure, HttpOptions, OrganizationArg, PrincipalAuthenticationArgs,
 };
 use crate::exit_code::ExitCode;
 
-const SHOW_COMMAND: &str = "um workflow run show";
-const RELEASE_COMMAND: &str = "um workflow run release";
+const SHOW_COMMAND: &str = "useful workflow run show";
+const RELEASE_COMMAND: &str = "useful workflow run release";
 /// The most deliveries `show` reads, the API's page bound.
 const SHOWN_DELIVERIES: u32 = 100;
 /// The run fields a definition-backed run's read carries and a run by `workflowPath` may
@@ -73,12 +73,12 @@ impl Control {
 
     fn command(&self) -> &'static str {
         match self {
-            Self::Answer { .. } => "um workflow run answer",
-            Self::Approve => "um workflow run approve",
-            Self::HandBack { .. } => "um workflow run hand-back",
-            Self::Lift { .. } => "um workflow run lift",
-            Self::Stop { .. } => "um workflow run stop",
-            Self::Retry => "um workflow run retry",
+            Self::Answer { .. } => "useful workflow run answer",
+            Self::Approve => "useful workflow run approve",
+            Self::HandBack { .. } => "useful workflow run hand-back",
+            Self::Lift { .. } => "useful workflow run lift",
+            Self::Stop { .. } => "useful workflow run stop",
+            Self::Retry => "useful workflow run retry",
         }
     }
 
@@ -217,7 +217,7 @@ impl CloudRun {
 
     /// Asks Cloud to release the run's current claim under one fresh key.
     pub(super) fn release(self) -> cli::CommandResult {
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate Cloud claim release request identity")?;
         cli::execute_deployment_command(
             Some(self),
@@ -256,7 +256,7 @@ impl CloudRun {
     /// Reads the run for its current wait, unless the control is a `stop`, and asks Cloud to
     /// carry the control naming that wait to the run's runner under one fresh key.
     pub(super) fn control(self, control: Control) -> cli::CommandResult {
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate Cloud run control request identity")?;
         let command = control.command();
         cli::execute_deployment_command(
@@ -509,7 +509,7 @@ impl CloudRun {
 }
 
 /// The diagnostic code, message and exit status leaf `command` reports `failure` under: the
-/// code and exit status the `um run` commands report it under (`failure_code`), but for an
+/// code and exit status the `useful run` commands report it under (`failure_code`), but for an
 /// unnamed conflict, which is `conflict`, and a rejected session, which exits 3 (INV-CLI-17,
 /// REQ-LOCALRUN-215). The message is the leaf's own, chosen by the code. Only `show` and
 /// `release` read the run's subject claim, so only their not-found names it.
@@ -526,7 +526,7 @@ fn failure_diagnostic(
     };
     let message = match code {
         "authentication_required" => {
-            "Cloud rejected the session; sign in with um auth login and try again."
+            "Cloud rejected the session; sign in with useful auth login and try again."
         }
         "forbidden" => "The principal may not do this to the run.",
         "not_found" if matches!(command, SHOW_COMMAND | RELEASE_COMMAND) => {
@@ -600,7 +600,7 @@ struct Diagnostic {
 }
 
 fn text(value: &str) -> String {
-    um_execution::normalize_terminal_scalar(value.as_bytes())
+    useful_execution::normalize_terminal_scalar(value.as_bytes())
 }
 
 /// The string at `key` of `object`, or `-` when it is absent, null or not a string.
@@ -628,11 +628,11 @@ fn path(elements: &Value) -> String {
 }
 
 fn wire(value: impl Serialize) -> String {
-    um_support::wire_name(value).unwrap_or_else(|| "-".to_owned())
+    useful_support::wire_name(value).unwrap_or_else(|| "-".to_owned())
 }
 
 /// The run as `show` prints it without `--json`: its identity, owner, route and what it
-/// waits for, workspace, claim, workflow state and outcome, its rejection as `um run show`
+/// waits for, workspace, claim, workflow state and outcome, its rejection as `useful run show`
 /// prints it (REQ-RUN-105), latest progress, exits with their mirror results and its
 /// deliveries, acceptance apart from the runner's application.
 fn write_plain(
@@ -852,7 +852,9 @@ fn write_deliveries(
 mod tests {
     use std::time::Duration;
 
-    use um_api::{ContinuationAdmissionViolation, RetryConflict, RunFailure, UnreachableCategory};
+    use useful_api::{
+        ContinuationAdmissionViolation, RetryConflict, RunFailure, UnreachableCategory,
+    };
 
     use super::{SHOW_COMMAND, failure_diagnostic};
     use crate::cli::{PrincipalAuthenticationKind, run::failure_code};

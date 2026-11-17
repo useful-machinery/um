@@ -1,5 +1,5 @@
 //! A definition's subject index (REQ-WFDEF-28): `workflows/<id>/subjects/<subject>` under the
-//! `um` home names the run that holds the definition's slot for that subject. `claim` takes
+//! `useful` home names the run that holds the definition's slot for that subject. `claim` takes
 //! the slot under an exclusive lock on `subjects/` and keeps the lock until the claim is
 //! dropped, so the caller creates the claimant's run directory while no other claim can read
 //! the slot; `SubjectClaim::take` and `name` split the claim so a successor's directory is
@@ -156,7 +156,7 @@ pub enum SubjectError {
 }
 
 impl SubjectError {
-    /// The refusal code `um workflow run create` reports (REQ-LOCALRUN-173), `None` for a
+    /// The refusal code `useful workflow run create` reports (REQ-LOCALRUN-173), `None` for a
     /// failure of the store.
     pub fn code(&self) -> Option<&'static str> {
         match self {
@@ -185,7 +185,7 @@ impl fmt::Display for SubjectError {
             Self::Busy { run } => write!(formatter, "run {run} holds the subject and is live"),
             Self::Settled { run } => write!(
                 formatter,
-                "run {run} holds the subject and has exited without a release; release it with um workflow run release {run}"
+                "run {run} holds the subject and has exited without a release; release it with useful workflow run release {run}"
             ),
             Self::Unavailable(error) => write!(formatter, "read the subject index: {error}"),
         }
@@ -348,7 +348,7 @@ mod tests {
             let temporary = tempfile::tempdir().unwrap();
             let root = temporary.path().to_owned();
             let home = WorkflowHome::from_lookup(|name| {
-                (name == "UM_HOME").then(|| root.clone().into_os_string())
+                (name == "USEFUL_HOME").then(|| root.clone().into_os_string())
             })
             .unwrap();
             for definition in [DEFINITION, OTHER_DEFINITION] {

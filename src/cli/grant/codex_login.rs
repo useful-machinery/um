@@ -1,4 +1,4 @@
-//! A fresh Codex sign-in in a private temporary Codex home, which `um grant create codex` and
+//! A fresh Codex sign-in in a private temporary Codex home, which `useful grant create codex` and
 //! the earlier `import` and `reconnect` with `--login` run (REQ-GRANT-34, REQ-GRANT-70,
 //! REQ-GRANT-74, INV-CLI-13).
 //!
@@ -36,7 +36,7 @@ pub(in crate::cli) const DEVICE: &[&str] = &["login", "--device-auth"];
 pub(in crate::cli) enum Failure {
     NotFound,
     Exited(ExitStatus),
-    /// A signal `um` received was passed to the sign-in.
+    /// A signal `useful` received was passed to the sign-in.
     Interrupted(Stop),
     NoLogin,
     Unusable(anyhow::Error),
@@ -46,15 +46,15 @@ impl Failure {
     pub(in crate::cli) const fn remedy(&self) -> &'static str {
         match self {
             Self::NotFound => {
-                "Install Codex so that codex is on your PATH, or import an auth.json:\n  um grant create codex --from-file PATH"
+                "Install Codex so that codex is on your PATH, or import an auth.json:\n  useful grant create codex --from-file PATH"
             }
             _ => {
-                "Run the command again and complete the Codex sign-in, or import an auth.json:\n  um grant create codex --from-file PATH"
+                "Run the command again and complete the Codex sign-in, or import an auth.json:\n  useful grant create codex --from-file PATH"
             }
         }
     }
 
-    /// The signal that ended the sign-in, when one asked for it to stop: one `um` passed to
+    /// The signal that ended the sign-in, when one asked for it to stop: one `useful` passed to
     /// it, or SIGINT, SIGTERM or SIGHUP ending it.
     pub(super) fn stop(&self) -> Option<Stop> {
         match self {
@@ -99,7 +99,7 @@ pub(in crate::cli) fn sign_in(
         return Ok(Err(Failure::NotFound));
     };
     let home = tempfile::Builder::new()
-        .prefix("um-codex-login-")
+        .prefix("useful-codex-login-")
         .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir()
         .context("create temporary Codex home")?;
@@ -126,7 +126,7 @@ pub(in crate::cli) fn sign_in(
 
 /// Writes the configuration and runs `codex` with `arguments` there with the member's
 /// terminal. Its standard output goes to standard error so that `--json` output stays
-/// unmixed. A signal that would stop `um` is passed to the child instead, so the home is still
+/// unmixed. A signal that would stop `useful` is passed to the child instead, so the home is still
 /// removed.
 fn sign_in_at(
     codex: &Path,
@@ -156,7 +156,7 @@ fn sign_in_at(
             .spawn();
         let mut child = match started {
             Ok(child) => child,
-            // A `codex` that cannot be started is the sign-in failing, not a fault of `um`.
+            // A `codex` that cannot be started is the sign-in failing, not a fault of `useful`.
             Err(error) => {
                 return Ok(Err(Failure::Unusable(
                     anyhow::Error::new(error).context("start codex login"),

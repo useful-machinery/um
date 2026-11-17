@@ -241,7 +241,7 @@ impl ExecutionJob {
                         })
                 });
                 let bound = tokio::task::spawn_blocking(move || {
-                    let admitted = um_execution::bind_cloud_continuation_context(
+                    let admitted = useful_execution::bind_cloud_continuation_context(
                         bound_admitted,
                         &private,
                         &record,
@@ -249,7 +249,7 @@ impl ExecutionJob {
                             .as_ref()
                             .map(|(path, id, number)| (path.as_path(), id.as_str(), *number)),
                     )?;
-                    Ok::<_, um_execution::LocalRunDirectoryError>((admitted, seed))
+                    Ok::<_, useful_execution::LocalRunDirectoryError>((admitted, seed))
                 })
                 .await;
                 let (rebound, seed) = match bound {
@@ -521,7 +521,7 @@ impl ExecutionJob {
                     })
             });
             move || {
-                um_execution::retain_cloud_continuation_evidence(
+                useful_execution::retain_cloud_continuation_evidence(
                     &private,
                     &attempt_id,
                     attempt_number,
@@ -554,7 +554,7 @@ impl ExecutionJob {
         // fail. Keep the snapshot with the retained report even without a set.
         let execution_root = self.accepted.root.execution.clone();
         self.accepted.root.settlement_snapshot = tokio::task::spawn_blocking(move || {
-            um_execution::capture_cloud_settlement_snapshot(&execution_root)
+            useful_execution::capture_cloud_settlement_snapshot(&execution_root)
         })
         .await
         .ok()
@@ -859,7 +859,7 @@ impl ExecutionJob {
         ExecutionCompletion::containment_gated(report, workspace_disposition)
     }
 
-    /// A tree run (REQ-RUNNERENROLL-91): `um workflow run create`, or the adopted run of a
+    /// A tree run (REQ-RUNNERENROLL-91): `useful workflow run create`, or the adopted run of a
     /// continuation (REQ-RUNNERENROLL-89), and the resume loop under the assignment's
     /// lease, its root progress and step observations queued as they change
     /// (REQ-RUNNERENROLL-88), then the record's exit as the attempt's one terminal report,

@@ -1,5 +1,5 @@
 //! The provider's consent that makes an OAuth grant (REQ-GRANT-1, REQ-GRANT-69), which both
-//! `um grant create` and its earlier spelling run: it starts the session with one key,
+//! `useful grant create` and its earlier spelling run: it starts the session with one key,
 //! replayed once on a lost response, prints where to approve it, opens that URL when asked to,
 //! and polls the session until it settles.
 
@@ -12,8 +12,8 @@ use std::time::Duration;
 use anyhow::Context;
 
 use crate::exit_code::ExitCode;
-use um_api::GrantFailure;
-use um_human_auth::Deployment;
+use useful_api::GrantFailure;
+use useful_human_auth::Deployment;
 
 use super::super::{ceremony_poll_interval, retry_delay, wait_for_poll};
 use output::SessionView;
@@ -28,7 +28,7 @@ type OperationControl = super::super::OperationControl<Recovery>;
 const CONSENT_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// The command a member ran the consent with, as its remedies name it: its input, and the
-/// commands it is to run next, which are `um grant`'s from either (REQ-GRANT-77).
+/// commands it is to run next, which are `useful grant`'s from either (REQ-GRANT-77).
 #[derive(Clone, Copy)]
 pub(in crate::cli) struct Front {
     create: &'static str,
@@ -42,8 +42,8 @@ impl Front {
         ..Self::GRANT
     };
     pub(in crate::cli) const GRANT: Self = Self {
-        create: "um grant create",
-        list: "um grant list",
+        create: "useful grant create",
+        list: "useful grant list",
         check_input: "Check the provider.",
     };
 }
@@ -86,7 +86,7 @@ impl Consent {
     ) -> Result<Ended, super::super::CommandFailure> {
         let unavailable = Arc::new(AtomicBool::new(false));
         let answered_unavailable = Arc::clone(&unavailable);
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate provider grant consent request key")?;
         let timeout = (!self.no_wait).then(|| self.timeout.unwrap_or(CONSENT_TIMEOUT));
         let deployment = deployment.clone();
@@ -188,7 +188,7 @@ impl Consent {
 fn with_api<T>(
     deployment: &Deployment,
     options: &Options,
-    f: impl FnMut(&um_api::GrantApi) -> Result<T, GrantFailure>,
+    f: impl FnMut(&useful_api::GrantApi) -> Result<T, GrantFailure>,
 ) -> anyhow::Result<Result<T, GrantFailure>> {
     super::super::with_human_session_api(deployment, options.http.transport_policy(), f)
 }

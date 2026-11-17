@@ -4,7 +4,7 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{
+use useful_api::{
     AcceptInvitationOutcome, AcceptedInvitationMembership, CommonOrganizationFailure, Invitation,
     InvitationDeliveryState, InvitationInboxEntry, InvitationState, InvitationTargetKind,
     InvitationTerminationOutcome, IssueInvitationOutcome, ListInvitationInboxOutcome,
@@ -209,7 +209,7 @@ pub(super) fn write_accept(
             "human_display_name_required",
             None,
             None,
-            "error: your account needs a display name before joining this organization\n\nSet it with um account update --display-name, then explicitly retry accepting the invitation.",
+            "error: your account needs a display name before joining this organization\n\nSet it with useful account update --display-name, then explicitly retry accepting the invitation.",
             OutcomeClass::GeneralFailure,
             json,
         ),
@@ -329,7 +329,7 @@ fn write_common(
             None,
             authentication
                 .rejected_error(
-                    "error: invitation management requires sign-in\n\nSign in first:\n  um auth login",
+                    "error: invitation management requires sign-in\n\nSign in first:\n  useful auth login",
                 )
                 .to_owned(),
             OutcomeClass::Unauthenticated,
@@ -472,9 +472,9 @@ fn write_organization_list_human(
 fn write_party_identity(
     output: &mut impl Write,
     label: &str,
-    identity: Option<&um_api::InvitationPartyIdentity>,
+    identity: Option<&useful_api::InvitationPartyIdentity>,
 ) -> io::Result<()> {
-    use um_api::NameState;
+    use useful_api::NameState;
     match identity {
         Some(identity) => {
             let name = match identity.name_state {
@@ -643,7 +643,7 @@ struct PreviewResult<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    invitation: &'a um_api::InvitationPreview,
+    invitation: &'a useful_api::InvitationPreview,
 }
 
 #[derive(Serialize)]

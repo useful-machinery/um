@@ -1,5 +1,5 @@
 //! The statement a leaf makes before it acts on a grant, and its `--yes`, which refuses a
-//! missing confirmation with that statement. `um grant` and the earlier commands it replaces
+//! missing confirmation with that statement. `useful grant` and the earlier commands it replaces
 //! share them. The `[y/N]` question every grant command asks on a terminal is here too.
 
 use std::fmt;
@@ -10,7 +10,7 @@ use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{ArgAction, ArgMatches, Args, FromArgMatches};
 
 use crate::exit_code::ExitCode;
-use um_api::MemberGrantKind;
+use useful_api::MemberGrantKind;
 
 /// Who can use a native grant once a runner holds it (REQ-GRANT-35, REQ-GRANT-66).
 pub(in crate::cli) const NATIVE_AUTHORIZE: &[&str] = &[
@@ -29,7 +29,7 @@ pub(in crate::cli) const NATIVE_REVOKE: &[&str] = &[
      member started it",
 ];
 
-/// What acting does: the same for every subject, or, for a leaf of `um grant`, by the kind of
+/// What acting does: the same for every subject, or, for a leaf of `useful grant`, by the kind of
 /// the grant it acts on, which the leaf knows only once it has read the grant.
 pub(in crate::cli) enum Statement {
     Fixed(&'static [&'static str]),
@@ -73,7 +73,7 @@ impl Statement {
 /// REQ-GRANT-67, REQ-GRANT-68).
 pub(in crate::cli) trait Stated: Args {
     /// The command path the refusal's usage names: the leaf's, or for an earlier leaf the
-    /// `um grant` leaf that replaces it (REQ-GRANT-77).
+    /// `useful grant` leaf that replaces it (REQ-GRANT-77).
     const COMMAND: &'static str;
     /// The arguments of the leaf at `COMMAND`, which the usage shows.
     type Usage: Args;

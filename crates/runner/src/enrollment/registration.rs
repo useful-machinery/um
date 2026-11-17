@@ -1,4 +1,4 @@
-//! The host side of a signed-in registration from `um runner serve`
+//! The host side of a signed-in registration from `useful runner serve`
 //! (REQ-RUNNERENROLL-117, INV-RUNNER-26): the registration record beside the
 //! state, and the operation that registers a runner, issues and consumes its
 //! activation and writes the state, resumably. Cloud's side is a
@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 
-use um_support::generate_idempotency_key;
+use useful_support::generate_idempotency_key;
 
 use super::{
     ActivationArtifact, EnrollmentError, EnrollmentHTTPOutcome, EnrollmentJournal,
@@ -348,7 +348,7 @@ fn resumable<A: RegistrationAuthority>(
     }
     if record.runner.is_none() {
         let stale = parse_rfc3339(&record.staged_at)
-            .is_none_or(|staged_at| um_support::utc_now() - staged_at > RESEND_WINDOW);
+            .is_none_or(|staged_at| useful_support::utc_now() - staged_at > RESEND_WINDOW);
         if stale || record.deployment != authority.api_url() {
             return Err(conflict(RegistrationConflictKind::Unresolved, &record));
         }

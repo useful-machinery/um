@@ -4,15 +4,15 @@ use std::path::PathBuf;
 use clap::Args;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_runner::RequestFailure;
-use um_runner::{AssignmentCounts, Operation, Response, StatusSnapshot};
+use useful_runner::RequestFailure;
+use useful_runner::{AssignmentCounts, Operation, Response, StatusSnapshot};
 
 pub(super) const ABOUT: &str = "Show live Runner Serve status";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
     /// Read the control socket path from the closed runner operator
-    /// configuration; the runner home under the um home is the default, read
+    /// configuration; the runner home under the useful home is the default, read
     /// without creating anything.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -21,13 +21,14 @@ pub(super) struct Command {
 impl Command {
     pub(super) fn execute(self) -> super::super::CommandResult {
         let socket_path = super::configured_control_socket_path(self.config.as_deref())?;
-        let response = um_runner::request(&socket_path, Operation::Status).map_err(|error| {
-            let outcome = match error {
-                RequestFailure::NotReachable => OutcomeClass::Unreachable,
-                RequestFailure::Protocol(_) => OutcomeClass::Protocol,
-            };
-            super::super::CommandFailure::for_outcome(anyhow::Error::new(error), outcome)
-        })?;
+        let response =
+            useful_runner::request(&socket_path, Operation::Status).map_err(|error| {
+                let outcome = match error {
+                    RequestFailure::NotReachable => OutcomeClass::Unreachable,
+                    RequestFailure::Protocol(_) => OutcomeClass::Protocol,
+                };
+                super::super::CommandFailure::for_outcome(anyhow::Error::new(error), outcome)
+            })?;
         let Response::Status(status) = response else {
             return Err(super::super::CommandFailure::for_outcome(
                 anyhow::anyhow!("Runner Serve control protocol is invalid"),
@@ -129,7 +130,7 @@ fn format_assignments(counts: AssignmentCounts) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use um_runner::{ConnectionState, ProcessState};
+    use useful_runner::{ConnectionState, ProcessState};
 
     // REQ-RUNNERENROLL-42, REQ-RUNNERENROLL-80
     #[test]

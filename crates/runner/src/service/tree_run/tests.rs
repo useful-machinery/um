@@ -1,4 +1,4 @@
-//! The tree-run job against an injected `um` executable and a fake capability server.
+//! The tree-run job against an injected `useful` executable and a fake capability server.
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -31,11 +31,11 @@ use crate::service::config::{AssignmentConfig, Config, RepositoryUrlPolicy};
 use crate::service::source::SourceCredentialBroker;
 use crate::service::source::test_support::fixture_source_broker;
 use crate::service::test_support::run_fixture_git;
-use um_execution::{
+use useful_execution::{
     CancellationReason, EnvironmentSnapshot, ResolvedAttachment, ResolvedFile, ResolvedInput,
     ResolvedInputs, ResolvedJsonInput,
 };
-use um_runner_protocol::{
+use useful_runner_protocol::{
     AssignmentDecline, CancellationMode, CloudFrame, ContinuationOffer, ExecutionSpecInvalidReason,
     RunControlApplication, RunControlOutcome, RunControlSkip, RunnerEnvelope, RunnerFrame,
     RunnerUnableReason, SourceDisplayRepositoryV1RunnerProjection, TreeExit, TriggerDelivery,
@@ -47,7 +47,7 @@ use um_runner_protocol::{
 const TREE_DIGEST: &str = "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945";
 const RUN_URL: &str = "https://usefulmachinery.com/acme/runs/run_01k0z6r1w8f4jy2m7q9v3x5abp";
 
-/// The injected `um`: answers `definition publish --json` with revision 1 of
+/// The injected `useful`: answers `definition publish --json` with revision 1 of
 /// `$TREE_TEST_DIGEST`, making its revision directory as the local publish does, or, while
 /// `$TREE_TEST_PUBLISH_REPORT` is set, prints its value and exits 1 as a refused publish
 /// does, after writing `publish.args` either way; records
@@ -97,8 +97,8 @@ const RUN_URL: &str = "https://usefulmachinery.com/acme/runs/run_01k0z6r1w8f4jy2
 /// beside it in its process group, writes the sleep's pid to `$TREE_TEST_LOG/hang.pid` and
 /// waits for it. While `$TREE_TEST_LOG/noise` exists every command first writes that many
 /// bytes to stderr. While `$TREE_TEST_LOG/unlaunchable` exists `run create` removes the
-/// injected `um` itself, so no later command can be launched.
-const UM_FIXTURE: &str = r#"#!/bin/sh
+/// injected `useful` itself, so no later command can be launched.
+const USEFUL_FIXTURE: &str = r#"#!/bin/sh
 log="$TREE_TEST_LOG"
 position='["merge"]'
 [ -z "$TREE_TEST_POSITION" ] || position="$TREE_TEST_POSITION"
@@ -109,7 +109,7 @@ stage() {
   if [ -d "$log/stages/$1" ]; then cp -R "$log/stages/$1/." "$run/"; fi
 }
 recorded() {
-  printf '{"schemaVersion":1,"command":"um workflow run %s","outcome":"recorded","exitStatus":0,"runDirectory":"%s","run":"run_01k0z6r1w8f4jy2m7q9v3x5loc","control":{"ordinal":1,"event":"control.%s","path":"controls/0001-%s.json","wait":null},"wait":null}\n' "$1" "$2" "$1" "$1"
+  printf '{"schemaVersion":1,"command":"useful workflow run %s","outcome":"recorded","exitStatus":0,"runDirectory":"%s","run":"run_01k0z6r1w8f4jy2m7q9v3x5loc","control":{"ordinal":1,"event":"control.%s","path":"controls/0001-%s.json","wait":null},"wait":null}\n' "$1" "$2" "$1" "$1"
 }
 retrying=
 if [ "$1 $2 $3" = "workflow run retry" ]; then
@@ -129,7 +129,7 @@ case "$1 $2 $3" in
   if test -x "$4/bin/check.sh"; then echo executable; else echo plain; fi > "$log/check.mode"
   if test -x "$4/workflow.yaml"; then echo executable; else echo plain; fi > "$log/workflow.mode"
   cp "$6" "$log/bindings.json"
-  mkdir -p -m 700 "$UM_HOME/workflows/def_01k0z6r1w8f4jy2m7q9v3x5loc/revisions/1"
+  mkdir -p -m 700 "$USEFUL_HOME/workflows/def_01k0z6r1w8f4jy2m7q9v3x5loc/revisions/1"
   printf '{"definition":{"id":"def_01k0z6r1w8f4jy2m7q9v3x5loc"},"revision":{"n":1,"tree":"%s"}}\n' "$TREE_TEST_DIGEST"
   ;;
 "workflow run create")
@@ -137,12 +137,12 @@ case "$1 $2 $3" in
   env > "$log/create.env"
   if [ -e "$log/unlaunchable" ]; then rm -f "$0"; fi
   if [ "$TREE_TEST_STATE" = refused ]; then
-    printf '{"schemaVersion":1,"command":"um workflow run create","outcome":"rejected","exitStatus":1,"phase":"admission","workflow":{"path":"workflow.yaml"},"diagnostics":[{"code":"%s","message":"Install the tool the root workflow'"'"'s `requires.tools` names, or put it on the launching `PATH`.","location":{"kind":"required_tool","tool":"um-test-no-such-tool"}}]}\n' "${TREE_TEST_REFUSAL:-required_tool_unavailable}"
+    printf '{"schemaVersion":1,"command":"useful workflow run create","outcome":"rejected","exitStatus":1,"phase":"admission","workflow":{"path":"workflow.yaml"},"diagnostics":[{"code":"%s","message":"Install the tool the root workflow'"'"'s `requires.tools` names, or put it on the launching `PATH`.","location":{"kind":"required_tool","tool":"useful-test-no-such-tool"}}]}\n' "${TREE_TEST_REFUSAL:-required_tool_unavailable}"
     exit 1
   fi
-  resolution="$UM_HOME/workflows/def_01k0z6r1w8f4jy2m7q9v3x5loc/revisions/1/resolution.json"
+  resolution="$USEFUL_HOME/workflows/def_01k0z6r1w8f4jy2m7q9v3x5loc/revisions/1/resolution.json"
   if test -e "$resolution"; then cp "$resolution" "$log/resolution.json"; fi
-  run="$UM_HOME/workflows/def_01k0z6r1w8f4jy2m7q9v3x5loc/runs/run_01k0z6r1w8f4jy2m7q9v3x5loc"
+  run="$USEFUL_HOME/workflows/def_01k0z6r1w8f4jy2m7q9v3x5loc/runs/run_01k0z6r1w8f4jy2m7q9v3x5loc"
   mkdir -p "$run"
   if test -n "$TREE_TEST_MIRROR"; then cp -R "$TREE_TEST_MIRROR" "$run/mirror"; fi
   stage create
@@ -186,10 +186,10 @@ case "$1 $2 $3" in
     rm -f "$4/wait.json"
     stage event
     printf '{"state":"exited","outcome":"canceled","attempts":1,"position":[]}\n' > "$4/run.json"
-    printf '{"schemaVersion":1,"command":"um workflow run event","outcome":"applied","exitStatus":0,"runDirectory":"%s","run":"run_01k0z6r1w8f4jy2m7q9v3x5loc","trigger":"departed","action":"cancel","actionOutcome":"canceled","control":{"ordinal":1,"event":"cancel","path":"controls/0001-cancel.json","wait":null},"observation":{"team":"team_8c1b","state":"state_canceled","updatedAt":"2026-07-23T00:00:07.512Z"}}\n' "$4"
+    printf '{"schemaVersion":1,"command":"useful workflow run event","outcome":"applied","exitStatus":0,"runDirectory":"%s","run":"run_01k0z6r1w8f4jy2m7q9v3x5loc","trigger":"departed","action":"cancel","actionOutcome":"canceled","control":{"ordinal":1,"event":"cancel","path":"controls/0001-cancel.json","wait":null},"observation":{"team":"team_8c1b","state":"state_canceled","updatedAt":"2026-07-23T00:00:07.512Z"}}\n' "$4"
     ;;
   withdraw)
-    printf '{"schemaVersion":1,"command":"um workflow run event","outcome":"applied","exitStatus":0,"runDirectory":"%s","run":"run_01k0z6r1w8f4jy2m7q9v3x5loc","trigger":"departed","action":"withdraw","actionOutcome":%s,"control":{"ordinal":1,"event":"withdraw","path":"controls/0001-withdraw.json","wait":null},"observation":{"team":"team_8c1b","state":"state_canceled","updatedAt":"2026-07-23T00:00:07.512Z"}}\n' "$4" "$TREE_TEST_ACTION_OUTCOME"
+    printf '{"schemaVersion":1,"command":"useful workflow run event","outcome":"applied","exitStatus":0,"runDirectory":"%s","run":"run_01k0z6r1w8f4jy2m7q9v3x5loc","trigger":"departed","action":"withdraw","actionOutcome":%s,"control":{"ordinal":1,"event":"withdraw","path":"controls/0001-withdraw.json","wait":null},"observation":{"team":"team_8c1b","state":"state_canceled","updatedAt":"2026-07-23T00:00:07.512Z"}}\n' "$4" "$TREE_TEST_ACTION_OUTCOME"
     ;;
   hang)
     sleep 60 &
@@ -197,11 +197,11 @@ case "$1 $2 $3" in
     wait
     ;;
   owned)
-    printf '{"schemaVersion":1,"command":"um workflow run event","outcome":"refused","exitStatus":1,"runDirectory":"%s","diagnostics":[{"code":"issue_in_owned_state","message":"owned"}],"observation":{"team":"team_8c1b","state":"state_build","updatedAt":null}}\n' "$4"
+    printf '{"schemaVersion":1,"command":"useful workflow run event","outcome":"refused","exitStatus":1,"runDirectory":"%s","diagnostics":[{"code":"issue_in_owned_state","message":"owned"}],"observation":{"team":"team_8c1b","state":"state_build","updatedAt":null}}\n' "$4"
     exit 1
     ;;
   *)
-    printf '{"schemaVersion":1,"command":"um workflow run event","outcome":"refused","exitStatus":1,"runDirectory":"%s","diagnostics":[{"code":"event_not_later","message":"not later"}],"observation":null}\n' "$4"
+    printf '{"schemaVersion":1,"command":"useful workflow run event","outcome":"refused","exitStatus":1,"runDirectory":"%s","diagnostics":[{"code":"event_not_later","message":"not later"}],"observation":null}\n' "$4"
     exit 1
     ;;
   esac
@@ -220,7 +220,7 @@ case "$1 $2 $3" in
   printf '%s\n' "$*" >> "$log/control.args"
   echo "$3" >> "$log/order"
   if [ "$TREE_TEST_CONTROL" = refuse ]; then
-    printf '{"schemaVersion":1,"command":"um workflow run %s","outcome":"refused","exitStatus":1,"runDirectory":"%s","diagnostics":[{"code":"question_unknown","message":"unknown"}]}\n' "$3" "$4"
+    printf '{"schemaVersion":1,"command":"useful workflow run %s","outcome":"refused","exitStatus":1,"runDirectory":"%s","diagnostics":[{"code":"question_unknown","message":"unknown"}]}\n' "$3" "$4"
     exit 1
   fi
   if [ "$TREE_TEST_CONTROL" = silent ]; then
@@ -438,12 +438,12 @@ fn tree_offer() -> CloudFrame {
     .unwrap()
 }
 
-/// Writes the injected `um` to `directory`.
-fn injected_um(directory: &Path) -> PathBuf {
-    let um = directory.join("um");
-    fs::write(&um, UM_FIXTURE).unwrap();
-    fs::set_permissions(&um, fs::Permissions::from_mode(0o755)).unwrap();
-    um
+/// Writes the injected `useful` to `directory`.
+fn injected_useful(directory: &Path) -> PathBuf {
+    let useful = directory.join("useful");
+    fs::write(&useful, USEFUL_FIXTURE).unwrap();
+    fs::set_permissions(&useful, fs::Permissions::from_mode(0o755)).unwrap();
+    useful
 }
 
 struct Fixture {
@@ -456,7 +456,7 @@ struct Fixture {
     capability_requests: Arc<Mutex<Vec<Value>>>,
 }
 
-/// A manager whose next offer is a tree run of `TREE_FILES`, the injected `um`
+/// A manager whose next offer is a tree run of `TREE_FILES`, the injected `useful`
 /// reporting `published_digest` and leaving a record in `state` with `outcome`.
 fn fixture(published_digest: &str, state: &str, outcome: &str) -> Fixture {
     fixture_with(published_digest, state, outcome, &[])
@@ -491,7 +491,7 @@ fn fixture_recording(
     )
 }
 
-/// `fixture_recording`, each short `um` command abandoned once `bound` passes.
+/// `fixture_recording`, each short `useful` command abandoned once `bound` passes.
 fn fixture_bounded(
     published_digest: &str,
     state: &str,
@@ -546,7 +546,7 @@ fn fixture_sourced(
     run_fixture_git(&source, &["add", "."]);
     run_fixture_git(&source, &["commit", "--quiet", "-m", "fixture"]);
     let commit = run_fixture_git(&source, &["rev-parse", "HEAD"]);
-    let um = injected_um(temporary.path());
+    let useful = injected_useful(temporary.path());
 
     let (endpoint, capability_requests) = capability_server(files);
     let config = Config::new(
@@ -583,7 +583,7 @@ fn fixture_sourced(
         &config,
         source_broker(&source),
         TreeRunDependencies::new(Some(Arc::new(broker)))
-            .with_executable(um)
+            .with_executable(useful)
             .with_resume_intervals(TEST_INTERVALS)
             .with_command_bound(bound),
         environment,
@@ -690,7 +690,8 @@ async fn published_tree_runs_once_and_reports_the_chosen_outcome() {
     assert!(
         publish_env
             .iter()
-            .any(|line| line.starts_with("UM_HOME=") && line.ends_with(&format!("{private}/home")))
+            .any(|line| line.starts_with("USEFUL_HOME=")
+                && line.ends_with(&format!("{private}/home")))
     );
 
     let create = logged_lines(&fixture.log, "create.args");
@@ -722,7 +723,11 @@ async fn published_tree_runs_once_and_reports_the_chosen_outcome() {
     // each step (REQ-WFEXEC-22).
     let create_env = logged_lines(&fixture.log, "create.env");
     assert!(create_env.contains(&"GITHUB_TOKEN=daemon-github-token".to_owned()));
-    assert!(create_env.iter().any(|line| line.starts_with("UM_HOME=")));
+    assert!(
+        create_env
+            .iter()
+            .any(|line| line.starts_with("USEFUL_HOME="))
+    );
 
     let workflow_states = reports
         .iter()
@@ -1023,8 +1028,8 @@ async fn issued_grant_token_reaches_the_runtime_that_creates_the_run() {
 async fn runtime_never_receives_the_daemon_grant_token_names() {
     const GRANT_TOKEN_NAMES: [&str; 3] = [
         "GH_TOKEN",
-        "UM_LINEAR_ACCESS_TOKEN",
-        "UM_LINEAR_ACCESS_TOKEN_FILE",
+        "USEFUL_LINEAR_ACCESS_TOKEN",
+        "USEFUL_LINEAR_ACCESS_TOKEN_FILE",
     ];
     let variables = GRANT_TOKEN_NAMES.map(|name| (name, "daemon-private"));
     let mut fixture = fixture_with(TREE_DIGEST, "exited", "\"planned\"", &variables);
@@ -1067,14 +1072,14 @@ async fn published_digest_other_than_the_spec_declines_the_assignment() {
 fn publish_report(outcome: &str, diagnostics: Value) -> String {
     serde_json::to_string_pretty(&json!({
         "schemaVersion": 1,
-        "command": "um workflow definition publish",
+        "command": "useful workflow definition publish",
         "outcome": outcome,
         "diagnostics": diagnostics,
     }))
     .unwrap()
 }
 
-/// The decline of a publication the runner's `um` refused, carrying `facts`.
+/// The decline of a publication the runner's `useful` refused, carrying `facts`.
 fn refused_publication(facts: Option<ValidationFacts>) -> AssignmentDecline {
     AssignmentDecline::ExecutionSpecInvalid(ExecutionSpecInvalidReason::WorkflowSourceInvalid)
         .diagnosed(
@@ -1084,7 +1089,7 @@ fn refused_publication(facts: Option<ValidationFacts>) -> AssignmentDecline {
         .with_validation_facts(facts)
 }
 
-/// Offers `TREE_FILES` to a runner whose `um` prints `report` and exits 1 when publishing,
+/// Offers `TREE_FILES` to a runner whose `useful` prints `report` and exits 1 when publishing,
 /// asserting that the publish ran and no `create` did, and answers the decline.
 async fn decline_of_refused_publication(report: &str) -> Option<AssignmentDecline> {
     let mut fixture = fixture_with(
@@ -1369,7 +1374,7 @@ fn exited_with(writes: &[Value], earlier_writes: usize) -> super::records::TreeR
 }
 
 /// `exit` on a tree run's finish, as the runner encodes it for Cloud.
-fn encode_finish(exit: TreeExit) -> Result<Vec<u8>, um_runner_protocol::EncodeError> {
+fn encode_finish(exit: TreeExit) -> Result<Vec<u8>, useful_runner_protocol::EncodeError> {
     encode_runner_frame(&RunnerFrame::ExecutionFinished {
         envelope: RunnerEnvelope {
             message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
@@ -1646,7 +1651,7 @@ async fn external_wait_is_evaluated_at_once_and_each_interval_until_it_continues
     assert_eq!(chosen_outcome(&reports).as_deref(), Some("landed"));
 }
 
-/// The `since` of the wait the injected `um` leaves a waiting run on.
+/// The `since` of the wait the injected `useful` leaves a waiting run on.
 const WAIT_SINCE: &str = "2026-07-23T00:00:05Z";
 const CONTROL_ID: &str = "rct_01k0z6r1w8f4jy2m7q9v3x5acr";
 
@@ -1736,7 +1741,7 @@ fn control_wait_fixture(kind: &str, variables: &[(&str, &str)]) -> Fixture {
     control_wait_fixture_bounded(kind, variables, super::command::SHORT_COMMAND_BOUND)
 }
 
-/// `control_wait_fixture`, each short `um` command abandoned once `bound` passes.
+/// `control_wait_fixture`, each short `useful` command abandoned once `bound` passes.
 fn control_wait_fixture_bounded(
     kind: &str,
     variables: &[(&str, &str)],
@@ -2288,7 +2293,7 @@ async fn lease_loss_kills_the_process_and_reports_no_outcome() {
 fn local_record(log: &Path) -> Value {
     let home = logged_lines(log, "create.env")
         .into_iter()
-        .find_map(|line| line.strip_prefix("UM_HOME=").map(PathBuf::from))
+        .find_map(|line| line.strip_prefix("USEFUL_HOME=").map(PathBuf::from))
         .unwrap();
     serde_json::from_slice(
         &fs::read(home.join(
@@ -2300,7 +2305,7 @@ fn local_record(log: &Path) -> Value {
 }
 
 /// Shuts the runner down once the run reads `state`, then asserts the shutdown ran no
-/// `um workflow run cancel`, left the record reading `state` with no outcome, and reported
+/// `useful workflow run cancel`, left the record reading `state` with no outcome, and reported
 /// the attempt interrupted with no exit, so a continuation can adopt the run.
 async fn shut_down_at(mut fixture: Fixture, state: &str) {
     start(&mut fixture).await;
@@ -3657,11 +3662,11 @@ async fn entry_without_a_run_record_is_a_fan_out_element_as_the_engine_reads_it(
 
     let home = logged_lines(&fixture.log, "create.env")
         .into_iter()
-        .find_map(|line| line.strip_prefix("UM_HOME=").map(PathBuf::from))
+        .find_map(|line| line.strip_prefix("USEFUL_HOME=").map(PathBuf::from))
         .unwrap();
     let run =
         home.join("workflows/def_01k0z6r1w8f4jy2m7q9v3x5loc/runs/run_01k0z6r1w8f4jy2m7q9v3x5loc");
-    let engine = um_execution::child_run_directories(&run)
+    let engine = useful_execution::child_run_directories(&run)
         .unwrap()
         .into_iter()
         .map(|child| json!([{ "step": child.step, "item": child.item, "ordinal": child.ordinal }]))
@@ -4079,7 +4084,7 @@ async fn run_record_larger_than_the_bound_is_unreadable() {
     let mut fixture = fixture_recording(TREE_DIGEST, "exited", "\"planned\"", &[], Some(recorder));
     let mut oversized =
         br#"{"state":"exited","outcome":"planned","attempts":1,"position":[]}"#.to_vec();
-    let bound = usize::try_from(um_execution::MAXIMUM_DURABLE_RECORD_BYTES).unwrap();
+    let bound = usize::try_from(useful_execution::MAXIMUM_DURABLE_RECORD_BYTES).unwrap();
     oversized.resize(bound + 1, b' ');
     stage(&fixture.log, "exited", "", "run.json", &oversized);
     assert_record_unreadable(&mut fixture, &capture, "oversized").await;
@@ -4216,7 +4221,7 @@ struct Adopted {
     run: PathBuf,
     private: PathBuf,
     log: PathBuf,
-    um: PathBuf,
+    useful: PathBuf,
 }
 
 /// A home whose one run directory holds `record` as its `run.json`, and `wait` as its
@@ -4239,7 +4244,7 @@ fn adopted(record: Value, wait: Option<Value>) -> Adopted {
     if let Some(wait) = wait {
         fs::write(run.join("wait.json"), serde_json::to_vec(&wait).unwrap()).unwrap();
     }
-    let um = injected_um(temporary.path());
+    let useful = injected_useful(temporary.path());
     Adopted {
         _temporary: temporary,
         first,
@@ -4247,7 +4252,7 @@ fn adopted(record: Value, wait: Option<Value>) -> Adopted {
         run,
         private,
         log,
-        um,
+        useful,
     }
 }
 
@@ -4265,7 +4270,7 @@ fn adopt_run(
 }
 
 /// The adopting assignment's tree run, its offer carrying the `pending` deliveries the
-/// injected `um` answers by `event`.
+/// injected `useful` answers by `event`.
 fn adopt_run_with(
     adopted: &Adopted,
     steps: &[&str],
@@ -4283,7 +4288,7 @@ fn adopt_run_with(
     )
 }
 
-/// `adopt_run_with`, with `dependencies` but for the injected `um`.
+/// `adopt_run_with`, with `dependencies` but for the injected `useful`.
 fn adopt_run_at(
     adopted: &Adopted,
     steps: &[&str],
@@ -4312,7 +4317,7 @@ fn adopt_run_at(
         .map(|step| (*step).to_owned())
         .collect::<Vec<_>>();
     super::adopt(
-        &dependencies.with_executable(adopted.um.clone()),
+        &dependencies.with_executable(adopted.useful.clone()),
         &super::TreeAdoption {
             assignment_id: &assignment_id,
             home: &adopted.home,
@@ -4334,7 +4339,7 @@ async fn drive_adopted(
     resumes: &str,
 ) -> (
     super::TreeEnd,
-    Vec<(u64, um_runner_protocol::TreeRootProgress)>,
+    Vec<(u64, useful_runner_protocol::TreeRootProgress)>,
 ) {
     let run = adopt_run(adopted, steps, resumes).unwrap();
     let reports = Mutex::new(Vec::new());
@@ -4714,11 +4719,11 @@ async fn adopted_run_resumes_from_the_named_steps_in_the_adopting_environment() 
         )]
     );
     let environment = logged_lines(&adopted.log, "resume.env");
-    assert!(environment.contains(&format!("UM_HOME={}", adopted.home.display())));
+    assert!(environment.contains(&format!("USEFUL_HOME={}", adopted.home.display())));
     assert!(environment.contains(&"GITHUB_TOKEN=adopting-attempt-token".to_owned()));
     succeeded_with(&end, "landed");
     // The adopting assignment keeps its own log and documents; under the adopted home only
-    // the run's own `um` processes wrote.
+    // the run's own `useful` processes wrote.
     for own in ["tree-run.log", "tree-run.json"] {
         assert!(adopted.private.join(own).is_file(), "{own}");
     }
@@ -4836,7 +4841,7 @@ fn finished_payload(reports: &[ExecutionReport], offer: &AssignmentOffer) -> Val
 /// protocol schema.
 fn encoded_frame(report: &ExecutionReport, offer: &AssignmentOffer) -> Value {
     let frame = report.runner_frame(
-        um_runner_protocol::RunnerEnvelope {
+        useful_runner_protocol::RunnerEnvelope {
             message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             runner_id: "rnr_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned(),
             boot_id: BOOT.to_owned(),
@@ -4846,7 +4851,7 @@ fn encoded_frame(report: &ExecutionReport, offer: &AssignmentOffer) -> Value {
         offer.assignment_id.clone(),
         offer.attempt_id.clone(),
     );
-    let encoded = um_runner_protocol::encode_runner_frame(&frame)
+    let encoded = useful_runner_protocol::encode_runner_frame(&frame)
         .unwrap_or_else(|error| panic!("{report:#?} does not encode: {error:?}"));
     serde_json::from_slice(&encoded).unwrap()
 }
@@ -5276,7 +5281,7 @@ async fn adopted_exit_reports_the_run_mirror_and_releases_only_on_its_own_depart
     assert_eq!(exit, unreported_exit());
 }
 
-/// Stages `write` as the mirror file `name` the injected `um` copies into the run's `mirror/`
+/// Stages `write` as the mirror file `name` the injected `useful` copies into the run's `mirror/`
 /// at stage `stage`.
 fn stage_mirror_write(log: &Path, stage: &str, name: &str, write: &Value) {
     let mirror = log.join("stages").join(stage).join("mirror");
@@ -5491,7 +5496,7 @@ async fn adopted_run_counts_its_earlier_writes_before_applying_its_offer_deliver
 #[test]
 fn home_without_exactly_one_run_refuses_adoption() {
     let unavailable = AssignmentDecline::RunnerUnable(
-        um_runner_protocol::RunnerUnableReason::RetainedWorkspaceUnavailable,
+        useful_runner_protocol::RunnerUnableReason::RetainedWorkspaceUnavailable,
     )
     .diagnosed("workflow_tree_adoption", "tree_run_directory_unavailable");
 
@@ -5511,7 +5516,7 @@ fn home_without_exactly_one_run_refuses_adoption() {
 /// The boot of the tree run manager's work root.
 const BOOT: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
 
-/// The result the injected `um` reports for a run failing in `build`.
+/// The result the injected `useful` reports for a run failing in `build`.
 const BUILD_FAILED: &str = r#"{"outcome":"failed","primaryIssue":{"node":{"id":"build","role":"step"},"state":"failed","detail":{"phase":"execution","code":"command_exit","exitCode":2}}}"#;
 
 /// A manager whose first attempt's run fails in `build` and is left retained, with
@@ -5682,7 +5687,8 @@ async fn continuation_offer_adopts_the_retained_run_and_resumes_it_from_the_name
     );
     let home = assignment_directory(&workspace, &first.assignment_id).join("private/home");
     assert!(
-        logged_lines(&fixture.log, "resume.env").contains(&format!("UM_HOME={}", home.display()))
+        logged_lines(&fixture.log, "resume.env")
+            .contains(&format!("USEFUL_HOME={}", home.display()))
     );
     assert!(
         !assignment_directory(&workspace, &next.assignment_id)

@@ -7,7 +7,7 @@ macro_rules! impl_authenticated_account_outcome {
                 Self::Unauthenticated
             }
 
-            fn unreachable(category: um_api::UnreachableCategory) -> Self {
+            fn unreachable(category: useful_api::UnreachableCategory) -> Self {
                 Self::Unreachable(category)
             }
 
@@ -28,9 +28,9 @@ mod update;
 use anyhow::Context;
 use clap::{ArgGroup, Args, Subcommand};
 
-use um_api::{HttpClient, HttpTransportPolicy, signup_human, update_current_principal};
-use um_human_auth::Deployment;
-use um_support::generate_idempotency_key;
+use useful_api::{HttpClient, HttpTransportPolicy, signup_human, update_current_principal};
+use useful_human_auth::Deployment;
+use useful_support::generate_idempotency_key;
 
 pub(super) const ABOUT: &str = "Manage your Useful Machinery account";
 const NAME: &str = "account";

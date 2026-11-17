@@ -372,7 +372,7 @@ fn entity_identifier_flags_match_the_command_tree_and_parser() {
             "{path:?}"
         );
 
-        let input = std::iter::once("um")
+        let input = std::iter::once("useful")
             .chain(path.iter().copied())
             .chain(arguments.iter().copied());
         assert!(super::parse(input).is_ok(), "{path:?}");
@@ -385,7 +385,7 @@ fn entity_identifier_flags_match_the_command_tree_and_parser() {
                 *arg
             }
         });
-        let input = std::iter::once("um")
+        let input = std::iter::once("useful")
             .chain(path.iter().copied())
             .chain(old_arguments);
         assert!(
@@ -493,20 +493,20 @@ fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
         &["project", "runner-pool", "remove", "example", "project"],
     ];
     for &args in gated {
-        let input = std::iter::once("um").chain(args.iter().copied());
+        let input = std::iter::once("useful").chain(args.iter().copied());
         assert_eq!(
             super::parse(input).unwrap_err().kind(),
             clap::error::ErrorKind::MissingRequiredArgument,
             "{args:?}"
         );
-        let input = std::iter::once("um")
+        let input = std::iter::once("useful")
             .chain(args.iter().copied())
             .chain(std::iter::once("--yes"));
         assert!(super::parse(input).is_ok(), "{args:?}");
     }
     for mode in ["disable", "drain"] {
         assert!(
-            super::parse(["um", "runner", mode, "example", "runner"]).is_ok(),
+            super::parse(["useful", "runner", mode, "example", "runner"]).is_ok(),
             "{mode}"
         );
     }
@@ -531,7 +531,7 @@ fn authorize_and_deauthorize_take_runner_as_an_option_and_refuse_a_malformed_tar
         &["authorize", "--all", RUNNER, "--yes"],
         &["authorize", RUNNER, "--all", "--yes"],
     ] {
-        let input = ["um", "grant"].into_iter().chain(args.iter().copied());
+        let input = ["useful", "grant"].into_iter().chain(args.iter().copied());
         assert!(super::parse(input).is_ok(), "{args:?}");
     }
     for (args, kind) in [
@@ -565,7 +565,7 @@ fn authorize_and_deauthorize_take_runner_as_an_option_and_refuse_a_malformed_tar
             clap::error::ErrorKind::ValueValidation,
         ),
     ] {
-        let input = ["um", "grant"].into_iter().chain(args.iter().copied());
+        let input = ["useful", "grant"].into_iter().chain(args.iter().copied());
         assert_eq!(super::parse(input).unwrap_err().kind(), kind, "{args:?}");
     }
 }
@@ -588,7 +588,7 @@ fn github_connections_live_only_under_the_connection_family() {
         &["github", "setup", "begin", "example"][..],
         &["github", "installation", "list", "example"][..],
     ] {
-        let input = std::iter::once("um").chain(path.iter().copied());
+        let input = std::iter::once("useful").chain(path.iter().copied());
         assert_eq!(
             super::parse(input).unwrap_err().kind(),
             clap::error::ErrorKind::InvalidSubcommand,
@@ -612,7 +612,7 @@ fn project_triggers_and_schedules_are_unknown_commands() {
         &["project", "schedule"][..],
         &["project", "schedule", "list", "example", "project"][..],
     ] {
-        let input = std::iter::once("um").chain(path.iter().copied());
+        let input = std::iter::once("useful").chain(path.iter().copied());
         assert_eq!(
             super::parse(input).unwrap_err().kind(),
             clap::error::ErrorKind::InvalidSubcommand,
@@ -674,7 +674,7 @@ fn renamed_leaves_have_only_the_approved_verb_paths() {
         &["project", "repository", "detach"][..],
         &["runner", "activation", "create"][..],
     ] {
-        let input = std::iter::once("um").chain(path.iter().copied());
+        let input = std::iter::once("useful").chain(path.iter().copied());
         assert_eq!(
             super::parse(input).unwrap_err().kind(),
             clap::error::ErrorKind::InvalidSubcommand,
@@ -683,7 +683,7 @@ fn renamed_leaves_have_only_the_approved_verb_paths() {
     }
     assert!(
         super::parse([
-            "um",
+            "useful",
             "runner",
             "activation",
             "issue",
@@ -1042,7 +1042,7 @@ fn parameterized_option_classes_are_isolated_but_ratchet_within_each_class() {
 // REQ-CONTINUE-85
 #[test]
 fn resume_takes_cloud_only_without_its_local_options() {
-    let resume = ["um", "workflow", "run", "resume", "run_1"];
+    let resume = ["useful", "workflow", "run", "resume", "run_1"];
     for local in [
         &["--workflow", "repair.yaml"][..],
         &["--execution-root", "root"][..],
@@ -1090,11 +1090,11 @@ fn resume_takes_cloud_only_without_its_local_options() {
 
 // REQ-LOCALRUN-172, REQ-LOCALRUN-189, REQ-LOCALRUN-187, REQ-CLOUDDEF-19: `show` and `release`
 // select a Cloud run only with `--cloud`, whose authentication and transport options need it;
-// `withdraw` and `cancel` take no `--cloud`, and `um run` gains no `release`.
+// `withdraw` and `cancel` take no `--cloud`, and `useful run` gains no `release`.
 #[test]
 fn show_and_release_take_cloud_and_other_run_leaves_do_not() {
     for leaf in ["show", "release"] {
-        let base = ["um", "workflow", "run", leaf, "run_1"];
+        let base = ["useful", "workflow", "run", leaf, "run_1"];
         for accepted in [
             &[][..],
             &["--json"][..],
@@ -1120,7 +1120,9 @@ fn show_and_release_take_cloud_and_other_run_leaves_do_not() {
         }
     }
     for leaf in ["withdraw", "cancel"] {
-        let input = ["um", "workflow", "run", leaf, "run_1", "--cloud", "acme"];
+        let input = [
+            "useful", "workflow", "run", leaf, "run_1", "--cloud", "acme",
+        ];
         assert_eq!(
             super::parse(input).unwrap_err().kind(),
             clap::error::ErrorKind::UnknownArgument,
@@ -1128,7 +1130,7 @@ fn show_and_release_take_cloud_and_other_run_leaves_do_not() {
         );
     }
     assert_eq!(
-        super::parse(["um", "run", "release", "acme", "run_1"])
+        super::parse(["useful", "run", "release", "acme", "run_1"])
             .unwrap_err()
             .kind(),
         clap::error::ErrorKind::InvalidSubcommand
@@ -1141,7 +1143,7 @@ fn show_and_release_take_cloud_and_other_run_leaves_do_not() {
 fn definition_cloud_evaluations_take_the_target_convention() {
     let definition = "def_01k0z6r1w8f4jy2m7q9v3x5abc";
     let project = "prj_01k0z6r1w8f4jy2m7q9v3x5abc";
-    let base = ["um", "workflow", "definition", "cloud", "evaluation"];
+    let base = ["useful", "workflow", "definition", "cloud", "evaluation"];
     for accepted in [
         &["list", "acme", definition, "--project-id", project][..],
         &[

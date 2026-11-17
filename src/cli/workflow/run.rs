@@ -29,8 +29,8 @@ pub(super) use super::{
 };
 pub(super) use create::acquire_agent_profile_replacement;
 
-/// `--cloud ORGANIZATION`, which sends a `um workflow run` leaf to Cloud in that organization
-/// instead of the `um` home: `resume`, `show`, `release` and the control leaves `answer`,
+/// `--cloud ORGANIZATION`, which sends a `useful workflow run` leaf to Cloud in that organization
+/// instead of the `useful` home: `resume`, `show`, `release` and the control leaves `answer`,
 /// `approve`, `hand-back`, `lift`, `stop` and `retry` to the Cloud run `RUN` names, and `create`
 /// to a new Cloud run of the Cloud definition `ID` (REQ-RUN-94), with the authentication and
 /// transport options only a Cloud request reads; a leaf's local-only options conflict with the

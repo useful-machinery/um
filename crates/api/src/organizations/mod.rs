@@ -1206,7 +1206,7 @@ fn execute_request(
 ) -> Result<RequestExecution, OrganizationError> {
     let mut last_failure = UnreachableCategory::Connection;
     for attempt in 0..spec.max_attempts {
-        let started = um_support::monotonic_now();
+        let started = useful_support::monotonic_now();
         let response = match client.run(timeout, send_request(client, spec, timeout)) {
             Ok(Ok(response)) => response,
             Ok(Err(AttemptError::Protocol(error))) => return Err(error),
@@ -1225,7 +1225,7 @@ fn execute_request(
         if spec.operation.can_retry_interrupted_response(status) {
             require_replayable_success_headers(spec, &response)?;
         }
-        let remaining = timeout.saturating_sub(um_support::elapsed(started));
+        let remaining = timeout.saturating_sub(useful_support::elapsed(started));
         match client.run(remaining, receive_response(spec.operation, response)) {
             Ok(Ok(response)) => return Ok(RequestExecution::Response(response)),
             Ok(Err(AttemptError::Protocol(error))) => return Err(error),
@@ -1259,7 +1259,7 @@ fn execute_request(
 
 fn delay_before_retry(attempt: usize, max_attempts: usize) {
     if attempt + 1 < max_attempts {
-        um_support::sleep(um_support::short_retry_delay());
+        useful_support::sleep(useful_support::short_retry_delay());
     }
 }
 

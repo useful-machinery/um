@@ -33,18 +33,18 @@ use crate::service::test_support::{
 use crate::service::workspace::{
     CleanupCancellation, CleanupSleeper, OwnedTree, TreeRemover, WorkRootHook, WorkspaceFilesystem,
 };
-use um_execution::{
+use useful_execution::{
     CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, ValidatedClaudeCodeInstallation,
     ValidatedCodexInstallation, ValidatedPiInstallation, resolve,
 };
-use um_runner_protocol::{
+use useful_runner_protocol::{
     ArtifactRegistrationOutcome, ArtifactRegistrationResponse, ArtifactResultRegistrationOutcome,
     ArtifactResultRegistrationResponse, CloudFrame, ExecutionCapacityV1RunnerProjection,
     ExecutionLimitsV1RunnerProjection, PrimaryWorkspaceSourceV1RunnerProjection,
     WorkflowDefinitionSourceV1RunnerProjection, WorkflowSourceClosureDigestV1RunnerProjection,
     WorkspaceMembership, WorkspaceWitness, decode_cloud_frame,
 };
-use um_test_support::watchdog::{FIXTURE_WAIT_BASE, host_scaled_recv};
+use useful_test_support::watchdog::{FIXTURE_WAIT_BASE, host_scaled_recv};
 
 const NOW: &str = "2026-07-23T00:00:00Z";
 mod agent_login_overlay_tests;
@@ -56,7 +56,7 @@ use harness_executable_tests::{manager_fixture_with_harnesses, manager_fixture_w
 const COMMAND_FIXTURE_TEST_NAME: &str = "service::assignment::tests::command_fixture_process";
 const FAILING_COMMAND_FIXTURE_TEST_NAME: &str =
     "service::assignment::tests::failing_command_fixture_process";
-// UM_* variables are intentionally removed from admitted command environments.
+// USEFUL_* variables are intentionally removed from admitted command environments.
 const COMMAND_FIXTURE_SOCKET: &str = "WORKFLOW_ASSIGNMENT_COMMAND_FIXTURE_SOCKET";
 
 #[test]
@@ -287,7 +287,7 @@ impl SourceCredentialBroker for BlockingSourceBroker {
             let _ = started.send(());
         }
         while !cancellation.is_cancelled() {
-            um_support::sleep(Duration::from_millis(5));
+            useful_support::sleep(Duration::from_millis(5));
         }
         if let Some(stopped) = self.stopped.lock().unwrap().take() {
             let _ = stopped.send(());
@@ -2034,7 +2034,7 @@ fn v3_source_binding_rejects_missing_or_conflicting_proof() {
         .workspace_membership
         .as_mut()
         .unwrap()
-        .change_request = Some(um_runner_protocol::WorkspaceChangeRequest {
+        .change_request = Some(useful_runner_protocol::WorkspaceChangeRequest {
         provider_id: "44".to_owned(),
         number: 1,
         head_repository_id: "999".to_owned(),
@@ -2116,9 +2116,9 @@ fn gitlab_offer_requires_matching_source_snapshot() {
 #[tokio::test]
 async fn malformed_run_input_projection_has_the_closed_immutable_decline() {
     let mut execution_spec = offer("bg").execution_spec;
-    execution_spec.run_inputs = Some(um_runner_protocol::RunInputProjectionV1 {
+    execution_spec.run_inputs = Some(useful_runner_protocol::RunInputProjectionV1 {
         input_set_id: "ris_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
-        manifest_digest: um_runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection {
+        manifest_digest: useful_runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection {
             algorithm: "sha256".to_owned(),
             value: "A".repeat(64),
         },
@@ -2400,7 +2400,7 @@ async fn prepared_event_after_absolute_deadline_cannot_retain_acceptance() {
 #[tokio::test]
 async fn retry_result_upload_preserves_the_cloud_attempt_number() {
     use base64::Engine as _;
-    use um_runner_protocol::{
+    use useful_runner_protocol::{
         ArtifactResultConfirmationOutcome, ArtifactResultConfirmationResponse,
         ArtifactUploadCapability,
     };
@@ -3254,7 +3254,7 @@ async fn cancellation_before_continuation_ready_releases_the_claim_without_an_ac
             previous_path
                 .parent()
                 .unwrap()
-                .join(".um-runner-serve-claim-v1"),
+                .join(".useful-runner-serve-claim-v1"),
         )
     })
     .await
@@ -4400,7 +4400,7 @@ steps:
       argv:
         - sh
         - -c
-        - 'test "$RUNNER_VISIBLE" = retained && test -z "${RUNNER_HIDDEN+x}" && test -z "${GH_TOKEN+x}" && test -z "${GITHUB_TOKEN+x}" && test -z "${GIT_ASKPASS+x}" && test -z "${GIT_CONFIG_KEY_0+x}" && test -z "${GIT_CONFIG_VALUE_0+x}" && test -z "${GIT_SSH_COMMAND+x}" && test -z "${SSH_AUTH_SOCK+x}" && test -z "${SSH_AGENT_PID+x}" && test -z "${UM_SOURCE_TOKEN_FD+x}"'
+        - 'test "$RUNNER_VISIBLE" = retained && test -z "${RUNNER_HIDDEN+x}" && test -z "${GH_TOKEN+x}" && test -z "${GITHUB_TOKEN+x}" && test -z "${GIT_ASKPASS+x}" && test -z "${GIT_CONFIG_KEY_0+x}" && test -z "${GIT_CONFIG_VALUE_0+x}" && test -z "${GIT_SSH_COMMAND+x}" && test -z "${SSH_AUTH_SOCK+x}" && test -z "${SSH_AGENT_PID+x}" && test -z "${USEFUL_SOURCE_TOKEN_FD+x}"'
 "#;
     let (_temporary, mut manager) = manager_fixture(workflow);
     let mut variables = manager.environment.variables().clone();
@@ -4426,7 +4426,7 @@ steps:
         ("SSH_AGENT_PID", "4242"),
         ("GH_TOKEN", "runner-private"),
         ("GITHUB_TOKEN", "runner-private"),
-        ("UM_SOURCE_TOKEN_FD", "9"),
+        ("USEFUL_SOURCE_TOKEN_FD", "9"),
     ] {
         variables.insert(OsString::from(name), OsString::from(value));
     }
@@ -4446,12 +4446,12 @@ steps:
         Some(OsStr::new("retained"))
     );
     assert_eq!(
-        environment.variable(OsStr::new("UM_SOURCE_BRANCH")),
+        environment.variable(OsStr::new("USEFUL_SOURCE_BRANCH")),
         Some(OsStr::new("main"))
     );
     let commit = run_fixture_git(execution.root(), &["rev-parse", "HEAD"]);
     assert_eq!(
-        environment.variable(OsStr::new("UM_SOURCE_COMMIT_OID")),
+        environment.variable(OsStr::new("USEFUL_SOURCE_COMMIT_OID")),
         Some(OsStr::new(&commit))
     );
     for name in [
@@ -4475,7 +4475,7 @@ steps:
         "SSH_AGENT_PID",
         "GH_TOKEN",
         "GITHUB_TOKEN",
-        "UM_SOURCE_TOKEN_FD",
+        "USEFUL_SOURCE_TOKEN_FD",
     ] {
         assert!(environment.variable(OsStr::new(name)).is_none(), "{name}");
     }
@@ -4489,11 +4489,11 @@ steps:
 async fn declared_grant_token_names_never_carry_the_runner_service_values() {
     const GRANT_TOKEN_NAMES: [&str; 3] = [
         "GH_TOKEN",
-        "UM_LINEAR_ACCESS_TOKEN",
-        "UM_LINEAR_ACCESS_TOKEN_FILE",
+        "USEFUL_LINEAR_ACCESS_TOKEN",
+        "USEFUL_LINEAR_ACCESS_TOKEN_FILE",
     ];
     let workflow = r#"schemaVersion: 1
-environmentPassthrough: [GH_TOKEN, UM_LINEAR_ACCESS_TOKEN, UM_LINEAR_ACCESS_TOKEN_FILE]
+environmentPassthrough: [GH_TOKEN, USEFUL_LINEAR_ACCESS_TOKEN, USEFUL_LINEAR_ACCESS_TOKEN_FILE]
 steps:
   check:
     kind: cmd
@@ -4501,7 +4501,7 @@ steps:
       argv:
         - sh
         - -c
-        - 'test -z "${GH_TOKEN+x}" && test -z "${UM_LINEAR_ACCESS_TOKEN+x}" && test -z "${UM_LINEAR_ACCESS_TOKEN_FILE+x}"'
+        - 'test -z "${GH_TOKEN+x}" && test -z "${USEFUL_LINEAR_ACCESS_TOKEN+x}" && test -z "${USEFUL_LINEAR_ACCESS_TOKEN_FILE+x}"'
 "#;
     let (_temporary, mut manager) = manager_fixture(workflow);
     let mut variables = manager.environment.variables().clone();
@@ -6446,7 +6446,7 @@ fn steps_only_progress_leaves_outbox_capacity_for_the_run() {
         attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
         report: ExecutionReport::TreeProgress {
             progress_sequence: 1,
-            progress: um_runner_protocol::TreeRootProgress {
+            progress: useful_runner_protocol::TreeRootProgress {
                 attempt: 1,
                 position: vec![json!("build")],
                 wait: None,

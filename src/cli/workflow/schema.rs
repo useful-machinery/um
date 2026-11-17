@@ -1,10 +1,10 @@
 use clap::Args;
 
-use um_execution::STRUCTURAL_SCHEMA;
+use useful_execution::STRUCTURAL_SCHEMA;
 
 pub(super) const ABOUT: &str = "Show the workflow structural schema";
 pub(super) const AFTER_HELP: &str = "Scope:
-  This schema checks workflow document structure only. Use `um workflow
+  This schema checks workflow document structure only. Use `useful workflow
   validate` to validate the complete workflow definition and its referenced files.";
 
 #[derive(Debug, Args)]

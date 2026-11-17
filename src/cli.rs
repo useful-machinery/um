@@ -2,20 +2,20 @@ macro_rules! impl_organization_human_credential_outcome {
     ($($outcome:ty),+ $(,)?) => {
         $(
             impl super::HumanCredentialOutcome for $outcome {
-                type Error = um_api::OrganizationError;
+                type Error = useful_api::OrganizationError;
 
                 fn unauthenticated() -> Self {
-                    Self::Common(um_api::CommonOrganizationFailure::Unauthenticated)
+                    Self::Common(useful_api::CommonOrganizationFailure::Unauthenticated)
                 }
 
-                fn unreachable(category: um_api::UnreachableCategory) -> Self {
-                    Self::Common(um_api::CommonOrganizationFailure::Unreachable(category))
+                fn unreachable(category: useful_api::UnreachableCategory) -> Self {
+                    Self::Common(useful_api::CommonOrganizationFailure::Unreachable(category))
                 }
 
                 fn is_unauthenticated(&self) -> bool {
                     matches!(
                         self,
-                        Self::Common(um_api::CommonOrganizationFailure::Unauthenticated)
+                        Self::Common(useful_api::CommonOrganizationFailure::Unauthenticated)
                     )
                 }
 
@@ -70,12 +70,12 @@ use self::entity::{
 };
 use crate::exit_code::{ExitCode, OutcomeClass};
 use crate::service_auth::{ServiceApiKey, read_api_key};
-use um_api::{
+use useful_api::{
     HttpClient, HttpTransportPolicy, MembershipRole, MembershipState, UnreachableCategory,
 };
-use um_human_auth::Cancellation;
-use um_human_auth::Deployment;
-use um_human_auth::RequiredOperation;
+use useful_human_auth::Cancellation;
+use useful_human_auth::Deployment;
+use useful_human_auth::RequiredOperation;
 
 pub(crate) type CommandResult = Result<ExitCode, CommandFailure>;
 
@@ -242,7 +242,7 @@ const AFTER_HELP: &str = "Documentation:\n  Public API contract: https://docs.us
 
 #[derive(Debug, Args)]
 #[command(
-    name = "um",
+    name = "useful",
     about = "Useful Machinery CLI",
     version = crate::build_info::VERSION,
     after_help = AFTER_HELP
@@ -258,12 +258,12 @@ pub(crate) struct Cli {
 
 impl CommandFactory for Cli {
     fn command() -> clap::Command {
-        with_pagination_after_help(<Self as Args>::augment_args(clap::Command::new("um")))
+        with_pagination_after_help(<Self as Args>::augment_args(clap::Command::new("useful")))
     }
 
     fn command_for_update() -> clap::Command {
         with_pagination_after_help(<Self as Args>::augment_args_for_update(clap::Command::new(
-            "um",
+            "useful",
         )))
     }
 }
@@ -606,7 +606,7 @@ fn invoked_path(matches: &clap::ArgMatches) -> String {
 
 impl Cli {
     pub(crate) fn execute(self) -> CommandResult {
-        um_api::identify_client(crate::build_info::VERSION);
+        useful_api::identify_client(crate::build_info::VERSION);
         if let Some(earlier) = self.earlier {
             earlier.write_notice();
         }
@@ -632,15 +632,15 @@ impl Cli {
 }
 
 pub(crate) const fn unreachable_outcome_class(
-    category: um_api::UnreachableCategory,
+    category: useful_api::UnreachableCategory,
 ) -> OutcomeClass {
     match category {
-        um_api::UnreachableCategory::RateLimited => OutcomeClass::RateLimited,
-        um_api::UnreachableCategory::Dns
-        | um_api::UnreachableCategory::Timeout
-        | um_api::UnreachableCategory::Connection
-        | um_api::UnreachableCategory::Tls
-        | um_api::UnreachableCategory::Server => OutcomeClass::Unreachable,
+        useful_api::UnreachableCategory::RateLimited => OutcomeClass::RateLimited,
+        useful_api::UnreachableCategory::Dns
+        | useful_api::UnreachableCategory::Timeout
+        | useful_api::UnreachableCategory::Connection
+        | useful_api::UnreachableCategory::Tls
+        | useful_api::UnreachableCategory::Server => OutcomeClass::Unreachable,
     }
 }
 
@@ -748,7 +748,7 @@ impl ApiFailureReport {
         Self::new(
             "unauthenticated",
             format!("! You must sign in before managing {subject}s."),
-            "Run:\n  um auth login",
+            "Run:\n  useful auth login",
             OutcomeClass::Unauthenticated,
         )
     }
@@ -757,7 +757,7 @@ impl ApiFailureReport {
         Self::new(
             "forbidden",
             format!("! Your account is not permitted to manage {subject}s."),
-            "Sign in as an active member:\n  um auth login",
+            "Sign in as an active member:\n  useful auth login",
             OutcomeClass::Forbidden,
         )
     }
@@ -1021,7 +1021,7 @@ fn execute_cancellable_with_signals(
 
 fn execute_cancellable_mutation_with_signals(
     context: &'static str,
-    operation: impl FnOnce(&um_api::HttpCancellation, &OperationControl<()>) -> CommandResult
+    operation: impl FnOnce(&useful_api::HttpCancellation, &OperationControl<()>) -> CommandResult
     + Send
     + 'static,
     interrupt_operation: impl FnOnce() -> bool + 'static,
@@ -1029,7 +1029,7 @@ fn execute_cancellable_mutation_with_signals(
 ) -> CommandResult {
     run_blocking_signal_runtime(context, async move {
         let mut signals = ProcessSignals::install(context)?;
-        let cancellation = um_api::HttpCancellation::new();
+        let cancellation = useful_api::HttpCancellation::new();
         let control = Arc::new(OperationControl::new(()));
         let operation_cancellation = cancellation.clone();
         let operation_control = Arc::clone(&control);
@@ -1139,7 +1139,7 @@ struct ObservationTimeout {
 impl ObservationTimeout {
     async fn wait(self) {
         match self.duration {
-            Some(duration) => um_support::async_sleep(duration).await,
+            Some(duration) => useful_support::async_sleep(duration).await,
             None => std::future::pending().await,
         }
     }
@@ -1175,7 +1175,7 @@ impl DeferredObservationTimeout {
         if self.started.await.is_err() {
             return std::future::pending().await;
         }
-        um_support::async_sleep(duration).await;
+        useful_support::async_sleep(duration).await;
     }
 }
 
@@ -1183,7 +1183,7 @@ const OBSERVATION_POLL_INTERVAL: Duration = Duration::from_secs(2);
 const MAXIMUM_CONSECUTIVE_OBSERVATION_FAILURES: usize = 2;
 
 fn observation_poll_interval() -> Duration {
-    um_support::poll_interval(OBSERVATION_POLL_INTERVAL)
+    useful_support::poll_interval(OBSERVATION_POLL_INTERVAL)
 }
 
 trait ObservationClock {
@@ -1195,11 +1195,11 @@ struct SystemObservationClock;
 
 impl ObservationClock for SystemObservationClock {
     fn now(&self) -> Instant {
-        um_support::monotonic_now()
+        useful_support::monotonic_now()
     }
 
     fn sleep(&self, duration: Duration) {
-        um_support::sleep(duration);
+        useful_support::sleep(duration);
     }
 }
 
@@ -1209,7 +1209,7 @@ const CEREMONY_POLL_INTERVAL: Duration = Duration::from_secs(5);
 const POLL_WAIT_SLICE: Duration = Duration::from_millis(100);
 
 fn ceremony_poll_interval() -> Duration {
-    um_support::poll_interval(CEREMONY_POLL_INTERVAL)
+    useful_support::poll_interval(CEREMONY_POLL_INTERVAL)
 }
 
 /// Waits `delay` in short slices so a signal ends the wait; false once the operation is
@@ -1765,7 +1765,7 @@ fn finish_read_only_operation(
 
 struct HumanApiOutcomeAdapters<O, E> {
     unauthenticated: fn() -> O,
-    unreachable: fn(um_api::UnreachableCategory) -> O,
+    unreachable: fn(useful_api::UnreachableCategory) -> O,
     operation_error: fn(E) -> anyhow::Error,
 }
 
@@ -1831,7 +1831,7 @@ fn execute_selected_api_observation<T, E>(
             Ok(Err(unreachable(UnreachableCategory::Timeout)))
         }
     } else {
-        match um_human_auth::execute_required_until(
+        match useful_human_auth::execute_required_until(
             context.client,
             context.deployment,
             |access_token, budget| operation(access_token.expose(), budget),
@@ -1857,7 +1857,7 @@ fn observation_http_budget(
 ) -> Result<Option<Duration>, UnreachableCategory> {
     match deadline {
         Some(end) => end
-            .checked_duration_since(um_support::monotonic_now())
+            .checked_duration_since(useful_support::monotonic_now())
             .filter(|duration| !duration.is_zero())
             .map(Some)
             .ok_or(UnreachableCategory::Timeout),
@@ -1896,7 +1896,7 @@ fn execute_required_api_operation_retrying_result<T, E>(
     unreachable: impl Fn(UnreachableCategory) -> E,
     session_context: &'static str,
 ) -> anyhow::Result<Result<T, E>> {
-    match um_human_auth::execute_required(
+    match useful_human_auth::execute_required(
         client,
         deployment,
         |access_token| operation(access_token.expose()),
@@ -1950,14 +1950,14 @@ fn with_human_session_api<A: HumanSessionApi, T>(
 }
 
 fn execute_human_api_operation<O, E>(
-    client: &um_api::HttpClient,
+    client: &useful_api::HttpClient,
     deployment: &Deployment,
     mut operation: impl FnMut(&str) -> Result<O, E>,
     credential_rejected: impl Fn(&Result<O, E>) -> bool,
     adapters: HumanApiOutcomeAdapters<O, E>,
     api_context: String,
 ) -> anyhow::Result<O> {
-    match um_human_auth::execute_required(
+    match useful_human_auth::execute_required(
         client,
         deployment,
         |access_token| operation(access_token.expose()),
@@ -2109,12 +2109,12 @@ mod tests {
 
     use super::{Cli, parse, unreachable_outcome_class};
     use crate::exit_code::{ExitCode, OutcomeClass};
-    use um_api::UnreachableCategory;
+    use useful_api::UnreachableCategory;
 
     // INV-TESTING-20
     #[test]
     fn a_unit_test_harness_is_never_its_own_internal_worker() {
-        match um_execution::unsupplied_internal_worker_executable() {
+        match useful_execution::unsupplied_internal_worker_executable() {
             Ok(worker) => {
                 assert_ne!(worker, std::env::current_exe().unwrap());
                 assert!(
@@ -2213,7 +2213,7 @@ mod tests {
         use super::observation_test_support::ControlledObservationClock;
         use std::time::Duration;
 
-        let started = um_support::monotonic_now();
+        let started = useful_support::monotonic_now();
         let clock = ControlledObservationClock::new(started);
         let control = super::OperationControl::new(());
         // The timeout wins after observation starts, before its first GET is admitted.
@@ -2253,7 +2253,7 @@ mod tests {
             }
         }
 
-        let started = um_support::monotonic_now();
+        let started = useful_support::monotonic_now();
         let control = Arc::new(super::OperationControl::new(()));
         let (at_boundary, reached) = mpsc::channel();
         let (resume, continue_read) = mpsc::channel();
@@ -2292,7 +2292,7 @@ mod tests {
         use std::time::Duration;
 
         for signal_after_get in [false, true] {
-            let started = um_support::monotonic_now();
+            let started = useful_support::monotonic_now();
             let clock = ControlledObservationClock::new(started);
             let control = super::OperationControl::new(());
             let mut requests = Vec::new();
@@ -2360,7 +2360,7 @@ mod tests {
         // The workflow command has an isolated environment. Supply the worker
         // contract to the nested fixture explicitly rather than relying on
         // the test runner's environment surviving the command boundary.
-        let worker = std::env::var("UM_TEST_INTERNAL_WORKER_EXECUTABLE")
+        let worker = std::env::var("USEFUL_TEST_INTERNAL_WORKER_EXECUTABLE")
             .expect("test worker executable must be supplied by the test runner");
         assert!(
             Path::new(&worker).is_file(),
@@ -2369,7 +2369,7 @@ mod tests {
         let fixture_arguments = vec![
             "/bin/sh".to_owned(),
             "-c".to_owned(),
-            "export UM_TEST_INTERNAL_WORKER_EXECUTABLE=\"$1\"; shift; exec \"$@\"".to_owned(),
+            "export USEFUL_TEST_INTERNAL_WORKER_EXECUTABLE=\"$1\"; shift; exec \"$@\"".to_owned(),
             "sh".to_owned(),
             worker,
             std::env::current_exe()
@@ -2382,7 +2382,7 @@ mod tests {
             "cli::tests::nested_workflow_fixture_process".to_owned(),
             "--nocapture".to_owned(),
         ];
-        um_runner::run_nested_workflow_delivery_failure_fixture(&fixture_arguments).unwrap();
+        useful_runner::run_nested_workflow_delivery_failure_fixture(&fixture_arguments).unwrap();
     }
 
     #[test]
@@ -2400,7 +2400,7 @@ mod tests {
         fs::create_dir_all(&source).unwrap();
         fs::copy(workspace.join("nested.yaml"), source.join("nested.yaml")).unwrap();
         let arguments = vec![
-            OsString::from("um"),
+            OsString::from("useful"),
             OsString::from("workflow"),
             OsString::from("run"),
             OsString::from("create"),
@@ -2520,7 +2520,7 @@ mod tests {
 
     #[test]
     fn command_groups_are_alphabetical_with_help_last() {
-        assert_command_order(&Cli::command(), "um");
+        assert_command_order(&Cli::command(), "useful");
     }
 
     fn customer_command_paths() -> Vec<String> {
@@ -2531,7 +2531,7 @@ mod tests {
         paths
     }
 
-    /// The families `um grant` and `um runner grant` replace (REQ-GRANT-77).
+    /// The families `useful grant` and `useful runner grant` replace (REQ-GRANT-77).
     const EARLIER_FAMILIES: [[&str; 2]; 4] = [
         ["auth", "agent-login"],
         ["auth", "credential"],
@@ -2615,7 +2615,7 @@ mod tests {
     fn service_authentication_is_explicit_and_human_only_leaves_reject_it() {
         assert!(
             parse([
-                "um",
+                "useful",
                 "service-principal",
                 "credential",
                 "list",
@@ -2626,7 +2626,7 @@ mod tests {
         );
         assert!(
             parse([
-                "um",
+                "useful",
                 "organization",
                 "show",
                 "example",
@@ -2637,7 +2637,7 @@ mod tests {
         );
         assert!(
             parse([
-                "um",
+                "useful",
                 "service-principal",
                 "create",
                 "--display-name",
@@ -2651,7 +2651,7 @@ mod tests {
         );
         assert!(
             parse([
-                "um",
+                "useful",
                 "organization",
                 "deletion",
                 "request",

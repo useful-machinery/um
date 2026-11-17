@@ -176,18 +176,18 @@ referenced prompt files. Then validate the bundle without executing it, run it i
 durable run directory, and return to that run later:
 
 ```sh
-um workflow validate \
+useful workflow validate \
   --source-root . \
-  .um/workflows/review.yaml
+  .useful/workflows/review.yaml
 
-um workflow run create \
+useful workflow run create \
   --path . \
-  --workflow .um/workflows/review.yaml \
+  --workflow .useful/workflows/review.yaml \
   --execution-root . \
-  --run-dir ~/.um/runs/review-001
+  --run-dir ~/.useful/runs/review-001
 
-um workflow run status ~/.um/runs/review-001
-um workflow run view ~/.um/runs/review-001
+useful workflow run status ~/.useful/runs/review-001
+useful workflow run view ~/.useful/runs/review-001
 ```
 
 During execution, Useful Machinery schedules ready steps, supervises each command or fresh agent
@@ -234,7 +234,7 @@ Create a service principal while signed in as a human, and direct its show-once 
 API key to a new private file:
 
 ```sh
-um service-principal create \
+useful service-principal create \
   --display-name "Build agent" \
   --api-key-file ./build-agent.key
 ```
@@ -259,14 +259,14 @@ Service credentials are explicit per invocation. The CLI does not persist a serv
 key or fall back between a service key and the human credential store:
 
 ```sh
-um service-principal credential list \
+useful service-principal credential list \
   --service-api-key-file ./build-agent.key
 
-um service-principal credential issue \
+useful service-principal credential issue \
   --service-api-key-file ./build-agent.key \
   --api-key-file ./build-agent-next.key
 
-um service-principal credential revoke \
+useful service-principal credential revoke \
   crd_01k0z6r1w8f4jy2m7q9v3x5abc \
   --service-api-key-file ./build-agent-next.key \
   --yes
@@ -306,7 +306,7 @@ runner activation or runner credential.
 A signed-in human proposes a delegation to one exact active service principal:
 
 ```sh
-um delegation propose prn_01k0z6r1w8f4jy2m7q9v3x5abc
+useful delegation propose prn_01k0z6r1w8f4jy2m7q9v3x5abc
 ```
 
 Proposal is deliberately human-only. Acceptance is deliberately service-only and always
@@ -314,7 +314,7 @@ requires the nominated service's explicit API-key input; the CLI never substitut
 stored human session:
 
 ```sh
-um delegation accept dlg_01k0z6r1w8f4jy2m7q9v3x5abc \
+useful delegation accept dlg_01k0z6r1w8f4jy2m7q9v3x5abc \
   --service-api-key-file ./build-agent.key
 ```
 
@@ -324,11 +324,11 @@ service. Listing returns one page and exposes an opaque next cursor when another
 available:
 
 ```sh
-um delegation list --limit 50
-um delegation list --cursor <CURSOR> \
+useful delegation list --limit 50
+useful delegation list --cursor <CURSOR> \
   --service-api-key-file ./build-agent.key
-um delegation show dlg_01k0z6r1w8f4jy2m7q9v3x5abc
-um delegation end dlg_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+useful delegation show dlg_01k0z6r1w8f4jy2m7q9v3x5abc
+useful delegation end dlg_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
 Ended relationships remain visible in delegation history with their terminal timestamp
@@ -354,13 +354,13 @@ build's source commit, even when the deployed API contract has since changed.
 
 ## Local workflow validation
 
-Use `um workflow validate` to resolve a checked-out Workflow V1 bundle
+Use `useful workflow validate` to resolve a checked-out Workflow V1 bundle
 without running it:
 
 ```sh
-um workflow validate \
+useful workflow validate \
   --source-root ./my-repository \
-  ./my-repository/.um/workflows/check.yaml
+  ./my-repository/.useful/workflows/check.yaml
 ```
 
 `workflow validate` accepts the same `--agent-profiles <PATH>` replacement document as
@@ -384,7 +384,7 @@ directory.
 For concise, version-aligned authoring guidance from the installed executable, run:
 
 ```sh
-um workflow reference
+useful workflow reference
 ```
 
 The command writes its version-aligned embedded Markdown unchanged to standard output.
@@ -402,7 +402,7 @@ Retrieve the self-contained Workflow V1 JSON Schema from an installed executable
 without a source checkout:
 
 ```sh
-um workflow schema > workflow-v1.schema.json
+useful workflow schema > workflow-v1.schema.json
 ```
 
 The command writes raw JSON Schema bytes without a wrapper or preamble and preserves the
@@ -434,7 +434,7 @@ local definition resolved successfully.
 List one page of a run's sealed Artifact Set without downloading it:
 
 ```sh
-um artifact list acme-research run_01k0z6r1w8f4jy2m7q9v3x5abc \
+useful artifact list acme-research run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --limit 50
 ```
 
@@ -454,7 +454,7 @@ network, invalid-cursor, and invalid-response outcomes.
 Download and verify the complete set only when its bytes are needed:
 
 ```sh
-um artifact download acme-research \
+useful artifact download acme-research \
   run_01k0z6r1w8f4jy2m7q9v3x5abc --output ./downloaded-attempt-result
 ```
 
@@ -471,7 +471,7 @@ Validate one copied or downloaded Artifact Set V1 directory without its original
 workflow source, or execution checkout:
 
 ```sh
-um artifact validate ./downloaded-attempt-result
+useful artifact validate ./downloaded-attempt-result
 ```
 
 The command validates the complete closed `result.json` contract and every declared
@@ -497,15 +497,15 @@ return 2 and do not inspect the artifact directory.
 
 ## Local workflow execution
 
-Use `um workflow run create` to execute a mixed command, PiJsonV1,
+Use `useful workflow run create` to execute a mixed command, PiJsonV1,
 ClaudeCodeStreamJsonV1, and CodexAppServerV1 agent Workflow V1 DAG in an existing
 caller-owned directory and create one durable local run
 directory:
 
 ```sh
-um workflow run create \
+useful workflow run create \
   --path ./my-repository \
-  --workflow .um/workflows/check.yaml \
+  --workflow .useful/workflows/check.yaml \
   --execution-root ./my-checkout \
   --run-dir ./runs/check-001 \
   --max-parallel 2
@@ -513,7 +513,7 @@ um workflow run create \
 
 The run directory must not exist and must be disjoint from the execution root. The CLI
 normalizes it from its nearest existing parent and creates any missing parent suffix.
-First-workflow onboarding uses the owner-private `~/.um/runs/` durable state root
+First-workflow onboarding uses the owner-private `~/.useful/runs/` durable state root
 by default; retained runs are application state and do not belong under `~/.config`.
 The CLI retains immutable workflow and named-input bytes, durable closed run and attempt
 state, and attempt 1's atomic result beneath `attempts/000001/result`. Every agent
@@ -575,12 +575,12 @@ Its exact bytes are retained with the run and reapplied by `run retry` and `run 
 [`schemas/agent-profile-replacement-v1.schema.json`](schemas/agent-profile-replacement-v1.schema.json).
 
 ```sh
-um workflow run create \
+useful workflow run create \
   --path . \
-  --workflow .um/workflows/review.yaml \
+  --workflow .useful/workflows/review.yaml \
   --execution-root . \
-  --run-dir ~/.um/runs/review-002 \
-  --agent-profiles ~/.um/profiles/claude.yaml
+  --run-dir ~/.useful/runs/review-002 \
+  --agent-profiles ~/.useful/profiles/claude.yaml
 ```
 
 Without `--plain` or `--json`, run uses the interactive terminal interface when stdin and
@@ -638,7 +638,7 @@ rejected. Useful Machinery does not read provider credentials during definition 
 installation discovery, rejection presentation, or doctor checks.
 
 Local execution snapshots the inherited environment after resolution and removes
-`UM_` variables before launching commands or agents. Other caller-provided values are
+`USEFUL_` variables before launching commands or agents. Other caller-provided values are
 retained unless the closed harness profile fixes them. ClaudeCodeStreamJsonV1 removes
 `CLAUDE_CODE_PROJECT_DIR_NAME` to keep retained-session routing authoritative and applies
 its documented native controls; values such as `GH_TOKEN`, `GITHUB_TOKEN`, and Git or SSH
@@ -683,22 +683,22 @@ Inspect the durable state and retry eligibility of an existing local run without
 it:
 
 ```sh
-um workflow run status ./runs/check-001
+useful workflow run status ./runs/check-001
 ```
 
 The run-directory positional is an ordinary host path resolved from the process's
 initial working directory. Retry uses the same durable handle explicitly:
 
 ```sh
-um workflow run retry ./runs/check-001 --execution-root ./my-checkout
+useful workflow run retry ./runs/check-001 --execution-root ./my-checkout
 ```
 
 To reexecute a selected ordinary step and its downstream ordinary dependents,
 inherit the other eligible ordinary steps by reference, and rerun all finalizers:
 
 ```sh
-um workflow run resume ./runs/check-001 --from build --from verify
-um workflow run resume ./runs/check-001 --from verify \
+useful workflow run resume ./runs/check-001 --from build --from verify
+useful workflow run resume ./runs/check-001 --from verify \
   --workflow ./revised-workflow.yaml --execution-root ./another-checkout
 ```
 
@@ -713,7 +713,7 @@ run inputs and primary-workspace Git baseline remain immutable. A continuation i
 allowed only from an eligible latest failed, cancelled, or interrupted attempt, after
 all retained process groups are proven quiescent. Before actions run, plain output
 reports the ordered reexecuted and inherited partitions. Executed steps, recovery
-handlers, and finalizers can read the credential-free `UM_CONTINUATION_CONTEXT`
+handlers, and finalizers can read the credential-free `USEFUL_CONTINUATION_CONTEXT`
 file; initial runs and explicit retries do not receive this variable. A continued
 step starts fresh; an inherited step has neither a new invocation nor a copied log.
 A required body-data consumer of an inherited skipped output is rejected, while
@@ -756,7 +756,7 @@ respectively.
 View a successfully published terminal attempt from one stable read-only snapshot:
 
 ```sh
-um workflow run view ./runs/check-001 [--attempt 1] [--plain | --json]
+useful workflow run view ./runs/check-001 [--attempt 1] [--plain | --json]
 ```
 
 Omitting `--attempt` selects the current attempt from the snapshot. Without an explicit
@@ -794,15 +794,15 @@ workflow. `--color` affects only plain and TUI styling; JSON is always ANSI-free
 
 ## Version inspection
 
-Use `um --version` or `um version` for conventional one-line
-output. Use `um version --json` for the schema-version-1 structured contract:
+Use `useful --version` or `useful version` for conventional one-line
+output. Use `useful version --json` for the schema-version-1 structured contract:
 
 ```json
 {
   "schemaVersion": 1,
-  "command": "um",
+  "command": "useful",
   "version": "0.10.0",
-  "executablePath": "/resolved/path/to/um",
+  "executablePath": "/resolved/path/to/useful",
   "buildIdentity": "unknown"
 }
 ```
@@ -814,17 +814,17 @@ The schema does not define a release channel.
 
 ## Human authentication
 
-Use `um auth login` to authenticate through a browser on the same machine or
+Use `useful auth login` to authenticate through a browser on the same machine or
 another machine. The CLI prints an activation URL and user code, never opens a browser,
 and never listens for an inbound callback. Add `--json` to receive newline-delimited
 schema-version-1 events. Use `--force` to start a new device authorization transaction
 without checking an existing credential with the API.
 
-Use `um auth status` to ask the selected deployment whether the current
+Use `useful auth status` to ask the selected deployment whether the current
 identity is authenticated, requires signup, is forbidden, is unauthenticated, or is
 unreachable. `forbidden` (exit 1) means the deployment accepts the sign-in but refuses its
 account, as it does for an account that is suspended, deleted, or scheduled for deletion;
-the stored sign-in is kept, and `um account deletion cancel` stops a scheduled deletion
+the stored sign-in is kept, and `useful account deletion cancel` stops a scheduled deletion
 before its deadline. Add `--json` for the schema-version-1 structured result.
 Authenticated, signup-required, and forbidden results preserve any server actions as
 complete opaque JSON values. The CLI does not
@@ -835,16 +835,16 @@ Manage the OIDC identities linked to the signed-in account under `auth identity`
 
 ```sh
 # List one page; the current local-session identity is marked when that page contains it.
-um auth identity list --limit 50
+useful auth identity list --limit 50
 
 # Continue when the result includes a next cursor.
-um auth identity list --limit 50 --cursor "$NEXT_CURSOR"
+useful auth identity list --limit 50 --cursor "$NEXT_CURSOR"
 
 # Prove control of another identity in a fresh browser/device flow and link it.
-um auth identity link
+useful auth identity link
 
 # Remove a non-current identity by the opaque ID returned by list.
-um auth identity remove idn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+useful auth identity remove idn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
 `auth identity link` keeps the session that passed preflight as the acting identity
@@ -865,7 +865,7 @@ minutes and refuses to remove either its exact identity or the last usable ident
 remove the identity currently used on this device, first find the item marked `current`
 in `list`. Listing is oldest-first and returns one page, so follow each `nextCursor` with
 `--cursor` until the marked identity appears. Record that ID, run
-`um auth login --force`, and choose a different identity already linked to
+`useful auth login --force`, and choose a different identity already linked to
 the same account. That fresh login replaces the local session. Removing the former
 identity then leaves the replacement local session signed in and unchanged. A removal
 command never deletes or revokes the current local credential. With
@@ -895,11 +895,11 @@ enable a provider or link accounts by email.
 
 One successful login establishes a renewable human session. The CLI stores the one-hour
 access token, its expiration, and a rotating refresh token in
-`~/.um/credentials.json`, then silently renews access for every human-authenticated
+`~/.useful/credentials.json`, then silently renews access for every human-authenticated
 command while the refresh session remains valid. Auth0 expires refresh sessions after 30
 days idle or 90 days total.
 
-Use `um auth logout` to remove the human credential for the active deployment
+Use `useful auth logout` to remove the human credential for the active deployment
 and ask Auth0 to revoke its refresh token. The result distinguishes confirmed and
 unconfirmed server revocation; local removal still completes when Auth0 is unreachable.
 The human store remains separate from workflow-run state and all runner credentials.
@@ -911,7 +911,7 @@ the option is not global.
 
 ## Grants
 
-`um grant` manages what Useful Machinery may do as you at other providers. A grant is an
+`useful grant` manages what Useful Machinery may do as you at other providers. A grant is an
 OAuth grant (`github`, `gitlab.com`, `linear`), your consent at the provider, whose ID begins
 `pgr_`, or a native grant (`claude_code`, `codex`), a coding agent's own login imported for
 one organization, whose ID begins `agl_`. Each grant is used only on the runners you authorize
@@ -925,8 +925,8 @@ for it. The commands take your signed-in session only, never a service API key.
 # started. When you already hold a grant of the provider, the command asks before replacing it
 # on a terminal and otherwise exits 2 unless you pass --replace; the new sign-in becomes that
 # grant's next generation, keeping its ID and the runners it is authorized for.
-um grant create linear
-um grant create github --replace --json
+useful grant create linear
+useful grant create github --replace --json
 
 # For codex this runs `codex login` in a private temporary Codex home (mode 0700) that it
 # removes afterwards, and imports the login it writes; your own Codex home is never read or
@@ -936,9 +936,9 @@ um grant create github --replace --json
 # existing auth.json from an owned mode-0600 file, or - for standard input, instead. The grant
 # is for your only organization, or the one --organization names. A coding agent's sign-in
 # has no consent to wait for, so --no-wait and --timeout are refused for codex and claude_code.
-um grant create codex
-um grant create codex --device --organization acme
-um grant create codex --from-file ~/backup/auth.json --replace
+useful grant create codex
+useful grant create codex --device --organization acme
+useful grant create codex --from-file ~/backup/auth.json --replace
 
 # For claude_code this runs `claude setup-token` with a private temporary configuration
 # directory (mode 0700) that it removes afterwards; your own Claude Code configuration is never
@@ -947,8 +947,8 @@ um grant create codex --from-file ~/backup/auth.json --replace
 # standard input the command fails at once, starting no sign-in, and names --token-file -.
 # --token-file imports a token claude setup-token printed from an owned mode-0600 file, or -
 # for standard input, instead.
-um grant create claude_code
-um grant create claude_code --token-file - --organization acme < token.txt
+useful grant create claude_code
+useful grant create claude_code --token-file - --organization acme < token.txt
 
 # Without a provider, or with --all, run the sign-in of each provider you hold no active or
 # reconnect_required grant of, one after another: github, gitlab.com, linear, claude_code,
@@ -963,34 +963,34 @@ um grant create claude_code --token-file - --organization acme < token.txt
 # the Codex sign-in; --no-wait and --timeout apply to the consents. --from-file and --token-file
 # need a provider, and --replace a provider or --workflow. With --json each provider's events
 # are followed by a summary event.
-um grant create
-um grant create --all --organization acme --json
+useful grant create
+useful grant create --all --organization acme --json
 
 # With --workflow FILE, which repeats, sign in to only the providers those workflows and the
-# workflows their workflow steps run call for, derived as um runner doctor --workflow derives
+# workflows their workflow steps run call for, derived as useful runner doctor --workflow derives
 # them; the kind gitlab means gitlab.com. Before any sign-in the command prints the workflow
 # files, each provider to sign in to and each passed over as held with what calls for it, and
 # the declarations that may use credentials the workflows do not name, for which no sign-in is
 # run. Without --source-root each file is bounded by the root of the Git repository that holds
 # it, and a file in no repository is refused with exit 2. A file that does not resolve is
-# reported as um workflow validate reports it, with exit 1. --workflow does not take a provider.
+# reported as useful workflow validate reports it, with exit 1. --workflow does not take a provider.
 # A provider every grant of which you hold needs reconnecting (its consent lapsed, or a runner
 # reported its login refused) is planned to reconnect: on a terminal the command asks first,
 # before any sign-in, and --replace replaces it without asking, storing the sign-in as the
 # grant's next generation so it keeps its ID and its runners; it never replaces a healthy
-# grant. One you keep is reported reconnect_required, naming um grant create PROVIDER
+# grant. One you keep is reported reconnect_required, naming useful grant create PROVIDER
 # --replace. With --json the plan is a first workflow_requirements event, whose selected,
 # reconnect and held arrays name each provider and what calls for it.
-um grant create --workflow workflow.yaml --workflow ../other/workflow.yaml
-um grant create --workflow workflow.yaml --source-root . --json
-um grant create --workflow workflow.yaml --replace
+useful grant create --workflow workflow.yaml --workflow ../other/workflow.yaml
+useful grant create --workflow workflow.yaml --source-root . --json
+useful grant create --workflow workflow.yaml --replace
 
 # List every grant you hold: its ID, provider, kind, the account it acts as (an OAuth grant's
 # linked identity, a native grant's organization), its state and generation, and each runner
 # it is authorized for with that runner's availability and next action and, for a native
 # grant, the last use the runner reported and when. Then name each provider you hold nothing
 # for. It reads every page; there is no --limit or --cursor.
-um grant list
+useful grant list
 
 # Show one grant in detail: for a native grant what each runner was last delivered and
 # reported, its last use and when, and for each runner whose authorization has ended the one
@@ -998,15 +998,15 @@ um grant list
 # again; for an OAuth grant its scopes, last use and expiries, and the newest 20 tokens issued
 # from it with the run and assignment of each (--uses LIMIT, 1 to 200, shows another number).
 # Name it by its ID, or by its provider when you hold one grant of it.
-um grant list agl_01k0z6r1w8f4jy2m7q9v3x5abc
-um grant list codex --json
+useful grant list agl_01k0z6r1w8f4jy2m7q9v3x5abc
+useful grant list codex --json
 
-# Authorize one runner, named by the rnr_ ID that `um runner list acme` prints, to use a
+# Authorize one runner, named by the rnr_ ID that `useful runner list acme` prints, to use a
 # grant. For an OAuth grant, every run on that runner that you start can then be issued tokens
 # from it; for a native grant, every run that runner serves, whichever member caused it, can
 # use the login, and every step on that runner can read it. The command reads the grant, says
 # which applies, and does nothing without --yes. A Codex grant serves one runner at a time.
-um grant authorize codex rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+useful grant authorize codex rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 
 # Leave the runner out to choose it from a list. At a terminal it shows the runners the grant
 # can be authorized for and is not yet, each by name, pool, online or offline, mode when not
@@ -1014,15 +1014,15 @@ um grant authorize codex rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 # states what authorizing does, naming the runner, and asks before it acts unless --yes was
 # given: any answer but y, or Esc at the list, sends nothing and exits 2. Where the command
 # cannot prompt (no terminal, or --json), it lists the same runners and exits 2 having sent
-# nothing. `um grant authorize --all` offers the runners of your organizations, and
-# `um grant deauthorize GRANT` only the runners the grant is authorized for.
-um grant authorize codex
+# nothing. `useful grant authorize --all` offers the runners of your organizations, and
+# `useful grant deauthorize GRANT` only the runners the grant is authorized for.
+useful grant authorize codex
 
 # Offered more than one runner, the list ends with a choice of all of them, except for a Codex
 # grant, which serves one runner at a time, and for --all. With all chosen the command states
 # how many runners it covers, acts on each in turn and prints one outcome per runner; it exits
 # 1 when any runner was refused, and a failure that is not one runner's refusal ends it there.
-um grant authorize claude_code
+useful grant authorize claude_code
 
 # Authorize that runner for every grant of yours that can serve it: each OAuth grant and each
 # native grant of the runner's organization. It prints one outcome per grant (`authorized`,
@@ -1031,20 +1031,20 @@ um grant authorize claude_code
 # and exits 1 when any grant was refused. A failure that is not one grant's refusal, such as a
 # rate limit, ends it at that grant: it prints the outcomes so far, then the failure naming
 # that grant, and exits 1.
-um grant authorize --all rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+useful grant authorize --all rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 
 # End that runner's authorization. For a native grant Cloud also asks the run that runner is
 # serving, whichever member started it, to stop, and the command prints whether the runner has
 # confirmed removing its copy and the run asked to stop; for an OAuth grant no run is stopped
 # and no further token is issued there.
-um grant deauthorize codex rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+useful grant deauthorize codex rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 
 # Revoke a grant everywhere. An OAuth grant is erased and revoked at the provider where the
 # provider offers it. A native grant is erased and the command prints each runner it was
 # authorized for with its removal state and the run asked to stop there; a confirmation covers
 # only the copy that runner kept, and the session at the provider stays signed in until you
 # sign out there.
-um grant revoke github --yes
+useful grant revoke github --yes
 ```
 
 `list --json` prints one schema-version-1 document with outcome `listed`, `grants` (each with
@@ -1090,35 +1090,35 @@ A refusal exits 1 with its outcome (`runner_not_found`, `runner_holds_login`,
 Every runner authorization `list` prints, and every provider you hold nothing for, carries one
 `availability` (`available`, `unverified`, `reconnect_required`, `pending`, `delivery_failed`,
 `insufficient_permission`, `not_delivered` or `not_connected`) and one `nextAction`, and the
-text form names the command or step that next action means: `um grant create PROVIDER
---replace` to reconnect, `um grant authorize GRANT RUNNER --yes` for a grant no runner is
-authorized for, `um runner grant sync` on the runner's host after a failed
-delivery, and `um grant create PROVIDER` for a provider you hold nothing for. A runner that
+text form names the command or step that next action means: `useful grant create PROVIDER
+--replace` to reconnect, `useful grant authorize GRANT RUNNER --yes` for a grant no runner is
+authorized for, `useful runner grant sync` on the runner's host after a failed
+delivery, and `useful grant create PROVIDER` for a provider you hold nothing for. A runner that
 has not yet reported installing what Cloud holds is `pending` with `wait_for_runner`, and a
 login in place that the runner has neither checked with its provider nor had a step use at
 this generation is `unverified`.
 
-On the runner's host, `um runner grant sync` asks the live runner, through the control socket
+On the runner's host, `useful runner grant sync` asks the live runner, through the control socket
 its runner home's configuration names or, with `--config PATH`, that file's, to set up the
 agent logins authorized for it now and prints each provider's readiness; see
 [Runner serve](#runner-serve).
 
 The earlier commands remain for one release with their arguments, output and exit statuses
 unchanged, but are absent from help, and each first prints a line on standard error naming
-the command that replaces it: `um auth grant create` and `um auth agent-login import` are
-`um grant create PROVIDER`; `um auth agent-login reconnect` is
-`um grant create PROVIDER --replace`; `um auth grant list`, `um auth agent-login list` and
-`um auth credential status` are `um grant list`; `um auth agent-login show` is
-`um grant list GRANT`; `um auth agent-login authorize`, `deauthorize` and `revoke` and
-`um auth grant revoke` are the `um grant` leaf of the same name; and
-`um runner agent-login sync` is `um runner grant sync`; and `um auth grant uses` is
-`um grant list GRANT`.
+the command that replaces it: `useful auth grant create` and `useful auth agent-login import` are
+`useful grant create PROVIDER`; `useful auth agent-login reconnect` is
+`useful grant create PROVIDER --replace`; `useful auth grant list`, `useful auth agent-login list` and
+`useful auth credential status` are `useful grant list`; `useful auth agent-login show` is
+`useful grant list GRANT`; `useful auth agent-login authorize`, `deauthorize` and `revoke` and
+`useful auth grant revoke` are the `useful grant` leaf of the same name; and
+`useful runner agent-login sync` is `useful runner grant sync`; and `useful auth grant uses` is
+`useful grant list GRANT`.
 
 ## Account management
 
 OAuth login does not implicitly create a Useful Machinery account. When authentication
 status is `signup_required` and the deployment advertises signup, use
-`um account signup` after the customer explicitly approves account creation.
+`useful account signup` after the customer explicitly approves account creation.
 Add `--json` for a schema-version-1 structured result. The CLI authenticates the request
 with the existing human credential and retries an ambiguous transport failure once with
 the same opaque idempotency key.
@@ -1127,8 +1127,8 @@ Set or clear the authenticated account's optional display name with exactly one 
 options:
 
 ```sh
-um account update --display-name "Ada Lovelace"
-um account update --clear-display-name
+useful account update --display-name "Ada Lovelace"
+useful account update --clear-display-name
 ```
 
 The deployment removes surrounding Unicode whitespace and accepts 1 through 200 Unicode
@@ -1139,7 +1139,7 @@ name is `set` or `cleared`; `--json` reports the same stable `outcome` and the a
 
 Each invocation generates a fresh opaque idempotency key. After an ambiguous transport
 failure, the CLI retries once with the same key and exact merge patch. If the result still
-cannot be confirmed, check `um auth status` before issuing another update.
+cannot be confirmed, check `useful auth status` before issuing another update.
 Structured failures report one of `invalid_display_name`, `unauthenticated`, `forbidden`,
 `idempotency_conflict`, `request_too_large`, `unsupported_media_type`, or `unreachable`.
 
@@ -1147,7 +1147,7 @@ Schedule deletion of the authenticated human account only after reviewing the 30
 window and confirming explicitly:
 
 ```sh
-um account deletion request --yes
+useful account deletion request --yes
 ```
 
 A successful request reports the principal ID, `deletion_pending` state, request time,
@@ -1162,8 +1162,8 @@ until the lifecycle state has been confirmed with the deployment operator.
 If the reply to the request is lost, the command repeats the identical request with the same
 request identity. When the deployment refuses that repeat as `forbidden`, the first request
 may already have scheduled deletion, so the command reports `acceptance_unknown` (exit 4)
-instead and keeps the local credential. Run `um auth status` to check the account's state,
-and `um account deletion cancel` only to keep an account whose deletion is scheduled.
+instead and keeps the local credential. Run `useful auth status` to check the account's state,
+and `useful account deletion cancel` only to keep an account whose deletion is scheduled.
 
 Supplying `--service-api-key-file PATH|-` to the request deletes the authenticated
 service principal immediately instead of creating a schedule. A successful JSON result
@@ -1173,14 +1173,14 @@ credential store.
 Cancel before the deadline with a fresh browser proof from the same still-linked identity:
 
 ```sh
-um account deletion cancel
+useful account deletion cancel
 ```
 
 Cancellation does not use or require the stored local session. It requests a fresh
 browser/device access token without `offline_access`, sends that token only as the API
 bearer, and never stores it or a refresh token. A successful cancellation reports the
 returned active lifecycle transition while leaving the credential store unchanged; run
-`um auth login` afterward to establish a renewable local session. This
+`useful auth login` afterward to establish a renewable local session. This
 separation is intentional: an old stored credential, a refreshed background session, or
 a different linked identity does not replace the API's distinct, later, same-identity
 proof requirement.
@@ -1212,52 +1212,52 @@ and passes accepted references to the deployment without normalization.
 
 ```sh
 # Discover your organization memberships and their organization IDs and slugs.
-um organization list --limit 50
+useful organization list --limit 50
 
 # Create an organization. The deployment may assign the slug when it is omitted.
-um organization create \
+useful organization create \
   --display-name "Acme Research" \
   --slug acme-research
 
 # Read an accessible active organization by ID or exact slug.
-um organization show acme-research
+useful organization show acme-research
 
 # Update the display name, slug, or both. At least one option is required.
-um organization update acme-research \
+useful organization update acme-research \
   --display-name "Acme Labs" \
   --slug acme-labs
 
 # Schedule deletion for 30 days as a current active human owner.
-um organization deletion request acme-labs --yes
+useful organization deletion request acme-labs --yes
 
 # Cancel before the deadline with a fresh browser proof.
-um organization deletion cancel acme-labs
+useful organization deletion cancel acme-labs
 
 # Read one active member-directory page. Both pagination options are optional.
-um organization member list acme-labs \
+useful organization member list acme-labs \
   --limit 50 \
   --cursor opaque-continuation
 
 # Read one owner-only page containing active, suspended, and ended memberships.
-um organization member history acme-labs --limit 50
+useful organization member history acme-labs --limit 50
 
 # Read one owner-only page of privacy-safe audit records.
-um organization audit list acme-labs \
+useful organization audit list acme-labs \
   --limit 50 \
   --cursor opaque-continuation
 
 # Change another member's organization role.
-um organization member update acme-labs \
+useful organization member update acme-labs \
   mem_01k0z6r1w8f4jy2m7q9v3x5abc \
   --role owner
 
 # Permanently end another member's membership.
-um organization member remove acme-labs \
+useful organization member remove acme-labs \
   mem_01k0z6r1w8f4jy2m7q9v3x5abc \
   --yes
 
 # Permanently end your own membership.
-um organization leave acme-labs --yes
+useful organization leave acme-labs --yes
 ```
 
 Add `--json` to any of these leaves for its schema-version-1 result. Organization
@@ -1328,16 +1328,16 @@ invitation history, and revoke an outstanding invitation:
 
 ```sh
 # Issue to exactly one target kind.
-um organization invitation issue acme-labs \
+useful organization invitation issue acme-labs \
   --principal-id prn_01k0z6r1w8f4jy2m7q9v3x5abc
-um organization invitation issue acme-labs \
+useful organization invitation issue acme-labs \
   --email teammate@example.com
 
 # Read one owner-only page, including terminal history.
-um organization invitation list acme-labs --limit 50
+useful organization invitation list acme-labs --limit 50
 
 # Revoke an outstanding invitation.
-um organization invitation revoke acme-labs \
+useful organization invitation revoke acme-labs \
   inv_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
@@ -1345,20 +1345,20 @@ The current principal can list directly targeted outstanding invitations, previe
 invitation, and accept or decline it:
 
 ```sh
-um invitation list --limit 50
-um invitation preview inv_01k0z6r1w8f4jy2m7q9v3x5abc
-um invitation accept inv_01k0z6r1w8f4jy2m7q9v3x5abc
-um invitation decline inv_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+useful invitation list --limit 50
+useful invitation preview inv_01k0z6r1w8f4jy2m7q9v3x5abc
+useful invitation accept inv_01k0z6r1w8f4jy2m7q9v3x5abc
+useful invitation decline inv_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
 Email-targeted invitation links contain a bearer capability. Supply it only through a
 private regular file owned by the current Unix user, or through explicit standard input:
 
 ```sh
-um invitation preview inv_01k0z6r1w8f4jy2m7q9v3x5abc \
-  --capability-file ~/.config/um/invitation.capability
-um invitation accept inv_01k0z6r1w8f4jy2m7q9v3x5abc \
-  --capability-file - < ~/.config/um/invitation.capability
+useful invitation preview inv_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --capability-file ~/.config/useful/invitation.capability
+useful invitation accept inv_01k0z6r1w8f4jy2m7q9v3x5abc \
+  --capability-file - < ~/.config/useful/invitation.capability
 ```
 
 Capability files must use mode `0600`, must not be symlinks, and must be owned by the
@@ -1393,7 +1393,7 @@ Setup is deliberately split around browser consent. The CLI neither opens a brow
 listens for an inbound callback. Begin a ten-minute, single-use setup session:
 
 ```sh
-um connection github setup begin acme-labs
+useful connection github setup begin acme-labs
 ```
 
 Open the reported URL in a browser and approve the GitHub account and repositories.
@@ -1402,7 +1402,7 @@ installation ID and the completion command. Run that command with the ID to comp
 same session as the same Useful Machinery principal:
 
 ```sh
-um connection github setup complete \
+useful connection github setup complete \
   acme-labs \
   ghs_01k0z6r1w8f4jy2m7q9v3x5abc \
   --provider-installation-id 12345678
@@ -1419,7 +1419,7 @@ List the organization's stable installation bindings and their current `active`,
 `disconnected`, or `revoked` state:
 
 ```sh
-um connection github installation list acme-labs
+useful connection github installation list acme-labs
 ```
 
 Discover the repositories currently authorized through one active binding. This is a
@@ -1427,7 +1427,7 @@ live provider-backed read and may update existing repository availability projec
 it does not bind a project or create repository connections eagerly:
 
 ```sh
-um connection github repository list \
+useful connection github repository list \
   acme-labs \
   ghi_01k0z6r1w8f4jy2m7q9v3x5abc
 ```
@@ -1435,7 +1435,7 @@ um connection github repository list \
 Remove an installation binding from Useful Machinery with its stable binding ID:
 
 ```sh
-um connection github installation remove \
+useful connection github installation remove \
   acme-labs \
   ghi_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
@@ -1471,13 +1471,13 @@ not during CLI configuration. This command does not edit a Google document or la
 an action.
 
 ```sh
-um project action create ORG PROJECT --config-file examples/action-config.json
-um project action list ORG PROJECT --limit 50 --cursor CURSOR
-um project action show ORG PROJECT ACTION
-um project action update ORG PROJECT ACTION --config-file patch.json --expected-version 3
-um project action enable ORG PROJECT ACTION
-um project action disable ORG PROJECT ACTION
-um project action delete ORG PROJECT ACTION --yes
+useful project action create ORG PROJECT --config-file examples/action-config.json
+useful project action list ORG PROJECT --limit 50 --cursor CURSOR
+useful project action show ORG PROJECT ACTION
+useful project action update ORG PROJECT ACTION --config-file patch.json --expected-version 3
+useful project action enable ORG PROJECT ACTION
+useful project action disable ORG PROJECT ACTION
+useful project action delete ORG PROJECT ACTION --yes
 ```
 
 A patch contains only changed configuration fields, never `enabled` or
@@ -1501,11 +1501,11 @@ is not a published or installed release.
 
 ## Triggers and schedules
 
-`um project trigger` and `um project schedule` are removed. Triggers that target a
+`useful project trigger` and `useful project schedule` are removed. Triggers that target a
 `workflowPath` and their Linear lifecycle policy are retired in Cloud: declare start, control
 and schedule triggers in a published workflow definition's root instead, and use the root's
 `mirror` for issue state. Retained trigger and schedule records
-stay readable through the public API; `um run linear show` and `um run linear history` still
+stay readable through the public API; `useful run linear show` and `useful run linear history` still
 read a run's retained lifecycle binding.
 
 ## GitLab.com connections and credential candidates
@@ -1516,16 +1516,16 @@ not enable execution. See the [GitLab.com setup guide](https://docs.usefulmachin
 for supported token kinds, Developer access, expiry and the retained-record limit.
 
 ```sh
-um connection gitlab create ORG https://gitlab.com --json
-um connection gitlab list ORG --json
-um connection gitlab show ORG CONNECTION --json
-um connection gitlab credential create ORG CONNECTION --expected-version VERSION \
+useful connection gitlab create ORG https://gitlab.com --json
+useful connection gitlab list ORG --json
+useful connection gitlab show ORG CONNECTION --json
+useful connection gitlab credential create ORG CONNECTION --expected-version VERSION \
   --kind service-account --token-file /path/to/private-token --json
-um connection gitlab credential show ORG CONNECTION CANDIDATE --json
-um connection gitlab credential activate ORG CONNECTION CANDIDATE \
+useful connection gitlab credential show ORG CONNECTION CANDIDATE --json
+useful connection gitlab credential activate ORG CONNECTION CANDIDATE \
   --expected-provider-user-id ID --dedicated-automation --json
-um connection gitlab credential cancel ORG CONNECTION CANDIDATE --json
-um connection gitlab remove ORG CONNECTION --expected-version VERSION --yes --json
+useful connection gitlab credential cancel ORG CONNECTION CANDIDATE --json
+useful connection gitlab remove ORG CONNECTION --expected-version VERSION --yes --json
 ```
 
 Pass the credential only from an owned, regular, non-symlink mode-0600 file or
@@ -1557,14 +1557,14 @@ command to change multiple IDs atomically; each command supports `--idempotency-
 `--delegator-principal-id` for service-action attribution.
 
 ```sh
-um connection gitlab repository list ORG CONNECTION --json
-um connection gitlab repository list ORG CONNECTION --selected --json
-um connection gitlab repository link ORG CONNECTION --repository-id REPOSITORY --expected-version VERSION --json
-um project create ORG --name PROJECT_NAME --gitlab-connection-id CONNECTION \
+useful connection gitlab repository list ORG CONNECTION --json
+useful connection gitlab repository list ORG CONNECTION --selected --json
+useful connection gitlab repository link ORG CONNECTION --repository-id REPOSITORY --expected-version VERSION --json
+useful project create ORG --name PROJECT_NAME --gitlab-connection-id CONNECTION \
   --repository-id REPOSITORY --json
-um project repository set ORG PROJECT --gitlab-connection-id CONNECTION \
+useful project repository set ORG PROJECT --gitlab-connection-id CONNECTION \
   --repository-id REPOSITORY --json
-um connection gitlab repository remove ORG CONNECTION --repository-id REPOSITORY \
+useful connection gitlab repository remove ORG CONNECTION --repository-id REPOSITORY \
   --expected-version VERSION --yes --json
 ```
 
@@ -1582,10 +1582,10 @@ It does not open a browser or listen for the callback. Use the selected human se
 (or explicitly pass `--service-api-key-file PATH|-` for the same authorized principal):
 
 ```sh
-um connection linear authorization create acme-labs
-um connection linear authorization create acme-labs --connection-id lcn_01k0z6r1w8f4jy2m7q9v3x5abc
+useful connection linear authorization create acme-labs
+useful connection linear authorization create acme-labs --connection-id lcn_01k0z6r1w8f4jy2m7q9v3x5abc
 # To request write consent explicitly on a new or read-only connection:
-um connection linear authorization create acme-labs --enable-state-updates
+useful connection linear authorization create acme-labs --enable-state-updates
 ```
 
 Open the URL in a browser as the initiating owner. By default, the command polls the
@@ -1596,14 +1596,14 @@ access cancels callback processing. Save the session ID and inspect it later as 
 same owner; do not start another session merely because polling stopped:
 
 ```sh
-um connection linear authorization show acme-labs las_01k0z6r1w8f4jy2m7q9v3x5abc
-um connection linear authorization wait acme-labs las_01k0z6r1w8f4jy2m7q9v3x5abc --timeout 5m
-um connection linear list acme-labs
-um connection linear show acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc
-um connection linear team list acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc
-um connection linear state list acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc LINEAR_TEAM_ID
-um connection linear remove acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
-um connection linear delete acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+useful connection linear authorization show acme-labs las_01k0z6r1w8f4jy2m7q9v3x5abc
+useful connection linear authorization wait acme-labs las_01k0z6r1w8f4jy2m7q9v3x5abc --timeout 5m
+useful connection linear list acme-labs
+useful connection linear show acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc
+useful connection linear team list acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc
+useful connection linear state list acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc LINEAR_TEAM_ID
+useful connection linear remove acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+useful connection linear delete acme-labs lcn_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
 Remove erases the credential but reserves the workspace binding; delete also
@@ -1632,90 +1632,90 @@ or exact name. Start by discovering those values:
 
 ```sh
 # Discover the current account's organization memberships.
-um organization list
+useful organization list
 
 # Discover active and retained GitHub installation bindings for one organization.
-um connection github installation list acme-labs
+useful connection github installation list acme-labs
 
 # Discover the repositories currently authorized for one installation.
-um connection github repository list \
+useful connection github repository list \
   acme-labs \
   ghi_01k0z6r1w8f4jy2m7q9v3x5abc
 
 # Discover existing runner pools and copy a pool ID or exact name when needed.
-um runner pool list acme-labs
+useful runner pool list acme-labs
 ```
 
 Create a project from one discovered repository. Omit `--default-branch` to select the
 provider-observed default branch, and omit `--pool-id` to create a valid project
 that reports `runner_pool_unassigned` until configured. `--pool-id` names the project's
-first pool; add more with `um project runner-pool set`:
+first pool; add more with `useful project runner-pool set`:
 
 ```sh
-um project create acme-labs \
-  --name um \
+useful project create acme-labs \
+  --name useful \
   --installation-id ghi_01k0z6r1w8f4jy2m7q9v3x5abc \
   --repository-id 123456789 \
   --default-branch release \
   --pool-id rpl_01k0z6r1w8f4jy2m7q9v3x5abc
 
 # Page projects and show one complete configuration and readiness projection.
-um project list acme-labs --limit 50
-um project show \
+useful project list acme-labs --limit 50
+useful project show \
   acme-labs \
   prj_01k0z6r1w8f4jy2m7q9v3x5abc
 
 # Rename without changing execution configuration.
-um project rename \
+useful project rename \
   acme-labs \
   prj_01k0z6r1w8f4jy2m7q9v3x5abc \
-  --name um-release
+  --name useful-release
 ```
 
-An owner retires a project with `um project archive` and brings it back with
-`um project unarchive`; neither asks for confirmation, and repeating either changes nothing.
+An owner retires a project with `useful project archive` and brings it back with
+`useful project unarchive`; neither asks for confirmation, and repeating either changes nothing.
 An archived project admits no new runs and no configuration change until it is unarchived,
 while runs already admitted finish. Removing its runner pools stays possible, so a pool can
-be freed for deletion. `um project list` omits archived projects unless given
-`--include-archived`, which marks each archived entry; `um project show` prints an
+be freed for deletion. `useful project list` omits archived projects unless given
+`--include-archived`, which marks each archived entry; `useful project show` prints an
 `archived` line with the time. A change refused because the project is archived reports
 `project_archived` and exits 1:
 
 ```sh
-um project archive acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
-um project list acme-labs --include-archived
-um project unarchive acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
+useful project archive acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
+useful project list acme-labs --include-archived
+useful project unarchive acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
 ```
 
 Repository and runner-pool settings are independent. `set` assigns or atomically
 replaces the current value. Repeated removals are API-defined no-ops.
 
 A project runs on a set of the organization's runner pools, with no order among them, and
-one pool may serve several projects. `um project runner-pool set` replaces the whole set
+one pool may serve several projects. `useful project runner-pool set` replaces the whole set
 with the one or more pools it names, up to 20, each by ID or exact name; naming the same
-set again changes nothing. `um project runner-pool remove` empties the set, after which the
-project reports `runner_pool_unassigned`. `um project show` lists every pool of the set. A
+set again changes nothing. `useful project runner-pool remove` empties the set, after which the
+project reports `runner_pool_unassigned`. `useful project show` lists every pool of the set. A
 member's personal pool cannot serve a project, and naming one is refused:
 
 ```sh
 # Read, replace, update, or remove the repository binding.
-um project repository show \
+useful project repository show \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
-um project repository set \
+useful project repository set \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --installation-id ghi_01k0z6r1w8f4jy2m7q9v3x5abc \
   --repository-id 123456789
-um project repository update \
+useful project repository update \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --default-branch stable
-um project repository remove \
+useful project repository remove \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 
 # Replace the project's runner pools with the pools named, or remove them all.
-um project runner-pool set \
+useful project runner-pool set \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   rpl_01k0z6r1w8f4jy2m7q9v3x5abc builders
-um project runner-pool remove \
+useful project runner-pool remove \
   acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
@@ -1730,7 +1730,7 @@ same-organization repository and runner-pool checks remain server-enforced.
 ### Signed project webhooks
 
 After a qualified maintenance cutover, owners can create a subscription with
-`um project webhook create ORG PROJECT --config-file config.json`; use `-` for
+`useful project webhook create ORG PROJECT --config-file config.json`; use `-` for
 bounded standard input, unless the service credential also reads standard input.
 For example, the file may contain
 `{"url":"https://receiver.example.com/hook","eventTypes":["run.failed"],"contextKeys":[]}`.
@@ -1740,7 +1740,7 @@ JSON create/rotate results retain the operation `outcome` and report
 `secretDisclosure: "shown_once"` only when a validated signing secret is included;
 `"metadata_only"` explicitly means no secret was recovered. Human output gives
 the same warning. Never treat a metadata-only response as a new signing key.
-`um project webhook update ORG PROJECT WEBHOOK --expected-version 1 --config-file patch.json`
+`useful project webhook update ORG PROJECT WEBHOOK --expected-version 1 --config-file patch.json`
 replaces only supplied selections and never reads the version implicitly. Empty
 `contextKeys` clears that selection. URL changes require a new subscription.
 
@@ -1765,7 +1765,7 @@ raw-body signature verification, deduplication, overlap and retention.
 
 ## Cloud workflow definitions
 
-`um workflow definition publish --cloud ORGANIZATION --project PROJECT` records the
+`useful workflow definition publish --cloud ORGANIZATION --project PROJECT` records the
 revision locally and then publishes the tree to that project's Cloud definition: it
 uploads and seals the tree under its digest and publishes the revision with its bindings.
 A home's first publication creates the Cloud definition, or reuses the project's definition
@@ -1774,20 +1774,20 @@ locally; later ones publish to it, and `--cloud-new` creates another. A Cloud re
 the local revision recorded and exits 1.
 
 ```sh
-um workflow definition publish .um/engineering --bindings bindings.json \
+useful workflow definition publish .useful/engineering --bindings bindings.json \
   --cloud acme-labs --project prj_01k0z6r1w8f4jy2m7q9v3x5abc --json
 ```
 
 `--to` and `--new` choose the local definition under the home, and `--cloud-to` and
 `--cloud-new` choose the Cloud one. Cloud and the home assign their ids separately, in the
 same `def_` shape, and they are not interchangeable: `--to` takes an id
-`um workflow definition list` prints, and `--cloud-to` one
-`um workflow definition cloud list` prints. To publish the next revision of an existing
+`useful workflow definition list` prints, and `--cloud-to` one
+`useful workflow definition cloud list` prints. To publish the next revision of an existing
 Cloud definition from a home that has never published it, find its id and name it once:
 
 ```sh
-um workflow definition cloud list acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
-um workflow definition publish .um/engineering --bindings bindings.json \
+useful workflow definition cloud list acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
+useful workflow definition publish .useful/engineering --bindings bindings.json \
   --cloud acme-labs --project prj_01k0z6r1w8f4jy2m7q9v3x5abc --cloud-to DEFINITION
 ```
 
@@ -1804,35 +1804,35 @@ than one of the project's definitions is identical, Cloud refuses with
 `definition-reuse-ambiguous` and the report names their ids (`cloud.workflow.definitionIds`):
 choose one with `--cloud-to`, or create another with `--cloud-new`.
 
-`um workflow definition cloud` reads and changes a project's Cloud definitions, and lists
+`useful workflow definition cloud` reads and changes a project's Cloud definitions, and lists
 and shows a definition's start evaluations, newest first:
 
 ```sh
-um workflow definition cloud list acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc --limit 20
-um workflow definition cloud show acme-labs DEFINITION \
+useful workflow definition cloud list acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc --limit 20
+useful workflow definition cloud show acme-labs DEFINITION \
   --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc
 # enable, disable, archive and unarchive take the same arguments.
-um workflow definition cloud disable acme-labs DEFINITION \
+useful workflow definition cloud disable acme-labs DEFINITION \
   --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc
-um workflow definition cloud set-principal acme-labs DEFINITION PRINCIPAL \
+useful workflow definition cloud set-principal acme-labs DEFINITION PRINCIPAL \
   --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc
-um workflow definition cloud evaluation list acme-labs DEFINITION \
+useful workflow definition cloud evaluation list acme-labs DEFINITION \
   --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc --state failed
-um workflow definition cloud evaluation show acme-labs DEFINITION EVALUATION \
+useful workflow definition cloud evaluation show acme-labs DEFINITION EVALUATION \
   --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc
 ```
 
-With `--cloud ORGANIZATION`, `um workflow run show`, `resume` and `release` take a Cloud
+With `--cloud ORGANIZATION`, `useful workflow run show`, `resume` and `release` take a Cloud
 run ID as `RUN` and read or write no local run: `show` reads the run with its definition,
 subject claim, workflow state, latest progress, exits and newest trigger deliveries;
-`resume` asks Cloud to continue it, as `um run continue` does; and `release` asks Cloud,
+`resume` asks Cloud to continue it, as `useful run continue` does; and `release` asks Cloud,
 as an organization owner, to release the subject claim of the exited run. The control
 leaves take the same option ([Cloud runs](#cloud-runs)).
 
 ```sh
-um workflow run show run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --json
-um workflow run resume run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --from build
-um workflow run release run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs
+useful workflow run show run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --json
+useful workflow run resume run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --from build
+useful workflow run release run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs
 ```
 
 ## Cloud runs
@@ -1841,11 +1841,11 @@ List materialized runs within one organization (newest first) with bounded,
 opaque-cursor pages. Filters combine with AND; repeat exact context matches:
 
 ```sh
-um run list acme-labs --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
+useful run list acme-labs --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --state-group active --created-after 2025-01-01T00:00:00Z \
   --integration-context source=linear --integration-context linearIssue=LIV-123 \
   --limit 50 --json
-um run list acme-labs --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
+useful run list acme-labs --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --state-group active --created-after 2025-01-01T00:00:00Z \
   --integration-context source=linear --integration-context linearIssue=LIV-123 \
   --limit 50 --cursor 'CURSOR_FROM_NEXT_CURSOR' --json
@@ -1860,16 +1860,16 @@ using context filters, and do not put context in logs. For ticket dispatch, writ
 
 Run commands use the selected human OAuth credential by default and accept
 `--service-api-key-file PATH|-` when an API operation permits a service actor. They use
-the configured Useful Machinery deployment. `um workflow` runs and inspects local workflow
+the configured Useful Machinery deployment. `useful workflow` runs and inspects local workflow
 definitions and run directories; with `--cloud ORGANIZATION` it also publishes a definition
 to Cloud, creates a run of a Cloud definition, and reads and controls a definition-backed
-Cloud run, and `um workflow definition cloud` manages Cloud definitions (see
+Cloud run, and `useful workflow definition cloud` manages Cloud definitions (see
 [Cloud workflow definitions](#cloud-workflow-definitions)).
 
 Start a Cloud run of a workflow published as a Cloud definition with
-`um workflow run create ID --cloud ORGANIZATION --project PROJECT`; `um workflow definition
+`useful workflow run create ID --cloud ORGANIZATION --project PROJECT`; `useful workflow definition
 publish DIR --bindings FILE --cloud ORGANIZATION --project PROJECT` prints the id. `ID` is
-sent as the Cloud definition id, and nothing under the `um` home or any execution root is
+sent as the Cloud definition id, and nothing under the `useful` home or any execution root is
 read. `--workflow FILE` names a workflow file of the definition's tree, relative to its root,
 and the root workflow is run when it is omitted. The command takes `--source-branch`,
 `--workspace-branch` or `--workspace-commit`, `--display-name`, the named-input options or
@@ -1880,18 +1880,18 @@ it with no owner, in the project's runner pools. The local options (`--path`,
 `--execution-root`, `--run-dir`, `--agent-profiles`, `--stop-before`, `--owner`,
 `--external`) are usage errors beside `--cloud`, as the Cloud options are without it. A run
 of a definition names no publication: publish an export of a succeeded run with
-`um publication create`.
+`useful publication create`.
 
 ```sh
 # Admit an inputless run of the definition's root workflow without waiting for execution.
-um workflow run create def_01k0z6r1w8f4jy2m7q9v3x5abc \
+useful workflow run create def_01k0z6r1w8f4jy2m7q9v3x5abc \
   --cloud acme-labs --project prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --source-branch main \
   --display-name "Release checks"
 
 # Or run a workflow file of its tree and bind mixed values, including ordered and
 # explicitly empty collections.
-um workflow run create def_01k0z6r1w8f4jy2m7q9v3x5abc \
+useful workflow run create def_01k0z6r1w8f4jy2m7q9v3x5abc \
   --cloud acme-labs --project prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --workflow flows/review.yaml \
   --input-text-file request ./request.txt \
@@ -1902,7 +1902,7 @@ um workflow run create def_01k0z6r1w8f4jy2m7q9v3x5abc \
   --input-attachments-empty optionalEvidence
 
 # Create an open immutable set, upload its object members, and then seal it.
-um run input-set create acme-labs \
+useful run input-set create acme-labs \
   --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --input-text-file request ./request.txt \
   --input-attachment evidence text/plain ./notes.txt \
@@ -1910,44 +1910,44 @@ um run input-set create acme-labs \
   --json > input-set.json
 input_set_id=$(jq -er '.inputSet.id' input-set.json)
 
-um run input-set upload acme-labs "$input_set_id" \
+useful run input-set upload acme-labs "$input_set_id" \
   --member-file inputs/request ./request.txt \
   --member-file inputs/evidence/000000 ./notes.txt \
   --member-file inputs/evidence/000001 ./report.pdf
-um run input-set seal acme-labs "$input_set_id"
+useful run input-set seal acme-labs "$input_set_id"
 
-um workflow run create def_01k0z6r1w8f4jy2m7q9v3x5abc \
+useful workflow run create def_01k0z6r1w8f4jy2m7q9v3x5abc \
   --cloud acme-labs --project prj_01k0z6r1w8f4jy2m7q9v3x5abc \
   --input-set-id "$input_set_id"
 
 # Read the latest public projection.
-um run show \
+useful run show \
   acme-labs \
   run_01k0z6r1w8f4jy2m7q9v3x5abc
 
 # Observe settlement for up to 30 minutes without changing the run.
-um run show acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
+useful run show acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --wait --timeout 30m
 
 # Read the retained Linear lifecycle binding a retired trigger admitted the run with;
 # outcome not_found when none.
-um run linear show acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc --json
+useful run linear show acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc --json
 # List the binding's retained desired-state updates, newest first; --cursor continues a page.
-um run linear history acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc --limit 50 --json
+useful run linear history acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc --limit 50 --json
 
 # Continue from selected steps on the same retained runner boot. Admission is not execution.
-um run continue acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
+useful run continue acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --from build --from test --expected-version 7 --json
 # Observe the immutable admission receipt with the current Run until it settles.
-um run continue acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
+useful run continue acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --from build --wait --timeout 30m
 
 # Retry an eligible terminal run; observe the durable receipt until it resolves.
-um run retry acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
+useful run retry acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --expected-version 7 --timeout 30m
 
 # Request graceful cancellation; force is a separate explicit, separately keyed choice.
-um run cancel acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
+useful run cancel acme-labs run_01k0z6r1w8f4jy2m7q9v3x5abc \
   --wait --timeout 30m
 ```
 
@@ -1959,15 +1959,15 @@ leaf applies it to a local run. The output reports Cloud's acceptance, not the r
 application; `wait_not_current` means the run's wait changed after the read.
 
 ```sh
-um workflow run answer run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs \
+useful workflow run answer run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs \
   --question scope --text "Only the public API"
-um workflow run approve run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs
-um workflow run hand-back run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs \
+useful workflow run approve run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs
+useful workflow run hand-back run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs \
   --notes "Split the migration"
-um workflow run retry run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --json
-um workflow run stop run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs \
+useful workflow run retry run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --json
+useful workflow run stop run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs \
   --before review --reason "Hold for review"
-um workflow run lift run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --before review
+useful workflow run lift run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --before review
 ```
 
 Without an input flag, `workflow run create --cloud` admits an inputless run. The mixed-input flags may be
@@ -2030,12 +2030,12 @@ than claiming no run was created.
 Retained content is explicit run-scoped administration:
 
 ```sh
-um run input show acme-labs "$run_id" --json
+useful run input show acme-labs "$run_id" --json
 # Omit --member to download every member, or repeat it for an exact subset.
-um run input download acme-labs "$run_id" \
+useful run input download acme-labs "$run_id" \
   --member inputs/request \
   --output ./retained-inputs --json
-um run input delete acme-labs "$run_id" --yes
+useful run input delete acme-labs "$run_id" --yes
 ```
 
 A download first validates the retained inventory, requests capabilities in batches of at
@@ -2150,17 +2150,17 @@ definition=def_01k0z6r1w8f4jy2m7q9v3x5abc
 request_path=./request.txt
 artifact_path=./downloaded-run
 
-um workflow run create "$definition" \
+useful workflow run create "$definition" \
   --cloud "$organization" --project "$project" \
   --input-text-file request "$request_path" \
   --json > create.json
 run_id=$(jq -er 'select(.outcome == "accepted") | .runId' create.json)
 
-um run show "$organization" "$run_id" \
+useful run show "$organization" "$run_id" \
   --wait --timeout 30m --json > observed.json
 jq -e '.outcome == "settled" and .run.state == "succeeded"' observed.json >/dev/null
 
-um artifact download "$organization" "$run_id" \
+useful artifact download "$organization" "$run_id" \
   --output "$artifact_path" --json > download.json
 jq -e '.outcome == "downloaded"' download.json >/dev/null
 jq . "$artifact_path/result.json"
@@ -2185,20 +2185,20 @@ The complete Publication command surface is:
 
 ```sh
 # Create one attempt for an exact export and retain its identity.
-um publication create acme-labs "$run_id" \
+useful publication create acme-labs "$run_id" \
   --export changes --json > publication-create.json
 publication_id=$(jq -er '.publication.id' publication-create.json)
 
 # Create another attempt and wait locally for its terminal outcome.
-um publication create acme-labs "$run_id" \
+useful publication create acme-labs "$run_id" \
   --export changes --wait --timeout 30m
 
 # Read the current attempt, optionally waiting for a terminal snapshot.
-um publication show \
+useful publication show \
   acme-labs "$run_id" "$publication_id" --wait --timeout 30m
 
 # List one oldest-first page of attempts beneath the run.
-um publication list \
+useful publication list \
   acme-labs "$run_id" --limit 50
 ```
 
@@ -2207,7 +2207,7 @@ select its repository-local number. Cloud captures its head when the request is 
 use the optional hash when the caller has already inspected that exact revision:
 
 ```sh
-um publication create acme-labs "$run_id" --export changes \
+useful publication create acme-labs "$run_id" --export changes \
   --change-request 42 --expected-head "$inspected_head" --wait --json
 ```
 
@@ -2227,11 +2227,11 @@ waits for the selected Publication:
 set -euo pipefail
 organization=acme-labs
 
-um run show "$organization" "$run_id" \
+useful run show "$organization" "$run_id" \
   --wait --timeout 30m --json > run-observed.json
 jq -e '.outcome == "settled" and .run.state == "succeeded"' run-observed.json >/dev/null
 
-um publication create "$organization" "$run_id" \
+useful publication create "$organization" "$run_id" \
   --export changes --wait --timeout 30m --json > publication.json
 jq -e '.outcome == "succeeded"' publication.json >/dev/null
 publication_id=$(jq -er '.publication.id' publication.json)
@@ -2271,7 +2271,7 @@ logs or expose credentials.
 
 A runner pool is a named group of runners that projects run on. Every human member of an
 organization also has a personal pool, named by the service, that shows its member in
-`um runner pool show`; it serves that member's own runners and cannot serve a project.
+`useful runner pool show`; it serves that member's own runners and cannot serve a project.
 Owners administer every pool. A member administers the runners in their own personal pool:
 registering, renaming, changing the mode of and deleting them, and issuing their
 activations and join keys. Creating, renaming and deleting pools and moving runners between
@@ -2280,17 +2280,17 @@ pools stay with owners. Commands taking a pool or runner accept its ID or exact 
 ```sh
 # Show a pool, its member when it is personal, its waiting runs, and how many of its
 # runners are online, busy, idle and offline.
-um runner pool show acme-labs builders
+useful runner pool show acme-labs builders
 
 # Register a runner in a named pool, in a member's personal pool by principal ID, or,
 # naming neither, in your own personal pool. The activation file must not exist.
-um runner create acme-labs --pool-id builders --activation-file ./runner.activation.json
-um runner create acme-labs --member prn_01k0z6r1w8f4jy2m7q9v3x5abc \
+useful runner create acme-labs --pool-id builders --activation-file ./runner.activation.json
+useful runner create acme-labs --member prn_01k0z6r1w8f4jy2m7q9v3x5abc \
   --activation-file ./runner.activation.json
-um runner create acme-labs --activation-file ./runner.activation.json
+useful runner create acme-labs --activation-file ./runner.activation.json
 ```
 
-`um runner pool show` counts a runner busy while it holds unfinished work and idle while it
+`useful runner pool show` counts a runner busy while it holds unfinished work and idle while it
 is enabled, connected and free, from one snapshot; `--json` carries the counts and waiting
 runs as `status`. Against a Cloud release that does not report pool status, it shows the
 pool alone. `--pool-id` and `--member` cannot be combined, and a service actor must name one
@@ -2303,14 +2303,14 @@ a name the service chooses and its own credential, generated on the host.
 ```sh
 # Issue a key for a pool (or, naming none, your personal pool) that admits hosts for
 # seven days. A runner that joined with it is removed after one hour offline. The key's
-# one line of JSON goes to standard output, ready to paste at `um runner serve --join-key`.
-um runner join-key issue acme-labs \
+# one line of JSON goes to standard output, ready to paste at `useful runner serve --join-key`.
+useful runner join-key issue acme-labs \
   --pool-id builders \
   --expires-in 7d \
   --remove-after 1h
 
 # Or write the key to a new protected file, for hosts that start unattended.
-um runner join-key issue acme-labs \
+useful runner join-key issue acme-labs \
   --pool-id builders \
   --expires-in 7d \
   --remove-after 1h \
@@ -2318,10 +2318,10 @@ um runner join-key issue acme-labs \
 
 # List keys with their pool, issuer, state (issued, revoked or expired), expiry and
 # removal time. Continue with --cursor when a next cursor is shown.
-um runner join-key list acme-labs --pool-id builders
+useful runner join-key list acme-labs --pool-id builders
 
 # Stop new joins. The runners that joined with the key stay in the pool.
-um runner join-key revoke acme-labs rjk_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+useful runner join-key revoke acme-labs rjk_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 ```
 
 `--expires-in` runs from `1m` to `365d` and `--remove-after` from `5m` to `30d`, each a
@@ -2340,15 +2340,15 @@ key's removal time, counted from when Cloud last saw it, or from its join if it 
 connected, and holds no reserved or unfinished work; its runs and records are kept. A
 disabled runner is not removed, and re-enabling, renaming or moving a runner starts its
 offline time again. A runner registered with an activation is never removed this way, and
-revoking or expiring a key removes no runner. `um runner show` names the key a runner
+revoking or expiring a key removes no runner. `useful runner show` names the key a runner
 joined with. A workspace a runner kept for a failed run does not keep the runner: once a
 runner is removed or deleted, the runs whose workspaces it kept can no longer be continued
-with `um run continue`. Choose `--remove-after` to cover the longest outage after which
+with `useful run continue`. Choose `--remove-after` to cover the longest outage after which
 failed runs should still be continuable on the key's runners.
 
 ## Runner doctor
 
-Use `um runner doctor` to inspect the local prerequisites currently known to
+Use `useful runner doctor` to inspect the local prerequisites currently known to
 the runner. The default set contains only `environment.command.git`. It executes the
 `git` resolved from the runner process's `PATH`, requires a parseable version at least
 `2.29.0`, and reports a pass or failure for that check. Select
@@ -2361,40 +2361,40 @@ execution requirements are not all checked yet.
 
 ```sh
 # Run the default checks.
-um runner doctor
+useful runner doctor
 
 # Run a named check. Repeat --check to select more than one registered check.
-um runner doctor --check environment.command.git
+useful runner doctor --check environment.command.git
 
 # Validate the Pi installation selected from inherited PATH only.
-um runner doctor \
+useful runner doctor \
   --check execution.harness.pi-json-v1
 
 # Validate Claude Code independently, or repeat --check to inspect multiple harnesses.
-um runner doctor \
+useful runner doctor \
   --check execution.harness.claude-code-stream-json-v1
 
 # Validate Codex independently.
-um runner doctor \
+useful runner doctor \
   --check execution.harness.codex-app-server-v1
 
 # Check the agent-login readiness the runner serving from the runner home recorded.
-um runner doctor --check credentials.agent-logins
+useful runner doctor --check credentials.agent-logins
 
 # The same check for a service installation that names its configuration.
-um runner doctor \
-  --check credentials.agent-logins --config /etc/um/runner.json
+useful runner doctor \
+  --check credentials.agent-logins --config /etc/useful/runner.json
 
 # List IDs without running any checks.
-um runner doctor --list-checks
+useful runner doctor --list-checks
 
 # Emit the schema-version-1 JSON report.
-um runner doctor --json
+useful runner doctor --json
 ```
 
 With `--workflow FILE` the doctor runs no check and instead lists the credentials a workflow
 tree needs: it resolves each named workflow and every child workflow
-its `workflow` steps name, as `um workflow validate` does, and reports one requirement per
+its `workflow` steps name, as `useful workflow validate` does, and reports one requirement per
 kind (`github`, `gitlab`, `linear`, `claude_code`, `codex`) with every declaration that calls
 for it, followed by the nodes and forwarded variables whose credentials it cannot see. Agent
 profiles on Claude Code or Codex and credential-like names in the root
@@ -2410,7 +2410,7 @@ the signed-in member or, with `--service-api-key-file`, a service principal, abo
 organization's connections for the providers the workflows need: its Linear and GitLab
 connections and its GitHub App installations. A provider reads `missing`,
 `reconnect_required` (an inactive connection, or a GitLab credential that expired) or, for
-Linear, `insufficient_permission` with the `um connection` command that fixes it, and the
+Linear, `insufficient_permission` with the `useful connection` command that fixes it, and the
 command exits 1; a connection Useful Machinery holds ready stays `unverified` with
 `cloud: ready`, because the credential reaches a runner only for a run. A read the caller may
 not make leaves its requirement `unverified` with code `not_permitted`; only an organization
@@ -2418,14 +2418,14 @@ owner may list GitHub App installations. Add `--project-id PROJECT` to take the 
 provider from the project's repository instead of the `origin` remote: an unavailable
 repository reads `reconnect_required` with code `repository_unavailable`, or `unverified`
 with code `provider_unavailable` while the deployment's GitLab admission is closed, and names
-`um project repository show`.
+`useful project repository show`.
 
 With `--grants` the doctor also reads your own grants and shows, beneath each requirement, what
 you hold of its provider: each grant with, for every runner it is authorized for, its
-availability and next action as `um grant list` reports them, or `not_connected` with the
-`um grant create` command that makes one. Add `--runner-id RUNNER`, the runner's ID as
-`um runner list` prints it, to see each grant's status on that runner alone, or
-`not_connected` with the `um grant authorize` command when it is not authorized there;
+availability and next action as `useful grant list` reports them, or `not_connected` with the
+`useful grant create` command that makes one. Add `--runner-id RUNNER`, the runner's ID as
+`useful runner list` prints it, to see each grant's status on that runner alone, or
+`not_connected` with the `useful grant authorize` command when it is not authorized there;
 `--organization-id` keeps only that organization's coding agent grants. Your grants change a
 requirement's state and the exit status only with `--require-grants`, which needs `--grants`
 and `--runner-id`: a provider for which you hold no grant that runner can use (one
@@ -2433,42 +2433,42 @@ and `--runner-id`: a provider for which you hold no grant that runner can use (o
 and the doctor exits 1. `--grants` uses your own sign-in, never a service API key.
 
 With `--connect` the doctor signs you in to what the workflows need and then checks again. It
-runs the flow `um grant create --workflow` runs over the same files: it prints the plan of the
+runs the flow `useful grant create --workflow` runs over the same files: it prints the plan of the
 providers to sign in to, to reconnect and already held, runs the same sign-ins in the same
 order, and prints the same summary. `--organization-id ORGANIZATION` names the organization of
 a coding agent's grant, and `--replace` replaces each grant that needs reconnecting without
 asking. Once the sign-ins end it reads your grants again and prints the `--grants` report,
 with the organization's connections when `--readiness` is given; add `--runner-id RUNNER` to
 see each grant's status on that runner. With `--json` every line is one JSON document: the
-events `um grant create --workflow --json` prints, then the report as a last event `report`.
+events `useful grant create --workflow --json` prints, then the report as a last event `report`.
 A failure before the summary, or a signal that stops a sign-in, ends the command with that
 status and no report. Otherwise it exits 1 when a sign-in failed, when every provider selected
 was passed over, or when `--readiness` finds a requirement failing, and 0 otherwise.
 `--connect` uses your own sign-in, never a service API key. The doctor runs no step of the
 workflow in any mode, and it does not authorize a runner: the report names the
-`um grant authorize` command that does. Without `--readiness`, `--grants` or `--connect`
+`useful grant authorize` command that does. Without `--readiness`, `--grants` or `--connect`
 nothing is contacted.
 
 ```sh
 # List the credentials a workflow tree needs without running it.
-um runner doctor --workflow workflow.yaml
+useful runner doctor --workflow workflow.yaml
 
 # Bound the files by a directory other than their Git repository.
-um runner doctor --workflow workflow.yaml --source-root .
+useful runner doctor --workflow workflow.yaml --source-root .
 
 # Also check the organization's connections for the providers it needs.
-um runner doctor --workflow workflow.yaml \
+useful runner doctor --workflow workflow.yaml \
   --readiness --organization-id acme
 
 # Take the repository's provider from a project instead of the origin remote.
-um runner doctor --workflow workflow.yaml \
+useful runner doctor --workflow workflow.yaml \
   --readiness --organization-id acme --project-id PROJECT
 
 # Show your grants for the providers it needs, and their status on one runner.
-um runner doctor --workflow workflow.yaml --grants --runner-id RUNNER
+useful runner doctor --workflow workflow.yaml --grants --runner-id RUNNER
 
 # Sign in to what it lacks, replace what needs reconnecting, and report again.
-um runner doctor --workflow workflow.yaml --connect --replace --runner-id RUNNER
+useful runner doctor --workflow workflow.yaml --connect --replace --runner-id RUNNER
 ```
 
 A selected harness check identifies its execution profile and compatibility policy in
@@ -2482,11 +2482,11 @@ release newer than the qualification release. An untested installation still pas
 with code `ok`, and the command exits 0 when every selected check passes.
 
 The opt-in `credentials.agent-logins` check reads the readiness document
-`um runner serve` records beside `runnerStatePath`, found through `--config PATH` or,
+`useful runner serve` records beside `runnerStatePath`, found through `--config PATH` or,
 without it, the runner home's configuration (see [Runner serve](#runner-serve)); a runner
 home that holds no configuration is read as its default layout, with the state at
-`runner/state.json`. No other check reads the configuration or anything under the `um`
-home, so the default checks run with neither `UM_HOME` nor `HOME` set. It passes when every agent login Cloud authorized
+`runner/state.json`. No other check reads the configuration or anything under the `useful`
+home, so the default checks run with neither `USEFUL_HOME` nor `HOME` set. It passes when every agent login Cloud authorized
 for the runner is `ready` and was not refused at its last use, or Cloud authorized none
 (`revoked`, or `not_authorized` with no authorization in force), and otherwise fails with that
 provider's state as its code, such as `foreign_login`, `not_authorized` for a login whose
@@ -2495,8 +2495,8 @@ login the provider refused at its last use. Its details name each provider's ava
 `<provider>_availability` and `<provider>_next_action`. It fails
 `readiness_unknown` when the runner has recorded no readiness yet, a runner home that holds
 no configuration included, `config_invalid` for a configuration it cannot load, and
-`config_required` when no `--config` is given and the `um` home cannot be located because
-neither `UM_HOME` nor `HOME` is set. It takes no lock, creates nothing, never reads the
+`config_required` when no `--config` is given and the `useful` home cannot be located because
+neither `USEFUL_HOME` nor `HOME` is set. It takes no lock, creates nothing, never reads the
 runner credential, contacts nothing, and reports no login material.
 
 Checks are registered statically by components compiled into this executable. The
@@ -2558,12 +2558,12 @@ sign-in only to register a host that holds no enrolled state when `--personal` o
 `--pool-id` is given, and the runner it then serves uses its own credential. Enrollment,
 service startup, `runner status` and `runner grant sync` consume the same closed operator
 configuration. Without `--config` it is the runner home's: the
-directory `runner` under the `um` home (`$UM_HOME` when it is set and not empty, otherwise
-`$HOME/.um`, a relative home taken from the working directory) holds the configuration and
+directory `runner` under the `useful` home (`$USEFUL_HOME` when it is set and not empty, otherwise
+`$HOME/.useful`, a relative home taken from the working directory) holds the configuration and
 the files it names:
 
 ```text
-<um home>/runner/
+<useful home>/runner/
 ├── config.json     operator configuration
 ├── state.json      enrolled state, written by runner enroll, a registration or a join
 ├── control.sock    control socket, created by a serving runner
@@ -2571,7 +2571,7 @@ the files it names:
 ```
 
 `runner serve` and `runner enroll` given no `--config` first create what the home lacks, on
-the host alone: the `um` home, `runner/` and `runner/work/`, each with mode `0700`, and
+the host alone: the `useful` home, `runner/` and `runner/work/`, each with mode `0700`, and
 `runner/config.json` with mode `0600`, holding `schemaVersion` 1, `deploymentMode`
 `production` and the absolute paths of `runner/state.json`, `runner/control.sock` and
 `runner/work`. Initialization writes no state, journal, lock or socket, contacts no Cloud
@@ -2588,31 +2588,31 @@ configuration, reported as an invalid configuration; or when the configuration n
 in a home that was moved or copied, reported as a conflict naming both paths.
 
 `runner status` and `runner grant sync` given no `--config` create and change nothing under
-the `um` home. When the runner home holds a configuration they ask the control socket it
+the `useful` home. When the runner home holds a configuration they ask the control socket it
 names, and one that does not load is their failure; when it holds none they ask
 `runner/control.sock`, so a home no runner serves from answers as an absent socket does,
 with exit 4. A command that reads the configuration, given no `--config` while neither
-`UM_HOME` nor `HOME` is set, exits 1 naming both variables and `--config`, having created
+`USEFUL_HOME` nor `HOME` is set, exits 1 naming both variables and `--config`, having created
 nothing.
 
 ```sh
-um runner enroll --activation-file /protected/path/activation.json
-um runner serve
-um runner status
+useful runner enroll --activation-file /protected/path/activation.json
+useful runner serve
+useful runner status
 ```
 
 A start that finds no enrolled state and is given neither a join key nor `--personal` or
-`--pool-id` exits 1 saying the host is not enrolled and naming `um runner enroll --activation-file <PATH>` and
-`um runner serve --join-key-file <PATH>` as the ways to enroll it; it contacts no Cloud
+`--pool-id` exits 1 saying the host is not enrolled and naming `useful runner enroll --activation-file <PATH>` and
+`useful runner serve --join-key-file <PATH>` as the ways to enroll it; it contacts no Cloud
 deployment.
 
-Another `UM_HOME` selects another runner home, and with it that home's workflow storage, so
+Another `USEFUL_HOME` selects another runner home, and with it that home's workflow storage, so
 a second runner on one host is the same commands with, for example,
-`UM_HOME=/srv/um-two um runner serve`. The two homes serve at once, each with its own
+`USEFUL_HOME=/srv/useful-two useful runner serve`. The two homes serve at once, each with its own
 identity, while a second `runner serve` on one home is refused as it is for one
 `--config`. Where a person's sign-in is stored, a coding agent's own configuration
 directory such as `CLAUDE_CONFIG_DIR`, and the Cloud organization a command addresses do
-not follow `UM_HOME`.
+not follow `USEFUL_HOME`.
 
 A service installation names a configuration with absolute paths owned by its service
 account with `--config PATH`, which is authoritative: the command uses that file as before
@@ -2623,14 +2623,14 @@ work root it names must exist before startup:
 {
   "schemaVersion": 1,
   "deploymentMode": "production",
-  "runnerStatePath": "/var/lib/um/runner-state.json",
-  "controlSocketPath": "/run/um/runner.sock",
-  "workRoot": "/var/lib/um/work"
+  "runnerStatePath": "/var/lib/useful/runner-state.json",
+  "controlSocketPath": "/run/useful/runner.sock",
+  "workRoot": "/var/lib/useful/work"
 }
 ```
 
 ```sh
-um runner serve --config /etc/um/runner.json
+useful runner serve --config /etc/useful/runner.json
 ```
 
 Production operators should follow the private monorepo's
@@ -2638,17 +2638,17 @@ Production operators should follow the private monorepo's
 service-manager shutdown allowance, control-plane cutover, drain, and recovery. That
 operator runbook is intentionally outside this public CLI source mirror.
 
-A person signed in on the host with `um auth login` can instead register it when the
+A person signed in on the host with `useful auth login` can instead register it when the
 service first starts, with no activation file, in their own personal pool or, given the
 pool's ID or exact name, in another pool:
 
 ```sh
-um runner serve --config /etc/um/runner.json --personal --organization my-org
-um runner serve --config /etc/um/runner.json --pool-id builders --organization my-org
+useful runner serve --config /etc/useful/runner.json --personal --organization my-org
+useful runner serve --config /etc/useful/runner.json --pool-id builders --organization my-org
 ```
 
 `--organization` is required with `--personal` or `--pool-id` and refused without one of
-them; `--personal`, `--pool-id` and a join key, `UM_RUNNER_JOIN_KEY` included, exclude one
+them; `--personal`, `--pool-id` and a join key, `USEFUL_RUNNER_JOIN_KEY` included, exclude one
 another. Each violation is a usage error, exit 2, before the configuration is read. The
 command takes no organization from the environment or the sign-in, never tries another
 mode when the one given fails, never looks for an existing runner by its name and takes no
@@ -2697,7 +2697,7 @@ From a terminal, `--join-key` asks for the key's one line of JSON, as `runner jo
 issue` printed it, at a prompt that does not echo it:
 
 ```sh
-um runner serve --config /etc/um/runner.json --join-key
+useful runner serve --config /etc/useful/runner.json --join-key
 ```
 
 The flag takes no value, so the key is never a command-line argument. The prompt reads one
@@ -2707,13 +2707,13 @@ fails as a usage error, exit 2, before anything is staged or sent, and names the
 an unattended start; it never waits for input. A line that is not a join key fails as an
 unreadable key does and sends nothing.
 
-An unattended host takes the key as a file or in the `UM_RUNNER_JOIN_KEY` environment
+An unattended host takes the key as a file or in the `USEFUL_RUNNER_JOIN_KEY` environment
 variable, which holds the key's one line of JSON, for example from a platform's secret
 store:
 
 ```sh
-um runner serve --join-key-file /protected/path/builders.join-key.json
-UM_RUNNER_JOIN_KEY="$BUILDERS_JOIN_KEY" um runner serve --config /etc/um/runner.json
+useful runner serve --join-key-file /protected/path/builders.join-key.json
+USEFUL_RUNNER_JOIN_KEY="$BUILDERS_JOIN_KEY" useful runner serve --config /etc/useful/runner.json
 ```
 
 On a host that holds no enrolled state, the service generates its credential, joins the
@@ -2727,9 +2727,9 @@ Cloud, so a host that cannot serve registers no runner. A key given with `--join
 is read as an activation is: from a regular file private to the current user, which is
 left in place, or from piped standard input with `--join-key-file -`; an interactive
 terminal is refused there, since `--join-key` is the terminal's input. `--join-key`,
-`--join-key-file` and `UM_RUNNER_JOIN_KEY` exclude one another: giving the key in more than
+`--join-key-file` and `USEFUL_RUNNER_JOIN_KEY` exclude one another: giving the key in more than
 one way is a usage error, and an expired key is refused before Cloud is contacted. The
-service reads the key once, removes `UM_RUNNER_JOIN_KEY` from its own environment by
+service reads the key once, removes `USEFUL_RUNNER_JOIN_KEY` from its own environment by
 restarting itself without it, never writes the key to its state or keeps it for a later
 start, and never passes it to a workflow step.
 
@@ -2765,7 +2765,7 @@ and every runner materializes and verifies that source before admission.
 Rotate a running host only with a replacement activation issued for its existing runner:
 
 ```sh
-um runner enroll \
+useful runner enroll \
   --replace-credential \
   --activation-file /protected/path/replacement-activation.json
 ```
@@ -2800,13 +2800,13 @@ provider by running that coding agent's own program once with the login, outside
 with a fixed prompt that asks for a one-word answer: a login it installs when it starts or
 while it holds no assignment, and every `ready` login when you ask it to set up now. A check
 spends one model turn of the login owner's account at the provider, starts only while the
-runner holds no assignment, and is never made for an assignment's own setup. `um runner
+runner holds no assignment, and is never made for an assignment's own setup. `useful runner
 status` shows each provider's readiness once it has set up, and you can ask the live runner
 to set up now:
 
 ```sh
-um runner grant sync
-um runner grant sync --json
+useful runner grant sync
+useful runner grant sync --json
 ```
 
 The command goes only through the local control socket and prints one line per provider
@@ -2833,7 +2833,7 @@ Serve found no supported `claude` or `codex` on its `PATH` when it started), `st
 authorized for the runner is not `ready`, one Cloud refuses the owner of
 (`insufficient_permission`) included, or its login was refused at its last use, and 4 when
 Runner Serve is not reachable or holds an assignment (`runner_busy`); a check with no answer
-does not change the exit status. A Runner Serve process started from an older `um` refuses
+does not change the exit status. A Runner Serve process started from an older `useful` refuses
 the request; restart it on this release.
 
 Runner startup selects `pi`, `claude`, and `codex` independently from its inherited
@@ -2887,7 +2887,7 @@ acceptance. The fixed preparation deadline is not extended
 by progress. Verified staging remains under the assignment root through execution and is
 removed or quarantined by the existing release path. Cloud commands, agents, and
 finalizers receive the exact recorded source branch and pinned commit as
-`UM_SOURCE_BRANCH` and `UM_SOURCE_COMMIT_OID`; local execution receives neither.
+`USEFUL_SOURCE_BRANCH` and `USEFUL_SOURCE_COMMIT_OID`; local execution receives neither.
 After the later start effect, a token-free repository helper can obtain lease-bound read
 access only for the credential-free primary `origin`. Runner Serve disables the helper,
 revokes every known issuance after process quiescence, destroys local helper and token
@@ -2934,7 +2934,7 @@ For example, the receiver and its credential both remain under the operator's co
 ```sh
 OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=https://telemetry.example.test/v1/traces \
 OTEL_EXPORTER_OTLP_TRACES_HEADERS='authorization=Bearer%20operator-owned-token' \
-  um runner serve
+  useful runner serve
 ```
 
 `OTEL_SDK_DISABLED` is the sole remote-export privacy switch. Case-insensitive `true`
@@ -3013,7 +3013,7 @@ Release binaries are not currently signed or notarized. Verify a downloaded arch
 with the attached checksums and GitHub attestation before running it:
 
 ```sh
-archive='um-<version>-<target>.tar.gz'
+archive='useful-<version>-<target>.tar.gz'
 
 # Linux
 sha256sum --ignore-missing --check SHA256SUMS

@@ -24,7 +24,7 @@ slow-timeout = { period = "30s", terminate-after = 2 }
 # started late beside the rest of the suite. Host load from other work can
 # still stretch them past the ordinary 60-second limit (52-60 s and timeouts
 # at load 30-40), so they receive the integration-test backstop.
-filter = "package(um-execution) & (test(=workflow::local_run::tests::artifact_set_carrier_boundary_is_shared_by_archive_and_portable_inspection) | test(=workflow::local_run::tests::archived_attempt_loads_valid_result_larger_than_state_document_limit))"
+filter = "package(useful-execution) & (test(=workflow::local_run::tests::artifact_set_carrier_boundary_is_shared_by_archive_and_portable_inspection) | test(=workflow::local_run::tests::archived_attempt_loads_valid_result_larger_than_state_document_limit))"
 priority = 100
 threads-required = 2
 slow-timeout = { period = "60s", terminate-after = 2 }
@@ -34,7 +34,7 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 # host_scaled_watchdog multiplies by the host's load, up to four times; it
 # receives the integration-test backstop so the watchdog's diagnosis, not this
 # termination, is what a loaded host reports.
-filter = "package(um-execution) & test(=workflow::pi::adapter_tests::stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_report)"
+filter = "package(useful-execution) & test(=workflow::pi::adapter_tests::stubborn_descendant_is_forced_at_the_injected_deadline_before_terminal_report)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
@@ -42,14 +42,14 @@ slow-timeout = { period = "60s", terminate-after = 2 }
 # that host_scaled_watchdog multiplies by the host's load, up to four times;
 # the package receives the integration-test backstop so the watchdog's
 # diagnosis, not this termination, is what a loaded host reports.
-filter = "package(um-runner)"
+filter = "package(useful-runner)"
 slow-timeout = { period = "60s", terminate-after = 2 }
 
 [[profile.default.overrides]]
 # On macOS, the process-heavy tests below use the wider group instead. Only
 # the group differs; the later overrides still set their timeouts.
 platform = 'cfg(target_os = "macos")'
-filter = "(package(um-execution) & (test(workflow::pi::adapter_tests) | test(workflow::codex::adapter_tests))) | kind(test)"
+filter = "(package(useful-execution) & (test(workflow::pi::adapter_tests) | test(workflow::codex::adapter_tests))) | kind(test)"
 test-group = "external-process-macos"
 
 [[profile.default.overrides]]
@@ -57,7 +57,7 @@ test-group = "external-process-macos"
 # process-capacity limit without widening their cancellation deadlines or the
 # default slow-test backstop. Uncapped, the Codex fixtures miss their 10-second
 # watchdogs on macOS once the rest of the suite overlaps them.
-filter = "package(um-execution) & (test(workflow::pi::adapter_tests) | test(workflow::codex::adapter_tests))"
+filter = "package(useful-execution) & (test(workflow::pi::adapter_tests) | test(workflow::codex::adapter_tests))"
 test-group = "external-process"
 
 [[profile.default.overrides]]

@@ -33,11 +33,11 @@ fn names(directory: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// Asserts that `um_home` holds the runner home's directories at `0700` and
+/// Asserts that `useful_home` holds the runner home's directories at `0700` and
 /// its configuration at `0600`, and no enrolled state.
-fn assert_layout(um_home: &Path) {
-    let runner = um_home.join("runner");
-    for directory in [um_home.to_owned(), runner.clone(), runner.join("work")] {
+fn assert_layout(useful_home: &Path) {
+    let runner = useful_home.join("runner");
+    for directory in [useful_home.to_owned(), runner.clone(), runner.join("work")] {
         assert!(fs::symlink_metadata(&directory).unwrap().is_dir());
         assert_eq!(mode(&directory), 0o700, "{}", directory.display());
     }
@@ -45,35 +45,35 @@ fn assert_layout(um_home: &Path) {
     assert!(!runner.join("state.json").exists());
 }
 
-/// Asserts that `um_home` holds the runner home `serve` initializes and
+/// Asserts that `useful_home` holds the runner home `serve` initializes and
 /// nothing else under `runner/`: no state, journal, lock or socket.
-fn assert_initialized(um_home: &Path) {
-    assert_layout(um_home);
+fn assert_initialized(useful_home: &Path) {
+    assert_layout(useful_home);
     assert_eq!(
-        names(&um_home.join("runner")),
+        names(&useful_home.join("runner")),
         BTreeSet::from(["config.json".to_owned(), "work".to_owned()])
     );
 }
 
-/// `um runner serve ARGUMENTS` with an empty `PATH`, so no harness of the
-/// machine running the suite is discovered, and `UM_HOME` and `HOME` as given:
+/// `useful runner serve ARGUMENTS` with an empty `PATH`, so no harness of the
+/// machine running the suite is discovered, and `USEFUL_HOME` and `HOME` as given:
 /// a variable given `None` is removed.
 fn serve_with_homes(
     arguments: &[&str],
-    um_home: Option<&Path>,
+    useful_home: Option<&Path>,
     home: Option<&Path>,
     empty_path: &tempfile::TempDir,
 ) -> Command {
     let mut command = serve_command(arguments);
     command.env("PATH", empty_path.path());
-    set_homes(&mut command, um_home, home);
+    set_homes(&mut command, useful_home, home);
     command
 }
 
-/// Gives `command` `UM_HOME` and `HOME` as given, removing a variable given
+/// Gives `command` `USEFUL_HOME` and `HOME` as given, removing a variable given
 /// `None`.
-fn set_homes(command: &mut Command, um_home: Option<&Path>, home: Option<&Path>) {
-    for (name, value) in [(UM_HOME_VARIABLE, um_home), (HOME, home)] {
+fn set_homes(command: &mut Command, useful_home: Option<&Path>, home: Option<&Path>) {
+    for (name, value) in [(USEFUL_HOME_VARIABLE, useful_home), (HOME, home)] {
         match value {
             Some(value) => command.env(name, value),
             None => command.env_remove(name),
@@ -81,7 +81,7 @@ fn set_homes(command: &mut Command, um_home: Option<&Path>, home: Option<&Path>)
     }
 }
 
-/// A `um` home under `/tmp`, so the control socket of its runner home fits
+/// A `useful` home under `/tmp`, so the control socket of its runner home fits
 /// `sun_path` whatever the suite's `TMPDIR`.
 struct ServeHome {
     root: tempfile::TempDir,
@@ -98,12 +98,12 @@ impl ServeHome {
         }
     }
 
-    fn um_home(&self) -> PathBuf {
-        self.root.path().join("um")
+    fn useful_home(&self) -> PathBuf {
+        self.root.path().join("useful")
     }
 
     fn runner(&self) -> PathBuf {
-        self.um_home().join("runner")
+        self.useful_home().join("runner")
     }
 
     fn state(&self) -> PathBuf {
@@ -113,7 +113,11 @@ impl ServeHome {
     /// A `development` configuration of the home's own layout, which the
     /// loopback fakes need, naming `state` as its state.
     fn write_development_config(&self, state: &Path) {
-        for directory in [self.um_home(), self.runner(), self.runner().join("work")] {
+        for directory in [
+            self.useful_home(),
+            self.runner(),
+            self.runner().join("work"),
+        ] {
             fs::create_dir_all(&directory).unwrap();
             fs::set_permissions(&directory, Permissions::from_mode(0o700)).unwrap();
         }
@@ -147,7 +151,7 @@ impl ServeHome {
         ServeProcess::start(
             serve_with_homes(
                 arguments,
-                Some(&self.um_home()),
+                Some(&self.useful_home()),
                 Some(self.root.path()),
                 &self.empty_path,
             ),
@@ -172,32 +176,32 @@ fn serve_on_an_empty_home_initializes_it_and_says_the_host_is_not_enrolled() {
     let custom = tempfile::tempdir().unwrap();
     let elsewhere = tempfile::tempdir().unwrap();
     let home = tempfile::tempdir().unwrap();
-    let custom_um_home = custom.path().join("custom-um");
-    let default_um_home = home.path().join(".um");
+    let custom_useful_home = custom.path().join("custom-useful");
+    let default_useful_home = home.path().join(".useful");
     let empty = Path::new("");
-    // Each case: UM_HOME, HOME and the `um` home they select.
+    // Each case: USEFUL_HOME, HOME and the `useful` home they select.
     let cases: [(Option<&Path>, Option<&Path>, &Path); 3] = [
         (
-            Some(&custom_um_home),
+            Some(&custom_useful_home),
             Some(elsewhere.path()),
-            &custom_um_home,
+            &custom_useful_home,
         ),
-        (Some(empty), Some(home.path()), &default_um_home),
-        (None, Some(home.path()), &default_um_home),
+        (Some(empty), Some(home.path()), &default_useful_home),
+        (None, Some(home.path()), &default_useful_home),
     ];
-    for (um_home, home_variable, selected) in cases {
+    for (useful_home, home_variable, selected) in cases {
         if selected.exists() {
             fs::remove_dir_all(selected).unwrap();
         }
 
-        let output = serve_with_homes(&[], um_home, home_variable, &empty_path)
+        let output = serve_with_homes(&[], useful_home, home_variable, &empty_path)
             .output()
             .unwrap();
 
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert_eq!(output.status.code(), Some(1), "{stderr}");
         assert!(output.stdout.is_empty());
-        for named in ["um runner enroll", "--join-key-file"] {
+        for named in ["useful runner enroll", "--join-key-file"] {
             assert!(stderr.contains(named), "{named}: {stderr}");
         }
         assert_initialized(selected);
@@ -212,7 +216,7 @@ fn serve_on_an_empty_home_initializes_it_and_says_the_host_is_not_enrolled() {
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(output.status.code(), Some(1), "{stderr}");
-    for named in [UM_HOME_VARIABLE, "--config"] {
+    for named in [USEFUL_HOME_VARIABLE, "--config"] {
         assert!(stderr.contains(named), "{named}: {stderr}");
     }
     assert!(names(working_directory.path()).is_empty());
@@ -223,14 +227,14 @@ fn serve_on_an_empty_home_initializes_it_and_says_the_host_is_not_enrolled() {
 fn serve_given_a_configuration_neither_reads_nor_creates_the_runner_home() {
     let witness = ConnectionWitness::new();
     let fixture = ServeStatusFixture::new(&witness.url);
-    let um_home = tempfile::tempdir().unwrap();
+    let useful_home = tempfile::tempdir().unwrap();
     let empty_path = tempfile::tempdir().unwrap();
 
     let serve = ServeProcess::start(
         serve_with_homes(
             &["--config", &fixture.config],
-            Some(um_home.path()),
-            Some(um_home.path()),
+            Some(useful_home.path()),
+            Some(useful_home.path()),
             &empty_path,
         ),
         StandardInput::Null,
@@ -240,7 +244,7 @@ fn serve_given_a_configuration_neither_reads_nor_creates_the_runner_home() {
         connection_bearer(serve, &witness),
         bearer_of(&enrolled_state_document(&witness.url))
     );
-    assert!(names(um_home.path()).is_empty());
+    assert!(names(useful_home.path()).is_empty());
 }
 
 // REQ-RUNNERENROLL-110
@@ -357,20 +361,20 @@ impl ServeHome {
         path.to_string_lossy().into_owned()
     }
 
-    /// `um runner enroll ARGUMENTS` with this home as `UM_HOME`.
+    /// `useful runner enroll ARGUMENTS` with this home as `USEFUL_HOME`.
     fn enroll(&self, arguments: &[&str]) -> Output {
         let mut command = vec!["runner", "enroll"];
         command.extend_from_slice(arguments);
         self.run(&command)
     }
 
-    /// `um ARGUMENTS` with this home as `UM_HOME`.
+    /// `useful ARGUMENTS` with this home as `USEFUL_HOME`.
     fn run(&self, arguments: &[&str]) -> Output {
-        let um_home = self.um_home();
+        let useful_home = self.useful_home();
         run_with_env(
             arguments,
             &[
-                (UM_HOME_VARIABLE, um_home.to_str().unwrap()),
+                (USEFUL_HOME_VARIABLE, useful_home.to_str().unwrap()),
                 (HOME, self.root.path().to_str().unwrap()),
             ],
         )
@@ -398,7 +402,7 @@ fn enroll_on_an_empty_home_initializes_it_and_its_production_configuration_refus
     let output = home.enroll(&["--activation-file", &activation, "--json"]);
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
-    assert_layout(&home.um_home());
+    assert_layout(&home.useful_home());
     assert!(!home.journal().exists());
     let config: serde_json::Value =
         serde_json::from_slice(&fs::read(home.runner().join("config.json")).unwrap()).unwrap();
@@ -489,7 +493,7 @@ fn enroll_given_a_configuration_neither_reads_nor_creates_the_runner_home() {
     fixture.write_development_config(&fixture.state());
     let config = fixture.runner().join("config.json");
     let activation = fixture.write_activation(&join_base(&server), ACTIVATION_ID);
-    let um_home = tempfile::tempdir().unwrap();
+    let useful_home = tempfile::tempdir().unwrap();
 
     let output = run_with_env(
         &[
@@ -501,13 +505,13 @@ fn enroll_given_a_configuration_neither_reads_nor_creates_the_runner_home() {
             config.to_str().unwrap(),
             "--json",
         ],
-        &[(UM_HOME_VARIABLE, um_home.path().to_str().unwrap())],
+        &[(USEFUL_HOME_VARIABLE, useful_home.path().to_str().unwrap())],
     );
 
     assert!(output.status.success(), "{output:?}");
     server.finish_one();
     assert_eq!(mode(&fixture.state()), 0o600);
-    assert!(names(um_home.path()).is_empty());
+    assert!(names(useful_home.path()).is_empty());
 }
 
 // REQ-RUNNERENROLL-48, REQ-RUNNERENROLL-109
@@ -555,7 +559,7 @@ fn enroll_replace_credential_without_a_configuration_asks_the_homes_control_sock
     assert_eq!(state["pendingCredential"]["id"], replacement);
 }
 
-/// `um runner status` and both spellings of `um runner grant sync`, each with
+/// `useful runner status` and both spellings of `useful runner grant sync`, each with
 /// the request it sends and a live runner's answer to it.
 fn reading_commands() -> [(&'static [&'static str], &'static [u8], Vec<u8>); 3] {
     [
@@ -579,14 +583,14 @@ fn reading_commands_on_an_absent_or_empty_home_find_no_runner_and_create_nothing
 
         assert_eq!(output.status.code(), Some(4), "{command:?}: {output:?}");
         assert!(output.stdout.is_empty(), "{command:?}");
-        assert!(!home.um_home().exists(), "{command:?}");
+        assert!(!home.useful_home().exists(), "{command:?}");
 
-        fs::create_dir(home.um_home()).unwrap();
+        fs::create_dir(home.useful_home()).unwrap();
         let output = home.run(command);
 
         assert_eq!(output.status.code(), Some(4), "{command:?}: {output:?}");
         assert!(output.stdout.is_empty(), "{command:?}");
-        assert!(names(&home.um_home()).is_empty(), "{command:?}");
+        assert!(names(&home.useful_home()).is_empty(), "{command:?}");
     }
 }
 
@@ -662,16 +666,16 @@ fn status_given_a_configuration_neither_reads_nor_creates_the_runner_home() {
     let socket = ScriptedControlSocket::answering(&socket_path, CONNECTED_STATUS.to_vec());
     let config = fixture.root.path().join("config.json");
     write_status_config_at(&config, &socket_path);
-    let um_home = tempfile::tempdir().unwrap();
+    let useful_home = tempfile::tempdir().unwrap();
 
     let output = run_with_env(
         &["runner", "status", "--config", config.to_str().unwrap()],
-        &[(UM_HOME_VARIABLE, um_home.path().to_str().unwrap())],
+        &[(USEFUL_HOME_VARIABLE, useful_home.path().to_str().unwrap())],
     );
 
     assert_eq!(socket.request(), STATUS_REQUEST);
     assert!(output.status.success(), "{output:?}");
-    assert!(names(um_home.path()).is_empty());
+    assert!(names(useful_home.path()).is_empty());
 }
 
 const AGENT_LOGINS: [&str; 3] = ["--check", "credentials.agent-logins", "--json"];
@@ -683,17 +687,21 @@ const DOCTOR_AGENT_LOGINS: [&str; 5] = [
     "--json",
 ];
 
-/// `um runner doctor ARGUMENTS` with `PATH` naming only a Git that reports
-/// 2.42.0, and `UM_HOME` and `HOME` as given: a variable given `None` is
+/// `useful runner doctor ARGUMENTS` with `PATH` naming only a Git that reports
+/// 2.42.0, and `USEFUL_HOME` and `HOME` as given: a variable given `None` is
 /// removed.
-fn doctor_with_homes(arguments: &[&str], um_home: Option<&Path>, home: Option<&Path>) -> Output {
+fn doctor_with_homes(
+    arguments: &[&str],
+    useful_home: Option<&Path>,
+    home: Option<&Path>,
+) -> Output {
     let git = fake_git("printf '%s\\n' 'git version 2.42.0'");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args(["runner", "doctor"])
         .args(arguments)
         .env("PATH", git.path());
-    set_homes(&mut command, um_home, home);
+    set_homes(&mut command, useful_home, home);
     command.output().unwrap()
 }
 
@@ -709,13 +717,13 @@ fn only_check(output: &Output) -> serde_json::Value {
 #[test]
 fn doctor_agent_logins_on_an_empty_home_is_readiness_unknown_and_creates_nothing() {
     let home = ServeHome::new();
-    fs::create_dir(home.um_home()).unwrap();
+    fs::create_dir(home.useful_home()).unwrap();
 
     let output = home.run(&DOCTOR_AGENT_LOGINS);
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(only_check(&output)["code"], "readiness_unknown");
-    assert!(names(&home.um_home()).is_empty());
+    assert!(names(&home.useful_home()).is_empty());
 }
 
 // REQ-RUNNERENROLL-86
@@ -749,45 +757,45 @@ fn doctor_agent_logins_reads_the_readiness_beside_the_state_the_homes_configurat
 
 // REQ-RUNNERENROLL-86
 #[test]
-fn doctor_agent_logins_without_a_um_home_or_configuration_is_config_required() {
+fn doctor_agent_logins_without_a_useful_home_or_configuration_is_config_required() {
     let output = doctor_with_homes(&AGENT_LOGINS, None, None);
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(only_check(&output)["code"], "config_required");
 
-    let um_home = tempfile::tempdir().unwrap();
-    let absent = um_home.path().join("no-such-runner.json");
+    let useful_home = tempfile::tempdir().unwrap();
+    let absent = useful_home.path().join("no-such-runner.json");
     let arguments = [&AGENT_LOGINS[..], &["--config", absent.to_str().unwrap()]].concat();
-    let output = doctor_with_homes(&arguments, Some(um_home.path()), None);
+    let output = doctor_with_homes(&arguments, Some(useful_home.path()), None);
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
     assert_eq!(only_check(&output)["code"], "config_invalid");
-    assert!(names(um_home.path()).is_empty());
+    assert!(names(useful_home.path()).is_empty());
 }
 
 // REQ-RUNNERENROLL-45
 #[test]
-fn doctor_default_checks_and_check_list_need_no_um_home_and_create_none() {
+fn doctor_default_checks_and_check_list_need_no_useful_home_and_create_none() {
     let root = tempfile::tempdir().unwrap();
-    let absent = root.path().join("um");
-    for um_home in [None, Some(absent.as_path())] {
-        let output = doctor_with_homes(&["--json"], um_home, None);
+    let absent = root.path().join("useful");
+    for useful_home in [None, Some(absent.as_path())] {
+        let output = doctor_with_homes(&["--json"], useful_home, None);
 
-        assert!(output.status.success(), "{um_home:?}: {output:?}");
+        assert!(output.status.success(), "{useful_home:?}: {output:?}");
         let check = only_check(&output);
-        assert_eq!(check["id"], "environment.command.git", "{um_home:?}");
-        assert_eq!(check["status"], "pass", "{um_home:?}");
+        assert_eq!(check["id"], "environment.command.git", "{useful_home:?}");
+        assert_eq!(check["status"], "pass", "{useful_home:?}");
 
-        let output = doctor_with_homes(&["--list-checks"], um_home, None);
+        let output = doctor_with_homes(&["--list-checks"], useful_home, None);
 
-        assert!(output.status.success(), "{um_home:?}: {output:?}");
+        assert!(output.status.success(), "{useful_home:?}: {output:?}");
         assert!(
             String::from_utf8(output.stdout)
                 .unwrap()
                 .lines()
                 .any(|line| line == "credentials.agent-logins"),
-            "{um_home:?}"
+            "{useful_home:?}"
         );
-        assert!(!absent.exists(), "{um_home:?}");
+        assert!(!absent.exists(), "{useful_home:?}");
     }
 }

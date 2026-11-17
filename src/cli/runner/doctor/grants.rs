@@ -1,8 +1,8 @@
-//! The grants read of `um runner doctor --workflow --grants` (REQ-CREDREADY-22,
+//! The grants read of `useful runner doctor --workflow --grants` (REQ-CREDREADY-22,
 //! REQ-CREDREADY-23): the signed-in member's own unrevoked grants, each requirement shown
 //! beside what the member holds of its provider, with the availability and next action of the
 //! member's projection (REQ-GRANT-53) on each runner a grant is authorized for, or on the one
-//! `--runner-id` names. It lives in the command because `um-runner` reaches neither the API nor
+//! `--runner-id` names. It lives in the command because `useful-runner` reaches neither the API nor
 //! the human session, and it changes no requirement's state or code (REQ-CREDREADY-18) unless
 //! `--require-grants` asks for a grant the named runner can use (REQ-CREDREADY-26).
 
@@ -10,10 +10,10 @@ use std::io::{self, Write};
 
 use serde::Serialize;
 
-use um_api::{HttpTransportPolicy, MemberGrant, MemberGrantFailure, MemberGrantKind};
-use um_human_auth::Deployment;
-use um_runner::CredentialKind;
-use um_support::Availability;
+use useful_api::{HttpTransportPolicy, MemberGrant, MemberGrantFailure, MemberGrantKind};
+use useful_human_auth::Deployment;
+use useful_runner::CredentialKind;
+use useful_support::Availability;
 
 use super::super::super::grant;
 use super::super::super::grant::projection::{
@@ -40,7 +40,7 @@ pub(super) struct Held<'a> {
 
 impl<'a> Request<'a> {
     /// Reads the member's grants with the human session, or the failure that ends the command
-    /// as it ends `um grant list` (`grant::output::failure`), with no report.
+    /// as it ends `useful grant list` (`grant::output::failure`), with no report.
     pub(super) fn read(
         &self,
         deployment: &Deployment,
@@ -176,7 +176,7 @@ pub(super) struct ProviderView<'a> {
     status: Option<MemberStatus>,
 }
 
-/// A grant as the doctor shows it: the fields of `um grant list`'s view that say which grant
+/// A grant as the doctor shows it: the fields of `useful grant list`'s view that say which grant
 /// it is and whose account, and its status on each runner reported (REQ-GRANT-64).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]

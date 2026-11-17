@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow, bail};
 use clap::{Args, Subcommand, ValueEnum};
 use serde_json::{Value, json};
-use um_api::{
+use useful_api::{
     GitLabAccountUse, GitLabApi, GitLabFailure, GitLabRepositoryQuery, GitLabSelection,
     GitLabSubmission, GitLabTokenKind, HttpClient,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 use zeroize::Zeroizing;
 
 use super::super::secret_file::{SecretInput, trim_line_ending};
@@ -105,7 +105,7 @@ impl Key {
     fn value(&self) -> anyhow::Result<String> {
         let value = match &self.idempotency_key {
             Some(key) => key.clone(),
-            None => um_support::generate_idempotency_key().context("generate request key")?,
+            None => useful_support::generate_idempotency_key().context("generate request key")?,
         };
         if value.is_empty()
             || value.len() > 255

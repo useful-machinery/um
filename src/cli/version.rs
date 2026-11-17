@@ -7,7 +7,7 @@ use serde::Serialize;
 use crate::exit_code::ExitCode;
 
 pub(super) const ABOUT: &str = "Print version information";
-const COMMAND_NAME: &str = "um";
+const COMMAND_NAME: &str = "useful";
 
 pub(super) type Command = super::JsonArgs<super::VersionJson>;
 

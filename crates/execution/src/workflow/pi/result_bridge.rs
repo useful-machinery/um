@@ -37,7 +37,7 @@ const MAX_MODEL_REFERENCE_EXPANSIONS: usize = 128;
 const TOOL_NAME_PREFIX: &str = "scherzo_result_";
 const EXTENSION_FILE_NAME: &str = "pi-json-v1-result-extension.ts";
 const SOCKET_FILE_NAME: &str = "result-validation.sock";
-const CONFIG_MARKER: &str = "\"__UM_PI_JSON_V1_CONFIG_JSON__\"";
+const CONFIG_MARKER: &str = "\"__USEFUL_PI_JSON_V1_CONFIG_JSON__\"";
 const CHANNEL_FAILURE_CAUSE: &str = "The result-validation channel failed.";
 const EXTENSION_TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -500,7 +500,7 @@ async fn read_request_frame<Clock: CoordinatorClock>(
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
         Ok(_) | Err(_) => return FrameRead::ProtocolFailure,
     }
-    um_support::strict_json_from_slice(&payload)
+    useful_support::strict_json_from_slice(&payload)
         .and_then(serde_json::from_value)
         .map(FrameRead::Request)
         .unwrap_or(FrameRead::ProtocolFailure)

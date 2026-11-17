@@ -24,11 +24,11 @@ use super::test_support::{
 };
 use crate::credential::test_credential;
 use crate::telemetry::test_recorder;
-use um_execution::CaptureCancellation;
+use useful_execution::CaptureCancellation;
 
 const REPLAY_BOOT_ID: &str = "rbt_00000000000000000000000001";
 const REPLAY_TIMESTAMP: &str = "2026-07-23T00:00:00Z";
-const REPLAY_OVERRIDE: &str = "UM_RUNNER_CONVERSATION_FIXTURE";
+const REPLAY_OVERRIDE: &str = "USEFUL_RUNNER_CONVERSATION_FIXTURE";
 
 struct UnavailableSourceBroker;
 

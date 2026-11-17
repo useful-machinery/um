@@ -1,6 +1,6 @@
 //! Bounded, redacted copies of harness stream lines kept beside a protocol rejection.
 //!
-//! `redact_secrets` is the twin of `SECRET_SHAPES` in `.um/cloud/scripts/workflow_support.py`;
+//! `redact_secrets` is the twin of `SECRET_SHAPES` in `.useful/cloud/scripts/workflow_support.py`;
 //! the two languages cannot share one source, so change both together.
 
 use std::borrow::Cow;

@@ -9,14 +9,14 @@ use crate::cli::grant::authorization::{
     write_session_note,
 };
 use crate::cli::grant::authorize::MOVE_CODEX_GRANT;
-// The earlier `um auth credential status` lists an agent login's ended authorizations as `show`
+// The earlier `useful auth credential status` lists an agent login's ended authorizations as `show`
 // does.
 pub(in crate::cli::auth) use crate::cli::grant::authorization::{
     EndedAuthorizationView, ended_authorizations,
 };
 use crate::cli::grant::projection::agent_login_provider;
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{
+use useful_api::{
     AgentLogin, AgentLoginAuthorization, AgentLoginFailure, AgentLoginList, AgentLoginState,
 };
 
@@ -236,7 +236,7 @@ pub(super) fn write_revoke(
         Some(_) => {}
         None if after.is_none() => writeln!(
             stdout,
-            "\nTo see which runners have confirmed removing it:\n  um grant list {agent_login_id}"
+            "\nTo see which runners have confirmed removing it:\n  useful grant list {agent_login_id}"
         )?,
         None => {}
     }
@@ -309,12 +309,12 @@ fn report(deployment: &str, failure: &AgentLoginFailure) -> ApiFailureReport {
         AgentLoginFailure::AgentLoginNotFound => refused(
             "agent_login_not_found",
             "error: agent login not found",
-            "List your grants:\n  um grant list",
+            "List your grants:\n  useful grant list",
         ),
         AgentLoginFailure::OrganizationNotFound => refused(
             "organization_not_found",
             "error: organization not found among your active memberships",
-            "List your organizations:\n  um organization list",
+            "List your organizations:\n  useful organization list",
         ),
         AgentLoginFailure::MaterialInvalid => refused(
             "material_invalid",
@@ -324,17 +324,17 @@ fn report(deployment: &str, failure: &AgentLoginFailure) -> ApiFailureReport {
         AgentLoginFailure::LimitReached => refused(
             "limit_reached",
             "error: you hold the most agent logins this organization allows",
-            "Revoke one you no longer use:\n  um grant revoke GRANT --yes",
+            "Revoke one you no longer use:\n  useful grant revoke GRANT --yes",
         ),
         AgentLoginFailure::RunnerNotFound => refused(
             "runner_not_found",
             "error: runner not found in the agent login's organization",
-            "List the organization's runners and use a runner ID:\n  um runner list ORGANIZATION",
+            "List the organization's runners and use a runner ID:\n  useful runner list ORGANIZATION",
         ),
         AgentLoginFailure::RunnerHoldsLogin => refused(
             "runner_holds_login",
             "error: that runner already holds an agent login for this coding agent",
-            "The owner of the login the runner holds must end that authorization first:\n  um grant deauthorize GRANT RUNNER --yes",
+            "The owner of the login the runner holds must end that authorization first:\n  useful grant deauthorize GRANT RUNNER --yes",
         ),
         AgentLoginFailure::LoginAlreadyAuthorized => refused(
             "login_already_authorized",
@@ -344,7 +344,7 @@ fn report(deployment: &str, failure: &AgentLoginFailure) -> ApiFailureReport {
         AgentLoginFailure::AuthorizationNotFound => refused(
             "authorization_not_found",
             "error: that runner holds no authorization of this agent login",
-            "Show the grant's authorizations:\n  um grant list GRANT",
+            "Show the grant's authorizations:\n  useful grant list GRANT",
         ),
         AgentLoginFailure::RateLimited { retry_after } => {
             ApiFailureReport::rate_limited(SUBJECT, *retry_after)

@@ -35,7 +35,7 @@ const inputFixturePath = fileURLToPath(
 
 async function materializeInputFixture(): Promise<string> {
   const template = await readFile(inputTemplatePath, "utf8");
-  const marker = '"__UM_PI_JSON_V1_INPUT_CONFIG_JSON__"';
+  const marker = '"__USEFUL_PI_JSON_V1_INPUT_CONFIG_JSON__"';
   if (template.split(marker).length !== 2) {
     throw new Error("Input extension template must contain exactly one marker");
   }

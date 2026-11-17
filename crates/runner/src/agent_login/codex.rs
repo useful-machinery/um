@@ -8,7 +8,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use time::OffsetDateTime;
-use um_execution::CODEX_LOGIN_VARIABLE;
+use useful_execution::CODEX_LOGIN_VARIABLE;
 
 use super::cloud::Delivery;
 use super::directory::{self, LoginDirectory};
@@ -18,11 +18,11 @@ use super::{FailureStage, InstallRefusal, ServiceEnvironment};
 const AUTH_FILE: &str = "auth.json";
 const CONFIG_FILE: &str = "config.toml";
 /// The runner's Codex home's whole configuration: keep the login in
-/// `auth.json`. The same bytes `um grant create codex` gives the Codex it
+/// `auth.json`. The same bytes `useful grant create codex` gives the Codex it
 /// signs in with.
 const CONFIG: &[u8] = b"cli_auth_credentials_store = \"file\"\n";
-const AUTH_TEMPORARY_PREFIX: &str = ".um-auth.json.tmp";
-const CONFIG_TEMPORARY_PREFIX: &str = ".um-config.toml.tmp";
+const AUTH_TEMPORARY_PREFIX: &str = ".useful-auth.json.tmp";
+const CONFIG_TEMPORARY_PREFIX: &str = ".useful-config.toml.tmp";
 /// The prefixes of the temporary files the runner writes its Codex home
 /// through.
 pub(crate) const TEMPORARY_PREFIXES: [&str; 2] = [AUTH_TEMPORARY_PREFIX, CONFIG_TEMPORARY_PREFIX];

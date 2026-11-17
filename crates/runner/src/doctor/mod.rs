@@ -8,7 +8,7 @@ mod workflow_credentials;
 use std::collections::BTreeSet;
 use std::fmt;
 
-use um_execution::{HarnessQualification, UntestedHarnessAdvisory};
+use useful_execution::{HarnessQualification, UntestedHarnessAdvisory};
 
 use agent_logins::AgentLoginsCheck;
 use claude_code::ClaudeCodeCheck;
@@ -275,7 +275,7 @@ impl fmt::Display for SelectionError {
         match self {
             Self::UnknownId(id) => write!(
                 formatter,
-                "unknown runner doctor check '{id}'; use 'um runner doctor --list-checks' to list available checks"
+                "unknown runner doctor check '{id}'; use 'useful runner doctor --list-checks' to list available checks"
             ),
         }
     }

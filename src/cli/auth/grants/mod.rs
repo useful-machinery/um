@@ -6,11 +6,11 @@ mod uses;
 
 use clap::{Args, Subcommand};
 
-use um_api::{GrantApi, GrantFailure};
+use useful_api::{GrantApi, GrantFailure};
 
-// `um auth credential status` reports a failed read of the grants as `um auth grant` does.
+// `useful auth credential status` reports a failed read of the grants as `useful auth grant` does.
 pub(in crate::cli::auth) use output::failure;
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Manage your provider grants";
 
@@ -54,12 +54,12 @@ impl Command {
 
 impl super::super::HumanSessionApi for GrantApi {
     type Failure = GrantFailure;
-    type BuildError = um_api::GrantApiError;
+    type BuildError = useful_api::GrantApiError;
 
     fn build(
         api_url: &str,
         token: &str,
-        policy: um_api::HttpTransportPolicy,
+        policy: useful_api::HttpTransportPolicy,
     ) -> Result<Self, Self::BuildError> {
         Self::new(api_url, token, policy)
     }
@@ -72,7 +72,7 @@ impl super::super::HumanSessionApi for GrantApi {
         GrantFailure::Unauthenticated
     }
 
-    fn unreachable(category: um_api::UnreachableCategory) -> GrantFailure {
+    fn unreachable(category: useful_api::UnreachableCategory) -> GrantFailure {
         GrantFailure::Unreachable { category }
     }
 }

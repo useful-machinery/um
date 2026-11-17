@@ -1,4 +1,4 @@
-//! `um workflow run show` (REQ-LOCALRUN-189): one run from its records, read as `status`
+//! `useful workflow run show` (REQ-LOCALRUN-189): one run from its records, read as `status`
 //! reads it, without taking its lock or changing its directory, with its mirror writes
 //! (REQ-LOCALRUN-193) and each running child's attempt and in-flight steps, read from the
 //! child's records the same way, and under a child that is a nested run its `edges` counts and
@@ -13,7 +13,7 @@ use anyhow::Context;
 use clap::Args;
 use serde::Serialize;
 use serde_json::{Map, Value};
-use um_execution::{
+use useful_execution::{
     ChildRun, ControlEvent, LocalStatusAttempt, LocalStatusProgress, LocalStatusResult,
     LocalStatusStart, MirrorAction, MirrorSkipReason, MirrorWrite, MirrorWriteOutcome, RunState,
     WaitRecord, WorkflowRunRecord, child_runs, human_duration, normalize_terminal_path,
@@ -28,7 +28,7 @@ use crate::exit_code::ExitCode;
 pub(super) const ABOUT: &str =
     "Show a local workflow run from its records, or a Cloud run with --cloud";
 pub(super) const AFTER_HELP: &str = "With --cloud ORGANIZATION, RUN is a Cloud run ID: the command reads that run with its definition, subject claim, workflow state and outcome, latest progress, exits and newest trigger deliveries. It reads and writes no local run.";
-const COMMAND: &str = "um workflow run show";
+const COMMAND: &str = "useful workflow run show";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -134,7 +134,7 @@ impl Command {
         })?;
         let record: WorkflowRunRecord =
             serde_json::from_value(record).map_err(|error| invalid(error.to_string()))?;
-        let now = um_support::utc_now();
+        let now = useful_support::utc_now();
         let children = children(
             child_runs(&run_directory).map_err(|error| invalid(error.to_string()))?,
             now,

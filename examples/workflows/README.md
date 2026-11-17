@@ -33,7 +33,7 @@ Machinery presentation and execution testing.
 Every command node launches `sh`. Most use only shell built-ins and `sleep`;
 `command-dataflow.yaml` and `recovery.yaml` also use basic local filesystem utilities.
 The examples that write files confine them to the execution root, and command inputs are
-read only from the engine-provided `UM_STEP_INPUTS` directory. No command example
+read only from the engine-provided `USEFUL_STEP_INPUTS` directory. No command example
 uses the network.
 
 `hostile-output.yaml` and `large-response.yaml` use command steps so their exact bytes
@@ -55,7 +55,7 @@ command, captures text, JSON, and file outputs from paths, and supplies all thre
 to a downstream command:
 
 ```sh
-um workflow run create \
+useful workflow run create \
   --path . \
   --workflow command-dataflow.yaml \
   --execution-root "$execution_root" \
@@ -69,7 +69,7 @@ The Claude attachment workflow includes `attachments/aurora-brief.txt` staticall
 accepts required named instructions and updates:
 
 ```sh
-um workflow run create \
+useful workflow run create \
   --path . \
   --workflow agent-claude-attachment.yaml \
   --execution-root "$execution_root" \
@@ -104,7 +104,7 @@ the workflow succeeds.
 Definition validation is offline and does not contact a model provider:
 
 ```sh
-um workflow validate \
+useful workflow validate \
   --source-root . \
   agent-codex-basic.yaml
 ```
@@ -114,7 +114,7 @@ remain test fixtures rather than public runnable examples.
 
 ## Run and inspect a workflow
 
-From this directory, with `um` on `PATH`, the following example validates and
+From this directory, with `useful` on `PATH`, the following example validates and
 runs a command-only workflow, emits the terminal result as JSON, then reads the retained
 run through both status and archived-view commands:
 
@@ -129,11 +129,11 @@ run through both status and archived-view commands:
   run_dir="$tmp_dir/results/${workflow%.yaml}"
   mkdir "$execution_root" "$tmp_dir/results"
 
-  um workflow validate \
+  useful workflow validate \
     --source-root . \
     "$workflow"
 
-  um workflow run create \
+  useful workflow run create \
     --path . \
     --workflow "$workflow" \
     --execution-root "$execution_root" \
@@ -141,8 +141,8 @@ run through both status and archived-view commands:
     --max-parallel 4 \
     --json
 
-  um workflow run status "$run_dir" --json
-  um workflow run view "$run_dir" --plain
+  useful workflow run status "$run_dir" --json
+  useful workflow run view "$run_dir" --plain
 )
 ```
 
@@ -151,7 +151,7 @@ whose latest attempt failed or was cancelled, first use `workflow run status` to
 that it is eligible, then run:
 
 ```sh
-um workflow run retry \
+useful workflow run retry \
   "$run_dir" \
   --execution-root "$execution_root" \
   --json

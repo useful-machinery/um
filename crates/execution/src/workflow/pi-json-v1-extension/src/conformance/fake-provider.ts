@@ -23,14 +23,15 @@ import { Type } from "typebox";
 
 const MAXIMUM_FRAME_BYTES = 16 * 1024 * 1024;
 const configuredSocketPath =
-  process.env.UM_PI_FAKE_PROVIDER_SOCKET ??
+  process.env.USEFUL_PI_FAKE_PROVIDER_SOCKET ??
   process.env.WORKFLOW_RUN_FIXTURE_SOCKET;
 
 if (configuredSocketPath === undefined) {
   throw new Error("A fake-provider control socket is required");
 }
 const socketPath: string = configuredSocketPath;
-const stubbornFixtureExecutable = process.env.UM_PI_STUBBORN_FIXTURE_EXECUTABLE;
+const stubbornFixtureExecutable =
+  process.env.USEFUL_PI_STUBBORN_FIXTURE_EXECUTABLE;
 
 interface ResponseUsage {
   inputTokens: number | undefined;
@@ -711,11 +712,11 @@ export default function fakeProviderExtension(pi: ExtensionAPI): void {
   // active invocation cwd through ExtensionContext when the tool executes.
   pi.registerTool(createBashToolDefinition("/"));
 
-  pi.registerProvider("um-fake", {
+  pi.registerProvider("useful-fake", {
     name: "Useful Machinery deterministic fake provider",
     baseUrl: "http://offline.invalid",
     apiKey: "offline-fixture-key",
-    api: "um-fake-api",
+    api: "useful-fake-api",
     models: [
       {
         id: "conformance",
@@ -840,7 +841,7 @@ export default function fakeProviderExtension(pi: ExtensionAPI): void {
         };
         const ready = (data: Buffer): void => {
           startupOutput += data.toString("utf8");
-          if (startupOutput.includes("UM_STUBBORN_READY")) {
+          if (startupOutput.includes("USEFUL_STUBBORN_READY")) {
             cleanup();
             resolve();
             return;
@@ -896,7 +897,7 @@ export default function fakeProviderExtension(pi: ExtensionAPI): void {
     if (ctx.isIdle()) {
       throw new Error("The starting run must already count as busy");
     }
-    if (process.env.UM_PI_FAKE_BASH_ONLY_TOOLS === "1") {
+    if (process.env.USEFUL_PI_FAKE_BASH_ONLY_TOOLS === "1") {
       pi.setActiveTools(["bash"]);
     }
     const response = await exchange(
@@ -917,7 +918,7 @@ export default function fakeProviderExtension(pi: ExtensionAPI): void {
     }
   });
 
-  if (process.env.UM_PI_FAKE_HOLD_SETTLEMENT === "1") {
+  if (process.env.USEFUL_PI_FAKE_HOLD_SETTLEMENT === "1") {
     pi.on("agent_settled", async () => {
       const response = await exchange({ kind: "settlement" });
       if (!isRecord(response) || response.kind !== "release") {

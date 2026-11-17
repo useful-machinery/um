@@ -29,7 +29,7 @@ pub struct LocalStatusStart {
 }
 
 /// The current attempt's start and its in-flight nodes (REQ-LOCALRUN-189). A start the state
-/// does not record, as in a state an earlier `um` wrote (REQ-LOCALRUN-201), is `None`.
+/// does not record, as in a state an earlier `useful` wrote (REQ-LOCALRUN-201), is `None`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LocalStatusProgress {
     pub started: Option<LocalStatusStart>,

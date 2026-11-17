@@ -288,7 +288,7 @@ fn retry_transport_failure(
     *last_failure = category;
     let retry = http_util::can_retry_ambiguous_mutation(attempt, CREATE_ATTEMPTS, category);
     if retry {
-        um_support::sleep(um_support::short_retry_delay());
+        useful_support::sleep(useful_support::short_retry_delay());
     }
     retry
 }
@@ -523,7 +523,7 @@ fn require_media_type(
 }
 
 fn decode_closed_publication(body: &[u8]) -> Result<Publication, PublicationFailure> {
-    let value = um_support::strict_json_from_slice(body)
+    let value = useful_support::strict_json_from_slice(body)
         .map_err(|_| PublicationFailure::protocol(false))?;
     decode_closed_publication_value(value)
 }
@@ -640,7 +640,7 @@ fn decode_closed_publication_list(
     requested_run_id: &str,
     maximum_items: usize,
 ) -> Result<PublicationList, PublicationFailure> {
-    let value = um_support::strict_json_from_slice(body)
+    let value = useful_support::strict_json_from_slice(body)
         .map_err(|_| PublicationFailure::protocol(false))?;
     let object = value
         .as_object()
@@ -809,7 +809,9 @@ fn valid_publication_diagnostic_member(key: &str, value: &serde_json::Value) -> 
                     byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'.' | b'_' | b'-')
                 })
         }),
-        _ => value.as_str().is_some_and(um_support::is_diagnostic_slug),
+        _ => value
+            .as_str()
+            .is_some_and(useful_support::is_diagnostic_slug),
     }
 }
 
@@ -864,22 +866,22 @@ fn validate_publication(
         .as_deref()
         .map(timestamp)
         .transpose()?;
-    let identities_valid = um_support::valid_typed_id(&publication.id, "pub_")
-        && um_support::valid_typed_id(&publication.organization_id, "org_")
-        && um_support::valid_typed_id(&publication.project_id, "prj_")
-        && um_support::valid_typed_id(&publication.run_id, "run_")
-        && um_support::valid_typed_id(&publication.artifact_set_id, "ats_")
-        && um_support::valid_typed_id(&publication.actor_principal_id, "prn_")
-        && um_support::valid_typed_id(&publication.target.repository_connection_id, "rpc_");
+    let identities_valid = useful_support::valid_typed_id(&publication.id, "pub_")
+        && useful_support::valid_typed_id(&publication.organization_id, "org_")
+        && useful_support::valid_typed_id(&publication.project_id, "prj_")
+        && useful_support::valid_typed_id(&publication.run_id, "run_")
+        && useful_support::valid_typed_id(&publication.artifact_set_id, "ats_")
+        && useful_support::valid_typed_id(&publication.actor_principal_id, "prn_")
+        && useful_support::valid_typed_id(&publication.target.repository_connection_id, "rpc_");
     let snapshot_valid = publication.run_id == requested_run_id
         && requested_publication_id.is_none_or(|expected| publication.id == expected)
         && requested_export_name.is_none_or(|expected| publication.export_name == expected)
-        && um_support::is_identifier(&publication.export_name)
+        && useful_support::is_identifier(&publication.export_name)
         && publication.version >= 1
         && publication.artifact.artifact_version == 1
-        && um_support::is_lowercase_hex(&publication.artifact.base_oid, 40)
-        && um_support::is_lowercase_hex(&publication.artifact.head_oid, 40)
-        && um_support::is_lowercase_hex(&publication.artifact.tree_oid, 40)
+        && useful_support::is_lowercase_hex(&publication.artifact.base_oid, 40)
+        && useful_support::is_lowercase_hex(&publication.artifact.head_oid, 40)
+        && useful_support::is_lowercase_hex(&publication.artifact.tree_oid, 40)
         && valid_provider_id(&publication.target.provider_repository_id)
         && if publication.provider_kind == ProviderKind::Gitlab {
             (3..=8192).contains(&publication.target.full_name.chars().count())
@@ -894,7 +896,7 @@ fn validate_publication(
                     .target
                     .gitlab_connection_id
                     .as_ref()
-                    .is_some_and(|id| um_support::valid_typed_id(id, "glc_"))
+                    .is_some_and(|id| useful_support::valid_typed_id(id, "glc_"))
                 && publication.target.instance_url.is_some()
                 && publication.target.branch_version == 2
                 && match (
@@ -959,7 +961,7 @@ fn validate_publication(
                         .target
                         .expected_head_oid
                         .as_deref()
-                        .is_some_and(|oid| um_support::is_lowercase_hex(oid, 40))
+                        .is_some_and(|oid| useful_support::is_lowercase_hex(oid, 40))
             }
         }
         && valid_bounded_string(&publication.target.destination_branch, 1, 1024)
@@ -1195,7 +1197,7 @@ fn validate_publication(
 
 fn valid_branch(branch: &models::PublicationBranch, expected_head: &str) -> bool {
     branch.head_oid == expected_head
-        && um_support::is_lowercase_hex(&branch.head_oid, 40)
+        && useful_support::is_lowercase_hex(&branch.head_oid, 40)
         && valid_https_url(&branch.url)
 }
 

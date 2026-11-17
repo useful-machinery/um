@@ -108,8 +108,8 @@ const NESTED_TREE_PROGRAM: &str = "#!/bin/sh
 set -eu
 stage=$1
 part=-
-if [ -f \"${UM_STEP_INPUTS:-}/values/part\" ]; then
-  part=$(cat \"$UM_STEP_INPUTS/values/part\")
+if [ -f \"${USEFUL_STEP_INPUTS:-}/values/part\" ]; then
+  part=$(cat \"$USEFUL_STEP_INPUTS/values/part\")
 fi
 printf '%s %s\\n' \"$stage\" \"$part\" >> stages.log
 printf 'visible=%s hidden=%s\\n' \"${NESTED_VISIBLE-unset}\" \"${NESTED_HIDDEN-unset}\" >> \"seen-$stage-$part\"
@@ -140,7 +140,7 @@ pub(super) fn nested_tree() -> TreeBundle {
     bundle
 }
 
-/// `um workflow run create` of the nested tree over parts `a` and `b`, with both test
+/// `useful workflow run create` of the nested tree over parts `a` and `b`, with both test
 /// variables set in the launching environment.
 pub(super) fn create_nested(bundle: &TreeBundle, name: &str) -> std::process::Output {
     nested_command(bundle, name).output().unwrap()
@@ -155,7 +155,7 @@ pub(super) fn nested_command(bundle: &TreeBundle, name: &str) -> std::process::C
     command
 }
 
-/// The arguments of `um workflow run create` of the nested tree over parts `a` and `b` into
+/// The arguments of `useful workflow run create` of the nested tree over parts `a` and `b` into
 /// the run directory `name`, with `extra` before the last.
 fn nested_args(bundle: &TreeBundle, name: &str, extra: &[&str]) -> Vec<String> {
     let mut args = bundle.args(&bundle.result(name));
@@ -328,12 +328,12 @@ const ASKING_TREE_PROGRAM: &str = "#!/bin/sh
 set -eu
 stage=$1
 part=-
-if [ -f \"${UM_STEP_INPUTS:-}/values/part\" ]; then
-  part=$(cat \"$UM_STEP_INPUTS/values/part\")
+if [ -f \"${USEFUL_STEP_INPUTS:-}/values/part\" ]; then
+  part=$(cat \"$USEFUL_STEP_INPUTS/values/part\")
 fi
 printf '%s %s\\n' \"$stage\" \"$part\" >> stages.log
-if [ -f \"${UM_STEP_INPUTS:-}/values/answers\" ]; then
-  answers=$(cat \"$UM_STEP_INPUTS/values/answers\")
+if [ -f \"${USEFUL_STEP_INPUTS:-}/values/answers\" ]; then
+  answers=$(cat \"$USEFUL_STEP_INPUTS/values/answers\")
   if [ \"$answers\" != null ]; then
     printf '%s' \"$answers\" > \"answers-$stage-$part\"
   fi
@@ -357,7 +357,7 @@ printf '%s needs a decision' \"$part\" > summary.txt
 /// `nested-prep` appends `prep PART` to the execution root's `preps.log`.
 const ASKING_TREE_PREP: &str = "#!/bin/sh
 set -eu
-printf 'prep %s\\n' \"$(cat \"$UM_STEP_INPUTS/values/part\")\" >> preps.log
+printf 'prep %s\\n' \"$(cat \"$USEFUL_STEP_INPUTS/values/part\")\" >> preps.log
 ";
 
 /// The nested tree whose nested workflow is `ASKING_TREE_PART`: `outer` fans out over parts
@@ -663,7 +663,7 @@ fn an_interrupted_nested_stage_leaves_the_root_in_the_carried_repair_wait() {
         "the nested stage's held step",
         || {
             execution.join("held-work-a").exists()
-                && um_execution::lock_holder(&destination).is_ok_and(|holder| holder.is_some())
+                && useful_execution::lock_holder(&destination).is_ok_and(|holder| holder.is_some())
         },
         |held| *held,
     );
@@ -1137,7 +1137,7 @@ fn a_withdrawal_is_honored_at_the_next_nested_step_boundary() {
         let mut full = vec!["workflow".to_owned(), "run".to_owned()];
         full.extend(args.iter().map(|arg| (*arg).to_owned()));
         let mut command = isolated_command(&full);
-        command.env("UM_HOME", home.path());
+        command.env("USEFUL_HOME", home.path());
         stub.point(&mut command);
         command
     };
@@ -1247,7 +1247,7 @@ fn abandoned_while_held(bundle: &TreeBundle, name: &str, held: &str) -> std::pat
         "the nested stage's held step",
         || {
             execution.join(format!("held-{held}")).exists()
-                && um_execution::lock_holder(&destination).is_ok_and(|holder| holder.is_some())
+                && useful_execution::lock_holder(&destination).is_ok_and(|holder| holder.is_some())
         },
         |held| *held,
     );
@@ -1260,7 +1260,7 @@ fn abandoned_while_held(bundle: &TreeBundle, name: &str, held: &str) -> std::pat
     run
 }
 
-/// `um workflow run resume RUN --json` of the abandoned `run`, once the killed process's lock
+/// `useful workflow run resume RUN --json` of the abandoned `run`, once the killed process's lock
 /// is released and its orphaned step gone.
 fn resumed_once_abandoned(run: &Path) -> std::process::Output {
     super::poll_until(
@@ -1433,7 +1433,7 @@ fn published_run_waiting_in_a_carried_answer() -> (
         r#"[{"name":"a"},{"name":"b"}]"#.to_owned(),
         "--json".to_owned(),
     ]);
-    create.env("UM_HOME", home.path());
+    create.env("USEFUL_HOME", home.path());
     let terminal = completed(&create.output().unwrap());
     assert_eq!(terminal["outcome"], "waiting", "{terminal}");
     let predecessor = std::path::PathBuf::from(terminal["runDirectory"].as_str().unwrap());
@@ -1465,7 +1465,10 @@ fn an_upgrade_carries_a_nested_wait_and_starts_its_nested_run_afresh() {
     );
     assert_eq!(publish()["revision"]["n"], 2);
     let refusal = super::workflow_run::tree_rejection(&upgrade());
-    assert_eq!(refusal["command"], "um workflow run upgrade", "{refusal}");
+    assert_eq!(
+        refusal["command"], "useful workflow run upgrade",
+        "{refusal}"
+    );
     assert_eq!(
         refusal["diagnostics"][0]["code"], "wait_target_unresolved",
         "{refusal}"

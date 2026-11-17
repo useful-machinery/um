@@ -1,6 +1,6 @@
 # CLI output style
 
-Conventions for every human-facing string the `um` CLI prints: help
+Conventions for every human-facing string the `useful` CLI prints: help
 text, errors, warnings, progress, reports, and prompts. Machine surfaces (JSON
 documents, schema files, protocol messages) are governed by their contracts,
 not this guide.
@@ -31,7 +31,7 @@ An error has two parts: a **diagnostic line** and an optional **remedy block**.
 error: cannot retry run: attempt 1 succeeded
 
 A succeeded run cannot be retried. Start a new run instead:
-  um workflow run create --path <DIR> --execution-root <PATH> --run-dir <NEW_DIR>
+  useful workflow run create --path <DIR> --execution-root <PATH> --run-dir <NEW_DIR>
 ```
 
 Diagnostic line rules:
@@ -59,7 +59,7 @@ Remedy block rules:
 ! You must sign in before managing Useful Machinery organizations.
 
 Run:
-  um auth login
+  useful auth login
 ```
 
 - Every dead end gets a remedy or an explicit statement that none exists.
@@ -276,7 +276,7 @@ Pagination:
   large lists safe.
 
   `workflow definition list` and `workflow run list` read the definitions and
-  runs under the local `um` home, not an API, so there is no continuation to
+  runs under the local `useful` home, not an API, so there is no continuation to
   page through: `workflow definition list` prints every definition the home
   holds, and `workflow run list` the home's live runs, or every run under
   `--all`, in one listing.

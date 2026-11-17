@@ -30,8 +30,8 @@ if ! PATH="$ambient_directory:$PATH" \
   CARGO_TARGET_DIR="$cargo_target" \
   RUSTC_WRAPPER="$ambient_directory/$ambient_command" \
   DEVENV_TUI=false \
-  UM_CLI_SUITE_TESTS_RUN_BY=fixture \
-  UM_CLI_STRICT_DEVENV_TEST_MARKER="$marker_value" \
+  USEFUL_CLI_SUITE_TESTS_RUN_BY=fixture \
+  USEFUL_CLI_STRICT_DEVENV_TEST_MARKER="$marker_value" \
   "$boundary" shell -- bash -c '
     set -euo pipefail
     expected_target=$1
@@ -44,8 +44,8 @@ if ! PATH="$ambient_directory:$PATH" \
     [[ ${CARGO_INCREMENTAL:-} == 1 ]]
     [[ ${RUSTC_WRAPPER:-} == "$ambient_directory/$ambient_command" ]]
     [[ ${DEVENV_TUI:-} == false ]]
-    [[ ${UM_CLI_SUITE_TESTS_RUN_BY:-} == fixture ]]
-    [[ -z ${UM_CLI_STRICT_DEVENV_TEST_MARKER+x} ]]
+    [[ ${USEFUL_CLI_SUITE_TESTS_RUN_BY:-} == fixture ]]
+    [[ -z ${USEFUL_CLI_STRICT_DEVENV_TEST_MARKER+x} ]]
     [[ :$PATH: != *":$ambient_directory:"* ]]
     ! command -v "$ambient_command" >/dev/null 2>&1
     if "$ambient_command" 2>"$diagnostic"; then

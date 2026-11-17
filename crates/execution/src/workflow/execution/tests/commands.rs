@@ -140,10 +140,10 @@ steps:
             - /bin/sh
             - -c
             - |
-              test -n "$UM_RECOVERY_CONTEXT" || exit 92
+              test -n "$USEFUL_RECOVERY_CONTEXT" || exit 92
               printf '%s %s' "${{KEPT-unset}}" "${{DROPPED-unset}}" > handler.txt
               printf repaired > repaired.marker
-              printf '%s' '{{"schemaVersion":1,"decision":"recheck","summary":"repaired","reason":"recheck"}}' > "$UM_RECOVERY_RESULT"
+              printf '%s' '{{"schemaVersion":1,"decision":"recheck","summary":"repaired","reason":"recheck"}}' > "$USEFUL_RECOVERY_RESULT"
     command:
       argv:
         - /bin/sh
@@ -210,17 +210,17 @@ steps:
             - -c
             - |
               if IFS= read -r unexpected; then exit 91; fi
-              test -r "$UM_RECOVERY_CONTEXT"
-              test ! -w "$UM_RECOVERY_CONTEXT"
-              grep -q '"schemaVersion": 1' "$UM_RECOVERY_CONTEXT"
-              grep -q '"recoveryRound": 1' "$UM_RECOVERY_CONTEXT"
-              grep -q '"executionNumber": 1' "$UM_RECOVERY_CONTEXT"
-              grep -q '"command_stderr"' "$UM_RECOVERY_CONTEXT"
-              test -z "${UM_INHERITED+x}"
-              printf '%s\n%s\n' UM_RECOVERY_CONTEXT UM_RECOVERY_RESULT > recovery-environment.txt
-              printf '%s\n%s\n' "$UM_RECOVERY_CONTEXT" "$UM_RECOVERY_RESULT" > recovery-private-paths.txt
+              test -r "$USEFUL_RECOVERY_CONTEXT"
+              test ! -w "$USEFUL_RECOVERY_CONTEXT"
+              grep -q '"schemaVersion": 1' "$USEFUL_RECOVERY_CONTEXT"
+              grep -q '"recoveryRound": 1' "$USEFUL_RECOVERY_CONTEXT"
+              grep -q '"executionNumber": 1' "$USEFUL_RECOVERY_CONTEXT"
+              grep -q '"command_stderr"' "$USEFUL_RECOVERY_CONTEXT"
+              test -z "${USEFUL_INHERITED+x}"
+              printf '%s\n%s\n' USEFUL_RECOVERY_CONTEXT USEFUL_RECOVERY_RESULT > recovery-environment.txt
+              printf '%s\n%s\n' "$USEFUL_RECOVERY_CONTEXT" "$USEFUL_RECOVERY_RESULT" > recovery-private-paths.txt
               printf repaired > repaired.marker
-              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired workspace","reason":"target should pass unchanged"}' > "$UM_RECOVERY_RESULT"
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired workspace","reason":"target should pass unchanged"}' > "$USEFUL_RECOVERY_RESULT"
               printf 'handler ordinary output is diagnostic only'
     command:
       argv:
@@ -255,7 +255,7 @@ async fn source_neutral_command_handler_repairs_and_rechecks_with_private_author
             EnvironmentSnapshot::new([
                 ("PATH", "/bin:/usr/bin"),
                 ("EXPLICIT_VALUE", "retained"),
-                ("UM_INHERITED", "must-be-scrubbed"),
+                ("USEFUL_INHERITED", "must-be-scrubbed"),
             ]),
             CancellationSource::new(),
             1,
@@ -286,7 +286,7 @@ async fn source_neutral_command_handler_repairs_and_rechecks_with_private_author
         assert_eq!(bytes, b"terminal output");
         assert_eq!(
             fs::read_to_string(fixture.execution_root.join("recovery-environment.txt")).unwrap(),
-            "UM_RECOVERY_CONTEXT\nUM_RECOVERY_RESULT\n"
+            "USEFUL_RECOVERY_CONTEXT\nUSEFUL_RECOVERY_RESULT\n"
         );
         let private_paths =
             fs::read_to_string(fixture.execution_root.join("recovery-private-paths.txt")).unwrap();
@@ -340,7 +340,7 @@ steps:
             - -c
             - |
               printf repaired > repaired.marker
-              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired workspace","reason":"rerun the target"}' > "$UM_RECOVERY_RESULT"
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired workspace","reason":"rerun the target"}' > "$USEFUL_RECOVERY_RESULT"
     command:
       argv: [/bin/sh, -c, "test -f repaired.marker || exit 75"]
 "#;
@@ -395,7 +395,7 @@ steps:
             - -c
             - |
               pwd -P > handler-cwd.txt
-              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired workspace","reason":"rerun the target"}' > "$UM_RECOVERY_RESULT"
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired workspace","reason":"rerun the target"}' > "$USEFUL_RECOVERY_RESULT"
     command:
       argv: [/bin/sh, -c, "pwd -P >> target-cwd.txt; test -f ../repairs/handler-cwd.txt || exit 75"]
 "#;
@@ -724,7 +724,7 @@ async fn command_handler_failures_stop_once_without_authorizing_recheck() {
             (
                 "execution",
                 r#"command:
-          argv: [/bin/sh, -c, "printf '%s' '{\"schemaVersion\":1,\"decision\":\"recheck\",\"summary\":\"looks valid\",\"reason\":\"but exit fails\"}' > \"$UM_RECOVERY_RESULT\"; exit 9"]"#,
+          argv: [/bin/sh, -c, "printf '%s' '{\"schemaVersion\":1,\"decision\":\"recheck\",\"summary\":\"looks valid\",\"reason\":\"but exit fails\"}' > \"$USEFUL_RECOVERY_RESULT\"; exit 9"]"#,
                 RecoveryHandlerFailure::CommandExitFailed { code: Some(9) },
             ),
             (
@@ -736,7 +736,7 @@ async fn command_handler_failures_stop_once_without_authorizing_recheck() {
             (
                 "validation",
                 r#"command:
-          argv: [/bin/sh, -c, "printf '{' > \"$UM_RECOVERY_RESULT\""]"#,
+          argv: [/bin/sh, -c, "printf '{' > \"$USEFUL_RECOVERY_RESULT\""]"#,
                 RecoveryHandlerFailure::DecisionInvalid(
                     RecoveryDecisionFailureKind::InvalidJson,
                 ),
@@ -748,8 +748,8 @@ async fn command_handler_failures_stop_once_without_authorizing_recheck() {
             - /bin/sh
             - -c
             - |
-              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"valid","reason":"before settlement sabotage"}' > "$UM_RECOVERY_RESULT"
-              root=${UM_RECOVERY_CONTEXT%/context/context.json}
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"valid","reason":"before settlement sabotage"}' > "$USEFUL_RECOVERY_RESULT"
+              root=${USEFUL_RECOVERY_CONTEXT%/context/context.json}
               mv "$root" "$root-moved""#,
                 RecoveryHandlerFailure::SettlementFailed,
             ),
@@ -943,17 +943,17 @@ async fn admitted_producer_consumer_executes_with_inputs_observations_and_export
         let producer_script = r#"set -eu
 if IFS= read -r unexpected; then exit 91; fi
 {
-  printf '%s|' "$(cat "$UM_STEP_INPUTS/values/prompt")"
-  cat "$UM_STEP_INPUTS/collections/attachments/000000"
+  printf '%s|' "$(cat "$USEFUL_STEP_INPUTS/values/prompt")"
+  cat "$USEFUL_STEP_INPUTS/collections/attachments/000000"
   printf '|'
-  cat "$UM_STEP_INPUTS/collections/attachments/000001"
+  cat "$USEFUL_STEP_INPUTS/collections/attachments/000001"
 } > produced.txt
 printf producer-standard-output
 printf producer-standard-error >&2
 "#;
         let consumer_script = r#"set -eu
 if IFS= read -r unexpected; then exit 92; fi
-cat "$UM_STEP_INPUTS/values/artifact" > exported.txt
+cat "$USEFUL_STEP_INPUTS/values/artifact" > exported.txt
 printf consumer-standard-output
 printf consumer-standard-error >&2
 "#;
@@ -1672,7 +1672,7 @@ steps:
             - /bin/sh
             - -c
             - |
-              printf '%s' '{"schemaVersion":1,"decision":"gave_up","summary":"unrepairable","reason":"the target cannot pass"}' > "$UM_RECOVERY_RESULT"
+              printf '%s' '{"schemaVersion":1,"decision":"gave_up","summary":"unrepairable","reason":"the target cannot pass"}' > "$USEFUL_RECOVERY_RESULT"
     command:
       argv: [/bin/sh, -c, "exit 75"]
 "#,

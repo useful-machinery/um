@@ -68,8 +68,8 @@ fn retained_identity_and_local_generation_survive_fresh_boot_without_adopting_le
     assert_eq!(inventory["priorAttemptId"], ATTEMPT);
     assert!(inventory["observedClaim"].is_null());
     assert_eq!(inventory["lastClaimGeneration"], 0);
-    let frame = um_runner_protocol::RunnerFrame::WorkspaceInventory {
-        envelope: um_runner_protocol::RunnerEnvelope {
+    let frame = useful_runner_protocol::RunnerFrame::WorkspaceInventory {
+        envelope: useful_runner_protocol::RunnerEnvelope {
             message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
             runner_id: RUNNER.into(),
             boot_id: BOOT_A.into(),
@@ -78,7 +78,7 @@ fn retained_identity_and_local_generation_survive_fresh_boot_without_adopting_le
         },
         payload: inventory,
     };
-    let encoded = um_runner_protocol::encode_runner_frame(&frame).unwrap();
+    let encoded = useful_runner_protocol::encode_runner_frame(&frame).unwrap();
     let value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
     assert_eq!(value["type"], "workspace_inventory");
     assert_eq!(value["payload"]["originAssignmentId"], ASSIGNMENT);
@@ -431,9 +431,9 @@ fn discovery_covers_empty_present_and_unreadable_anchors_without_claiming() {
     assert_eq!(present[0]["lastClaimGeneration"], 0);
     assert_eq!(present[0]["discovery"], true);
     let wire = |payload: serde_json::Value, message_id: &str, sequence| {
-        um_runner_protocol::encode_runner_frame(
-            &um_runner_protocol::RunnerFrame::WorkspaceInventory {
-                envelope: um_runner_protocol::RunnerEnvelope {
+        useful_runner_protocol::encode_runner_frame(
+            &useful_runner_protocol::RunnerFrame::WorkspaceInventory {
+                envelope: useful_runner_protocol::RunnerEnvelope {
                     message_id: message_id.into(),
                     runner_id: RUNNER.into(),
                     boot_id: BOOT_A.into(),
@@ -621,7 +621,7 @@ fn claimed_generation_survives_restart_and_uncommitted_staging_cannot_reset_it()
     let claimed = store.claim_fixture(&id, &grant(&initial, 1), true).unwrap();
     let private = store.private_by_attempt(&claimed).unwrap()[ATTEMPT].clone();
     fs::write(
-        private.join(".um-recovery-incomplete-staging"),
+        private.join(".useful-recovery-incomplete-staging"),
         b"{\"lastClaimGeneration\":0",
     )
     .unwrap();
@@ -657,11 +657,11 @@ fn qualify_persistent_host_recovery() {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
-    use um_execution::{AuthenticatedProcessGroup, DurableProcessGuardStore};
+    use useful_execution::{AuthenticatedProcessGroup, DurableProcessGuardStore};
 
-    let path = PathBuf::from(std::env::var("UM_RECOVERY_FIXTURE_PATH").unwrap());
+    let path = PathBuf::from(std::env::var("USEFUL_RECOVERY_FIXTURE_PATH").unwrap());
     let evidence = path.with_extension("evidence.json");
-    let phase = std::env::var("UM_RECOVERY_FIXTURE_PHASE").unwrap();
+    let phase = std::env::var("USEFUL_RECOVERY_FIXTURE_PHASE").unwrap();
     if phase == "inspect" {
         // Used after an external syscall-level crash/fault injector. Reopening
         // must never heal an uncertain catalog, manifest or claim by replacing it.
@@ -802,12 +802,12 @@ fn qualify_persistent_host_recovery() {
             saved["osBootId"] != serde_json::to_value(&current_boot).unwrap()["osBootId"];
         assert_eq!(
             rebooted,
-            std::env::var("UM_RECOVERY_EXPECT_REBOOT").unwrap() == "1"
+            std::env::var("USEFUL_RECOVERY_EXPECT_REBOOT").unwrap() == "1"
         );
         let device_changed = saved["device"] != fs::metadata(&path).unwrap().dev();
         assert_eq!(
             device_changed,
-            std::env::var("UM_RECOVERY_EXPECT_DEVICE_CHANGE").unwrap() == "1"
+            std::env::var("USEFUL_RECOVERY_EXPECT_DEVICE_CHANGE").unwrap() == "1"
         );
         AssignmentProcessGuards::durable_recovery(&target.private, current_boot, store.host())
             .unwrap();

@@ -2,8 +2,8 @@ use anyhow::Context;
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use um_api::AgentLoginFailure;
-use um_human_auth::Deployment;
+use useful_api::AgentLoginFailure;
+use useful_human_auth::Deployment;
 
 use crate::cli::grant::confirmation::NATIVE_AUTHORIZE;
 
@@ -25,7 +25,7 @@ pub(super) struct Command {
 
 /// Who can use the agent login once a runner holds it (REQ-GRANT-35).
 impl Stated for Command {
-    const COMMAND: &'static str = "um grant authorize";
+    const COMMAND: &'static str = "useful grant authorize";
     type Usage = crate::cli::grant::authorize::Command;
     const STATEMENT: Statement = Statement::Fixed(NATIVE_AUTHORIZE);
     const ACTION: &'static str = "to authorize the runner";
@@ -41,7 +41,7 @@ impl Command {
             format_args!("Authorizing runner {runner_id} for agent login {agent_login_id}:"),
             NATIVE_AUTHORIZE,
         )?;
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate agent login authorization request key")?;
         run_leaf(
             deployment,

@@ -6,17 +6,17 @@ use serde::Serialize;
 use time::OffsetDateTime;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{
+use useful_api::{
     CancelDeletionOutcome, CommonLifecycleFailure, DeletionSchedule, HttpClient,
     HttpTransportPolicy, LifecycleApiError, LifecycleTransition, RequestDeletionOutcome,
     UnreachableCategory, cancel_current_principal_deletion, cancel_organization_deletion,
     request_current_principal_deletion, request_organization_deletion,
 };
-use um_human_auth::Cancellation;
-use um_human_auth::Deployment;
-use um_human_auth::{self, LocalCredentialState, RequiredOperationWithBinding, SessionBinding};
-use um_human_auth::{AuthorizationError, DeviceAuthorization};
-use um_human_auth::{DeviceFlowError, DeviceFlowOutcome, DeviceFlowPhase};
+use useful_human_auth::Cancellation;
+use useful_human_auth::Deployment;
+use useful_human_auth::{self, LocalCredentialState, RequiredOperationWithBinding, SessionBinding};
+use useful_human_auth::{AuthorizationError, DeviceAuthorization};
+use useful_human_auth::{DeviceFlowError, DeviceFlowOutcome, DeviceFlowPhase};
 
 use super::OrganizationArg;
 
@@ -151,7 +151,7 @@ impl OrganizationCommand {
 
 impl AccountRequestCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let idempotency_key = um_support::generate_idempotency_key()
+        let idempotency_key = useful_support::generate_idempotency_key()
             .context("generate account deletion request identity")?;
         let client = HttpClient::new(self.request.http.transport_policy())
             .map_err(|error| anyhow!(error))
@@ -172,7 +172,7 @@ impl AccountRequestCommand {
         {
             match binding {
                 Some(binding) => {
-                    match um_human_auth::remove_bound_credential(deployment, &binding) {
+                    match useful_human_auth::remove_bound_credential(deployment, &binding) {
                         Ok(LocalCredentialState::Removed) => {
                             (Some(LocalCredentialDisposition::Removed), None)
                         }
@@ -210,7 +210,7 @@ impl AccountRequestCommand {
             writeln!(stderr, "error: {error:#}")?;
             writeln!(
                 stderr,
-                "\nRemove the deployment's local credential before continuing:\n  um auth logout"
+                "\nRemove the deployment's local credential before continuing:\n  useful auth logout"
             )?;
             return Ok(ExitCode::GeneralFailure);
         }
@@ -221,7 +221,7 @@ impl AccountRequestCommand {
 impl OrganizationRequestCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let organization_ref = self.organization_ref.into_string();
-        let idempotency_key = um_support::generate_idempotency_key()
+        let idempotency_key = useful_support::generate_idempotency_key()
             .context("generate organization deletion request identity")?;
         let client = HttpClient::new(self.request.http.transport_policy())
             .map_err(|error| anyhow!(error))
@@ -299,7 +299,7 @@ fn request_deletion_with_credential(
         .context(api_context);
     }
 
-    match um_human_auth::execute_required_with_binding(
+    match useful_human_auth::execute_required_with_binding(
         client,
         deployment,
         |access_token| {
@@ -396,18 +396,18 @@ impl DeletionTarget {
 
     fn cancellation_command(&self) -> String {
         match self {
-            Self::Account => "um account deletion cancel".to_owned(),
+            Self::Account => "useful account deletion cancel".to_owned(),
             Self::Organization(organization_ref) => {
-                format!("um organization deletion cancel {organization_ref}")
+                format!("useful organization deletion cancel {organization_ref}")
             }
         }
     }
 
     fn status_command(&self) -> String {
         match self {
-            Self::Account => "um auth status".to_owned(),
+            Self::Account => "useful auth status".to_owned(),
             Self::Organization(organization_ref) => {
-                format!("um organization show {organization_ref}")
+                format!("useful organization show {organization_ref}")
             }
         }
     }
@@ -424,7 +424,7 @@ fn execute_cancellation(
         .map_err(|error| anyhow!(error))
         .context("prepare deletion cancellation networking")?;
     let mut output = CancellationOutput::new(json, &target);
-    let proof = um_human_auth::identity_proof(
+    let proof = useful_human_auth::identity_proof(
         &client,
         deployment,
         cancellation,
@@ -460,7 +460,7 @@ fn execute_cancellation(
         }
     };
 
-    let idempotency_key = um_support::generate_idempotency_key()
+    let idempotency_key = useful_support::generate_idempotency_key()
         .context("generate deletion cancellation request identity")?;
     let result = match &target {
         DeletionTarget::Account => cancel_current_principal_deletion(
@@ -800,18 +800,18 @@ fn write_schedule_fields(output: &mut impl Write, schedule: &DeletionSchedule) -
     writeln!(output, "updated: {}", schedule.updated_at)
 }
 
-const fn resource_key(kind: um_api::LifecycleResourceKind) -> &'static str {
+const fn resource_key(kind: useful_api::LifecycleResourceKind) -> &'static str {
     match kind {
-        um_api::LifecycleResourceKind::Principal => "principal",
-        um_api::LifecycleResourceKind::Organization => "organization",
+        useful_api::LifecycleResourceKind::Principal => "principal",
+        useful_api::LifecycleResourceKind::Organization => "organization",
     }
 }
 
-const fn lifecycle_state(state: um_api::LifecycleState) -> &'static str {
+const fn lifecycle_state(state: useful_api::LifecycleState) -> &'static str {
     match state {
-        um_api::LifecycleState::Active => "active",
-        um_api::LifecycleState::Suspended => "suspended",
-        um_api::LifecycleState::DeletionPending => "deletion_pending",
+        useful_api::LifecycleState::Active => "active",
+        useful_api::LifecycleState::Suspended => "suspended",
+        useful_api::LifecycleState::DeletionPending => "deletion_pending",
     }
 }
 
@@ -850,7 +850,7 @@ impl<'a> CancellationOutput<'a> {
     ) -> anyhow::Result<()> {
         // Keep deletion-cancellation presentation and its error context next to this command.
         if self.json {
-            let event = um_human_auth::activation_event(
+            let event = useful_human_auth::activation_event(
                 deployment,
                 authorization,
                 expires_at,
@@ -1032,7 +1032,7 @@ impl<'a> CancellationOutput<'a> {
             if matches!(self.target, DeletionTarget::Account) {
                 writeln!(
                     stdout,
-                    "\nSign in to establish a renewable local session:\n  um auth login"
+                    "\nSign in to establish a renewable local session:\n  useful auth login"
                 )?;
             }
         } else {
@@ -1078,7 +1078,7 @@ fn common_lifecycle_failure(
             FailureOperation::Request => unauthenticated_failure(
                 target,
                 "requires sign-in",
-                "Sign in first:\n  um auth login",
+                "Sign in first:\n  useful auth login",
             ),
             FailureOperation::Cancellation => unauthenticated_failure(
                 target,
@@ -1089,7 +1089,7 @@ fn common_lifecycle_failure(
         CommonLifecycleFailure::Forbidden => FailurePresentation::new(
             "forbidden",
             match (operation, target) {
-                (FailureOperation::Request, DeletionTarget::Account) => "error: account deletion not permitted\n\nCheck why the deployment refuses the account:\n  um auth status".to_owned(),
+                (FailureOperation::Request, DeletionTarget::Account) => "error: account deletion not permitted\n\nCheck why the deployment refuses the account:\n  useful auth status".to_owned(),
                 (FailureOperation::Request, DeletionTarget::Organization(_)) => "error: organization deletion not permitted\n\nUse a current active human owner account.".to_owned(),
                 (FailureOperation::Cancellation, _) => format!(
                     "error: {} deletion cancellation not permitted\n\nUse the required linked identity and active owner account.",

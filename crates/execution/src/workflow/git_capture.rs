@@ -1913,7 +1913,7 @@ fn wait_managed_child(
     stream_finished: impl Fn() -> bool,
     workers_finished: impl Fn() -> bool,
 ) -> Result<ExitStatus, ProcessFailure> {
-    let started = um_support::monotonic_now();
+    let started = useful_support::monotonic_now();
     let mut status = None;
     let mut stream_closed_at = None;
     loop {
@@ -1938,22 +1938,22 @@ fn wait_managed_child(
             return Ok(status);
         }
         if status.is_none() && stream_finished() {
-            let closed_at = stream_closed_at.get_or_insert_with(um_support::monotonic_now);
-            if um_support::elapsed(*closed_at) >= Duration::from_millis(100) {
+            let closed_at = stream_closed_at.get_or_insert_with(useful_support::monotonic_now);
+            if useful_support::elapsed(*closed_at) >= Duration::from_millis(100) {
                 child.terminate();
                 return Err(ProcessFailure::StreamClosed);
             }
         } else {
             stream_closed_at = None;
         }
-        if um_support::elapsed(started) >= timeout {
+        if useful_support::elapsed(started) >= timeout {
             child.terminate();
             return Err(ProcessFailure::TimedOut {
                 command,
                 limit: timeout,
             });
         }
-        um_support::sleep(PROCESS_POLL_INTERVAL);
+        useful_support::sleep(PROCESS_POLL_INTERVAL);
     }
 }
 

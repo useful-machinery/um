@@ -2,8 +2,8 @@ use anyhow::Context;
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use um_api::AgentLoginFailure;
-use um_human_auth::Deployment;
+use useful_api::AgentLoginFailure;
+use useful_human_auth::Deployment;
 
 use crate::cli::grant::confirmation::NATIVE_DEAUTHORIZE;
 
@@ -25,7 +25,7 @@ pub(super) struct Command {
 
 /// The stop Cloud requests of the runner's run (REQ-GRANT-48).
 impl Stated for Command {
-    const COMMAND: &'static str = "um grant deauthorize";
+    const COMMAND: &'static str = "useful grant deauthorize";
     type Usage = crate::cli::grant::deauthorize::Command;
     const STATEMENT: Statement = Statement::Fixed(NATIVE_DEAUTHORIZE);
     const ACTION: &'static str = "to end the runner's authorization";
@@ -43,7 +43,7 @@ impl Command {
             ),
             NATIVE_DEAUTHORIZE,
         )?;
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate agent login deauthorization request key")?;
         run_leaf(
             deployment,

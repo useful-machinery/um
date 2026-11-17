@@ -6,10 +6,10 @@ fn signup_environment<'a>(
 ) -> [(&'static str, &'a str); 5] {
     [
         (CREDENTIALS_FILE_VARIABLE, credential_path),
-        ("UM_API_URL", &server.api_url),
-        ("UM_AUTH_ISSUER", &server.issuer),
-        ("UM_AUTH_AUDIENCE", "https://api.fixture.example"),
-        ("UM_AUTH_CLIENT_ID", "fixture-public-client"),
+        ("USEFUL_API_URL", &server.api_url),
+        ("USEFUL_AUTH_ISSUER", &server.issuer),
+        ("USEFUL_AUTH_AUDIENCE", "https://api.fixture.example"),
+        ("USEFUL_AUTH_CLIENT_ID", "fixture-public-client"),
     ]
 }
 
@@ -206,7 +206,7 @@ fn signup_reports_a_refused_account_as_forbidden_and_names_deletion_cancel() {
     );
 
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("um account deletion cancel"));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("useful account deletion cancel"));
     server.finish();
 }
 
@@ -233,7 +233,7 @@ fn already_provisioned_signup_directs_the_human_to_status() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(
         output.stdout,
-        b"! This identity already has a Useful Machinery account.\n\nRun:\n  um auth status\n"
+        b"! This identity already has a Useful Machinery account.\n\nRun:\n  useful auth status\n"
     );
     assert!(output.stderr.is_empty());
     server.finish();

@@ -1,12 +1,12 @@
 use std::process::ExitCode;
 
-use um_execution::ExecutionOutcome;
+use useful_execution::ExecutionOutcome;
 
 fn main() -> ExitCode {
-    let outcome = if um_execution::child_guard_worker_requested() {
-        um_execution::run_child_guard_worker()
-    } else if um_execution::result_validation_worker_requested() {
-        um_execution::run_result_validation_worker()
+    let outcome = if useful_execution::child_guard_worker_requested() {
+        useful_execution::run_child_guard_worker()
+    } else if useful_execution::result_validation_worker_requested() {
+        useful_execution::run_result_validation_worker()
     } else {
         ExecutionOutcome::Failed
     };

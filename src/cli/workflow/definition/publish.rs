@@ -11,18 +11,18 @@ use super::super::super::{
 use super::cloud::{resend_once, with_api};
 use super::report::{display, write_invalid, write_json};
 use crate::exit_code::ExitCode;
-use um_api::{
+use useful_api::{
     WorkflowBindingValues, WorkflowDefinitionApi, WorkflowDefinitionFailure, WorkflowProblemDetail,
     WorkflowPublication, WorkflowTreeFile,
 };
-use um_execution::{
+use useful_execution::{
     BindingsFile, PublishTarget, Published, ValidatedTree, WorkflowHome, check_definition_id,
     publish, validate_workflow_tree,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Publish a local workflow tree as a definition revision";
-const COMMAND_NAME: &str = "um workflow definition publish";
+const COMMAND_NAME: &str = "useful workflow definition publish";
 const REFUSED: &str = "Publish refused.";
 /// The problem slug of a reuse that matched several identical Cloud definitions.
 const DEFINITION_REUSE_AMBIGUOUS: &str = "definition-reuse-ambiguous";
@@ -46,7 +46,7 @@ pub(super) struct Command {
         long,
         value_name = "ID",
         conflicts_with = "new",
-        help = "Publish to this local definition id, as `um workflow definition list` prints it, whatever its name"
+        help = "Publish to this local definition id, as `useful workflow definition list` prints it, whatever its name"
     )]
     to: Option<String>,
 
@@ -77,7 +77,7 @@ pub(super) struct Command {
         value_name = "CLOUD_ID",
         requires = "cloud",
         conflicts_with = "cloud_new",
-        help = "Publish to this Cloud definition id, as `um workflow definition cloud list` prints it, and record it for the local definition"
+        help = "Publish to this Cloud definition id, as `useful workflow definition cloud list` prints it, and record it for the local definition"
     )]
     cloud_to: Option<String>,
 
@@ -274,7 +274,7 @@ fn publish_to_cloud(
     tree: &ValidatedTree,
     published: &Published,
 ) -> anyhow::Result<Result<CloudPublished, WorkflowDefinitionFailure>> {
-    let key = um_support::generate_idempotency_key()
+    let key = useful_support::generate_idempotency_key()
         .context("generate Cloud workflow definition request identity")?;
     let files = tree
         .files
@@ -543,7 +543,7 @@ fn write_cloud_published(
                 // the target again.
                 Some(id) => writeln!(
                     stderr,
-                    "\nRevision {} of {} stays recorded locally, without {} as its Cloud definition. Resolve the error and publish again with the target:\n  um workflow definition publish <DIR> --cloud {} --project {} --cloud-to {}",
+                    "\nRevision {} of {} stays recorded locally, without {} as its Cloud definition. Resolve the error and publish again with the target:\n  useful workflow definition publish <DIR> --cloud {} --project {} --cloud-to {}",
                     published.revision.n,
                     display(&published.record.id),
                     display(id),
@@ -554,7 +554,7 @@ fn write_cloud_published(
                 // Several identical definitions answered the reuse: the owner chooses one.
                 None if ambiguous => writeln!(
                     stderr,
-                    "\nRevision {} of {} stays recorded locally. Several Cloud definitions of the project are identical to it. Publish again to the one listed that you choose, or create another:\n  um workflow definition publish <DIR> --cloud {} --project {} --cloud-to <CLOUD_ID>\n  um workflow definition publish <DIR> --cloud {} --project {} --cloud-new",
+                    "\nRevision {} of {} stays recorded locally. Several Cloud definitions of the project are identical to it. Publish again to the one listed that you choose, or create another:\n  useful workflow definition publish <DIR> --cloud {} --project {} --cloud-to <CLOUD_ID>\n  useful workflow definition publish <DIR> --cloud {} --project {} --cloud-new",
                     published.revision.n,
                     display(&published.record.id),
                     display(&target.organization),

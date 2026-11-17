@@ -1,6 +1,6 @@
-//! The runner home: the directory `runner/` under the `um` home, which holds the
+//! The runner home: the directory `runner/` under the `useful` home, which holds the
 //! operator configuration, the enrolled state, the control socket and the work
-//! root a `um runner` command uses when it is given no `--config`
+//! root a `useful runner` command uses when it is given no `--config`
 //! (REQ-RUNNERENROLL-109).
 
 use std::error::Error;
@@ -30,26 +30,29 @@ const WORK_DIRECTORY: &str = "work";
 const CONFIG_TEMPORARY_PREFIX: &str = ".runner-config.tmp";
 const SCHEMA_VERSION: u8 = 1;
 
-/// The runner home of one `um` home. Its paths are absolute, made so from the
+/// The runner home of one `useful` home. Its paths are absolute, made so from the
 /// working directory without resolving a link; the directories need not exist.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RunnerHome {
-    um_home: PathBuf,
+    useful_home: PathBuf,
 }
 
 impl RunnerHome {
-    /// The runner home under the `um` home `um_home`.
-    pub fn new(um_home: &Path) -> Result<Self, RunnerHomeError> {
-        let absolute = std::path::absolute(um_home).map_err(|source| RunnerHomeError::Resolve {
-            path: um_home.to_owned(),
-            source,
-        })?;
-        Ok(Self { um_home: absolute })
+    /// The runner home under the `useful` home `useful_home`.
+    pub fn new(useful_home: &Path) -> Result<Self, RunnerHomeError> {
+        let absolute =
+            std::path::absolute(useful_home).map_err(|source| RunnerHomeError::Resolve {
+                path: useful_home.to_owned(),
+                source,
+            })?;
+        Ok(Self {
+            useful_home: absolute,
+        })
     }
 
-    /// `runner/` under the `um` home.
+    /// `runner/` under the `useful` home.
     pub fn directory(&self) -> PathBuf {
-        self.um_home.join(RUNNER_DIRECTORY)
+        self.useful_home.join(RUNNER_DIRECTORY)
     }
 
     /// `runner/config.json`, the operator configuration.
@@ -74,21 +77,21 @@ impl RunnerHome {
 
     /// Creates what the home lacks and answers the path of its operator
     /// configuration, loaded and checked (REQ-RUNNERENROLL-110,
-    /// REQ-RUNNERENROLL-111). The `um` home, `runner/` and `runner/work/` are
+    /// REQ-RUNNERENROLL-111). The `useful` home, `runner/` and `runner/work/` are
     /// created `0700` when absent, and a generated configuration is published
     /// at `runner/config.json` when nothing is there. Nothing that exists is
     /// replaced, rewritten or re-moded (INV-RUNNER-25): an existing `runner/`
     /// must already be a private directory of the effective user, an existing
-    /// work root is left to `um runner serve`'s own checks, and an existing
+    /// work root is left to `useful runner serve`'s own checks, and an existing
     /// configuration is used as written. No state, journal, lock or socket is
     /// written.
     pub fn initialize(&self) -> Result<PathBuf, RunnerHomeError> {
         DirBuilder::new()
             .recursive(true)
             .mode(DIRECTORY_MODE)
-            .create(&self.um_home)
-            .map_err(|source| RunnerHomeError::CreateUmHome {
-                path: self.um_home.clone(),
+            .create(&self.useful_home)
+            .map_err(|source| RunnerHomeError::CreateUsefulHome {
+                path: self.useful_home.clone(),
                 source,
             })?;
         let directory = self.directory();
@@ -283,10 +286,10 @@ impl fmt::Display for PublicationStage {
 /// path it concerns; a failed I/O call keeps its error.
 #[derive(Debug)]
 pub enum RunnerHomeError {
-    /// The `um` home cannot be made absolute.
+    /// The `useful` home cannot be made absolute.
     Resolve { path: PathBuf, source: io::Error },
-    /// The `um` home cannot be created.
-    CreateUmHome { path: PathBuf, source: io::Error },
+    /// The `useful` home cannot be created.
+    CreateUsefulHome { path: PathBuf, source: io::Error },
     /// `runner/` or `runner/work/` cannot be created.
     CreateDirectory { path: PathBuf, source: io::Error },
     /// `runner/` is not a directory of the effective user with mode `0700`.
@@ -322,10 +325,14 @@ impl fmt::Display for RunnerHomeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Resolve { path, source } => {
-                write!(formatter, "resolve um home {}: {source}", path.display())
+                write!(
+                    formatter,
+                    "resolve useful home {}: {source}",
+                    path.display()
+                )
             }
-            Self::CreateUmHome { path, source } => {
-                write!(formatter, "create um home {}: {source}", path.display())
+            Self::CreateUsefulHome { path, source } => {
+                write!(formatter, "create useful home {}: {source}", path.display())
             }
             Self::CreateDirectory { path, source } => write!(
                 formatter,
@@ -479,12 +486,12 @@ mod tests {
         );
     }
 
-    /// A home whose `um` home, `runner/` and `runner/work/` exist and are
+    /// A home whose `useful` home, `runner/` and `runner/work/` exist and are
     /// private.
     fn prepared_home(temporary: &tempfile::TempDir) -> RunnerHome {
-        let home = RunnerHome::new(&temporary.path().join("um")).unwrap();
+        let home = RunnerHome::new(&temporary.path().join("useful")).unwrap();
         for directory in [
-            temporary.path().join("um"),
+            temporary.path().join("useful"),
             home.directory(),
             home.work_root(),
         ] {
@@ -495,16 +502,16 @@ mod tests {
 
     // REQ-RUNNERENROLL-110
     #[test]
-    fn initializing_an_empty_um_home_creates_a_private_layout_and_a_generated_configuration() {
+    fn initializing_an_empty_useful_home_creates_a_private_layout_and_a_generated_configuration() {
         let temporary = tempfile::tempdir().unwrap();
         let relative = relative_to_working_directory(&temporary.path().join("relative"));
         assert!(relative.is_relative());
-        for um_home in [temporary.path().join("absolute"), relative] {
-            let home = RunnerHome::new(&um_home).unwrap();
+        for useful_home in [temporary.path().join("absolute"), relative] {
+            let home = RunnerHome::new(&useful_home).unwrap();
 
             let config_path = home.initialize().unwrap();
 
-            let absolute = std::path::absolute(&um_home).unwrap();
+            let absolute = std::path::absolute(&useful_home).unwrap();
             assert_eq!(home.directory(), absolute.join("runner"));
             assert_eq!(config_path, home.config_path());
             for directory in [absolute.clone(), home.directory(), home.work_root()] {
@@ -541,7 +548,7 @@ mod tests {
     #[test]
     fn initialization_keeps_every_name_mode_inode_and_byte_that_exists() {
         let temporary = tempfile::tempdir().unwrap();
-        let home = RunnerHome::new(&temporary.path().join("um")).unwrap();
+        let home = RunnerHome::new(&temporary.path().join("useful")).unwrap();
         home.initialize().unwrap();
         let before = snapshot(temporary.path());
 
@@ -553,7 +560,11 @@ mod tests {
         // not have chosen.
         let temporary = tempfile::tempdir().unwrap();
         let home = prepared_home(&temporary);
-        fs::set_permissions(temporary.path().join("um"), Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(
+            temporary.path().join("useful"),
+            Permissions::from_mode(0o755),
+        )
+        .unwrap();
         fs::set_permissions(home.work_root(), Permissions::from_mode(0o750)).unwrap();
         write_development_config(&home, &home.state_path());
         write_private_file(&home.state_path(), b"{\"state\": \"kept\"}\n");
@@ -571,7 +582,7 @@ mod tests {
     fn concurrent_initializations_of_one_home_all_read_the_one_published_configuration() {
         const STARTS: usize = 8;
         let temporary = tempfile::tempdir().unwrap();
-        let home = RunnerHome::new(&temporary.path().join("um")).unwrap();
+        let home = RunnerHome::new(&temporary.path().join("useful")).unwrap();
         let barrier = Arc::new(Barrier::new(STARTS));
 
         let starts = (0..STARTS)
@@ -617,8 +628,8 @@ mod tests {
         ];
         for (case, prepare) in cases {
             let temporary = tempfile::tempdir().unwrap();
-            let home = RunnerHome::new(&temporary.path().join("um")).unwrap();
-            create_private_directory(&temporary.path().join("um"));
+            let home = RunnerHome::new(&temporary.path().join("useful")).unwrap();
+            create_private_directory(&temporary.path().join("useful"));
             prepare(&home.directory());
             let before = snapshot(temporary.path());
 
@@ -714,7 +725,7 @@ mod tests {
         // The home's own state, named through a link to the home, is no
         // conflict.
         let alias = temporary.path().join("alias");
-        symlink(temporary.path().join("um"), &alias).unwrap();
+        symlink(temporary.path().join("useful"), &alias).unwrap();
         write_development_config(&home, &alias.join("runner").join("state.json"));
         write_private_file(&home.state_path(), b"{}");
         assert_eq!(home.initialize().unwrap(), home.config_path());
@@ -724,7 +735,7 @@ mod tests {
     #[test]
     fn reading_a_home_answers_its_configured_socket_or_its_layouts_and_creates_nothing() {
         let temporary = tempfile::tempdir().unwrap();
-        let home = RunnerHome::new(&temporary.path().join("um")).unwrap();
+        let home = RunnerHome::new(&temporary.path().join("useful")).unwrap();
 
         assert!(home.existing_configuration().unwrap().is_none());
         assert_eq!(

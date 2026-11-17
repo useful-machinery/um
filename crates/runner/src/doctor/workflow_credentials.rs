@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use um_execution::{
+use useful_execution::{
     BindingKind, CommandRunner, ResolutionFailure, ResolvedWorkflow, RootBlocks, ValidatedHarness,
     ValidatedRecoveryHandler, ValidatedStep, resolve_workflow_file,
 };
@@ -279,7 +279,7 @@ impl CredentialRequirement {
         let title = self.kind.title();
         let show_repository = || {
             format!(
-                "um project repository show {organization} {}",
+                "useful project repository show {organization} {}",
                 project.unwrap_or("PROJECT")
             )
         };
@@ -288,38 +288,38 @@ impl CredentialRequirement {
         // missing, inactive or lacking a scope.
         let (list, remedy) = match self.kind {
             CredentialKind::Github => (
-                "um connection github installation list",
+                "useful connection github installation list",
                 format!(
-                    "Install the GitHub App for the organization with um connection github setup begin {organization}."
+                    "Install the GitHub App for the organization with useful connection github setup begin {organization}."
                 ),
             ),
             CredentialKind::Gitlab if missing => (
-                "um connection gitlab list",
+                "useful connection gitlab list",
                 format!(
-                    "Connect GitLab.com with um connection gitlab create {organization} https://gitlab.com, then give it a credential with um connection gitlab credential create."
+                    "Connect GitLab.com with useful connection gitlab create {organization} https://gitlab.com, then give it a credential with useful connection gitlab credential create."
                 ),
             ),
             CredentialKind::Gitlab => (
-                "um connection gitlab list",
+                "useful connection gitlab list",
                 format!(
-                    "Replace the GitLab connection's credential with um connection gitlab credential create {organization} CONNECTION; um connection gitlab list {organization} shows its ID."
+                    "Replace the GitLab connection's credential with useful connection gitlab credential create {organization} CONNECTION; useful connection gitlab list {organization} shows its ID."
                 ),
             ),
             CredentialKind::Linear if missing => (
-                "um connection linear list",
+                "useful connection linear list",
                 format!(
-                    "Connect a Linear workspace with um connection linear authorization create {organization}."
+                    "Connect a Linear workspace with useful connection linear authorization create {organization}."
                 ),
             ),
             CredentialKind::Linear => (
-                "um connection linear list",
+                "useful connection linear list",
                 format!(
-                    "Reauthorize the Linear connection with um connection linear authorization create {organization} --connection-id CONNECTION; um connection linear list {organization} shows its ID."
+                    "Reauthorize the Linear connection with useful connection linear authorization create {organization} --connection-id CONNECTION; useful connection linear list {organization} shows its ID."
                 ),
             ),
             CredentialKind::ClaudeCode | CredentialKind::Codex => {
                 return format!(
-                    "Sign {title} in on the runner host as the user that runs um runner serve, or give the runner your own login with um grant create {} and um grant authorize GRANT RUNNER --yes.",
+                    "Sign {title} in on the runner host as the user that runs useful runner serve, or give the runner your own login with useful grant create {} and useful grant authorize GRANT RUNNER --yes.",
                     self.kind.as_str()
                 );
             }
@@ -413,8 +413,8 @@ const RECOGNITION: Recognition = Recognition {
     credential_words: &["TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIALS"],
     credential_names: &["CLAUDE_CONFIG_DIR", "CODEX_HOME"],
     named_credentials: &[
-        ("UM_LINEAR_ACCESS_TOKEN", CredentialKind::Linear),
-        ("UM_LINEAR_ACCESS_TOKEN_FILE", CredentialKind::Linear),
+        ("USEFUL_LINEAR_ACCESS_TOKEN", CredentialKind::Linear),
+        ("USEFUL_LINEAR_ACCESS_TOKEN_FILE", CredentialKind::Linear),
     ],
     provider_words: &[
         ("GITHUB", CredentialKind::Github),
@@ -788,7 +788,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use um_execution::{CommandOutput, CommandProbeError, CommandRequest, CommandRunner};
+    use useful_execution::{CommandOutput, CommandProbeError, CommandRequest, CommandRunner};
 
     use super::super::git::{MAXIMUM_STDOUT_BYTES, SYSTEM_TIMEOUT};
     use super::{
@@ -1190,11 +1190,11 @@ steps:
                 ForwardedVariable::Calls(CredentialKind::Linear),
             ),
             (
-                "UM_LINEAR_ACCESS_TOKEN",
+                "USEFUL_LINEAR_ACCESS_TOKEN",
                 ForwardedVariable::Calls(CredentialKind::Linear),
             ),
             (
-                "UM_LINEAR_ACCESS_TOKEN_FILE",
+                "USEFUL_LINEAR_ACCESS_TOKEN_FILE",
                 ForwardedVariable::Calls(CredentialKind::Linear),
             ),
             (

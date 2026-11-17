@@ -19,8 +19,8 @@ use crate::credential::Credential;
 use crate::service::run_inputs::{
     BrokerFailure, PreparationDeadline, broker_operation_runtime, validate_capability_url,
 };
-use um_execution::CaptureCancellation;
-use um_runner_protocol::{WorkflowTreeFileV1RunnerProjection, WorkflowTreeV1RunnerProjection};
+use useful_execution::CaptureCancellation;
+use useful_runner_protocol::{WorkflowTreeFileV1RunnerProjection, WorkflowTreeV1RunnerProjection};
 
 const CAPABILITIES_PATH: &str = "/v1/runner/workflow-trees/download-capabilities";
 /// The Gateway's request limit: at most 256 distinct paths per capability request.
@@ -220,7 +220,7 @@ impl TreeBroker for HttpTreeBroker {
             }
             Ok(encoded)
         })?;
-        let answer: CapabilityAnswer = um_support::strict_json_from_slice(&encoded)
+        let answer: CapabilityAnswer = useful_support::strict_json_from_slice(&encoded)
             .and_then(serde_json::from_value)
             .map_err(|_| TreeDownloadFailure::InvalidResponse)?;
         if answer.schema_version != 1 || answer.digest != request.digest {

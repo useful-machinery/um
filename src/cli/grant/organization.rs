@@ -1,11 +1,11 @@
-//! The one organization a native grant `um grant create` makes is for (REQ-GRANT-72): the one
+//! The one organization a native grant `useful grant create` makes is for (REQ-GRANT-72): the one
 //! `--organization` names, or else the member's only active membership. The runner choice of
 //! `authorize` and `deauthorize` reads the member's active organizations here too
 //! (REQ-GRANT-81).
 
 use anyhow::anyhow;
 
-use um_api::{MemberGrantApi, MemberGrantFailure};
+use useful_api::{MemberGrantApi, MemberGrantFailure};
 
 // The largest page the membership list serves.
 const PAGE: i32 = 200;
@@ -70,7 +70,7 @@ pub(super) fn active(api: &MemberGrantApi) -> Result<Vec<(String, String)>, Memb
 /// The organization `named` names: an ID as given, a slug to the ID of the organization it
 /// names among the member's.
 pub(super) fn named(api: &MemberGrantApi, named: &str) -> Result<Organization, MemberGrantFailure> {
-    if um_support::valid_typed_id(named, "org_") {
+    if useful_support::valid_typed_id(named, "org_") {
         return Ok(Organization {
             id: named.to_owned(),
             slug: None,

@@ -2,7 +2,7 @@
 //! runner and what it reported (REQ-GRANT-13), its availability and next action
 //! (REQ-GRANT-53), and, once it ended, whether the runner has confirmed removing its copy
 //! (REQ-GRANT-47) and the stop requested of the run it was serving (REQ-GRANT-48).
-//! `um grant list` prints it for a grant of either kind, and the earlier commands it replaces
+//! `useful grant list` prints it for a grant of either kind, and the earlier commands it replaces
 //! for an agent login.
 
 use std::io::{self, Write};
@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use crate::exit_code::ExitCode;
 
-use um_api::{
+use useful_api::{
     AgentLogin, AgentLoginAuthorization, AgentLoginReportState, GrantEndedAuthorization,
     MemberGrantAuthorization,
 };
@@ -35,7 +35,7 @@ pub(in crate::cli) struct AuthorizationView<'a> {
     delivery: Option<DeliveryView<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     report: Option<ReportView<'a>>,
-    // The runner's last use of a native grant where `um grant list` prints no exchange
+    // The runner's last use of a native grant where `useful grant list` prints no exchange
     // (REQ-GRANT-64).
     #[serde(flatten)]
     last_use: Option<LastUseView<'a>>,
@@ -44,7 +44,7 @@ pub(in crate::cli) struct AuthorizationView<'a> {
     #[serde(flatten)]
     status: Option<MemberStatus>,
     // Whether the text form prints what was delivered and reported: an OAuth grant's
-    // authorization has no exchange, and `um grant list` leaves it to `list GRANT`.
+    // authorization has no exchange, and `useful grant list` leaves it to `list GRANT`.
     #[serde(skip)]
     exchange: bool,
 }
@@ -272,7 +272,7 @@ impl<'a> AuthorizationView<'a> {
         }
     }
 
-    /// The authorization of a grant `um grant authorize` just made, with the runner's
+    /// The authorization of a grant `useful grant authorize` just made, with the runner's
     /// organization: nothing has been delivered or reported under it yet.
     pub(in crate::cli) fn made(authorization: &'a MemberGrantAuthorization) -> Self {
         Self {
@@ -396,7 +396,7 @@ pub(in crate::cli) fn write_stop_note(output: &mut impl Write) -> io::Result<()>
     writeln!(
         output,
         "\nEach run asked to stop was sent a graceful cancellation request, whichever member started \
-         it. To wait for a run's cancellation to settle:\n  um run cancel ORGANIZATION RUN --wait"
+         it. To wait for a run's cancellation to settle:\n  useful run cancel ORGANIZATION RUN --wait"
     )
 }
 

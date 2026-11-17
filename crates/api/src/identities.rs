@@ -14,7 +14,7 @@ use super::problem::{
     QUANTITY_LIMIT_REACHED, REQUEST_BODY_TOO_LARGE, UNAUTHORIZED,
 };
 use super::{UnreachableCategory, bearer_authorization, classify_reqwest_error};
-use um_support::valid_typed_id;
+use useful_support::valid_typed_id;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 const READ_ATTEMPTS: usize = 1;
@@ -379,7 +379,7 @@ fn execute_request(
             Err(_) => last_failure = UnreachableCategory::Timeout,
         }
         if attempt + 1 < spec.max_attempts {
-            um_support::sleep(um_support::short_retry_delay());
+            useful_support::sleep(useful_support::short_retry_delay());
         }
     }
     Ok(RequestExecution::Unreachable(last_failure))

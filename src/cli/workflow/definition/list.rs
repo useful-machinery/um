@@ -1,4 +1,4 @@
-//! `um workflow definition list` (REQ-WFDEF-25).
+//! `useful workflow definition list` (REQ-WFDEF-25).
 
 use std::io::{self, Write};
 
@@ -6,10 +6,10 @@ use clap::Args;
 use serde::Serialize;
 
 use super::report::{display, write_json};
-use um_execution::{StoredDefinition, WorkflowHome, list_definitions};
+use useful_execution::{StoredDefinition, WorkflowHome, list_definitions};
 
 pub(super) const ABOUT: &str = "List local workflow definitions";
-const COMMAND_NAME: &str = "um workflow definition list";
+const COMMAND_NAME: &str = "useful workflow definition list";
 const REFUSED: &str = "List refused.";
 
 #[derive(Debug, Args)]

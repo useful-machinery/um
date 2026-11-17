@@ -272,7 +272,7 @@ fn validate_connection(
     _organization: &str,
     id: Option<&str>,
 ) -> Result<LinearConnection, LinearFailure> {
-    if !um_support::valid_typed_id(&value.id, "lcn_")
+    if !useful_support::valid_typed_id(&value.id, "lcn_")
         || value.organization_id.is_empty()
         || id.is_some_and(|id| value.id != id)
         || value.lifecycle_generation < 1
@@ -290,7 +290,7 @@ fn validate_session(
     organization: &str,
     id: Option<&str>,
 ) -> Result<LinearSession, LinearFailure> {
-    if !um_support::valid_typed_id(&value.id, "las_")
+    if !useful_support::valid_typed_id(&value.id, "las_")
         || value.organization_id.is_empty()
         || id.is_some_and(|id| value.id != id)
         || value.created_at.is_empty()

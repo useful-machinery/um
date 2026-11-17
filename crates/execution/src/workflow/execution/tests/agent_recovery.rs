@@ -110,7 +110,7 @@ async fn all_profiles_use_one_fresh_authoritative_recovery_protocol() {
                 ResolvedInputs::default(),
                 EnvironmentSnapshot::new([
                     ("PATH", "/bin:/usr/bin"),
-                    ("UM_INHERITED", "must-be-scrubbed"),
+                    ("USEFUL_INHERITED", "must-be-scrubbed"),
                 ]),
                 CancellationSource::new(),
                 1,
@@ -160,7 +160,7 @@ async fn all_profiles_use_one_fresh_authoritative_recovery_protocol() {
             assert!(
                 started
                     .environment()
-                    .variable(std::ffi::OsStr::new("UM_INHERITED"))
+                    .variable(std::ffi::OsStr::new("USEFUL_INHERITED"))
                     .is_none()
             );
             let context = read_recovery_context(&fs::read(&context_path).unwrap()).unwrap();

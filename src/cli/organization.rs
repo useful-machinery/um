@@ -11,14 +11,14 @@ use anyhow::Context;
 use clap::{Args, Subcommand};
 
 use crate::exit_code::ExitCode;
-use um_api::{
+use useful_api::{
     CreateOrganizationOutcome, GetOrganizationOutcome, HttpClient,
     ListCurrentPrincipalMembershipsOutcome, ListOrganizationAuditRecordsOutcome,
     ListOrganizationMembershipHistoryOutcome, ListOrganizationMembershipsOutcome,
     MembershipTerminationOutcome, OrganizationError, UpdateOrganizationMembershipOutcome,
     UpdateOrganizationOutcome,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Manage Useful Machinery organizations";
 const NAME: &str = "organization";
@@ -101,7 +101,7 @@ impl LeafOptions {
     where
         O: super::HumanCredentialOutcome<Error = OrganizationError>,
     {
-        let idempotency_key = um_support::generate_idempotency_key()
+        let idempotency_key = useful_support::generate_idempotency_key()
             .context("generate organization mutation request identity")?;
         self.execute(
             deployment,

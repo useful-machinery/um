@@ -1,7 +1,7 @@
 use std::fmt;
 
-use um_api as api;
-use um_api::{
+use useful_api as api;
+use useful_api::{
     AuthenticatedPrincipal, CurrentPrincipalError, CurrentPrincipalOutcome, HttpClient,
     UnreachableCategory,
 };

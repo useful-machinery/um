@@ -74,7 +74,7 @@ steps:
       argv:
         - sh
         - -c
-        - 'test -e ready && test "$(cat "$UM_STEP_INPUTS/values/findings")" = null && cp "$UM_STEP_INPUTS/values/prior" final.txt'
+        - 'test -e ready && test "$(cat "$USEFUL_STEP_INPUTS/values/findings")" = null && cp "$USEFUL_STEP_INPUTS/values/prior" final.txt'
 "#,
     );
     let run = bundle.result("optional-child");
@@ -234,7 +234,7 @@ steps:
       argv:
         - sh
         - -c
-        - 'printf "%s|%s" "$(cat "$UM_STEP_INPUTS/values/extra")" "$(cat "$UM_STEP_INPUTS/values/base")" > seen.txt && test -e ready'
+        - 'printf "%s|%s" "$(cat "$USEFUL_STEP_INPUTS/values/extra")" "$(cat "$USEFUL_STEP_INPUTS/values/base")" > seen.txt && test -e ready'
 "#,
     )
     .unwrap();
@@ -529,7 +529,7 @@ fn replacement_resolution_failure_uses_the_continuation_diagnostic_vocabulary() 
     assert_eq!(output.status.code(), Some(1));
     let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(workflow_run_schema().is_valid(&result), "{result}");
-    assert_eq!(result["command"], "um workflow run resume");
+    assert_eq!(result["command"], "useful workflow run resume");
     assert_eq!(result["phase"], "continuation");
     assert_eq!(
         result["diagnostics"][0]["code"],
@@ -1129,11 +1129,11 @@ fn retry_after_failed_continuation_reruns_the_initial_definition_without_context
 steps:
   first:
     kind: cmd
-    command: {argv: ["sh", "-c", "test -z \"${UM_CONTINUATION_CONTEXT:-}\"; echo first >> calls"]}
+    command: {argv: ["sh", "-c", "test -z \"${USEFUL_CONTINUATION_CONTEXT:-}\"; echo first >> calls"]}
   second:
     kind: cmd
     dependsOn: [first]
-    command: {argv: ["sh", "-c", "if test \"$PHASE\" = continued; then test -r \"$UM_CONTINUATION_CONTEXT\"; exit 75; fi; test -z \"${UM_CONTINUATION_CONTEXT:-}\"; test \"$PHASE\" = retry"]}
+    command: {argv: ["sh", "-c", "if test \"$PHASE\" = continued; then test -r \"$USEFUL_CONTINUATION_CONTEXT\"; exit 75; fi; test -z \"${USEFUL_CONTINUATION_CONTEXT:-}\"; test \"$PHASE\" = retry"]}
 finalizers:
   cleanup:
     kind: cmd
@@ -1163,7 +1163,7 @@ steps:
   second:
     kind: cmd
     dependsOn: [first]
-    command: {argv: ["sh", "-c", "test -r \"$UM_CONTINUATION_CONTEXT\"; exit 75"]}
+    command: {argv: ["sh", "-c", "test -r \"$USEFUL_CONTINUATION_CONTEXT\"; exit 75"]}
 finalizers:
   cleanup:
     kind: cmd
@@ -1235,7 +1235,7 @@ steps:
       data: {ref: outputs.producer.data}
       document: {ref: outputs.producer.document}
     command:
-      argv: ["sh", "-c", "test -r $UM_STEP_INPUTS/values/data; test -r $UM_STEP_INPUTS/values/document; test $PHASE = continuation"]
+      argv: ["sh", "-c", "test -r $USEFUL_STEP_INPUTS/values/data; test -r $USEFUL_STEP_INPUTS/values/document; test $PHASE = continuation"]
 exports:
   retainedDocument: {ref: outputs.producer.document}
 "#,
@@ -1307,12 +1307,12 @@ steps:
             - |
               set -eu
               if test "$PHASE" = resumed; then
-                test -r "$UM_CONTINUATION_CONTEXT"
+                test -r "$USEFUL_CONTINUATION_CONTEXT"
                 : > repaired
               else
-                test -z "${UM_CONTINUATION_CONTEXT:-}"
+                test -z "${USEFUL_CONTINUATION_CONTEXT:-}"
               fi
-              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"Retried after preparation.","reason":"Recheck current state."}' > "$UM_RECOVERY_RESULT"
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"Retried after preparation.","reason":"Recheck current state."}' > "$USEFUL_RECOVERY_RESULT"
     command:
       argv:
         - /bin/sh
@@ -1320,10 +1320,10 @@ steps:
         - |
           set -eu
           if test "$PHASE" = resumed; then
-            test -r "$UM_CONTINUATION_CONTEXT"
+            test -r "$USEFUL_CONTINUATION_CONTEXT"
             test -f repaired
           else
-            test -z "${UM_CONTINUATION_CONTEXT:-}"
+            test -z "${USEFUL_CONTINUATION_CONTEXT:-}"
             exit 75
           fi
 "#,
@@ -1453,7 +1453,7 @@ fn replacement_definition_and_root_are_selected_independently() {
 #[test]
 fn chained_continuation_keeps_original_producer_and_reruns_finalizers() {
     let bundle = RunBundle::new(
-        "schemaVersion: 1\nsteps:\n  producer:\n    kind: cmd\n    command: {argv: [\"sh\", \"-c\", \"echo producer >> calls; echo inherited > output.txt\"]}\n    outputs:\n      value: {kind: text, from: path, path: output.txt}\n  consumer:\n    kind: cmd\n    inputs:\n      value: {ref: outputs.producer.value}\n    command: {argv: [\"sh\", \"-c\", \"echo consumer >> calls; test \\\"$PHASE\\\" = final\"]}\nfinalizers:\n  cleanup:\n    kind: cmd\n    command: {argv: [\"sh\", \"-c\", \"if test \\\"$PHASE\\\" != initial; then test -r \\\"$UM_CONTINUATION_CONTEXT\\\"; else test -z ${UM_CONTINUATION_CONTEXT:-}; fi; echo cleanup >> calls\"]}\nexports:\n  retained:\n    ref: outputs.producer.value\n",
+        "schemaVersion: 1\nsteps:\n  producer:\n    kind: cmd\n    command: {argv: [\"sh\", \"-c\", \"echo producer >> calls; echo inherited > output.txt\"]}\n    outputs:\n      value: {kind: text, from: path, path: output.txt}\n  consumer:\n    kind: cmd\n    inputs:\n      value: {ref: outputs.producer.value}\n    command: {argv: [\"sh\", \"-c\", \"echo consumer >> calls; test \\\"$PHASE\\\" = final\"]}\nfinalizers:\n  cleanup:\n    kind: cmd\n    command: {argv: [\"sh\", \"-c\", \"if test \\\"$PHASE\\\" != initial; then test -r \\\"$USEFUL_CONTINUATION_CONTEXT\\\"; else test -z ${USEFUL_CONTINUATION_CONTEXT:-}; fi; echo cleanup >> calls\"]}\nexports:\n  retained:\n    ref: outputs.producer.value\n",
     );
     let run = bundle.result("chain");
     let mut initial = bundle.args(&run);
@@ -1547,7 +1547,7 @@ fn chained_continuation_keeps_original_producer_and_reruns_finalizers() {
 #[test]
 fn workflow_continue_inherits_prior_output_and_executes_only_downstream() {
     let bundle = RunBundle::new(
-        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"sh\", \"-c\", \"printf first > first.txt; echo first >> calls; test -z ${UM_CONTINUATION_CONTEXT:-}\"]}\n    outputs:\n      value: {kind: text, from: path, path: first.txt}\n  second:\n    kind: cmd\n    inputs:\n      value: {ref: outputs.first.value}\n    command: {argv: [\"sh\", \"-c\", \"echo second >> calls; if test \\\"$PHASE\\\" = continuation; then test -r \\\"$UM_CONTINUATION_CONTEXT\\\"; grep -q inheritedOutputs \\\"$UM_CONTINUATION_CONTEXT\\\"; else test -z ${UM_CONTINUATION_CONTEXT:-}; false; fi\"]}\n",
+        "schemaVersion: 1\nsteps:\n  first:\n    kind: cmd\n    command: {argv: [\"sh\", \"-c\", \"printf first > first.txt; echo first >> calls; test -z ${USEFUL_CONTINUATION_CONTEXT:-}\"]}\n    outputs:\n      value: {kind: text, from: path, path: first.txt}\n  second:\n    kind: cmd\n    inputs:\n      value: {ref: outputs.first.value}\n    command: {argv: [\"sh\", \"-c\", \"echo second >> calls; if test \\\"$PHASE\\\" = continuation; then test -r \\\"$USEFUL_CONTINUATION_CONTEXT\\\"; grep -q inheritedOutputs \\\"$USEFUL_CONTINUATION_CONTEXT\\\"; else test -z ${USEFUL_CONTINUATION_CONTEXT:-}; false; fi\"]}\n",
     );
     let run = bundle.result("continuation");
     let mut initial = bundle.args(&run);
@@ -1589,7 +1589,7 @@ fn workflow_continue_inherits_prior_output_and_executes_only_downstream() {
     assert_eq!(event["continuation"], continuation["continuation"]);
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
-    assert_eq!(terminal["command"], "um workflow run resume");
+    assert_eq!(terminal["command"], "useful workflow run resume");
     assert_eq!(
         terminal["result"]["continuation"],
         continuation["continuation"]
@@ -1823,7 +1823,7 @@ fn continuation_applies_the_retained_profile_replacement_to_every_attempt() {
 // REQ-LOCALRUN-171, REQ-LOCALRUN-175, REQ-CONTINUE-1, REQ-CONTINUE-28
 #[test]
 fn a_continuation_of_a_tree_run_verifies_and_rebinds_the_copy() {
-    let script = "#!/bin/sh\nset -eu\nprintf '%s' \"$UM_WORKFLOW_ROOT\" > workflow-root\ntest \"$PHASE\" = continuation\n";
+    let script = "#!/bin/sh\nset -eu\nprintf '%s' \"$USEFUL_WORKFLOW_ROOT\" > workflow-root\ntest \"$PHASE\" = continuation\n";
     let bundle = TreeBundle::new(
         "schemaVersion: 1\nenvironmentPassthrough: [PHASE]\nprograms: [bin]\nsteps:\n  report:\n    kind: cmd\n    command:\n      argv: [\"report\"]\n",
     );
@@ -1859,7 +1859,7 @@ fn a_continuation_of_a_tree_run_verifies_and_rebinds_the_copy() {
     assert_eq!(rejected.status.code(), Some(1));
     let rejection: serde_json::Value = serde_json::from_slice(&rejected.stdout).unwrap();
     assert!(workflow_run_schema().is_valid(&rejection), "{rejection}");
-    assert_eq!(rejection["command"], "um workflow run resume");
+    assert_eq!(rejection["command"], "useful workflow run resume");
     assert_eq!(rejection["phase"], "tree");
     assert_eq!(rejection["diagnostics"][0]["code"], "tree_copy_modified");
     assert!(!run_directory.join("attempts/000002").exists());
@@ -1981,8 +1981,8 @@ if [ -s \"verdicts-$1\" ]; then
   mv -f \"verdicts-$1.tmp\" \"verdicts-$1\"
 fi
 for input in answers notes findings; do
-  if [ -e \"${UM_STEP_INPUTS:-}/values/$input\" ]; then
-    cat \"$UM_STEP_INPUTS/values/$input\" > \"seen-$input.tmp\"
+  if [ -e \"${USEFUL_STEP_INPUTS:-}/values/$input\" ]; then
+    cat \"$USEFUL_STEP_INPUTS/values/$input\" > \"seen-$input.tmp\"
     mv -f \"seen-$input.tmp\" \"seen-$input\"
   fi
 done
@@ -2246,10 +2246,10 @@ fn an_answered_and_handed_back_run_continues_through_its_waits_to_landing() {
 
     // REQ-CONTINUE-74: a held wait changes nothing and answers quickly.
     let before = fs::read(run.join("run.json")).unwrap();
-    let started = um_support::monotonic_now();
+    let started = useful_support::monotonic_now();
     let held = completed(&resume(&run));
     assert!(
-        um_support::monotonic_now().saturating_duration_since(started)
+        useful_support::monotonic_now().saturating_duration_since(started)
             < std::time::Duration::from_secs(2)
     );
     assert_eq!(held["outcome"], "waiting", "{held}");
@@ -2472,8 +2472,8 @@ steps:
 /// `seen-answers-<part>`.
 const FAN_OUT_TREE_DECIDE: &str = "#!/bin/sh
 set -eu
-part=$(cat \"$UM_STEP_INPUTS/values/part\")
-answers=$(cat \"$UM_STEP_INPUTS/values/answers\")
+part=$(cat \"$USEFUL_STEP_INPUTS/values/part\")
+answers=$(cat \"$USEFUL_STEP_INPUTS/values/answers\")
 if [ \"$answers\" != null ]; then
   printf '%s' \"$answers\" > \"seen-answers-$part\"
 fi
@@ -2797,7 +2797,7 @@ fn a_resumed_workflow_step_receives_an_inherited_childs_json_export() {
     bundle.write_source("parts.schema.json", PARTS_SCHEMA);
     bundle.write_program(
         "bin/build-copy-parts",
-        "#!/bin/sh\nset -eu\ncp \"$UM_STEP_INPUTS/values/parts\" seen-parts.json\n",
+        "#!/bin/sh\nset -eu\ncp \"$USEFUL_STEP_INPUTS/values/parts\" seen-parts.json\n",
     );
     let root = bundle.execution_root();
     let parts = serde_json::json!([{"name": "a"}, {"name": "b"}]);
@@ -3099,7 +3099,7 @@ pub(super) fn chained(output: &std::process::Output) -> Vec<serde_json::Value> {
     documents
 }
 
-/// `um workflow run status RUN --json`, valid against its schema.
+/// `useful workflow run status RUN --json`, valid against its schema.
 pub(super) fn status_document(run: &Path) -> serde_json::Value {
     let output = isolated_command(&[
         "workflow".to_owned(),
@@ -3423,7 +3423,7 @@ fn a_withdraw_between_chained_attempts_waits_for_the_process_and_is_recorded() {
     let gate = bundle.result("chain-lock-gate");
     fs::create_dir_all(gate.parent().unwrap()).unwrap();
     let live = isolated_command(&bundle.args(&destination))
-        .env("UM_TEST_RUN_LOCK_GATE", &gate)
+        .env("USEFUL_TEST_RUN_LOCK_GATE", &gate)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -3436,11 +3436,14 @@ fn a_withdraw_between_chained_attempts_waits_for_the_process_and_is_recorded() {
     );
     let run = fs::canonicalize(&destination).unwrap();
     // Attempt 1 ended `continued`, the run lock is free and the record reads `running`.
-    let inspection = um_execution::inspect_wait(&run, &um_execution::NoConditions)
+    let inspection = useful_execution::inspect_wait(&run, &useful_execution::NoConditions)
         .unwrap()
         .inspection;
     assert!(
-        matches!(inspection, um_execution::WaitInspection::Continued { .. }),
+        matches!(
+            inspection,
+            useful_execution::WaitInspection::Continued { .. }
+        ),
         "{inspection:?}"
     );
 
@@ -3450,7 +3453,7 @@ fn a_withdraw_between_chained_attempts_waits_for_the_process_and_is_recorded() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    um_support::sleep(std::time::Duration::from_millis(500));
+    useful_support::sleep(std::time::Duration::from_millis(500));
     if withdraw.try_wait().unwrap().is_some() {
         panic!(
             "the withdraw did not wait for the chaining process: {:?}",
@@ -3500,7 +3503,7 @@ pub(super) enum QueueAnswer {
 /// `pull_request.queue_settled` condition reads (REQ-WFEXEC-65): it serves
 /// `GET /repos/useful-machinery/platform/pulls/3958` and
 /// `GET /v1/repos/useful-machinery/platform/merge-queue/pull/3958` as its answer says and
-/// records each request's head. `command` points a `um` invocation at it with the GitHub token
+/// records each request's head. `command` points a `useful` invocation at it with the GitHub token
 /// `test` and no `MERGIFY_TOKEN`.
 pub(super) struct QueueStub {
     base: String,
@@ -3522,8 +3525,8 @@ impl QueueStub {
                 let Ok(mut stream) = stream else { continue };
                 // As in `LinearStub`: the thread is detached and holds the listener for the whole
                 // test, so a connection it cannot read is skipped, where a panic would release
-                // the address the test's `um` processes still aim at (INV-TESTING-22).
-                let request = match um_test_support::try_read_request(&mut stream) {
+                // the address the test's `useful` processes still aim at (INV-TESTING-22).
+                let request = match useful_test_support::try_read_request(&mut stream) {
                     Ok(request) => request,
                     Err(error) => {
                         eprintln!("QueueStub skipped an unreadable request: {error}");
@@ -3601,7 +3604,7 @@ impl QueueStub {
             .collect()
     }
 
-    /// `um` with `args`, its GitHub token `test` in `GITHUB_TOKEN` and no other GitHub token
+    /// `useful` with `args`, its GitHub token `test` in `GITHUB_TOKEN` and no other GitHub token
     /// name, no `MERGIFY_TOKEN` and both APIs at the stub.
     pub(super) fn command(&self, args: &[String]) -> std::process::Command {
         let mut command = isolated_command(args);
@@ -3610,8 +3613,8 @@ impl QueueStub {
             .env_remove("GH_TOKEN")
             .env_remove("GH_TOKEN_FILE")
             .env_remove("MERGIFY_TOKEN")
-            .env("UM_GITHUB_API_URL", &self.base)
-            .env("UM_MERGIFY_API_URL", &self.base)
+            .env("USEFUL_GITHUB_API_URL", &self.base)
+            .env("USEFUL_MERGIFY_API_URL", &self.base)
             .env("NO_PROXY", "127.0.0.1")
             .env("no_proxy", "127.0.0.1");
         command
@@ -4008,8 +4011,8 @@ fn the_engineering_shape_loops_repairs_and_lands_through_the_queue() {
     );
 }
 
-/// `um workflow run resume RUN --cloud ORGANIZATION` against the scripted Cloud the
-/// `um run continue` tests use (REQ-CONTINUE-85).
+/// `useful workflow run resume RUN --cloud ORGANIZATION` against the scripted Cloud the
+/// `useful run continue` tests use (REQ-CONTINUE-85).
 mod cloud {
     use std::process::Output;
 
@@ -4032,7 +4035,7 @@ mod cloud {
             args.push("--json");
         }
         args.push("--allow-insecure-http");
-        execute_with_env(steps, &args, &[("UM_HOME", home)])
+        execute_with_env(steps, &args, &[("USEFUL_HOME", home)])
     }
 
     fn body(request: &str) -> serde_json::Value {

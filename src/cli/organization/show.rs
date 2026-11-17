@@ -2,8 +2,8 @@ use clap::Args;
 
 use crate::cli::OrganizationArg;
 use crate::exit_code::ExitCode;
-use um_api::get_organization;
-use um_human_auth::Deployment;
+use useful_api::get_organization;
+use useful_human_auth::Deployment;
 
 use super::{LeafOptions, output};
 

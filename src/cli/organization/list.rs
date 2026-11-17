@@ -1,7 +1,7 @@
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 use super::LeafOptions;
 
@@ -23,7 +23,7 @@ impl Command {
         self.options.execute(
             deployment,
             |client, api_url, access_token| {
-                um_api::list_current_principal_memberships(
+                useful_api::list_current_principal_memberships(
                     client,
                     api_url,
                     access_token,

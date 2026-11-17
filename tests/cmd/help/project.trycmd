@@ -1,8 +1,8 @@
 ```console
-$ um project --help
+$ useful project --help
 Manage Useful Machinery projects
 
-Usage: um project [COMMAND]
+Usage: useful project [COMMAND]
 
 Commands:
   action       Manage a project's actions

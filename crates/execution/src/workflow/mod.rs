@@ -238,23 +238,23 @@ fn structural_validator() -> Option<&'static Validator> {
 }
 
 pub fn is_input_name(value: &str) -> bool {
-    um_support::is_identifier(value)
+    useful_support::is_identifier(value)
 }
 
 pub fn is_valid_input_display_name(value: Option<&str>) -> bool {
-    um_support::is_valid_input_display_name(value)
+    useful_support::is_valid_input_display_name(value)
 }
 
 pub fn is_lowercase_hex(value: &str, length: usize) -> bool {
-    um_support::is_lowercase_hex(value, length)
+    useful_support::is_lowercase_hex(value, length)
 }
 
 pub fn lowercase_hex(bytes: &[u8]) -> String {
-    um_support::lowercase_hex(bytes)
+    useful_support::lowercase_hex(bytes)
 }
 
 pub fn is_valid_media_type(value: &str) -> bool {
-    um_support::is_valid_media_type(value)
+    useful_support::is_valid_media_type(value)
 }
 
 #[cfg(test)]

@@ -10,7 +10,7 @@ use anyhow::Context;
 use clap::{Args, Subcommand};
 
 use crate::exit_code::ExitCode;
-use um_execution::DefinitionError;
+use useful_execution::DefinitionError;
 
 pub(super) const ABOUT: &str = "Work with local workflow definitions and their trees";
 const COMMAND_PATH: &[&str] = &["workflow", "definition"];

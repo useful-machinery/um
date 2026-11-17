@@ -284,7 +284,7 @@ impl RunBundle {
         &self.claude_config
     }
 
-    /// `um workflow run create --path` over the source root. `--workflow=FILE` is the last
+    /// `useful workflow run create --path` over the source root. `--workflow=FILE` is the last
     /// argument and a single one, so a caller may insert options before it.
     pub(super) fn args(&self, result: &Path) -> Vec<String> {
         vec![
@@ -391,17 +391,17 @@ impl Drop for TreeBundle {
     }
 }
 
-/// The operator's Linear credentials and endpoint never reach a test's `um`: a mirrored run
+/// The operator's Linear credentials and endpoint never reach a test's `useful`: a mirrored run
 /// writes to Linear only through a stub the test points it at (REQ-LOCALRUN-192).
 const MIRROR_VARIABLES: [&str; 4] = [
     "LINEAR_API_KEY",
-    "UM_LINEAR_ACCESS_TOKEN",
-    "UM_LINEAR_ACCESS_TOKEN_FILE",
-    "UM_LINEAR_API_URL",
+    "USEFUL_LINEAR_ACCESS_TOKEN",
+    "USEFUL_LINEAR_ACCESS_TOKEN_FILE",
+    "USEFUL_LINEAR_API_URL",
 ];
 
 pub(super) fn isolated_command(args: &[String]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args(args)
         .env_remove(CREDENTIALS_FILE_VARIABLE)
@@ -627,7 +627,7 @@ steps:
       attachments:
         ref: inputs.evidence
     command:
-      argv: ["sh", "-c", "set -eu; if IFS= read -r unexpected; then exit 91; fi; test -z \"${UM_PRIVATE_SENTINEL+x}\"; { cat \"$UM_STEP_INPUTS/values/prompt\"; printf '|'; cat \"$UM_STEP_INPUTS/collections/attachments/000000\"; printf '|'; cat \"$UM_STEP_INPUTS/collections/attachments/000001\"; } > produced.txt; printf producer-live"]
+      argv: ["sh", "-c", "set -eu; if IFS= read -r unexpected; then exit 91; fi; test -z \"${USEFUL_PRIVATE_SENTINEL+x}\"; { cat \"$USEFUL_STEP_INPUTS/values/prompt\"; printf '|'; cat \"$USEFUL_STEP_INPUTS/collections/attachments/000000\"; printf '|'; cat \"$USEFUL_STEP_INPUTS/collections/attachments/000001\"; } > produced.txt; printf producer-live"]
     outputs:
       artifact:
         kind: file
@@ -640,7 +640,7 @@ steps:
       source:
         ref: outputs.produce.artifact
     command:
-      argv: ["sh", "-c", "set -eu; if IFS= read -r unexpected; then exit 92; fi; cat \"$UM_STEP_INPUTS/values/source\" > exported.txt; printf consumer-live"]
+      argv: ["sh", "-c", "set -eu; if IFS= read -r unexpected; then exit 92; fi; cat \"$USEFUL_STEP_INPUTS/values/source\" > exported.txt; printf consumer-live"]
     outputs:
       result:
         kind: file
@@ -1219,7 +1219,7 @@ steps:
       argv:
         - sh
         - -c
-        - 'set -- "$UM_STEP_INPUTS/collections/evidence"/*; test "$1" = "$UM_STEP_INPUTS/collections/evidence/*"'
+        - 'set -- "$USEFUL_STEP_INPUTS/collections/evidence"/*; test "$1" = "$USEFUL_STEP_INPUTS/collections/evidence/*"'
 finalizers:
   finish:
     kind: cmd
@@ -1398,14 +1398,14 @@ steps:
         - -c
         - |
           set -eu
-          test "$(cat "$UM_STEP_INPUTS/values/inlineText")" = inline-text
-          test "$(cat "$UM_STEP_INPUTS/values/fileText")" = file-text
-          test "$(cat "$UM_STEP_INPUTS/values/inlineJson")" = '{"inline":true}'
-          test "$(cat "$UM_STEP_INPUTS/values/fileJson")" = '{"from":"file"}'
-          test "$(cat "$UM_STEP_INPUTS/values/payload")" = file-payload
-          test "$(cat "$UM_STEP_INPUTS/collections/evidence/000000")" = attachment
-          set -- "$UM_STEP_INPUTS/collections/emptyEvidence"/*
-          test "$1" = "$UM_STEP_INPUTS/collections/emptyEvidence/*"
+          test "$(cat "$USEFUL_STEP_INPUTS/values/inlineText")" = inline-text
+          test "$(cat "$USEFUL_STEP_INPUTS/values/fileText")" = file-text
+          test "$(cat "$USEFUL_STEP_INPUTS/values/inlineJson")" = '{"inline":true}'
+          test "$(cat "$USEFUL_STEP_INPUTS/values/fileJson")" = '{"from":"file"}'
+          test "$(cat "$USEFUL_STEP_INPUTS/values/payload")" = file-payload
+          test "$(cat "$USEFUL_STEP_INPUTS/collections/evidence/000000")" = attachment
+          set -- "$USEFUL_STEP_INPUTS/collections/emptyEvidence"/*
+          test "$1" = "$USEFUL_STEP_INPUTS/collections/emptyEvidence/*"
 "#,
     );
     let text_path = bundle._temporary.path().join("input.txt");
@@ -1951,7 +1951,7 @@ steps:
       request:
         ref: inputs.request
     command:
-      argv: ["sh", "-c", "cat \"$UM_STEP_INPUTS/values/request\" > observed.txt"]
+      argv: ["sh", "-c", "cat \"$USEFUL_STEP_INPUTS/values/request\" > observed.txt"]
 "#,
     );
     let source = bundle.initial_cwd().join("relative-request.txt");
@@ -3181,7 +3181,7 @@ exports:
         String::from_utf8_lossy(&retry.stderr)
     );
     let terminal: serde_json::Value = serde_json::from_slice(&retry.stdout).unwrap();
-    assert_eq!(terminal["command"], "um workflow run retry");
+    assert_eq!(terminal["command"], "useful workflow run retry");
     assert_eq!(terminal["outcome"], "succeeded");
     assert_eq!(terminal["attemptNumber"], 2);
     assert_eq!(
@@ -3813,7 +3813,7 @@ agentProfiles:
     harness:
       kind: pi
       config:
-        model: um-fake/conformance
+        model: useful-fake/conformance
         thinking: xhigh
 steps:
   seed:
@@ -3934,11 +3934,11 @@ export default function fixtureWrite(pi: ExtensionAPI): void {
 #[test]
 #[ignore = "requires pinned harness"]
 fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
-    let pinned_pi = std::env::var_os("UM_PI_CONFORMANCE_EXECUTABLE")
+    let pinned_pi = std::env::var_os("USEFUL_PI_CONFORMANCE_EXECUTABLE")
         .map(PathBuf::from)
         .filter(|path| path.to_string_lossy().ends_with("-pi-1.3.0/bin/pi"))
         .unwrap_or_else(|| {
-            panic!("UM_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 1.3.0 executable")
+            panic!("USEFUL_PI_CONFORMANCE_EXECUTABLE must name the pinned Pi 1.3.0 executable")
         });
     let bundle = RunBundle::new(mixed_agent_source());
     for (path, text) in [
@@ -4000,7 +4000,7 @@ fn pinned_real_pi_runs_the_complete_mixed_value_and_export_dag() {
     let destination = bundle.result("mixed-agent");
     let mut args = bundle.args(&destination);
     args.insert(args.len() - 1, "--json".to_owned());
-    let output = Command::new(env!("CARGO_BIN_EXE_um"))
+    let output = Command::new(env!("CARGO_BIN_EXE_useful"))
         .args(args)
         .env_clear()
         .env("PATH", isolated_path.path())
@@ -4105,19 +4105,19 @@ fn local_run_forwards_only_declared_host_environment() {
             "absent absent present",
         ),
         (
-            "environmentPassthrough: [GH_TOKEN, UM_LINEAR_ACCESS_TOKEN]\n",
+            "environmentPassthrough: [GH_TOKEN, USEFUL_LINEAR_ACCESS_TOKEN]\n",
             "local-gh-token local-linear-token absent",
         ),
     ] {
         let bundle = RunBundle::new(&format!(
-            "schemaVersion: 1\n{declaration}steps:\n  authenticate:\n    kind: cmd\n    command:\n      argv: [sh, -c, 'test -z \"${{GITHUB_TOKEN+x}}\" && test -z \"${{UM_PRIVATE_SENTINEL+x}}\" && printf \"%s %s %s\" \"${{GH_TOKEN-absent}}\" \"${{UM_LINEAR_ACCESS_TOKEN-absent}}\" \"${{WORKFLOW_VISIBLE-absent}}\" > observed.txt']\n"
+            "schemaVersion: 1\n{declaration}steps:\n  authenticate:\n    kind: cmd\n    command:\n      argv: [sh, -c, 'test -z \"${{GITHUB_TOKEN+x}}\" && test -z \"${{USEFUL_PRIVATE_SENTINEL+x}}\" && printf \"%s %s %s\" \"${{GH_TOKEN-absent}}\" \"${{USEFUL_LINEAR_ACCESS_TOKEN-absent}}\" \"${{WORKFLOW_VISIBLE-absent}}\" > observed.txt']\n"
         ));
         let output = isolated_command(&bundle.args(&bundle.result("environment")))
             .env("GH_TOKEN", "local-gh-token")
             .env("GITHUB_TOKEN", "local-github-token")
-            .env("UM_LINEAR_ACCESS_TOKEN", "local-linear-token")
+            .env("USEFUL_LINEAR_ACCESS_TOKEN", "local-linear-token")
             .env("WORKFLOW_VISIBLE", "present")
-            .env("UM_PRIVATE_SENTINEL", "must-not-reach-command")
+            .env("USEFUL_PRIVATE_SENTINEL", "must-not-reach-command")
             .output()
             .unwrap();
         assert!(
@@ -4203,9 +4203,9 @@ fn json_run_executes_named_inputs_closed_stdin_publication_and_offline_boundarie
         ],
     );
     let mut child = isolated_command(&args)
-        .env("UM_PRIVATE_SENTINEL", "must-not-reach-command")
+        .env("USEFUL_PRIVATE_SENTINEL", "must-not-reach-command")
         .env(
-            "UM_API_URL",
+            "USEFUL_API_URL",
             format!("http://{}", listener.local_addr().unwrap()),
         )
         .stdin(Stdio::piped())
@@ -4224,7 +4224,7 @@ fn json_run_executes_named_inputs_closed_stdin_publication_and_offline_boundarie
     let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
     assert_eq!(terminal["schemaVersion"], 1);
-    assert_eq!(terminal["command"], "um workflow run create");
+    assert_eq!(terminal["command"], "useful workflow run create");
     assert_eq!(terminal["outcome"], "succeeded");
     assert_eq!(terminal["exitStatus"], 0);
     let normalized_run = normalized_run_directory(&destination);
@@ -4312,7 +4312,7 @@ fn json_run_executes_named_inputs_closed_stdin_publication_and_offline_boundarie
 // REQ-LOCALRUN-3, REQ-LOCALRUN-57, REQ-LOCALRUN-58
 #[tokio::test]
 async fn injected_tui_boundary_handshakes_help_and_quit_lifecycle() {
-    use um_execution::{
+    use useful_execution::{
         CancellationSource, HostInteraction, ObservationClock, RunTimingObservation,
         SystemObservationClock, TerminalBoundary, TerminalHostExit, TerminalInputEvent,
         TerminalLifecycleEvent, TerminalRect, WorkflowRunViewModel, WorkflowRunViewSnapshot,
@@ -4809,7 +4809,7 @@ steps:
       prompt:
         ref: inputs.request
     command:
-      argv: ["sh", "-c", "cat \"$UM_STEP_INPUTS/values/prompt\" > prompt.txt"]
+      argv: ["sh", "-c", "cat \"$USEFUL_STEP_INPUTS/values/prompt\" > prompt.txt"]
     outputs:
       prompt:
         kind: file
@@ -4930,7 +4930,7 @@ steps:
       attachments:
         ref: inputs.evidence
     command:
-      argv: ["sh", "-c", "cat \"$UM_STEP_INPUTS/collections/attachments/000000\" > attachment.bin"]
+      argv: ["sh", "-c", "cat \"$USEFUL_STEP_INPUTS/collections/attachments/000000\" > attachment.bin"]
     outputs:
       attachment:
         kind: file
@@ -5162,7 +5162,7 @@ steps:
       prompt:
         ref: inputs.request
     command:
-      argv: ["sh", "-c", "store=$(dirname \"$UM_STEP_INPUTS\"); mv \"$store\" \"$store.moved\""]
+      argv: ["sh", "-c", "store=$(dirname \"$USEFUL_STEP_INPUTS\"); mv \"$store\" \"$store.moved\""]
 "#,
     );
     let destination = bundle.result("cleanup-diagnostic");
@@ -5490,7 +5490,7 @@ fn cancellation_settles_with_a_full_unread_presentation_pipe() {
             assert_eq!(ready, [1]);
         }
         let pid = Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap();
-        let started = um_support::monotonic_now();
+        let started = useful_support::monotonic_now();
         kill_process(pid, Signal::INT).unwrap();
         if force_abort {
             let mut event = [0_u8; 1];
@@ -5505,7 +5505,7 @@ fn cancellation_settles_with_a_full_unread_presentation_pipe() {
         )
         .unwrap();
         assert!(
-            um_support::monotonic_now().saturating_duration_since(started)
+            useful_support::monotonic_now().saturating_duration_since(started)
                 < std::time::Duration::from_secs(10),
             "json={json}, finalizer={finalizer}, shared_pipe={shared_pipe}, force_abort={force_abort}"
         );
@@ -5830,10 +5830,10 @@ fn owner_death_before_registration_or_continuation_never_executes_user_code() {
              printf '%s\\n' \"$guard\" > \"$GUARD_PID\"; wait \"$guard\"",
         )
         .env("CONTROL", &control)
-        .env("GUARD_BIN", env!("CARGO_BIN_EXE_um"))
+        .env("GUARD_BIN", env!("CARGO_BIN_EXE_useful"))
         .env("GUARD_PID", &guard_pid)
-        .env("UM_INTERNAL_CHILD_GUARD_WORKER", "guard-v1")
-        .env("UM_INTERNAL_CHILD_GUARD_ROOT", staging.path())
+        .env("USEFUL_INTERNAL_CHILD_GUARD_WORKER", "guard-v1")
+        .env("USEFUL_INTERNAL_CHILD_GUARD_ROOT", staging.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -6740,9 +6740,9 @@ steps:
         - -c
         - |
           set -eu
-          test "$(cat "$UM_STEP_INPUTS/values/request")" = from-standard-input
-          test "$(cat "$UM_STEP_INPUTS/values/payload")" = from-dash-file
-          test "$(cat "$UM_STEP_INPUTS/collections/evidence/000000")" = from-dash-file
+          test "$(cat "$USEFUL_STEP_INPUTS/values/request")" = from-standard-input
+          test "$(cat "$USEFUL_STEP_INPUTS/values/payload")" = from-dash-file
+          test "$(cat "$USEFUL_STEP_INPUTS/collections/evidence/000000")" = from-dash-file
 "#,
     );
     fs::write(bundle.initial_cwd().join("-"), b"from-dash-file").unwrap();
@@ -6875,7 +6875,7 @@ steps:
       branch: {ref: inputs.branch}
       answers: {ref: inputs.answers}
     command:
-      argv: ["sh", "-c", "set -eu; for name in ticket base policy branch answers; do cat \"$UM_STEP_INPUTS/values/$name\" > \"observed-$name\"; done"]
+      argv: ["sh", "-c", "set -eu; for name in ticket base policy branch answers; do cat \"$USEFUL_STEP_INPUTS/values/$name\" > \"observed-$name\"; done"]
 "#,
     );
     bundle.write_source("policy/engineering.json", br#"{"reviewers":1}"#);
@@ -6934,7 +6934,7 @@ steps:
 
 const TREE_REPORT_WORKFLOW: &str = "schemaVersion: 1\nprograms: [bin]\nsteps:\n  report:\n    kind: cmd\n    command:\n      argv: [\"report\"]\n";
 
-const TREE_REPORT_PROGRAM: &str = "#!/bin/sh\nset -eu\nprintf '%s' \"$UM_WORKFLOW_ROOT\" > workflow-root\nprintf '%s' \"$(command -v report)\" > report-path\n";
+const TREE_REPORT_PROGRAM: &str = "#!/bin/sh\nset -eu\nprintf '%s' \"$USEFUL_WORKFLOW_ROOT\" > workflow-root\nprintf '%s' \"$(command -v report)\" > report-path\n";
 
 pub(super) fn tree_rejection(output: &Output) -> serde_json::Value {
     assert_eq!(
@@ -6953,13 +6953,16 @@ pub(super) fn tree_rejection(output: &Output) -> serde_json::Value {
 
 // REQ-LOCALRUN-169, REQ-LOCALRUN-170, REQ-WFEXEC-53, SC-LOCALRUN-8
 #[test]
-fn a_tree_run_executes_the_copys_programs_under_um_workflow_root() {
+fn a_tree_run_executes_the_copys_programs_under_useful_workflow_root() {
     let bundle = TreeBundle::new(TREE_REPORT_WORKFLOW);
     bundle.write_program("bin/report", TREE_REPORT_PROGRAM);
     let destination = bundle.result("tree");
 
     let output = isolated_command(&bundle.args(&destination))
-        .env("UM_WORKFLOW_ROOT", "/launching/value/never/reaches/a/step")
+        .env(
+            "USEFUL_WORKFLOW_ROOT",
+            "/launching/value/never/reaches/a/step",
+        )
         .output()
         .unwrap();
 
@@ -6993,7 +6996,7 @@ fn a_path_argv_under_a_tree_root_is_rejected_at_phase_tree() {
 
     let rejection = tree_rejection(&run(&bundle.args(&destination)));
 
-    assert_eq!(rejection["command"], "um workflow run create");
+    assert_eq!(rejection["command"], "useful workflow run create");
     assert_eq!(rejection["phase"], "tree");
     assert_eq!(rejection["workflow"], serde_json::Value::Null);
     let diagnostics = rejection["diagnostics"].as_array().unwrap();
@@ -7067,7 +7070,7 @@ fn a_workflow_file_outside_the_trees_workflow_files_is_rejected() {
 #[test]
 fn a_missing_required_tool_rejects_the_run() {
     let bundle = TreeBundle::new(
-        "schemaVersion: 1\nrequires:\n  tools: [um-test-no-such-tool]\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+        "schemaVersion: 1\nrequires:\n  tools: [useful-test-no-such-tool]\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
     );
     let destination = bundle.result("missing-tool");
 
@@ -7080,7 +7083,7 @@ fn a_missing_required_tool_rejects_the_run() {
     );
     assert_eq!(
         rejection["diagnostics"][0]["location"],
-        serde_json::json!({"kind": "required_tool", "tool": "um-test-no-such-tool"})
+        serde_json::json!({"kind": "required_tool", "tool": "useful-test-no-such-tool"})
     );
     assert!(!destination.exists());
 }
@@ -7088,7 +7091,7 @@ fn a_missing_required_tool_rejects_the_run() {
 const TREE_SUCCESS_WORKFLOW: &str =
     "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
 
-/// `um workflow run create --path` over `root` with `--json` and `options`.
+/// `useful workflow run create --path` over `root` with `--json` and `options`.
 pub(super) fn path_args(root: &Path, execution_root: &Path, options: &[&str]) -> Vec<String> {
     let mut args = vec![
         "workflow".to_owned(),
@@ -7213,12 +7216,12 @@ fn a_path_run_of_a_tree_records_itself_in_run_json() {
         bundle.execution_root(),
         &["--run-dir", &run_directory],
     ))
-    .env("USER", "um-run-owner")
+    .env("USER", "useful-run-owner")
     .output()
     .unwrap();
 
     let terminal = succeeded(&output);
-    assert_eq!(terminal["command"], "um workflow run create");
+    assert_eq!(terminal["command"], "useful workflow run create");
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(destination.join("workflow/manifest.json")).unwrap())
             .unwrap();
@@ -7235,7 +7238,7 @@ fn a_path_run_of_a_tree_records_itself_in_run_json() {
         )
     );
     assert_eq!(record["workflow"], "workflow.yaml");
-    assert_eq!(record["owner"], "um-run-owner");
+    assert_eq!(record["owner"], "useful-run-owner");
     assert_eq!(record["state"], "exited");
     assert_eq!(record["attempts"], 1);
 }
@@ -7565,7 +7568,7 @@ set -eu
 verdict=$(cat verdict-input)
 printf %s \"$verdict\" > verdict.txt
 if [ \"$verdict\" = planned ]; then
-  printf 'plan: %s' \"$(cat \"$UM_STEP_INPUTS/values/ticket\")\" > plan.txt
+  printf 'plan: %s' \"$(cat \"$USEFUL_STEP_INPUTS/values/ticket\")\" > plan.txt
 else
   rm -f plan.txt
   : > plan.txt
@@ -7776,7 +7779,7 @@ if [ -e hold ]; then
 fi
 verdict=$(cat verdict-input)
 printf %s \"$verdict\" > verdict.txt
-printf 'plan: %s' \"$(cat \"$UM_STEP_INPUTS/values/ticket\")\" > plan.txt
+printf 'plan: %s' \"$(cat \"$USEFUL_STEP_INPUTS/values/ticket\")\" > plan.txt
 ";
 
 /// Starts the child tree with `design`'s child held in `decide` and returns once it runs.
@@ -7799,14 +7802,14 @@ pub(super) fn spawn_held_child_tree(name: &str) -> (TreeBundle, PathBuf, std::pr
     (bundle, destination, child)
 }
 
-// REQ-WFEXEC-59, REQ-LOCALRUN-186: a cancellation of the parent, `um workflow run cancel`'s
+// REQ-WFEXEC-59, REQ-LOCALRUN-186: a cancellation of the parent, `useful workflow run cancel`'s
 // recorded cancel, reaches the child, which records `canceled`, and the step ends `cancelled`.
 #[test]
 fn cancelling_the_parent_cancels_its_running_child() {
     let (_bundle, destination, child) = spawn_held_child_tree("cancelled");
     poll_until(
         "the parent holds its run",
-        || um_execution::lock_holder(&destination).is_ok_and(|holder| holder.is_some()),
+        || useful_execution::lock_holder(&destination).is_ok_and(|holder| holder.is_some()),
         |held| *held,
     );
     let cancel = super::workflow_run_control::run_control(None, "cancel", &destination, &[]);

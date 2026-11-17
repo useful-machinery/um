@@ -404,7 +404,7 @@ impl AgentLoginCloud for HttpAgentLoginCloud {
                 ("unsupported_target", None, None) => LoginStatus::UnsupportedTarget,
                 _ => return Err(CloudFailure::InvalidResponse),
             };
-            if !um_support::valid_typed_id(&entry.agent_login_id, "agl_")
+            if !useful_support::valid_typed_id(&entry.agent_login_id, "agl_")
                 || logins.iter().any(|login| login.provider == provider)
             {
                 return Err(CloudFailure::InvalidResponse);
@@ -508,7 +508,7 @@ impl AgentLoginCloud for HttpAgentLoginCloud {
         if answer.schema_version != 1
             || answer.provider != provider
             || answer.generation < 1
-            || !um_support::valid_typed_id(&answer.grant_id, "pgr_")
+            || !useful_support::valid_typed_id(&answer.grant_id, "pgr_")
         {
             return Err(CloudFailure::InvalidResponse.into());
         }

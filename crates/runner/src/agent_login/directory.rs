@@ -29,9 +29,9 @@ const LINEAR_TOKEN: &str = "linear.token";
 /// The prefixes of the temporary files each grant token file is written
 /// through, in the order of `github`, `gitlab` and `linear`.
 pub(crate) const GRANT_TOKEN_TEMPORARY_PREFIXES: [&str; 3] = [
-    ".um-github.token.tmp",
-    ".um-gitlab.token.tmp",
-    ".um-linear.token.tmp",
+    ".useful-github.token.tmp",
+    ".useful-gitlab.token.tmp",
+    ".useful-linear.token.tmp",
 ];
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 

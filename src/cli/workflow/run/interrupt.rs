@@ -1,14 +1,16 @@
-//! `um workflow run interrupt` (REQ-LOCALRUN-202).
+//! `useful workflow run interrupt` (REQ-LOCALRUN-202).
 
 use clap::Args;
 use rustix::process::{Pid, Signal};
 use serde_json::{Map, Value};
-use um_execution::{CONTROL_INTERRUPT, RunState, WaitInspection, latest_child_run, lock_holder};
+use useful_execution::{
+    CONTROL_INTERRUPT, RunState, WaitInspection, latest_child_run, lock_holder,
+};
 
 use super::control::{Acted, ControlFailure, ControlTarget, Refusal};
 
 pub(super) const ABOUT: &str = "Interrupt a running run so that retry continues its stage";
-const COMMAND: &str = "um workflow run interrupt";
+const COMMAND: &str = "useful workflow run interrupt";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -97,7 +99,7 @@ fn live_child(target: &ControlTarget, pid: Pid) -> Result<(), ControlFailure> {
         Some((child, RunState::Running, _)) if lock_holder(&child)? == Some(pid) => Ok(()),
         _ => Err(Refusal::new(
             "child_not_live",
-            "The run is between stages; stop it before a step with `um workflow run stop --before STEP` instead.",
+            "The run is between stages; stop it before a step with `useful workflow run stop --before STEP` instead.",
         )
         .into()),
     }

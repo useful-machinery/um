@@ -626,7 +626,7 @@ fn retry_transport(
 ) -> Result<UnreachableCategory, ProjectFailure> {
     let category = classify_reqwest_error(error);
     if http_util::can_retry_ambiguous_mutation(attempt, attempts, category) {
-        um_support::sleep(um_support::short_retry_delay());
+        useful_support::sleep(useful_support::short_retry_delay());
         Ok(category)
     } else {
         Err(ProjectFailure::Unreachable(category))
@@ -816,9 +816,9 @@ fn validate_project(mut project: Project) -> Result<Project, ProjectFailure> {
         .repository
         .as_deref()
         .is_none_or(valid_repository_fields);
-    let valid = um_support::valid_typed_id(&project.id, "prj_")
-        && um_support::valid_typed_id(&project.organization_id, "org_")
-        && um_support::valid_url_safe_name(&project.name)
+    let valid = useful_support::valid_typed_id(&project.id, "prj_")
+        && useful_support::valid_typed_id(&project.organization_id, "org_")
+        && useful_support::valid_url_safe_name(&project.name)
         && pool_set_valid
         && repository_valid
         && project.execution_readiness.blockers == expected_blockers
@@ -832,7 +832,7 @@ fn validate_project(mut project: Project) -> Result<Project, ProjectFailure> {
 }
 
 fn valid_runner_pool(pool: &models::ProjectRunnerPoolSummary) -> bool {
-    um_support::valid_typed_id(&pool.id, "rpl_") && valid_bounded_text(&pool.name, 1, 63)
+    useful_support::valid_typed_id(&pool.id, "rpl_") && valid_bounded_text(&pool.name, 1, 63)
 }
 
 fn validate_repository(repository: ProjectRepository) -> Result<ProjectRepository, ProjectFailure> {
@@ -849,7 +849,7 @@ fn valid_repository_fields(repository: &ProjectRepository) -> bool {
             repository
                 .installation_binding_id
                 .as_deref()
-                .is_some_and(|id| um_support::valid_typed_id(id, "ghi_"))
+                .is_some_and(|id| useful_support::valid_typed_id(id, "ghi_"))
                 && repository.gitlab_connection_id.is_none()
                 && repository.instance_url.is_none()
                 && repository.admission_diagnostic.is_none()
@@ -860,7 +860,7 @@ fn valid_repository_fields(repository: &ProjectRepository) -> bool {
                 && repository
                     .gitlab_connection_id
                     .as_deref()
-                    .is_some_and(|id| um_support::valid_typed_id(id, "glc_"))
+                    .is_some_and(|id| useful_support::valid_typed_id(id, "glc_"))
                 && repository
                     .instance_url
                     .as_deref()
@@ -868,7 +868,7 @@ fn valid_repository_fields(repository: &ProjectRepository) -> bool {
                 && valid_gitlab_path(&repository.full_name)
         }
     };
-    um_support::valid_typed_id(&repository.connection_id, "rpc_")
+    useful_support::valid_typed_id(&repository.connection_id, "rpc_")
         && origin_valid
         && valid_provider_id(&repository.provider_repository_id)
         && valid_bounded_text(&repository.default_branch, 1, 1024)

@@ -6,11 +6,11 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_runner::{
+use useful_runner::{
     AgentLoginProvider, AgentLoginReadiness, ControlError, Operation, ProviderReadiness,
     RequestFailure, Response,
 };
-use um_support::{CredentialStatus, NextAction};
+use useful_support::{CredentialStatus, NextAction};
 
 use super::super::{CommandFailure, CommandResult, JsonArgs, RunnerJson};
 
@@ -33,7 +33,7 @@ enum AgentLoginCommand {
 #[derive(Debug, Args)]
 struct SyncCommand {
     /// Read the control socket path from the closed runner operator
-    /// configuration; the runner home under the um home is the default, read
+    /// configuration; the runner home under the useful home is the default, read
     /// without creating anything.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
@@ -106,7 +106,7 @@ impl SyncCommand {
     // command contacts no Cloud deployment itself.
     fn execute(self) -> CommandResult {
         let socket_path = super::configured_control_socket_path(self.config.as_deref())?;
-        let synced = match um_runner::request(&socket_path, Operation::SyncAgentLogins) {
+        let synced = match useful_runner::request(&socket_path, Operation::SyncAgentLogins) {
             Ok(Response::AgentLoginsSynced(synced)) => synced,
             Ok(Response::Error(error)) => return Err(control_failure(error)),
             Ok(Response::Status(_) | Response::Reloaded { .. }) => {
@@ -178,7 +178,7 @@ fn control_failure(error: ControlError) -> CommandFailure {
         // Only a serving process older than this release refuses the
         // well-formed request this command sends.
         ControlError::InvalidRequest => CommandFailure::new(anyhow!(
-            "Runner Serve does not offer agent-login setup (invalid_request); restart the running `um runner serve` on this release"
+            "Runner Serve does not offer agent-login setup (invalid_request); restart the running `useful runner serve` on this release"
         )),
         error => CommandFailure::new(anyhow!(
             "Runner Serve could not set up agent logins ({})",
@@ -283,7 +283,7 @@ fn grant_step(status: CredentialStatus, provider: AgentLoginProvider) -> Option<
                 .to_owned(),
         ),
         NextAction::Reconnect => Some(format!(
-            "the owner of the grant consents again with `um grant create {provider} --replace`; only they can"
+            "the owner of the grant consents again with `useful grant create {provider} --replace`; only they can"
         )),
         _ => runner_step(status, None),
     }
@@ -297,7 +297,7 @@ pub(super) struct Login<'a> {
 }
 
 /// The command or step a runner's next action names, each command a
-/// `um grant` or `um runner grant` one (REQ-GRANT-77). Reconnecting a login
+/// `useful grant` or `useful runner grant` one (REQ-GRANT-77). Reconnecting a login
 /// and restoring its owner's membership are the agent login's owner's to do,
 /// not the runner operator's, so those name the agent login.
 pub(super) fn runner_step(status: CredentialStatus, login: Option<Login<'_>>) -> Option<String> {
@@ -308,14 +308,14 @@ pub(super) fn runner_step(status: CredentialStatus, login: Option<Login<'_>>) ->
     );
     match status.next_action {
         NextAction::Reconnect => Some(format!(
-            "the owner of {agent_login} stores a new sign-in with `um grant create {} --replace`; only they can",
+            "the owner of {agent_login} stores a new sign-in with `useful grant create {} --replace`; only they can",
             login.as_ref().map_or("PROVIDER", |login| login.provider)
         )),
         NextAction::RestoreMembership => Some(format!(
             "the owner of {agent_login} must be an active member of the organization again; it is theirs to settle, not the runner's"
         )),
         NextAction::SyncRunner => {
-            Some("set grants up again with `um runner grant sync`".to_owned())
+            Some("set grants up again with `useful runner grant sync`".to_owned())
         }
         NextAction::CheckTarget => Some(
             "the deployment does not serve this provider for the runner's operating system"

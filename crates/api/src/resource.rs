@@ -437,7 +437,7 @@ pub(crate) fn organization_id<'a, F: ProblemFailure + 'a>(
     problems: impl IntoIterator<Item = &'a ProblemRow<F>>,
 ) -> Result<String, F> {
     let organization = organization(configuration, slug, problems)?;
-    if organization.slug != slug || !um_support::valid_typed_id(&organization.id, "org_") {
+    if organization.slug != slug || !useful_support::valid_typed_id(&organization.id, "org_") {
         return Err(F::invalid_response(false));
     }
     Ok(organization.id)

@@ -27,7 +27,7 @@
       "createdAt": "2026-10-10T12:00:00Z",
       "updatedAt": "2026-10-10T12:00:00Z",
       "displayName": "Summarize",
-      "workflowPath": ".um/workflows/summarize.yaml",
+      "workflowPath": ".useful/workflows/summarize.yaml",
       "definitionId": null,
       "enabled": false,
       "description": "",

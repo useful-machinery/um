@@ -6,7 +6,7 @@ use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use zeroize::Zeroizing;
 
-use um_api::{
+use useful_api::{
     BoundedBodyError, HttpClient, HttpEndpointError, HttpTransportPolicy, UnreachableCategory,
     classify_reqwest_error, media_type, read_bounded_body,
 };

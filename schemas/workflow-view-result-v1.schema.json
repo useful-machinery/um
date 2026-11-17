@@ -2464,7 +2464,7 @@
           "const": 1
         },
         "command": {
-          "const": "um workflow run view"
+          "const": "useful workflow run view"
         },
         "outcome": {
           "const": "view"
@@ -2649,7 +2649,7 @@
           "const": 1
         },
         "command": {
-          "const": "um workflow run view"
+          "const": "useful workflow run view"
         },
         "outcome": {
           "const": "error"

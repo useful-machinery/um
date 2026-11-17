@@ -1,5 +1,5 @@
 use super::*;
-use um_test_support::ScriptedHttpServer;
+use useful_test_support::ScriptedHttpServer;
 
 const TOKEN: &str = "runner-api-token-sentinel";
 const ORGANIZATION: &str = "acme";

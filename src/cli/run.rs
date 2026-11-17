@@ -7,15 +7,15 @@ use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{
+use useful_api::{
     CreateRunInput, HttpTransportPolicy, RetryConflict, Run, RunApi, RunArtifactDelivery,
     RunCancellationMode, RunCancellationResolutionKind, RunDefinitionSelection, RunFailure,
     RunList, RunListFilter, RunObservation, RunState,
 };
 #[cfg(test)]
-use um_api::{HttpClient, RunRead};
-use um_execution::visible_text;
-use um_human_auth::Deployment;
+use useful_api::{HttpClient, RunRead};
+use useful_execution::visible_text;
+use useful_human_auth::Deployment;
 
 use super::{OrganizationArg, ProjectArg};
 
@@ -93,7 +93,7 @@ type CloudInputOptions = super::CommonArgs<super::RunJson, super::PrincipalAuthe
 pub(in crate::cli) const INTEGRATION_CONTEXT_FILE_HELP: &str =
     "Read private immutable integration context from a JSON file, or - for standard input";
 
-/// The source, workspace, name and input-set options of `um workflow run create --cloud`
+/// The source, workspace, name and input-set options of `useful workflow run create --cloud`
 /// (REQ-RUN-94).
 #[derive(Debug, Args)]
 pub(in crate::cli) struct CreationOptions {
@@ -404,7 +404,10 @@ fn start_cloud_observation(
     timeout_start: &super::DeferredObservationTimeoutStart,
 ) -> (super::SystemObservationClock, std::time::Instant) {
     timeout_start.start();
-    (super::SystemObservationClock, um_support::monotonic_now())
+    (
+        super::SystemObservationClock,
+        useful_support::monotonic_now(),
+    )
 }
 
 fn finish_accepted<R>(
@@ -579,7 +582,7 @@ impl Creation {
                 }
             }
         };
-        let run_idempotency_key = um_support::generate_idempotency_key()
+        let run_idempotency_key = useful_support::generate_idempotency_key()
             .context("generate Cloud run request identity")?;
         if control.is_cancelled() {
             return Ok(ExitCode::GeneralFailure);
@@ -801,7 +804,7 @@ impl ShowCommand {
             move |control, timeout_start| {
                 timeout_start.start();
                 let clock = super::SystemObservationClock;
-                let started = um_support::monotonic_now();
+                let started = useful_support::monotonic_now();
                 let snapshot = control.recovery();
                 if self.wait.wait {
                     let result = observation::wait_run(
@@ -920,7 +923,7 @@ impl CancelCommand {
     fn execute(self, deployment: Deployment) -> super::CommandResult {
         let key = match self.idempotency_key.clone() {
             Some(key) => key,
-            None => um_support::generate_idempotency_key()
+            None => useful_support::generate_idempotency_key()
                 .context("generate Cloud cancellation request identity")?,
         };
         let mode = if self.force { "force" } else { "graceful" };
@@ -1212,10 +1215,10 @@ fn finish_cloud_observation<R, S>(
 
 /// What a `path_run_retired` report tells the user to do instead (REQ-RETRY-35,
 /// REQ-CONTINUE-87); Cloud's own problem prose is never relayed.
-const PATH_RUN_RETIRED_GUIDANCE: &str = "Cloud no longer retries or continues a run created by workflow path; publish the workflow as a definition (`um workflow definition publish --cloud`) and start a run of it.";
+const PATH_RUN_RETIRED_GUIDANCE: &str = "Cloud no longer retries or continues a run created by workflow path; publish the workflow as a definition (`useful workflow definition publish --cloud`) and start a run of it.";
 
 /// The diagnostic code and exit status a run command reports `failure` under; the `--cloud`
-/// leaves of `um workflow run` take theirs from it too (INV-CLI-17).
+/// leaves of `useful workflow run` take theirs from it too (INV-CLI-17).
 pub(in crate::cli) fn failure_code(
     failure: &RunFailure,
     _authentication: super::PrincipalAuthenticationKind,
@@ -1272,7 +1275,7 @@ fn write_cancel_failure(
     let (outcome, code, exit) = if dispatched
         && (matches!(
             failure,
-            RunFailure::Unreachable(category) if *category != um_api::UnreachableCategory::RateLimited
+            RunFailure::Unreachable(category) if *category != useful_api::UnreachableCategory::RateLimited
         ) || matches!(failure, RunFailure::Protocol { .. }))
     {
         (
@@ -1373,7 +1376,7 @@ const fn terminal_run_state(state: RunState) -> Option<TerminalRunState> {
 }
 
 fn parse_input_set_id(value: &str) -> Result<String, String> {
-    if um_support::valid_typed_id(value, "ris_") {
+    if useful_support::valid_typed_id(value, "ris_") {
         Ok(value.to_owned())
     } else {
         Err(
@@ -1384,7 +1387,7 @@ fn parse_input_set_id(value: &str) -> Result<String, String> {
 }
 
 fn run_api<'a>(
-    client: &'a um_api::HttpClient,
+    client: &'a useful_api::HttpClient,
     deployment: &Deployment,
     access_token: &str,
     transport_policy: HttpTransportPolicy,
@@ -1416,7 +1419,7 @@ fn with_pinned_run_mutation<T>(
     if let Some(api_key) = options.authentication.service_api_key()? {
         return submit(api_key.expose());
     }
-    match um_human_auth::execute_pinned_required(
+    match useful_human_auth::execute_pinned_required(
         &client,
         deployment,
         |token| submit(token.expose()),
@@ -1426,10 +1429,10 @@ fn with_pinned_run_mutation<T>(
                 .is_ok_and(|value| value.as_ref().is_err_and(RunFailure::credential_rejected))
         },
     ) {
-        Ok(um_human_auth::BoundRequiredOperation::Completed { result, .. }) => result,
+        Ok(useful_human_auth::BoundRequiredOperation::Completed { result, .. }) => result,
         Ok(
-            um_human_auth::BoundRequiredOperation::Unauthenticated { .. }
-            | um_human_auth::BoundRequiredOperation::ActingSessionChanged,
+            useful_human_auth::BoundRequiredOperation::Unauthenticated { .. }
+            | useful_human_auth::BoundRequiredOperation::ActingSessionChanged,
         ) => Ok(Err(RunFailure::Unauthenticated)),
         Err(error) => match error.unreachable_category() {
             Some(category) => Ok(Err(RunFailure::Unreachable(category))),
@@ -1526,7 +1529,7 @@ fn write_create(
     organization: &str,
     input_set_id: Option<&str>,
     submission: (Option<&str>, bool),
-    result: Result<um_api::RunCreationAcceptance, RunFailure>,
+    result: Result<useful_api::RunCreationAcceptance, RunFailure>,
     authentication: super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
@@ -1574,7 +1577,7 @@ fn write_create(
             };
             writeln!(
                 stderr,
-                "input set: {}\n\nInspect the input set with `um run input-set show`. {remedy} This rejection did not create a run.",
+                "input set: {}\n\nInspect the input set with `useful run input-set show`. {remedy} This rejection did not create a run.",
                 input_set_id.unwrap_or("none")
             )?;
         }
@@ -1608,7 +1611,7 @@ fn write_create(
             let remedy = match *problem_type {
                 "project-archived" => super::project::ARCHIVED_REMEDY,
                 "project-not-ready" => {
-                    "The project is not ready to run workflows; inspect it with `um project show` and clear the listed blockers before submitting a new request."
+                    "The project is not ready to run workflows; inspect it with `useful project show` and clear the listed blockers before submitting a new request."
                 }
                 "workspace-selection-unsupported" => {
                     "This deployment does not admit an explicit workspace selection. Omit --workspace-branch and --workspace-commit and keep --source-branch; the workspace is then pinned at the workflow definition commit, which the acceptance receipt reports."
@@ -1682,14 +1685,14 @@ fn write_create(
             if json
                 || (run_dispatched
                     && matches!(failure,
-                        RunFailure::Unreachable(category) if category != um_api::UnreachableCategory::RateLimited
+                        RunFailure::Unreachable(category) if category != useful_api::UnreachableCategory::RateLimited
                     ))
                 || (run_dispatched && matches!(failure, RunFailure::Protocol { .. })) =>
         {
             let (code, exit) = failure_code(&failure, authentication);
             let uncertain = run_dispatched
                 && (matches!(failure,
-                RunFailure::Unreachable(category) if category != um_api::UnreachableCategory::RateLimited)
+                RunFailure::Unreachable(category) if category != useful_api::UnreachableCategory::RateLimited)
                     || matches!(failure, RunFailure::Protocol { .. }));
             if let Some(input_set_id) = input_set_id {
                 write_staging_guidance(organization, input_set_id)?;
@@ -2127,7 +2130,7 @@ fn write_failure_with_input_set(
             None,
             authentication
                 .rejected_error(
-                    "error: Cloud run access requires sign-in\n\nSign in first:\n  um auth login",
+                    "error: Cloud run access requires sign-in\n\nSign in first:\n  useful auth login",
                 )
                 .to_owned(),
             OutcomeClass::Unauthenticated,
@@ -2237,7 +2240,7 @@ fn write_failure_with_input_set(
     } else if let Some(input_set_id) = input_set_id {
         writeln!(
             io::stderr().lock(),
-            "{human}\n\ninput set: {input_set_id}\n\nContinue explicitly with `um run input-set show` before creating another set."
+            "{human}\n\ninput set: {input_set_id}\n\nContinue explicitly with `useful run input-set show` before creating another set."
         )?;
     } else {
         writeln!(io::stderr().lock(), "{human}")?;
@@ -2248,7 +2251,7 @@ fn write_failure_with_input_set(
 fn write_staging_guidance(organization: &str, input_set_id: &str) -> anyhow::Result<()> {
     writeln!(
         io::stderr().lock(),
-        "input set: {input_set_id}\norganization: {organization}\n\nInspect with `um run input-set show`; if open, resume upload and sealing, or delete the set explicitly. Reconcile any uncertain run acceptance before creating another run."
+        "input set: {input_set_id}\norganization: {organization}\n\nInspect with `useful run input-set show`; if open, resume upload and sealing, or delete the set explicitly. Reconcile any uncertain run acceptance before creating another run."
     )?;
     Ok(())
 }
@@ -2409,7 +2412,7 @@ mod tests {
 
     use super::super::observation_test_support::ControlledObservationClock as ControlledWaitClock;
     use super::*;
-    use um_api::{
+    use useful_api::{
         HttpTransportPolicy, InputScalarMetadata, NamedInputMetadata, RunCreationAcceptance,
         RunInputManifest, UnreachableCategory,
     };
@@ -2735,7 +2738,7 @@ mod tests {
 
     #[test]
     fn publication_wait_uses_one_budget_across_run_handoff_and_linked_attempt() {
-        let started = um_support::monotonic_now();
+        let started = useful_support::monotonic_now();
         let clock = ControlledWaitClock::new(started);
         let mut pending = serde_json::to_value(run(RunState::Succeeded)).unwrap();
         pending["publication"] = serde_json::json!({
@@ -3018,7 +3021,7 @@ mod tests {
         assert_no_pending_request(&listener);
     }
 
-    fn receipt(state: &str, run: Option<Run>) -> um_api::RunCancellationEnvelope {
+    fn receipt(state: &str, run: Option<Run>) -> useful_api::RunCancellationEnvelope {
         let resolution = if state == "resolved" {
             serde_json::json!({"kind":"applied", "resolvedAt":"2026-08-10T12:05:00Z",
                 "effectiveRequestId":"cmd_01k0z6r1w8f4jy2m7q9v3x5abc", "runVersion":1})
@@ -3037,7 +3040,7 @@ mod tests {
     }
 
     fn scripted_cancellation(
-        responses: impl IntoIterator<Item = Result<um_api::RunCancellationEnvelope, RunFailure>>,
+        responses: impl IntoIterator<Item = Result<useful_api::RunCancellationEnvelope, RunFailure>>,
         mut record: impl FnMut(CloudSnapshot),
     ) -> (
         Result<super::super::TerminalObservation<CloudSnapshot, ()>, RunFailure>,
@@ -3047,12 +3050,12 @@ mod tests {
         let mut snapshot = CloudSnapshot::for_run("run_01k0z6r1w8f4jy2m7q9v3x5abc");
         snapshot.cancellation_request = Some(receipt("pending", None).request);
         let responses = RefCell::new(responses.into_iter().collect::<VecDeque<_>>());
-        let clock = ControlledWaitClock::new(um_support::monotonic_now());
+        let clock = ControlledWaitClock::new(useful_support::monotonic_now());
         let result = observation::wait_receipt_with(
             |_| responses.borrow_mut().pop_front().unwrap(),
             &snapshot,
             None,
-            um_support::monotonic_now(),
+            useful_support::monotonic_now(),
             &super::super::BlockingObservationControl::new(),
             &clock,
             &mut record,
@@ -3124,7 +3127,7 @@ mod tests {
                 .chain([terminal_state])
                 .map(|state| Ok(run(state)));
             let api = ScriptedObservationApi::new(responses);
-            let started_at = um_support::monotonic_now();
+            let started_at = useful_support::monotonic_now();
             let clock = ControlledWaitClock::new(started_at);
 
             let result = observe(&api, None, &clock).expect("the polling scenario should complete");
@@ -3149,13 +3152,13 @@ mod tests {
     fn wait_treats_admitted_creation_as_nonterminal() {
         let api = ScriptedObservationApi {
             responses: RefCell::new(VecDeque::from([
-                Ok(RunRead::Pending(um_api::RunCreationPending::new(
+                Ok(RunRead::Pending(useful_api::RunCreationPending::new(
                     "run_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
                 ))),
                 Ok(RunRead::Materialized(Box::new(run(RunState::Succeeded)))),
             ])),
         };
-        let clock = ControlledWaitClock::new(um_support::monotonic_now());
+        let clock = ControlledWaitClock::new(useful_support::monotonic_now());
 
         assert_succeeded_after_single_poll(
             observe(&api, None, &clock),
@@ -3170,7 +3173,7 @@ mod tests {
             Err(RunFailure::Unreachable(UnreachableCategory::Server)),
             Ok(run(RunState::Succeeded)),
         ]);
-        let started_at = um_support::monotonic_now();
+        let started_at = useful_support::monotonic_now();
         let clock = ControlledWaitClock::new(started_at);
 
         assert_succeeded_after_single_poll(
@@ -3187,7 +3190,7 @@ mod tests {
             Ok(run(RunState::Assigned)),
             Ok(run(RunState::Running)),
         ]);
-        let started_at = um_support::monotonic_now();
+        let started_at = useful_support::monotonic_now();
         let clock = ControlledWaitClock::new(started_at);
 
         let result = observe(&api, Some(Duration::from_secs(5)), &clock)
@@ -3202,7 +3205,7 @@ mod tests {
     fn wait_bounds_retries_and_preserves_the_transport_failure() {
         let failure = RunFailure::Unreachable(UnreachableCategory::Connection);
         let api = ScriptedObservationApi::new([Err(failure.clone()), Err(failure.clone())]);
-        let started_at = um_support::monotonic_now();
+        let started_at = useful_support::monotonic_now();
         let clock = ControlledWaitClock::new(started_at);
 
         let result = observe(&api, None, &clock);

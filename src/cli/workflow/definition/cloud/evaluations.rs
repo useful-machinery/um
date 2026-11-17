@@ -1,4 +1,4 @@
-//! `um workflow definition cloud evaluation list` and `show` (REQ-CLOUDDEF-15): a Cloud
+//! `useful workflow definition cloud evaluation list` and `show` (REQ-CLOUDDEF-15): a Cloud
 //! definition's retained start evaluations (REQ-TRIGGER-132), listed with the exact `state`
 //! and `runId` filters and read one at a time, each with its stored reason.
 
@@ -12,8 +12,8 @@ use super::super::super::super::{self as cli, OrganizationArg, PaginationArgs, P
 use super::super::report::display;
 use super::report::{self, Scope};
 use super::{Options, with_api};
-use um_api::{WorkflowDefinitionEvaluation, WorkflowEvaluationFilter};
-use um_human_auth::Deployment;
+use useful_api::{WorkflowDefinitionEvaluation, WorkflowEvaluationFilter};
+use useful_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "List and show a Cloud workflow definition's start evaluations";
 const COMMAND_PATH: &[&str] = &["workflow", "definition", "cloud", "evaluation"];

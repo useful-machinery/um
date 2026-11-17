@@ -221,11 +221,11 @@ cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 "$public_root/scripts/check-lint-policy"
 # A caller that already builds and runs this suite on the same source, such as
-# the private pipeline's cli-nix step, names itself in UM_CLI_SUITE_TESTS_RUN_BY.
+# the private pipeline's cli-nix step, names itself in USEFUL_CLI_SUITE_TESTS_RUN_BY.
 # The source, format, MSRV and lint checks above still run; the workspace
 # build, the test run and the release-archive check that reuses its binary do
 # not. The public workflow never sets the variable, so its suite stays complete.
-tests_run_by=${UM_CLI_SUITE_TESTS_RUN_BY:-}
+tests_run_by=${USEFUL_CLI_SUITE_TESTS_RUN_BY:-}
 if [[ -n $tests_run_by ]]; then
   printf 'Workspace build, nextest run and release-archive check skipped: run by %s on this source.\n' \
     "$tests_run_by"
@@ -237,7 +237,7 @@ else
   # binary also links is otherwise built with a host-only profile, and every
   # library above it, including the worker's, would compile a second time.
   cargo build --locked --workspace --all-features --bins --example internal-worker
-  export UM_TEST_INTERNAL_WORKER_EXECUTABLE="$cargo_target_dir/debug/examples/internal-worker"
+  export USEFUL_TEST_INTERNAL_WORKER_EXECUTABLE="$cargo_target_dir/debug/examples/internal-worker"
   # Nextest normally re-executes itself before each test process. That second
   # exec costs about 65 ms per test on macOS, roughly 15 s across this suite, and
   # only guards an interactive job-control race that this noninteractive check
@@ -266,7 +266,7 @@ else
       release_dist=$long_tmp_parent/release-dist
       archive=$(
         "$public_root/scripts/package-release-archive" \
-          --binary "$cargo_target_dir/debug/um" \
+          --binary "$cargo_target_dir/debug/useful" \
           --output "$release_dist" \
           --target "$host_target" \
           --version 0.0.0-dev \

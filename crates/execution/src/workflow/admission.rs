@@ -677,7 +677,7 @@ impl std::error::Error for ResolvedJsonInputError {
 impl ResolvedJsonInput {
     pub fn from_source(source: Arc<[u8]>) -> Result<Self, ResolvedJsonInputError> {
         let value = Arc::new(
-            um_support::strict_json_from_slice(&source)
+            useful_support::strict_json_from_slice(&source)
                 .map_err(ResolvedJsonInputError::InvalidSource)?,
         );
         let canonical = super::canonical_json::to_bounded_bytes(&value, u64::MAX)
@@ -751,7 +751,7 @@ impl ResolvedInputs {
         Self { values }
     }
 
-    /// The inputs by name; a Cloud tree run hands each to `um workflow run create`.
+    /// The inputs by name; a Cloud tree run hands each to `useful workflow run create`.
     pub fn values(&self) -> &BTreeMap<String, ResolvedInput> {
         &self.values
     }
@@ -879,13 +879,13 @@ fn is_base_workflow_environment_name(name: &OsStr) -> bool {
 
 /// The grant token names (REQ-WFFORMAT-32): a workflow may declare them in
 /// `environmentPassthrough` although `GH_TOKEN` is a GitHub credential name and the
-/// Linear names start with `UM_`. On a runner they are set only from a grant, never
+/// Linear names start with `USEFUL_`. On a runner they are set only from a grant, never
 /// from the service's own environment (REQ-WORKSPACE-18).
 pub fn grant_token_environment_names() -> [&'static str; 3] {
     [
         "GH_TOKEN",
-        "UM_LINEAR_ACCESS_TOKEN",
-        "UM_LINEAR_ACCESS_TOKEN_FILE",
+        "USEFUL_LINEAR_ACCESS_TOKEN",
+        "USEFUL_LINEAR_ACCESS_TOKEN_FILE",
     ]
 }
 
@@ -896,7 +896,7 @@ fn is_grant_token_environment_name(name: &OsStr) -> bool {
 }
 
 fn is_engine_reserved_environment_name(name: &OsStr) -> bool {
-    (name.as_encoded_bytes().starts_with(b"UM_") && !is_grant_token_environment_name(name))
+    (name.as_encoded_bytes().starts_with(b"USEFUL_") && !is_grant_token_environment_name(name))
         || name.as_encoded_bytes() == b"SCHERZO_CONTINUATION_CONTEXT"
 }
 
@@ -1750,7 +1750,7 @@ impl AdmittedWorkflow {
             .execution
             .environment
             .with_variable(
-                "UM_CONTINUATION_CONTEXT".into(),
+                "USEFUL_CONTINUATION_CONTEXT".into(),
                 path.as_os_str().to_owned(),
             )
             .with_variable(
@@ -1776,7 +1776,7 @@ impl AdmittedWorkflow {
 
     /// Binds the run's copy of the admitted tree once it exists (REQ-WFEXEC-53): `PATH`
     /// is led by `<copy_root>/<program>` for each `programs` directory in declared order,
-    /// ahead of the inherited value, and `UM_WORKFLOW_ROOT` names `copy_root`. Every
+    /// ahead of the inherited value, and `USEFUL_WORKFLOW_ROOT` names `copy_root`. Every
     /// command, recovery handler and agent child reads this environment. A run admitted
     /// without a tree is returned unchanged. A copy root that cannot be a `PATH` entry,
     /// one containing `:`, fails with the cause.
@@ -1784,10 +1784,10 @@ impl AdmittedWorkflow {
         let Some(tree) = self.tree.clone() else {
             return Ok(self);
         };
-        let mut environment = self
-            .execution
-            .environment
-            .with_variable("UM_WORKFLOW_ROOT".into(), copy_root.as_os_str().to_owned());
+        let mut environment = self.execution.environment.with_variable(
+            "USEFUL_WORKFLOW_ROOT".into(),
+            copy_root.as_os_str().to_owned(),
+        );
         if !tree.programs.is_empty() {
             let mut path = env::join_paths(tree.program_directories(copy_root))?;
             if let Some(inherited) = self.execution.environment.variable(OsStr::new("PATH")) {
@@ -2447,23 +2447,23 @@ fn admit_workflow_for(
         .for_workflow_children(&workflow.definition.environment_passthrough);
     if let Some(source_revision) = context.source_revision {
         environment = environment.with_variable(
-            OsString::from("UM_SOURCE_COMMIT_OID"),
+            OsString::from("USEFUL_SOURCE_COMMIT_OID"),
             OsString::from(source_revision.commit_oid.as_ref()),
         );
         if let Some(branch) = source_revision.branch {
             environment = environment.with_variable(
-                OsString::from("UM_SOURCE_BRANCH"),
+                OsString::from("USEFUL_SOURCE_BRANCH"),
                 OsString::from(branch.as_ref()),
             );
         }
         if let Some((branch, commit_oid)) = source_revision.definition {
             environment = environment
                 .with_variable(
-                    OsString::from("UM_WORKFLOW_SOURCE_BRANCH"),
+                    OsString::from("USEFUL_WORKFLOW_SOURCE_BRANCH"),
                     OsString::from(branch.as_ref()),
                 )
                 .with_variable(
-                    OsString::from("UM_WORKFLOW_SOURCE_COMMIT_OID"),
+                    OsString::from("USEFUL_WORKFLOW_SOURCE_COMMIT_OID"),
                     OsString::from(commit_oid.as_ref()),
                 );
         }

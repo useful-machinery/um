@@ -1,6 +1,6 @@
 # Architecture
 
-> This file is the enforced summary of the `um` executable's source boundary. The full
+> This file is the enforced summary of the `useful` executable's source boundary. The full
 > living descriptions are architecture chapters 12,
 > [CLI executable](../docs/architecture/12-cli-executable.md), 13,
 > [Workflow execution engine](../docs/architecture/13-workflow-execution-engine.md), and 14,
@@ -8,7 +8,7 @@
 
 ## Current state
 
-This repository defines the public source boundary for the Rust `um`
+This repository defines the public source boundary for the Rust `useful`
 executable. The current binary provides help, version output, deployment selection, a
 secure local human credential store, caller-managed service API-key input, OAuth Device
 Authorization, server-confirmed authentication status, explicit human-principal signup,
@@ -16,19 +16,19 @@ service-principal and credential lifecycle management, revoking logout, organiza
 profile and membership management, one-page active member-directory and owner-only membership-history reads, Cloud run creation
 with declared inputs and current projection reads, local Workflow V1 definition validation, and an outbound,
 enrolled runner transport.
-`um runner serve` opens a versioned WebSocket connection, durably
+`useful runner serve` opens a versioned WebSocket connection, durably
 acknowledges received assignment effects, and uses the shared workflow resolver,
 admission boundary, and execution engine for one configured command, Pi,
 Claude Code, Codex, or mixed workflow. Semantic acceptance reserves the runner's single
 local assignment slot; a matching later start effect authorizes execution.
-`um runner doctor` performs one
+`useful runner doctor` performs one
 default local Git check and can explicitly check the `pi`, `claude`, and `codex`
 installations selected independently from inherited `PATH`; passing those checks
 establishes only the selected closed harness installation, not complete runner readiness.
 
 ## One executable with separate roles
 
-`um` provides one installation and command tree. The root binary's thin command
+`useful` provides one installation and command tree. The root binary's thin command
 entrypoint under `src/cli/` dispatches to unpublished workspace crates with distinct
 responsibilities, whose dependency graph chapter 12 pins:
 
@@ -47,7 +47,7 @@ responsibilities, whose dependency graph chapter 12 pins:
   Rust.
 
 The long-running runner starts only through an explicit command such as
-`um runner serve`. Bare `um runner` prints help and does not start a service.
+`useful runner serve`. Bare `useful runner` prints help and does not start a service.
 
 ## Local workflow validation
 
@@ -66,11 +66,11 @@ not parse or validate workflow definitions independently.
 Validation stops at definition resolution. The adapter does not construct run
 admission or runtime state, execute command or agent steps, inspect harness
 availability, load either credential type, make a network request, or enter Runner
-Serve connectivity. Bare `um workflow` prints composed help rather than
+Serve connectivity. Bare `useful workflow` prints composed help rather than
 selecting a workflow or inferring a source boundary.
 
 The pure lexical and JSON decoding rules shared by Workflow V1 inputs and Cloud Run
-Input manifests live in the private `um-support` package beneath
+Input manifests live in the private `useful-support` package beneath
 `crates/support/`. The public API, command, runner, and execution components may depend
 on its explicit facade for duplicate-aware strict JSON decoding, input identifiers,
 diagnostic display names, media types, and hexadecimal digests; the leaf owns no
@@ -209,7 +209,7 @@ token, expiration, and refresh token atomically before confirmation so a tempora
 API failure does not require another browser flow. Login alone never creates a principal.
 An onboarding agent may invoke the separate signup command only after reporting that
 signup is required and obtaining explicit human
-approval. `um account signup` uses the existing human credential, creates
+approval. `useful account signup` uses the existing human credential, creates
 one opaque idempotency key per invocation, and retries an ambiguous transport failure
 once with that same key. It reports an authenticated principal only from the signup
 response and never begins another device authorization transaction.
@@ -380,22 +380,22 @@ second ID policy inside the API boundary.
 `cli/Cargo.toml` is both the workspace root and the sole binary package. Seven unpublished
 library members occupy their final roots:
 
-- `um-support` owns shared public-ID, timing, TLS-provider, and Workflow
+- `useful-support` owns shared public-ID, timing, TLS-provider, and Workflow
   contract leaves and has no internal dependency;
-- `um-test-support` owns the HTTP and hermetic Git fixtures and the host-scaled
+- `useful-test-support` owns the HTTP and hermetic Git fixtures and the host-scaled
   test watchdog, and is reachable only through dev dependencies;
-- `um-runner-protocol` owns runner wire DTOs, its generated codec, and its
+- `useful-runner-protocol` owns runner wire DTOs, its generated codec, and its
   embedded schema and has no internal dependency;
-- `um-api` owns the handwritten API and private generated client, depends on
+- `useful-api` owns the handwritten API and private generated client, depends on
   support in production, and uses test-support only for tests; and
-- `um-execution` owns execution, harness adapters, process containment,
+- `useful-execution` owns execution, harness adapters, process containment,
   workflow assets, and their tests, depends on support in production, and uses
   test-support only for tests. Its test-only internal-worker example keeps package
   suites independent of a previously built root executable;
-- `um-human-auth` owns human OAuth sessions and credential storage, depends
+- `useful-human-auth` owns human OAuth sessions and credential storage, depends
   on support and API in production, uses test-support only for tests, and
   exposes only the command-facing facade; and
-- `um-runner` owns Runner Serve, enrollment, doctor, local control,
+- `useful-runner` owns Runner Serve, enrollment, doctor, local control,
   assignment execution, artifact delivery, and telemetry. It depends only on support,
   runner-protocol, and execution in production and uses test-support only for tests.
 
@@ -403,8 +403,8 @@ The binary depends on support, API, execution, runner, and human-auth in product
 and on test-support for tests. Its dev dependencies enable only the `test-fixtures`
 seams used by root tests; production dependencies do not expose fixture constructors.
 Commands, service credential policy, build identity, and exit policy remain rooted in
-`src/`. There is one `um` executable, Cargo continues to provide
-`CARGO_BIN_EXE_um`, and the archive shape is unchanged.
+`src/`. There is one `useful` executable, Cargo continues to provide
+`CARGO_BIN_EXE_useful`, and the archive shape is unchanged.
 
 The remaining seams have this closed ownership matrix:
 
@@ -422,7 +422,7 @@ member's inherited lint policy, the residual root-module graph, private generate
 the final execution, process, runner, human-auth, and idempotency ownership, and confinement of
 command parsing, HTTP, WebSocket, telemetry, and terminal dependencies to their owning
 packages. The dev-only
-`um-test-support` facade supplies the Git fixture to execution and runner tests
+`useful-test-support` facade supplies the Git fixture to execution and runner tests
 without entering the production graph. The `src/service_auth.rs` boundary depends only
 on support's public-ID syntax and remains a root-owned policy for caller-managed service
 secrets. The API returns issued secrets in
@@ -449,10 +449,10 @@ only checked-in bytes and cannot become stale when public releases move. `change
 frozen legacy archive; new append-only intent is reviewed outside this exported tree.
 
 Native Cargo builds report the permanent `0.0.0-dev` fallback. Reproducible Nix builds
-inject `UM_VERSION` and `UM_BUILD_IDENTITY` at compile time. Official release builds
-inject `UM_VERSION` and the public release tag commit through `UM_RELEASE_COMMIT`,
-which takes precedence over a development build identity. Both `um version` and
-`um --version` read the same version. Structured version output also reports the
+inject `USEFUL_VERSION` and `USEFUL_BUILD_IDENTITY` at compile time. Official release builds
+inject `USEFUL_VERSION` and the public release tag commit through `USEFUL_RELEASE_COMMIT`,
+which takes precedence over a development build identity. Both `useful version` and
+`useful --version` read the same version. Structured version output also reports the
 resolved executable path and separately injected build identity. Packaging must verify
 the installed executable reports these exact values. `scripts/check-release` validates static policy and fallback
 consistency. Release-only planning observes stable state after source validation and binds that

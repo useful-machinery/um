@@ -1,14 +1,14 @@
-//! `um workflow run answer` (REQ-LOCALRUN-182); with `--cloud ORGANIZATION`, the answer is
+//! `useful workflow run answer` (REQ-LOCALRUN-182); with `--cloud ORGANIZATION`, the answer is
 //! carried to the Cloud run's runner instead (REQ-LOCALRUN-210).
 
 use clap::Args;
 use serde_json::{Map, Value};
-use um_execution::{CONTROL_ANSWER, WaitKind, WaitQuestions, read_controls, wait_questions};
+use useful_execution::{CONTROL_ANSWER, WaitKind, WaitQuestions, read_controls, wait_questions};
 
 use super::control::{Acted, ControlFailure, ControlTarget, Refusal};
 
 pub(super) const ABOUT: &str = "Answer a question a waiting run asks";
-const COMMAND: &str = "um workflow run answer";
+const COMMAND: &str = "useful workflow run answer";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {

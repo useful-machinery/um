@@ -5,8 +5,8 @@ use clap::{Args, Subcommand};
 
 use super::{CloudOptions, OrganizationArg, PaginationArgs, cloud};
 use crate::exit_code::ExitCode;
-use um_human_auth::Deployment;
-use um_support::generate_idempotency_key;
+use useful_human_auth::Deployment;
+use useful_support::generate_idempotency_key;
 
 pub(super) const ABOUT: &str = "Manage runner credential lifecycle";
 const COMMAND_PATH: &[&str] = &["runner", "credential"];
@@ -236,7 +236,7 @@ struct CredentialListOutput<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    items: &'a [um_api::RunnerCredential],
+    items: &'a [useful_api::RunnerCredential],
     next_cursor: Option<&'a str>,
 }
 
@@ -246,11 +246,11 @@ struct CredentialMutationOutput<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    credential: &'a um_api::RunnerCredential,
+    credential: &'a useful_api::RunnerCredential,
 }
 
-fn stored_state_label(state: um_api::RunnerCredentialStoredState) -> &'static str {
-    use um_api::RunnerCredentialStoredState;
+fn stored_state_label(state: useful_api::RunnerCredentialStoredState) -> &'static str {
+    use useful_api::RunnerCredentialStoredState;
     match state {
         RunnerCredentialStoredState::Active => "active",
         RunnerCredentialStoredState::Retiring => "retiring",
@@ -258,8 +258,8 @@ fn stored_state_label(state: um_api::RunnerCredentialStoredState) -> &'static st
     }
 }
 
-fn effective_state_label(state: um_api::RunnerCredentialEffectiveState) -> &'static str {
-    use um_api::RunnerCredentialEffectiveState;
+fn effective_state_label(state: useful_api::RunnerCredentialEffectiveState) -> &'static str {
+    use useful_api::RunnerCredentialEffectiveState;
     match state {
         RunnerCredentialEffectiveState::Active => "active",
         RunnerCredentialEffectiveState::Retiring => "retiring",

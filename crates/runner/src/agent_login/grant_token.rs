@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 
 use opentelemetry::KeyValue;
 use time::OffsetDateTime;
-use um_execution::EnvironmentSnapshot;
+use useful_execution::EnvironmentSnapshot;
 
 use super::FailureCause;
 use super::cloud::{
@@ -55,8 +55,8 @@ const OFFERED_VARIABLES: [(AgentLoginProvider, &str, &str); 3] = [
     ),
     (
         AgentLoginProvider::Linear,
-        "UM_LINEAR_ACCESS_TOKEN",
-        "UM_LINEAR_ACCESS_TOKEN_FILE",
+        "USEFUL_LINEAR_ACCESS_TOKEN",
+        "USEFUL_LINEAR_ACCESS_TOKEN_FILE",
     ),
 ];
 
@@ -256,7 +256,7 @@ pub(crate) struct AssignmentGrantTokens {
 }
 
 /// What a refresh, and the end of the assignment, publishes each readiness
-/// document it records to: the live status, so that `um runner status`
+/// document it records to: the live status, so that `useful runner status`
 /// shows it without waiting for a pass.
 pub(crate) type PublishReadiness = Arc<dyn Fn(&ReadinessDocument) + Send + Sync>;
 
@@ -745,7 +745,7 @@ impl Asking<'_> {
                 .map(|&provider| {
                     let request = self.request(provider);
                     let spawned = std::thread::Builder::new()
-                        .name("um-grant-token".to_owned())
+                        .name("useful-grant-token".to_owned())
                         .spawn_scoped(scope, move || self.cloud.grant_token(&request));
                     (provider, spawned)
                 })

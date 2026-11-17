@@ -91,7 +91,7 @@ fn initialize(parser: &mut CodexAppServerV1Parser) {
             "method": "initialize",
             "params": {
                 "clientInfo": {
-                    "name": "um",
+                    "name": "useful",
                     "version": CLIENT_VERSION,
                 }
             }

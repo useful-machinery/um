@@ -1,11 +1,11 @@
 //! The tree run's resume loop (REQ-RUNNERENROLL-91, REQ-RUNNERENROLL-99): one assignment,
-//! lease and claim carry the run through every engine attempt. After `um workflow run
-//! create` and each later `um` process exits, the loop reads `run.json`: `exited` ends
+//! lease and claim carry the run through every engine attempt. After `useful workflow run
+//! create` and each later `useful` process exits, the loop reads `run.json`: `exited` ends
 //! the loop; `waiting` reads `wait.json` and, for a wait only a control resolves (rule
-//! source `um`), runs `um workflow run resume` once a Cloud control is applied, and for an
+//! source `um`), runs `useful workflow run resume` once a Cloud control is applied, and for an
 //! external condition runs it on entry and then at an interval, longer while the condition
 //! is unavailable; `running` with no process left (an abandoned attempt or an unchained
-//! `continued` edge) runs `resume` once. A cancellation of a waiting run is `um workflow
+//! `continued` edge) runs `resume` once. A cancellation of a waiting run is `useful workflow
 //! run cancel`; the runner's shutdown or lease loss ends the loop with the record as it
 //! stands. Between and during the processes the loop reports each new root position as
 //! `tree_progress`, numbered from 1 apart from the attempt's transitions, with the step
@@ -14,7 +14,7 @@
 //! report that carries a new root position must be queued or the attempt aborts; one for
 //! steps alone that cannot be queued is offered again with the next read and costs the run
 //! nothing. Once
-//! the loop has ended on an exited record, after the last `um` process and so after the
+//! the loop has ended on an exited record, after the last `useful` process and so after the
 //! outcome hook, it reads the run's `mirror/` writes onto that record for the terminal
 //! report, the number the run's `mirror/` held when the runner took it marking the leading
 //! writes as earlier attempts', which request no release (REQ-RUNNERENROLL-99): none for a
@@ -26,7 +26,7 @@
 //! `ClassifiedEnd::Refused` naming the root workflow's first step, never as a missing
 //! record. An adopted run (REQ-RUNNERENROLL-89) creates nothing: with no named step the loop
 //! starts at the record the earlier attempt left, and with named steps its first command
-//! is `um workflow run resume RUN --from STEP...`, whose refusal ends the loop as a
+//! is `useful workflow run resume RUN --from STEP...`, whose refusal ends the loop as a
 //! `ClassifiedEnd::Refused` rather than as a failure. A cancellation that reaches that first
 //! command before it starts an engine attempt, the record still reading `exited` as the
 //! earlier attempt left it, ends the loop as a `ClassifiedEnd::Unstarted`: the attempt is
@@ -36,7 +36,7 @@
 //! first command, the loop ending `Unstarted` over an `exited` record and ending a standing
 //! run as one no process holds.
 //!
-//! Each trigger delivery for the assignment is applied once with `um workflow run event`
+//! Each trigger delivery for the assignment is applied once with `useful workflow run event`
 //! and its application reported (REQ-TRIGGER-136): while a process runs, beside it, so a
 //! cancel reaches the live run; while the run waits, at once, the wait staying in place
 //! unless the application ended or moved the run. The offer's pending deliveries are
@@ -64,14 +64,14 @@ use futures_util::FutureExt as _;
 use futures_util::future::FusedFuture as _;
 use serde_json::Value;
 use time::format_description::well_known::Rfc3339;
-use um_execution::{CancellationReason, CancellationSource, ConditionError, wait_identity};
-use um_runner_protocol::{
+use useful_execution::{CancellationReason, CancellationSource, ConditionError, wait_identity};
+use useful_runner_protocol::{
     RunControl, RunControlAction, RunControlApplication, RunControlOutcome, RunControlSkip,
     RunControlWait, TreeProgressWait, TreeRootProgress, TreeStepObservation, TreeStepState,
     TriggerDelivery, TriggerDeliveryApplication,
 };
 
-use super::command::{self, CommandExit, UmCommand};
+use super::command::{self, CommandExit, UsefulCommand};
 use super::records::{
     ClassifiedEnd, EngineResult, MIRROR_READER_LOST, RecordState, RefusedCommand, TreeConclusion,
     TreeRecord, TreeWait, conclude, conclude_classified, mirror_read_failure, read_record,
@@ -86,7 +86,7 @@ const MAXIMUM_REPORT_STEPS: usize = 64;
 
 /// The loop's intervals: between evaluations of a held external wait, between
 /// evaluations of one whose condition could not be read, and between reads of the
-/// record while a `um` process runs.
+/// record while a `useful` process runs.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::service) struct ResumeIntervals {
     pub(in crate::service) held: Duration,
@@ -192,7 +192,7 @@ impl TreeEnd {
         let wants_result = wants_result && !record.reads_cancellation();
         match tokio::task::spawn_blocking(move || {
             (
-                um_execution::read_mirror_writes(&directory),
+                useful_execution::read_mirror_writes(&directory),
                 wants_result
                     .then(|| read_recorded_result(&directory))
                     .flatten(),
@@ -660,7 +660,7 @@ async fn drive_to_end(driver: &mut Driver<'_>) -> Result<TreeEnd, DriveFailure> 
 }
 
 impl Driver<'_> {
-    /// Supervises one `um` command, reading the record at the record interval while it
+    /// Supervises one `useful` command, reading the record at the record interval while it
     /// runs so a new attempt, stage or step state is reported as it starts, and applying
     /// each delivery, and each control that names no wait, that arrives once the run
     /// directory exists, beside the process.
@@ -670,7 +670,7 @@ impl Driver<'_> {
     ) -> Result<CommandExit, DriveFailure> {
         let run = self.run;
         let supervised = command::supervise(
-            &run.um,
+            &run.useful,
             arguments,
             run.runs.clone(),
             &run.documents,
@@ -682,7 +682,7 @@ impl Driver<'_> {
         // replaces it.
         let cancellation = run.cancellation.source();
         let applying = apply_beside(
-            &run.um,
+            &run.useful,
             cancellation,
             PathBuf::new(),
             Vec::new(),
@@ -728,7 +728,8 @@ impl Driver<'_> {
                 let controls = self.take_unwaited_controls();
                 if !deliveries.is_empty() || !controls.is_empty() {
                     applying.set(
-                        apply_beside(&run.um, cancellation, directory, deliveries, controls).fuse(),
+                        apply_beside(&run.useful, cancellation, directory, deliveries, controls)
+                            .fuse(),
                     );
                 }
             }
@@ -769,7 +770,7 @@ impl Driver<'_> {
             let deliveries = self.take_deliveries();
             if !deliveries.is_empty() {
                 let applications = command::apply_deliveries(
-                    &run.um,
+                    &run.useful,
                     directory.to_owned(),
                     deliveries,
                     cancellation,
@@ -826,7 +827,8 @@ impl Driver<'_> {
         let cancellation = run.cancellation.source();
         let pending = self.take_pending();
         let applications =
-            command::apply_deliveries(&run.um, directory.to_owned(), pending, cancellation).await;
+            command::apply_deliveries(&run.useful, directory.to_owned(), pending, cancellation)
+                .await;
         self.report_applications(applications)?;
         let PendingStop::Held { start } = pending_stop else {
             return Ok(None);
@@ -842,11 +844,11 @@ impl Driver<'_> {
             false => Err(DriveFailure::Cause(command::PENDING_STOP_UNLIFTED)),
         };
         if let Some(start) = start
-            && !recorded(command::stop_before(&run.um, directory, start, cancellation).await)?
+            && !recorded(command::stop_before(&run.useful, directory, start, cancellation).await)?
         {
             return Ok(None);
         }
-        if !recorded(command::lift(&run.um, directory, first, cancellation).await)? {
+        if !recorded(command::lift(&run.useful, directory, first, cancellation).await)? {
             return Ok(None);
         }
         self.command(command::resume_arguments(directory))
@@ -868,7 +870,7 @@ impl Driver<'_> {
         }
         let was_standing = standing(directory).await;
         let applications = command::apply_deliveries(
-            &self.run.um,
+            &self.run.useful,
             directory.to_owned(),
             pending,
             self.run.cancellation.source(),
@@ -950,13 +952,14 @@ impl Driver<'_> {
         if let (RunControlAction::Retry { .. }, Some(wait)) = (&control.action, wait) {
             let exit = self.command(command::retry_arguments(directory)).await?;
             let outcome =
-                command::retry_outcome(&self.run.um, exit.document.clone(), directory, wait).await;
+                command::retry_outcome(&self.run.useful, exit.document.clone(), directory, wait)
+                    .await;
             let applied = matches!(outcome, RunControlOutcome::Applied { .. });
             self.report_control(control.control_id, outcome)?;
             return Ok((applied || exit.cancellation.is_some()).then_some(Woken::Ran(exit)));
         }
         let Some(outcome) = command::apply_control(
-            &self.run.um,
+            &self.run.useful,
             directory,
             &control.action,
             self.run.cancellation.source(),
@@ -1006,7 +1009,7 @@ impl Driver<'_> {
     }
 
     /// Ends a run no process holds: the runner's shutdown and lease loss leave the record
-    /// as it stands (`command::leaves_record`), and any other cancellation runs `um
+    /// as it stands (`command::leaves_record`), and any other cancellation runs `useful
     /// workflow run cancel`, which ends a waiting or abandoned record `canceled`
     /// (REQ-LOCALRUN-186).
     async fn cancelled(
@@ -1018,7 +1021,7 @@ impl Driver<'_> {
         if command::leaves_record(reason) {
             return Ok(TreeEnd::of(Some(record), None, Some(reason)));
         }
-        let _ = command::cancel_run(&self.run.um, &self.run.runs).await;
+        let _ = command::cancel_run(&self.run.useful, &self.run.runs).await;
         let record = match self.observe(directory.to_owned()).await {
             Some(observed) => {
                 self.flush(&observed.record, observed.steps, Some(reason))?;
@@ -1084,20 +1087,21 @@ fn named_wait(action: &RunControlAction) -> Option<&RunControlWait> {
 /// beside a running process, returning their applications in that order; none for those the
 /// assignment's `cancellation` abandoned.
 async fn apply_beside(
-    um: &UmCommand,
+    useful: &UsefulCommand,
     cancellation: &CancellationSource,
     directory: PathBuf,
     deliveries: Vec<TriggerDelivery>,
     controls: Vec<RunControl>,
 ) -> Vec<ExecutionReport> {
-    let mut reports = command::apply_deliveries(um, directory.clone(), deliveries, cancellation)
-        .await
-        .into_iter()
-        .map(|application| ExecutionReport::TriggerDeliveryApplied { application })
-        .collect::<Vec<_>>();
+    let mut reports =
+        command::apply_deliveries(useful, directory.clone(), deliveries, cancellation)
+            .await
+            .into_iter()
+            .map(|application| ExecutionReport::TriggerDeliveryApplied { application })
+            .collect::<Vec<_>>();
     for control in controls {
         let Some(outcome) =
-            command::apply_control(um, &directory, &control.action, cancellation).await
+            command::apply_control(useful, &directory, &control.action, cancellation).await
         else {
             break;
         };
@@ -1123,7 +1127,9 @@ async fn locate(runs: &Path) -> Option<PathBuf> {
 /// How many writes the run's `mirror/` at `directory` holds, read on a blocking worker, or
 /// the class of the failure to read it.
 async fn count_mirror_writes(directory: PathBuf) -> Result<usize, &'static str> {
-    match tokio::task::spawn_blocking(move || um_execution::read_mirror_writes(&directory)).await {
+    match tokio::task::spawn_blocking(move || useful_execution::read_mirror_writes(&directory))
+        .await
+    {
         Ok(Ok(writes)) => Ok(writes.len()),
         Ok(Err(error)) => Err(mirror_read_failure(&error)),
         Err(_) => Err(MIRROR_READER_LOST),

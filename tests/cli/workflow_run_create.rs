@@ -64,12 +64,12 @@ impl Published {
             .join(self.digest.trim_start_matches("sha256:"))
     }
 
-    /// `um workflow run ARGS` against the home.
+    /// `useful workflow run ARGS` against the home.
     fn run(&self, args: &[&str]) -> Output {
         self.command(args).output().unwrap()
     }
 
-    /// The `um workflow run ARGS` command against the home. The root mirrors to Linear
+    /// The `useful workflow run ARGS` command against the home. The root mirrors to Linear
     /// (REQ-LOCALRUN-191), so the command carries no Linear key or endpoint unless the test
     /// sets its own.
     pub(super) fn command(&self, args: &[&str]) -> Command {
@@ -77,11 +77,13 @@ impl Published {
         full.extend(args.iter().map(|arg| (*arg).to_owned()));
         let path = fixture_path_with_host_tools(&[&self.scratch.path().join("tools")]);
         let mut command = isolated_command(&full);
-        command.env("UM_HOME", self.home.path()).env("PATH", path);
+        command
+            .env("USEFUL_HOME", self.home.path())
+            .env("PATH", path);
         command
     }
 
-    /// `um workflow run create ID --execution-root E --json OPTIONS`.
+    /// `useful workflow run create ID --execution-root E --json OPTIONS`.
     fn create(&self, id: &str, options: &[&str]) -> Output {
         let execution_root = self.execution_root();
         let mut args = vec![
@@ -107,7 +109,7 @@ impl Published {
     /// A run created by `options`, its run directory checked to sit under the home.
     fn created(&self, options: &[&str]) -> (PathBuf, Value) {
         let terminal = succeeded(&self.create(&self.id, options));
-        assert_eq!(terminal["command"], "um workflow run create");
+        assert_eq!(terminal["command"], "useful workflow run create");
         let run_directory = PathBuf::from(terminal["runDirectory"].as_str().unwrap());
         assert_eq!(
             run_directory.parent(),
@@ -130,7 +132,7 @@ impl Published {
     fn refused(&self, id: &str, options: &[&str], code: &str) -> Value {
         let runs = self.runs();
         let rejection = tree_rejection(&self.create(id, options));
-        assert_eq!(rejection["command"], "um workflow run create");
+        assert_eq!(rejection["command"], "useful workflow run create");
         assert_eq!(rejection["phase"], "definition", "{rejection}");
         let diagnostics = rejection["diagnostics"].as_array().unwrap();
         assert_eq!(diagnostics.len(), 1, "{rejection}");
@@ -243,7 +245,7 @@ fn a_definition_run_starts_the_current_revision_under_the_home() {
 
 // INV-TESTING-20
 #[test]
-fn the_um_binary_of_a_test_build_is_its_own_worker_when_none_is_supplied() {
+fn the_useful_binary_of_a_test_build_is_its_own_worker_when_none_is_supplied() {
     let published = Published::engineering();
     let execution_root = published.execution_root();
 
@@ -260,7 +262,7 @@ fn the_um_binary_of_a_test_build_is_its_own_worker_when_none_is_supplied() {
             "ticket",
             "AUTO-1",
         ])
-        .env_remove("UM_TEST_INTERNAL_WORKER_EXECUTABLE")
+        .env_remove("USEFUL_TEST_INTERNAL_WORKER_EXECUTABLE")
         .output()
         .unwrap();
     let terminal = succeeded(&output);
@@ -521,7 +523,7 @@ fn a_created_run_records_the_owner_and_external_references_it_is_given() {
     }
 }
 
-/// `um workflow run create ID --cloud ORGANIZATION --project PROJECT` against a scripted Cloud
+/// `useful workflow run create ID --cloud ORGANIZATION --project PROJECT` against a scripted Cloud
 /// (REQ-RUN-94).
 mod cloud {
     use std::path::Path;
@@ -570,14 +572,14 @@ mod cloud {
             }
         }
 
-        /// `um workflow run create ARGS --allow-insecure-http` with the home as `UM_HOME`.
+        /// `useful workflow run create ARGS --allow-insecure-http` with the home as `USEFUL_HOME`.
         fn create(&self, args: &[&str]) -> Output {
             let mut full = vec!["workflow", "run", "create"];
             full.extend_from_slice(args);
             full.push("--allow-insecure-http");
             let mut environment =
                 deployment_environment(&self.server.api_url, &self.credential_path).to_vec();
-            environment.push(("UM_HOME", self.home.path().to_str().unwrap()));
+            environment.push(("USEFUL_HOME", self.home.path().to_str().unwrap()));
             run_with_env(&full, &environment)
         }
 
@@ -805,7 +807,7 @@ mod cloud {
     }
 }
 
-/// What `um workflow run create --cloud` does around acceptance, driven against the scripted
+/// What `useful workflow run create --cloud` does around acceptance, driven against the scripted
 /// Cloud of `cli/tests/cli/run.rs`: one idempotency key per invocation and the single resend
 /// (REQ-RUN-55 to REQ-RUN-57), `--wait` (REQ-RUN-58), the definite source-admission rejection
 /// (REQ-RUN-80), the named inputs staged and sealed before creation (REQ-RUNINPUT-53,
@@ -935,7 +937,7 @@ mod cloud_acceptance {
             deployment_environment(&server.api_url, credential_path.to_str().unwrap());
         let mut args = create_args(true);
         args.insert(args.len() - 1, "--wait");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
         command
             .args(args)
             .stdin(Stdio::null())
@@ -1494,7 +1496,7 @@ mod cloud_acceptance {
     // REQ-RUNINPUT-57
     #[test]
     fn explicit_input_set_conflicts_with_acquired_inputs_before_cloud_access() {
-        let output = Command::new(env!("CARGO_BIN_EXE_um"))
+        let output = Command::new(env!("CARGO_BIN_EXE_useful"))
             .args([
                 "workflow",
                 "run",
@@ -2913,7 +2915,7 @@ mod cloud_acceptance {
                 );
                 let environment =
                     deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-                let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+                let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
                 command
                     .args(create_args(json))
                     .stdin(Stdio::null())
@@ -2984,7 +2986,7 @@ mod cloud_acceptance {
                 upload_capability_response(input_bytes, &signed_url),
             ]);
             let environment = deployment_environment(&server.api_url, &credential_path);
-            let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
             command
                 .args(create_args_with_text_input(
                     "request",

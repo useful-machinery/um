@@ -17,29 +17,29 @@ use zeroize::Zeroizing;
 
 use super::super::{HttpOptions, OrganizationArg, PoolArg, PrincipalAuthenticationArgs};
 use crate::exit_code::ExitCode;
-use um_api::{HttpTransportPolicy, RunnerApi, RunnerFailure};
-use um_execution::{
+use useful_api::{HttpTransportPolicy, RunnerApi, RunnerFailure};
+use useful_execution::{
     ClaudeCodeInstallationFailure, CodexInstallationFailure, PiInstallationFailure,
     ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, ValidatedPiInstallation,
     discover_and_validate_claude_code_installation, discover_and_validate_codex_installation,
     discover_and_validate_pi_installation, human_duration,
 };
-use um_human_auth::Deployment;
-use um_runner::{
+use useful_human_auth::Deployment;
+use useful_runner::{
     ActivationArtifact, AmbiguousCause, Config, EnrollmentError, EnrollmentResponse,
     JoinKeyArtifact, JoinOutcome, JoinRefusal, JoinRetry, RecordedOptions, RegisteredRunner,
     RegistrationAuthority, RegistrationConflict, RegistrationConflictKind, RegistrationError,
     RegistrationOutcome, RegistrationStage, RegistrationTarget,
 };
-use um_support::generate_idempotency_key;
+use useful_support::generate_idempotency_key;
 
 pub(super) const ABOUT: &str = "Serve run assignments";
 
-const JOIN_KEY_VARIABLE: &str = "UM_RUNNER_JOIN_KEY";
+const JOIN_KEY_VARIABLE: &str = "USEFUL_RUNNER_JOIN_KEY";
 
 // One registration mode at most: a signed-in mode excludes the other and a
 // join key, needs --organization, and is the only use of --organization and
-// --allow-insecure-http. UM_RUNNER_JOIN_KEY is refused by `join_key_source`.
+// --allow-insecure-http. USEFUL_RUNNER_JOIN_KEY is refused by `join_key_source`.
 #[derive(Debug, Args)]
 #[command(
     group(
@@ -57,12 +57,12 @@ const JOIN_KEY_VARIABLE: &str = "UM_RUNNER_JOIN_KEY";
 )]
 pub(super) struct Command {
     /// Read the closed runner operator configuration and enrolled state; the
-    /// runner home under the um home is the default, created where it is missing.
+    /// runner home under the useful home is the default, created where it is missing.
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 
     /// Join the key's pool from a protected file or explicit stdin when the
-    /// host holds no enrolled state; UM_RUNNER_JOIN_KEY may hold the key instead.
+    /// host holds no enrolled state; USEFUL_RUNNER_JOIN_KEY may hold the key instead.
     #[arg(long, value_name = "PATH|-")]
     join_key_file: Option<PathBuf>,
 
@@ -160,7 +160,7 @@ impl Command {
                             if let Some(registration) = registration {
                                 registration.confirm(&config_path)?;
                             }
-                            um_runner::remove_completed_join_journal(&config_path)
+                            useful_runner::remove_completed_join_journal(&config_path)
                                 .context("remove the journal of the runner's completed join")?;
                             (config, discover())
                         }
@@ -205,7 +205,7 @@ impl Command {
             claude_code_installation,
             codex_installation,
         );
-        match um_runner::run(config, crate::build_info::VERSION) {
+        match useful_runner::run(config, crate::build_info::VERSION) {
             Ok(()) => Ok(ExitCode::Success),
             Err(error) => {
                 let exit_code = service_exit_code(error.requires_operator_recovery());
@@ -228,7 +228,7 @@ fn not_enrolled(config_path: &Path, explicit_config: bool) -> anyhow::Error {
         String::new()
     };
     anyhow::anyhow!(
-        "start runner with operator configuration {}: host is not enrolled\n\nEnroll the host with an activation an owner issued for it:\n  um runner enroll --activation-file <PATH>{config}\nOr start the runner with a join key a pool issued:\n  um runner serve --join-key-file <PATH>{config}",
+        "start runner with operator configuration {}: host is not enrolled\n\nEnroll the host with an activation an owner issued for it:\n  useful runner enroll --activation-file <PATH>{config}\nOr start the runner with a join key a pool issued:\n  useful runner serve --join-key-file <PATH>{config}",
         config_path.display()
     )
 }
@@ -237,7 +237,7 @@ fn load_config(config_path: &Path) -> anyhow::Result<Config> {
     Config::load(config_path).map_err(|error| config_load_error(config_path, error))
 }
 
-fn config_load_error(config_path: &Path, error: um_runner::ConfigError) -> anyhow::Error {
+fn config_load_error(config_path: &Path, error: useful_runner::ConfigError) -> anyhow::Error {
     anyhow::Error::new(error).context(format!(
         "load runner operator configuration {}",
         config_path.display()
@@ -351,7 +351,7 @@ impl SignedInRegistration {
     /// completing a record whose runner the state holds; it reads no sign-in
     /// and sends nothing.
     fn confirm(&self, config_path: &Path) -> anyhow::Result<()> {
-        match um_runner::confirm_registration(config_path, &self.organization, &self.target) {
+        match useful_runner::confirm_registration(config_path, &self.organization, &self.target) {
             Ok(()) => Ok(()),
             Err(RegistrationError::Conflict(conflict)) => {
                 Err(registration_conflict(CONFIRM_REGISTRATION, &conflict))
@@ -369,7 +369,7 @@ impl SignedInRegistration {
             transport_policy: self.transport_policy,
             authentication: PrincipalAuthenticationArgs::default(),
         };
-        let outcome = um_runner::register_unless_enrolled(
+        let outcome = useful_runner::register_unless_enrolled(
             config_path,
             &self.organization,
             &self.target,
@@ -575,18 +575,18 @@ fn registration_conflict(operation: &str, conflict: &RegistrationConflict) -> an
     );
     let remedy = match (conflict.kind, &conflict.recorded) {
         (RegistrationConflictKind::Target, Some(recorded)) => format!(
-            "Start the runner with the options its registration was made with:\n  {}\nA host that holds its runner state also starts without --personal and --pool-id. An owner moves a runner to another pool with um runner move.",
+            "Start the runner with the options its registration was made with:\n  {}\nA host that holds its runner state also starts without --personal and --pool-id. An owner moves a runner to another pool with useful runner move.",
             recorded_options(recorded)
         ),
         (RegistrationConflictKind::Target, None) => format!(
-            "The host was enrolled with an activation or a join key. Start {runner} without --personal and --pool-id. An owner moves a runner to another pool with um runner move."
+            "The host was enrolled with an activation or a join key. Start {runner} without --personal and --pool-id. An owner moves a runner to another pool with useful runner move."
         ),
         (RegistrationConflictKind::Unresolved, Some(recorded)) => format!(
             "Finish the registration by starting the runner with its options, signed in to the same deployment and account within six days of when it began:\n  {}\nOtherwise check the pool for a runner registered from this host, then remove {path}.",
             recorded_options(recorded)
         ),
         (RegistrationConflictKind::Unresolved, None) => format!(
-            "Finish the staged enrollment with um runner enroll --resume, or the staged join by starting the runner with its join key. Otherwise check the pool for a runner registered from this host, then remove {path}."
+            "Finish the staged enrollment with useful runner enroll --resume, or the staged join by starting the runner with its join key. Otherwise check the pool for a runner registered from this host, then remove {path}."
         ),
         (RegistrationConflictKind::StateMissing, _) => format!(
             "Restore the runner state file of {runner}. Otherwise remove {path}, and delete {runner} in Cloud if it is no longer wanted."
@@ -770,9 +770,9 @@ fn restore_terminal_on_signal(signals: SigSet, saved: &Termios, done: &AtomicBoo
     process::exit(i32::from(exit_code.as_u8()));
 }
 
-// A key in UM_RUNNER_JOIN_KEY never stays in this process's environment block,
+// A key in USEFUL_RUNNER_JOIN_KEY never stays in this process's environment block,
 // which `/proc/<pid>/environ` and `ps eww` read. The command validates it and
-// replaces itself with the same `um runner serve` started without the variable
+// replaces itself with the same `useful runner serve` started without the variable
 // and with the key on a pipe as `--join-key-file -`; the new image has no
 // variable, so it reads the pipe and does not hand the key on again.
 //
@@ -780,21 +780,21 @@ fn restore_terminal_on_signal(signals: SigSet, saved: &Termios, done: &AtomicBoo
 fn hand_join_key_to_new_image(text: &OsStr) -> anyhow::Error {
     match stage_join_key_handoff(text) {
         Ok(mut command) => anyhow::Error::new(command.exec())
-            .context("start um runner serve with the join key on standard input"),
+            .context("start useful runner serve with the join key on standard input"),
         Err(error) => error,
     }
 }
 
-// An enrolled host does not read UM_RUNNER_JOIN_KEY, but the variable still
+// An enrolled host does not read USEFUL_RUNNER_JOIN_KEY, but the variable still
 // leaves its environment block: the command replaces itself with the same
-// `um runner serve` started without it. Returns only when the restart fails.
+// `useful runner serve` started without it. Returns only when the restart fails.
 fn restart_without_join_key_variable() -> anyhow::Error {
-    match std::env::current_exe().context("locate the um executable") {
+    match std::env::current_exe().context("locate the useful executable") {
         Ok(executable) => anyhow::Error::new(
             join_key_handoff_command(&executable, std::env::args_os(), None).exec(),
         )
         .context(format!(
-            "restart um runner serve without {JOIN_KEY_VARIABLE}"
+            "restart useful runner serve without {JOIN_KEY_VARIABLE}"
         )),
         Err(error) => error,
     }
@@ -811,7 +811,7 @@ fn stage_join_key_handoff(text: &OsStr) -> anyhow::Result<process::Command> {
         .write_all(key)
         .context("write the join key to its pipe")?;
     drop(writer);
-    let executable = std::env::current_exe().context("locate the um executable")?;
+    let executable = std::env::current_exe().context("locate the useful executable")?;
     Ok(join_key_handoff_command(
         &executable,
         std::env::args_os(),
@@ -819,7 +819,7 @@ fn stage_join_key_handoff(text: &OsStr) -> anyhow::Result<process::Command> {
     ))
 }
 
-// The same `um runner serve` without UM_RUNNER_JOIN_KEY, given the key on
+// The same `useful runner serve` without USEFUL_RUNNER_JOIN_KEY, given the key on
 // standard input as `--join-key-file -` when there is one to hand on.
 fn join_key_handoff_command(
     executable: &Path,
@@ -847,7 +847,7 @@ fn join_unless_enrolled(
     let report_retry = |retry| {
         let _ = write_join_retry(&mut io::stderr().lock(), &join_key_id, retry);
     };
-    match um_runner::join_unless_enrolled(config_path, join_key, report_retry) {
+    match useful_runner::join_unless_enrolled(config_path, join_key, report_retry) {
         Ok(JoinOutcome::AlreadyEnrolled) => Ok(()),
         Ok(JoinOutcome::Joined(response)) => {
             write_enrolled(&mut io::stderr().lock(), "✓ Runner joined.", &response)?;
@@ -880,7 +880,7 @@ fn join_failure(join_key_id: &str, error: EnrollmentError) -> anyhow::Error {
             ref journal,
             ref join_key_id,
         } => anyhow::anyhow!(
-            "join runner pool with join key {join_key_id}: {error}\ncode: {}\n\nCloud rejected the token this start gave for join key {join_key_id}, so the same join key will be rejected again however it is given. Start um runner serve with join key {join_key_id} as it was issued, which completes the staged join. Otherwise look in the pool for a runner that joined from this host and delete it if there is one, then remove {} and start the runner with a join key Cloud accepts.",
+            "join runner pool with join key {join_key_id}: {error}\ncode: {}\n\nCloud rejected the token this start gave for join key {join_key_id}, so the same join key will be rejected again however it is given. Start useful runner serve with join key {join_key_id} as it was issued, which completes the staged join. Otherwise look in the pool for a runner that joined from this host and delete it if there is one, then remove {} and start the runner with a join key Cloud accepts.",
             JoinRefusal::Unauthorized.code(),
             journal.display()
         ),
@@ -980,7 +980,7 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
-    use um_execution::ClaudeCodeIncompatibility;
+    use useful_execution::ClaudeCodeIncompatibility;
 
     // REQ-RUNNERENROLL-32
     #[test]
@@ -1157,7 +1157,7 @@ mod tests {
             }
         }
 
-        let journal = PathBuf::from("/var/lib/um/runner-state.join.json");
+        let journal = PathBuf::from("/var/lib/useful/runner-state.join.json");
         let failure = join_failure(
             JOIN_KEY_ID,
             EnrollmentError::StagedJoinUnauthorized {
@@ -1214,19 +1214,26 @@ mod tests {
     fn a_join_key_variable_is_handed_to_a_new_image_without_it_on_standard_input() {
         let (reader, _writer) = io::pipe().unwrap();
         let command = join_key_handoff_command(
-            Path::new("/installed/um"),
-            ["um", "runner", "serve", "--config", "/etc/um/runner.toml"].map(OsString::from),
+            Path::new("/installed/useful"),
+            [
+                "useful",
+                "runner",
+                "serve",
+                "--config",
+                "/etc/useful/runner.toml",
+            ]
+            .map(OsString::from),
             Some(Stdio::from(reader)),
         );
 
-        assert_eq!(command.get_program(), "/installed/um");
+        assert_eq!(command.get_program(), "/installed/useful");
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             [
                 "runner",
                 "serve",
                 "--config",
-                "/etc/um/runner.toml",
+                "/etc/useful/runner.toml",
                 "--join-key-file",
                 "-",
             ],
@@ -1241,15 +1248,22 @@ mod tests {
     #[test]
     fn an_enrolled_host_restarts_without_the_join_key_variable_and_hands_on_no_key() {
         let command = join_key_handoff_command(
-            Path::new("/installed/um"),
-            ["um", "runner", "serve", "--config", "/etc/um/runner.toml"].map(OsString::from),
+            Path::new("/installed/useful"),
+            [
+                "useful",
+                "runner",
+                "serve",
+                "--config",
+                "/etc/useful/runner.toml",
+            ]
+            .map(OsString::from),
             None,
         );
 
-        assert_eq!(command.get_program(), "/installed/um");
+        assert_eq!(command.get_program(), "/installed/useful");
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
-            ["runner", "serve", "--config", "/etc/um/runner.toml"],
+            ["runner", "serve", "--config", "/etc/useful/runner.toml"],
         );
         assert_eq!(
             command.get_envs().collect::<Vec<_>>(),

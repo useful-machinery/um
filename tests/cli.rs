@@ -29,7 +29,7 @@ mod account_update;
 #[path = "cli/agent_logins.rs"]
 mod agent_logins;
 use api_test_support::read_request;
-use um_test_support as api_test_support;
+use useful_test_support as api_test_support;
 #[path = "cli/artifact_remote.rs"]
 mod artifact_remote;
 #[path = "cli/artifact_validate.rs"]
@@ -119,13 +119,13 @@ mod workflow_validate;
 #[path = "cli/workflow_view.rs"]
 mod workflow_view;
 
-const BUILD_VERSION: &str = match option_env!("UM_VERSION") {
+const BUILD_VERSION: &str = match option_env!("USEFUL_VERSION") {
     Some(version) => version,
     None => env!("CARGO_PKG_VERSION"),
 };
-const BUILD_IDENTITY: &str = match option_env!("UM_RELEASE_COMMIT") {
+const BUILD_IDENTITY: &str = match option_env!("USEFUL_RELEASE_COMMIT") {
     Some(identity) => identity,
-    None => match option_env!("UM_BUILD_IDENTITY") {
+    None => match option_env!("USEFUL_BUILD_IDENTITY") {
         Some(identity) => identity,
         None => "unknown",
     },
@@ -212,13 +212,13 @@ fn poll_until<T: std::fmt::Debug>(
 }
 
 const ECHO_IDEMPOTENCY_KEY: &str = api_test_support::REQUEST_IDEMPOTENCY_KEY_ECHO;
-const CREDENTIALS_FILE_VARIABLE: &str = "UM_CREDENTIALS_FILE";
-const UM_HOME_VARIABLE: &str = "UM_HOME";
+const CREDENTIALS_FILE_VARIABLE: &str = "USEFUL_CREDENTIALS_FILE";
+const USEFUL_HOME_VARIABLE: &str = "USEFUL_HOME";
 const DEPLOYMENT_VARIABLES: [&str; 4] = [
-    "UM_API_URL",
-    "UM_AUTH_ISSUER",
-    "UM_AUTH_AUDIENCE",
-    "UM_AUTH_CLIENT_ID",
+    "USEFUL_API_URL",
+    "USEFUL_AUTH_ISSUER",
+    "USEFUL_AUTH_AUDIENCE",
+    "USEFUL_AUTH_CLIENT_ID",
 ];
 const RUNNER_TELEMETRY_VARIABLES: [&str; 9] = [
     "OTEL_SDK_DISABLED",
@@ -232,14 +232,14 @@ const RUNNER_TELEMETRY_VARIABLES: [&str; 9] = [
     "OTEL_EXPORTER_OTLP_TIMEOUT",
 ];
 
-/// A fresh, empty `um` home a launched `um` receives as `UM_HOME` unless the
-/// test names its own, so no command reaches the real `$HOME/.um` (whose
+/// A fresh, empty `useful` home a launched `useful` receives as `USEFUL_HOME` unless the
+/// test names its own, so no command reaches the real `$HOME/.useful` (whose
 /// `runner/` may hold a live runner) of whoever runs the suite.
-struct IsolatedUmHome(tempfile::TempDir);
+struct IsolatedUsefulHome(tempfile::TempDir);
 
-impl IsolatedUmHome {
+impl IsolatedUsefulHome {
     fn new() -> Self {
-        Self(tempfile::tempdir().expect("temporary um home should be created"))
+        Self(tempfile::tempdir().expect("temporary useful home should be created"))
     }
 
     fn apply_unless_given<Name: AsRef<str>, Value>(
@@ -249,9 +249,9 @@ impl IsolatedUmHome {
     ) {
         if !environment
             .iter()
-            .any(|(name, _)| name.as_ref() == UM_HOME_VARIABLE)
+            .any(|(name, _)| name.as_ref() == USEFUL_HOME_VARIABLE)
         {
-            command.env(UM_HOME_VARIABLE, self.0.path());
+            command.env(USEFUL_HOME_VARIABLE, self.0.path());
         }
     }
 }
@@ -265,8 +265,8 @@ fn run_with_env(args: &[&str], environment: &[(&str, &str)]) -> Output {
 }
 
 fn run_with_stdin(args: &[&str], environment: &[(&str, &str)], standard_input: &[u8]) -> Output {
-    let um_home = IsolatedUmHome::new();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let useful_home = IsolatedUsefulHome::new();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args(args)
         .stdin(Stdio::piped())
@@ -279,7 +279,7 @@ fn run_with_stdin(args: &[&str], environment: &[(&str, &str)], standard_input: &
     {
         command.env_remove(variable);
     }
-    um_home.apply_unless_given(&mut command, environment);
+    useful_home.apply_unless_given(&mut command, environment);
     for (name, value) in environment {
         command.env(name, value);
     }
@@ -309,8 +309,8 @@ fn run_with_env_from(
         .expect("temporary credential directory should be private");
     let default_credential_path = credential_directory.path().join("credentials.json");
     let default_path = tempfile::tempdir().expect("temporary empty PATH should be created");
-    let um_home = IsolatedUmHome::new();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let useful_home = IsolatedUsefulHome::new();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command.args(args).env_remove(CREDENTIALS_FILE_VARIABLE);
     for variable in DEPLOYMENT_VARIABLES
         .into_iter()
@@ -318,7 +318,7 @@ fn run_with_env_from(
     {
         command.env_remove(variable);
     }
-    um_home.apply_unless_given(&mut command, environment);
+    useful_home.apply_unless_given(&mut command, environment);
     if !environment
         .iter()
         .any(|(name, _)| *name == CREDENTIALS_FILE_VARIABLE)
@@ -335,7 +335,7 @@ fn run_with_env_from(
         command.current_dir(current_dir);
     }
 
-    command.output().expect("um should run")
+    command.output().expect("useful should run")
 }
 
 fn assert_human_doctor_detail_matches_json(
@@ -732,13 +732,13 @@ fn deployment_environment_with_issuer<'a>(
 ) -> [(&'static str, &'a str); 6] {
     [
         (CREDENTIALS_FILE_VARIABLE, credential_path),
-        ("UM_API_URL", api_url),
-        ("UM_AUTH_ISSUER", issuer),
-        ("UM_AUTH_AUDIENCE", "https://api.fixture.example"),
-        ("UM_AUTH_CLIENT_ID", "fixture-public-client"),
+        ("USEFUL_API_URL", api_url),
+        ("USEFUL_AUTH_ISSUER", issuer),
+        ("USEFUL_AUTH_AUDIENCE", "https://api.fixture.example"),
+        ("USEFUL_AUTH_CLIENT_ID", "fixture-public-client"),
         // Scripted servers answer at once, so skip the production polling
         // cadence between observations. Controlled-clock unit tests cover it.
-        ("UM_TEST_POLL_INTERVAL_MILLISECONDS", "10"),
+        ("USEFUL_TEST_POLL_INTERVAL_MILLISECONDS", "10"),
     ]
 }
 
@@ -813,7 +813,10 @@ fn write_credential_fixture_with_refresh_token(
 // INV-CLI-8
 #[test]
 fn auth_without_a_subcommand_prints_composed_help_without_loading_deployment() {
-    let output = run_with_env(&["auth"], &[("UM_API_URL", "partial-override-is-ignored")]);
+    let output = run_with_env(
+        &["auth"],
+        &[("USEFUL_API_URL", "partial-override-is-ignored")],
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     assert!(output.status.success());
@@ -824,7 +827,7 @@ fn auth_without_a_subcommand_prints_composed_help_without_loading_deployment() {
 // REQ-ONBOARD-3
 #[test]
 fn version_command_and_flag_report_the_resolved_build_version() {
-    let expected = format!("um {BUILD_VERSION}\n");
+    let expected = format!("useful {BUILD_VERSION}\n");
 
     for args in [["version"].as_slice(), ["--version"].as_slice()] {
         let output = run(args);
@@ -839,8 +842,8 @@ fn version_command_and_flag_report_the_resolved_build_version() {
 #[test]
 fn structured_version_reports_the_resolved_build_version_contract() {
     let output = run(&["version", "--json"]);
-    let expected_executable_path =
-        std::fs::canonicalize(env!("CARGO_BIN_EXE_um")).expect("um executable path should resolve");
+    let expected_executable_path = std::fs::canonicalize(env!("CARGO_BIN_EXE_useful"))
+        .expect("useful executable path should resolve");
     let mut actual: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("version output should be JSON");
     let actual_executable_path = actual
@@ -858,7 +861,7 @@ fn structured_version_reports_the_resolved_build_version_contract() {
         .remove("executablePath");
     let expected = serde_json::json!({
         "schemaVersion": 1,
-        "command": "um",
+        "command": "useful",
         "version": BUILD_VERSION,
         "buildIdentity": BUILD_IDENTITY,
     });
@@ -885,14 +888,14 @@ fn version_inspection_ignores_deployment_credentials_and_network() {
         .expect("temporary credential path should be UTF-8");
     let environments: [&[(&str, &str)]; 2] = [
         &[
-            ("UM_API_URL", "partial-override-is-ignored"),
+            ("USEFUL_API_URL", "partial-override-is-ignored"),
             (CREDENTIALS_FILE_VARIABLE, credential_path),
         ],
         &[
-            ("UM_API_URL", &api_url),
-            ("UM_AUTH_ISSUER", &api_url),
-            ("UM_AUTH_AUDIENCE", "https://api.version.invalid"),
-            ("UM_AUTH_CLIENT_ID", "version-client"),
+            ("USEFUL_API_URL", &api_url),
+            ("USEFUL_AUTH_ISSUER", &api_url),
+            ("USEFUL_AUTH_AUDIENCE", "https://api.version.invalid"),
+            ("USEFUL_AUTH_CLIENT_ID", "version-client"),
             (CREDENTIALS_FILE_VARIABLE, credential_path),
         ],
     ];
@@ -945,7 +948,7 @@ fn insecure_http_flag_is_scoped_to_networked_leaf_commands() {
 fn partial_deployment_override_fails_before_auth_dispatch() {
     let output = run_with_env(
         &["auth", "status", "--json"],
-        &[("UM_API_URL", "https://api.fixture.example")],
+        &[("USEFUL_API_URL", "https://api.fixture.example")],
     );
 
     assert_eq!(output.status.code(), Some(1));
@@ -1267,7 +1270,9 @@ fn status_reports_a_refused_account_as_forbidden_and_keeps_the_sign_in() {
             );
             assert!(output.stderr.is_empty());
         } else {
-            assert!(String::from_utf8_lossy(&output.stdout).contains("um account deletion cancel"));
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains("useful account deletion cancel")
+            );
         }
         assert_eq!(fs::read(&credential_path).unwrap(), stored);
         let request = server.finish();
@@ -1292,7 +1297,7 @@ fn async_client_requests_name_the_cli_version_in_the_user_agent() {
     assert_eq!(output.status.code(), Some(3));
     assert_eq!(
         header_value(&server.finish(), "user-agent"),
-        format!("um/{BUILD_VERSION}")
+        format!("useful/{BUILD_VERSION}")
     );
 }
 
@@ -1723,9 +1728,9 @@ fn concurrent_processes_exchange_one_rotating_refresh_token_once() {
     let api_url = server.api_url.clone();
     let issuer = server.issuer.clone();
     let environment = deployment_environment_with_issuer(&api_url, &issuer, credential_path);
-    let um_home = IsolatedUmHome::new();
+    let useful_home = IsolatedUsefulHome::new();
     let command = || {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
         command
             .args(["auth", "status", "--json", "--allow-insecure-http"])
             .stdout(Stdio::piped())
@@ -1733,7 +1738,7 @@ fn concurrent_processes_exchange_one_rotating_refresh_token_once() {
         command
             .env_remove(CREDENTIALS_FILE_VARIABLE)
             .env("PATH", "");
-        um_home.apply_unless_given(&mut command, &environment);
+        useful_home.apply_unless_given(&mut command, &environment);
         for variable in DEPLOYMENT_VARIABLES {
             command.env_remove(variable);
         }
@@ -2212,7 +2217,7 @@ fn runner_doctor_reports_schema_one_json() {
         report,
         serde_json::json!({
             "schemaVersion": 1,
-            "command": "um runner doctor",
+            "command": "useful runner doctor",
             "deployment": null,
             "checks": [{
                 "id": "environment.command.git",
@@ -2288,7 +2293,7 @@ fn runner_doctor_does_not_load_human_configuration() {
         &["runner", "doctor"],
         &[
             ("PATH", path),
-            ("UM_API_URL", "partial-override-is-ignored"),
+            ("USEFUL_API_URL", "partial-override-is-ignored"),
             (CREDENTIALS_FILE_VARIABLE, "/dev/null/credentials.json"),
         ],
     );
@@ -2507,7 +2512,7 @@ fn runner_serve_defaults_to_the_runner_home_and_rejects_removed_flags() {
     assert_eq!(unenrolled.status.code(), Some(1));
     assert!(unenrolled.stdout.is_empty());
     let stderr = String::from_utf8_lossy(&unenrolled.stderr);
-    assert!(stderr.contains("um runner enroll"), "{stderr}");
+    assert!(stderr.contains("useful runner enroll"), "{stderr}");
 
     let directory = private_credential_directory();
     let config_path =

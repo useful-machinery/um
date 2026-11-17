@@ -14,7 +14,7 @@ use ring::digest::{SHA256, digest};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 
-use um_support::generate_idempotency_key;
+use useful_support::generate_idempotency_key;
 
 use super::service::Backoff;
 use super::validation::{valid_secret_syntax, valid_typed_id};
@@ -1127,7 +1127,7 @@ fn send_until_answered(
                 *resent = true;
                 let delay = backoff.next_delay();
                 observe_retry(JoinRetry { cause, delay });
-                um_support::sleep(delay);
+                useful_support::sleep(delay);
             }
             outcome => return outcome,
         }
@@ -1159,7 +1159,7 @@ fn send_enrollment(
     url: &str,
     token: &str,
 ) -> Result<EnrollmentHTTPOutcome, EnrollmentError> {
-    um_support::install_provider();
+    useful_support::install_provider();
     let client = reqwest::blocking::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(REQUEST_TIMEOUT)
@@ -1456,7 +1456,7 @@ impl Error for ArtifactReadFailure {
 }
 
 fn require_unexpired(expires_at: &str, expired: EnrollmentError) -> Result<(), EnrollmentError> {
-    if parse_rfc3339(expires_at).is_none_or(|expires_at| expires_at <= um_support::utc_now()) {
+    if parse_rfc3339(expires_at).is_none_or(|expires_at| expires_at <= useful_support::utc_now()) {
         return Err(expired);
     }
     Ok(())
@@ -2001,12 +2001,12 @@ pub(crate) fn sync_directory_io(path: &Path) -> io::Result<()> {
 
 fn acquire_state_lock(path: &Path) -> Result<StateLock, EnrollmentError> {
     let file = open_or_create_private_file(path).map_err(|_| EnrollmentError::StateLock)?;
-    let start = um_support::monotonic_now();
+    let start = useful_support::monotonic_now();
     loop {
         match FileExt::try_lock(&file) {
             Ok(()) => return Ok(StateLock { file }),
-            Err(TryLockError::WouldBlock) if um_support::elapsed(start) < LOCK_TIMEOUT => {
-                um_support::sleep(LOCK_RETRY);
+            Err(TryLockError::WouldBlock) if useful_support::elapsed(start) < LOCK_TIMEOUT => {
+                useful_support::sleep(LOCK_RETRY);
             }
             Err(TryLockError::WouldBlock | TryLockError::Error(_)) => {
                 return Err(EnrollmentError::StateLock);
@@ -2296,7 +2296,7 @@ fn valid_name(value: &str) -> bool {
 }
 
 fn now_rfc3339() -> Result<String, EnrollmentError> {
-    um_support::utc_now()
+    useful_support::utc_now()
         .format(&Rfc3339)
         .map_err(|_| EnrollmentError::StateWrite)
 }
@@ -2544,7 +2544,7 @@ impl fmt::Display for ResendRemedy<'_> {
         } = self;
         write!(
             formatter,
-            "start um runner serve once more with join key {join_key_id}, which resends the same join, or remove {} after confirming in the pool that no runner joined from this host",
+            "start useful runner serve once more with join key {join_key_id}, which resends the same join, or remove {} after confirming in the pool that no runner joined from this host",
             journal.display()
         )
     }

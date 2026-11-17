@@ -743,7 +743,7 @@ async fn concurrent_consumers_receive_private_inputs_and_reserved_environment() 
             let expected_environment = [
                 "EXPLICIT_VALUE",
                 "PATH",
-                "UM_STEP_INPUTS",
+                "USEFUL_STEP_INPUTS",
                 FIXTURE_EXIT_CODE,
                 FIXTURE_SOCKET,
             ];
@@ -759,10 +759,10 @@ async fn concurrent_consumers_receive_private_inputs_and_reserved_environment() 
                     .map(String::as_str)
                     .collect::<Vec<_>>();
                 assert_eq!(observed_environment, expected_environment);
-                assert!(!report.environment.contains_key("UM_INHERITED"));
+                assert!(!report.environment.contains_key("USEFUL_INHERITED"));
             }
-            let first_path = PathBuf::from(&first_report.environment["UM_STEP_INPUTS"]);
-            let second_path = PathBuf::from(&second_report.environment["UM_STEP_INPUTS"]);
+            let first_path = PathBuf::from(&first_report.environment["USEFUL_STEP_INPUTS"]);
+            let second_path = PathBuf::from(&second_report.environment["USEFUL_STEP_INPUTS"]);
             assert_ne!(first_path, second_path);
             assert_eq!(artifacts.inputs.reservation_usage(), (2, 6, 32));
             assert_eq!(
@@ -848,8 +848,8 @@ async fn concurrent_consumers_copy_one_committed_file_without_shared_mutation() 
             release(producer_control).await;
             let (first_control, first_report) = accept_report(&listener).await;
             let (second_control, second_report) = accept_report(&listener).await;
-            let first_path = PathBuf::from(&first_report.environment["UM_STEP_INPUTS"]);
-            let second_path = PathBuf::from(&second_report.environment["UM_STEP_INPUTS"]);
+            let first_path = PathBuf::from(&first_report.environment["USEFUL_STEP_INPUTS"]);
+            let second_path = PathBuf::from(&second_report.environment["USEFUL_STEP_INPUTS"]);
             assert_ne!(first_path, second_path);
             assert_eq!(artifacts.inputs.reservation_usage(), (2, 2, 26));
             let first_file = first_path.join("values/artifact");
@@ -2946,7 +2946,7 @@ async fn input_views_cleanup_after_launch_and_execution_failures() {
         );
         let command = async {
             let (control, report) = accept_report(&listener).await;
-            let path = PathBuf::from(&report.environment["UM_STEP_INPUTS"]);
+            let path = PathBuf::from(&report.environment["USEFUL_STEP_INPUTS"]);
             release(control).await;
             path
         };
@@ -2963,7 +2963,7 @@ async fn input_views_cleanup_after_launch_and_execution_failures() {
             temporary.path(),
             &execution_root,
             &launch_source,
-            EnvironmentSnapshot::new([("UM_STEP_INPUTS", "caller-value")]),
+            EnvironmentSnapshot::new([("USEFUL_STEP_INPUTS", "caller-value")]),
             FixtureExecution {
                 limits: ExecutionPolicyLimits::new(
                     1,
@@ -3042,7 +3042,7 @@ async fn input_staging_cleanup_is_deferred_to_caller_and_retryable() {
         );
         let command = async {
             let (control, report) = accept_report(&listener).await;
-            let path = PathBuf::from(&report.environment["UM_STEP_INPUTS"]);
+            let path = PathBuf::from(&report.environment["USEFUL_STEP_INPUTS"]);
             release(control).await;
             path
         };
@@ -3323,7 +3323,7 @@ async fn input_view_cleanup_precedes_controlled_cancellation_quiescence() {
             ),
             (OsString::from(FIXTURE_ROLE), OsString::from(FIXTURE_PARENT)),
             (
-                OsString::from("UM_INHERITED"),
+                OsString::from("USEFUL_INHERITED"),
                 OsString::from("must-not-reach-command"),
             ),
         ]);
@@ -3366,9 +3366,10 @@ async fn input_view_cleanup_precedes_controlled_cancellation_quiescence() {
             }
         );
         let mut processes = accept_group(&listener).await;
-        let parent_path = PathBuf::from(&processes[FIXTURE_PARENT].1.environment["UM_STEP_INPUTS"]);
+        let parent_path =
+            PathBuf::from(&processes[FIXTURE_PARENT].1.environment["USEFUL_STEP_INPUTS"]);
         let descendant_path =
-            PathBuf::from(&processes[FIXTURE_DESCENDANT].1.environment["UM_STEP_INPUTS"]);
+            PathBuf::from(&processes[FIXTURE_DESCENDANT].1.environment["USEFUL_STEP_INPUTS"]);
         assert_eq!(parent_path, descendant_path);
         assert_eq!(artifacts.inputs.reservation_usage(), (1, 1, 13));
 
@@ -4368,7 +4369,7 @@ fn fixture_environment(
             OsString::from("from-admission"),
         ),
         (
-            OsString::from("UM_INHERITED"),
+            OsString::from("USEFUL_INHERITED"),
             OsString::from("must-not-reach-command"),
         ),
     ];

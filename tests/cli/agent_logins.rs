@@ -294,7 +294,7 @@ fn list_json_prints_one_page_with_its_cursor_and_passes_the_page_options() {
     );
     // The earlier command names its replacement on standard error, and only that
     // (REQ-GRANT-77).
-    assert_eq!(after_notice(&output, "um grant list"), "");
+    assert_eq!(after_notice(&output, "useful grant list"), "");
     assert_no_secret_output(&output, &[SENTINEL]);
     let request = server.finish().pop().unwrap();
     assert!(
@@ -331,7 +331,7 @@ fn show_reads_one_agent_login() {
         })
     );
     // The replacement reads the one grant by its id (REQ-GRANT-77).
-    assert_eq!(after_notice(&output, "um grant list GRANT"), "");
+    assert_eq!(after_notice(&output, "useful grant list GRANT"), "");
     assert_no_secret_output(&output, &[SENTINEL]);
     let request = server.finish().pop().unwrap();
     assert!(request.starts_with(&format!(
@@ -468,7 +468,7 @@ fn show_prints_ended_authorizations_with_their_removal_stop_and_a_reports_last_u
         "{text}"
     );
     assert!(
-        in_force.contains("um grant create codex --replace"),
+        in_force.contains("useful grant create codex --replace"),
         "{text}"
     );
     assert_next_actions_name_the_grant_commands(&text);
@@ -881,7 +881,7 @@ fn refusals_report_their_outcome_with_exit_status_1() {
     )]);
     let output = run_agent_login(&server, &credential, &["show", AGENT_LOGIN_ID], &[]);
     assert_eq!(output.status.code(), Some(1));
-    assert!(after_notice(&output, "um grant list").contains("um grant list"));
+    assert!(after_notice(&output, "useful grant list").contains("useful grant list"));
     server.finish();
 }
 
@@ -970,7 +970,7 @@ fn import_codex_sends_the_file_byte_for_byte_and_prints_the_login() {
     // The replacement names the provider, without which it signs in to every provider
     // lacked (REQ-GRANT-77).
     for output in [&human, &labelled] {
-        after_notice(output, "um grant create PROVIDER");
+        after_notice(output, "useful grant create PROVIDER");
     }
     let document = json_output(&labelled);
     assert_eq!(document["outcome"], "imported");
@@ -1361,11 +1361,11 @@ fn unsafe_or_malformed_material_and_a_mismatched_source_exit_2_before_any_reques
 // How the fake `codex` behaves after it records its invocation.
 pub(super) enum SignIn {
     // Writes this auth.json into $CODEX_HOME with a group- and world-readable mode, as a
-    // file codex writes need not be 0600 for um to read it.
+    // file codex writes need not be 0600 for useful to read it.
     Writes(&'static str),
     Exits(u8),
     WritesNothing,
-    // Asks um to terminate, as a member's interrupt would, and waits to be stopped.
+    // Asks useful to terminate, as a member's interrupt would, and waits to be stopped.
     Interrupts,
     // Is executable and cannot be started: its interpreter does not exist.
     CannotStart,
@@ -1388,7 +1388,7 @@ pub(super) enum SetupToken {
     Prints,
     Exits(u8),
     PrintsNothing,
-    // Asks um to terminate, as a member's interrupt would, and waits to be stopped.
+    // Asks useful to terminate, as a member's interrupt would, and waits to be stopped.
     Interrupts,
 }
 
@@ -1398,7 +1398,7 @@ pub(super) const CLAUDE_TOKEN: &str = "sk-ant-oat01-private_claude_code_token-se
 pub(super) const CLAUDE_TOKEN_SENTINEL: &str = "private_claude_code_token-sentinel";
 pub(super) const CLAUDE_SIGN_IN_URL: &str =
     "https://claude.example.test/oauth/authorize?code=true&state=public-fixture-state";
-pub(super) const CLAUDE_FLOW: &str = "UM_TEST_CLAUDE_FLOW";
+pub(super) const CLAUDE_FLOW: &str = "USEFUL_TEST_CLAUDE_FLOW";
 pub(super) const PASTE_PROMPT: &str = "Paste code here if prompted > ";
 pub(super) const PASTE_CODE: &str = "public-fixture-paste-code";
 pub(super) const AFTER_TOKEN: &str = "claude-after-token";
@@ -1420,7 +1420,7 @@ impl FakeProgram {
             SignIn::CannotStart => String::new(),
         };
         let interpreter = if matches!(sign_in, SignIn::CannotStart) {
-            "/nonexistent/um-test-interpreter"
+            "/nonexistent/useful-test-interpreter"
         } else {
             "/bin/sh"
         };
@@ -1481,7 +1481,7 @@ impl FakeProgram {
     }
 
     // Writes `bin/NAME` as a script for `interpreter` whose body `script` makes, given a
-    // function that quotes the path of a record. um runs it with only `bin` on PATH; the
+    // function that quotes the path of a record. useful runs it with only `bin` on PATH; the
     // script's own `ls`, `cp` and `sleep` come from the test's PATH, since a build sandbox
     // may have nothing under /usr/bin or /bin.
     fn new(
@@ -1520,7 +1520,7 @@ impl FakeProgram {
 }
 
 // A member's home with an ambient Codex login and an ambient Claude Code configuration, which a
-// sign-in `um` runs must neither read nor change.
+// sign-in `useful` runs must neither read nor change.
 pub(super) struct AmbientHome {
     home: tempfile::TempDir,
     // Where the command may create its temporary Codex home or Claude Code configuration.
@@ -2198,12 +2198,12 @@ fn authorize_states_who_can_use_the_login_before_it_authorizes_the_runner() {
     );
     // The earlier command names its replacement on standard error before the statement
     // (REQ-GRANT-77).
-    assert_states_both_exposures(after_notice(&human, "um grant authorize").as_bytes());
+    assert_states_both_exposures(after_notice(&human, "useful grant authorize").as_bytes());
     let text = String::from_utf8(human.stdout).unwrap();
     assert!(text.contains(AUTHORIZATION_ID), "{text}");
     assert!(text.contains(RUNNER_ID), "{text}");
     assert!(output.status.success());
-    assert_states_both_exposures(after_notice(&output, "um grant authorize").as_bytes());
+    assert_states_both_exposures(after_notice(&output, "useful grant authorize").as_bytes());
     let document = json_output(&output);
     assert_eq!(document["outcome"], "authorized");
     assert_eq!(document["agentLoginId"], AGENT_LOGIN_ID);
@@ -2415,17 +2415,17 @@ fn authorize_refusals_exit_1_with_their_remedy() {
         (
             agent_login_problem("404 Not Found", 404, "agent-login-runner-not-found"),
             "runner_not_found",
-            "um runner list",
+            "useful runner list",
         ),
         (
             agent_login_problem("409 Conflict", 409, "agent-login-runner-conflict"),
             "runner_holds_login",
-            "um grant deauthorize",
+            "useful grant deauthorize",
         ),
         (
             agent_login_problem("409 Conflict", 409, "agent-login-already-authorized"),
             "login_already_authorized",
-            "um grant deauthorize GRANT RUNNER --yes",
+            "useful grant deauthorize GRANT RUNNER --yes",
         ),
     ];
     for (response, outcome, remedy) in cases {
@@ -2442,11 +2442,14 @@ fn authorize_refusals_exit_1_with_their_remedy() {
         assert_eq!(output.status.code(), Some(1), "{outcome}");
         assert_eq!(json_output(&output)["outcome"], outcome);
         assert_eq!(human.status.code(), Some(1), "{outcome}");
-        let text = after_notice(&human, "um grant authorize");
+        let text = after_notice(&human, "useful grant authorize");
         assert!(text.contains(remedy), "{outcome}: {text}");
         // A Codex login already authorized cannot be served by another sign-in: the held
         // grant is refused or replaced in place (REQ-GRANT-73).
-        assert!(!text.contains("um grant create codex"), "{outcome}: {text}");
+        assert!(
+            !text.contains("useful grant create codex"),
+            "{outcome}: {text}"
+        );
         assert_eq!(server.finish().len(), 2, "{outcome}");
     }
 }

@@ -6,8 +6,8 @@ struct RunnerCreationOutput<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    runner: &'a um_api::RunnerRegistration,
-    activation: &'a um_api::RunnerActivation,
+    runner: &'a useful_api::RunnerRegistration,
+    activation: &'a useful_api::RunnerActivation,
     activation_file: &'a str,
 }
 mod agent_login;
@@ -26,8 +26,8 @@ use std::path::{Path, PathBuf};
 use clap::{Args, Subcommand};
 
 use crate::exit_code::ExitCode;
-use um_human_auth::Deployment;
-use um_support::generate_idempotency_key;
+use useful_human_auth::Deployment;
+use useful_support::generate_idempotency_key;
 
 use super::{OrganizationArg, PaginationArgs, PoolArg};
 
@@ -98,7 +98,7 @@ impl CloudOptions {
     fn write_failure(
         &self,
         deployment: &Deployment,
-        failure: &um_api::RunnerFailure,
+        failure: &useful_api::RunnerFailure,
     ) -> anyhow::Result<ExitCode> {
         cloud::write_failure(
             deployment.fingerprint().api_url(),
@@ -240,7 +240,7 @@ impl Command {
                 execute_cloud(command, |command, deployment| {
                     command.execute(
                         deployment,
-                        um_api::RunnerRegistrationMode::Enabled,
+                        useful_api::RunnerRegistrationMode::Enabled,
                         "enabled",
                         "✓ Runner enabled.",
                     )
@@ -249,7 +249,7 @@ impl Command {
             Some(RunnerCommand::Drain(command)) => execute_cloud(command, |command, deployment| {
                 command.execute(
                     deployment,
-                    um_api::RunnerRegistrationMode::Draining,
+                    useful_api::RunnerRegistrationMode::Draining,
                     "draining",
                     "✓ Runner draining.",
                 )
@@ -258,7 +258,7 @@ impl Command {
                 execute_cloud(command, |command, deployment| {
                     command.execute(
                         deployment,
-                        um_api::RunnerRegistrationMode::Disabled,
+                        useful_api::RunnerRegistrationMode::Disabled,
                         "disabled",
                         "✓ Runner disabled.",
                     )
@@ -299,7 +299,7 @@ fn configured_control_socket_path(config: Option<&Path>) -> anyhow::Result<PathB
     match config {
         Some(path) => {
             let config_path = operator_config_path(path)?;
-            um_runner::load_control_socket_path(&config_path).with_context(|| {
+            useful_runner::load_control_socket_path(&config_path).with_context(|| {
                 format!(
                     "load runner operator configuration {}",
                     config_path.display()
@@ -314,47 +314,47 @@ fn configured_control_socket_path(config: Option<&Path>) -> anyhow::Result<PathB
 
 /// Where `doctor`'s check that needs the operator configuration finds it when
 /// it runs: the file `--config` names, which touches no runner home, or else
-/// the runner home's; `None` when there is no `--config` and the `um` home
+/// the runner home's; `None` when there is no `--config` and the `useful` home
 /// cannot be located (REQ-RUNNERENROLL-45, REQ-RUNNERENROLL-86). Reads and
 /// creates nothing.
 fn doctor_operator_config(
     config: Option<&Path>,
-) -> anyhow::Result<Option<um_runner::OperatorConfigSource>> {
+) -> anyhow::Result<Option<useful_runner::OperatorConfigSource>> {
     Ok(match config {
-        Some(path) => Some(um_runner::OperatorConfigSource::File(operator_config_path(
-            path,
-        )?)),
-        None => located_runner_home()?.map(um_runner::OperatorConfigSource::Home),
+        Some(path) => Some(useful_runner::OperatorConfigSource::File(
+            operator_config_path(path)?,
+        )),
+        None => located_runner_home()?.map(useful_runner::OperatorConfigSource::Home),
     })
 }
 
-/// The runner home of the `um` home the environment selects (REQ-WFDEF-17),
+/// The runner home of the `useful` home the environment selects (REQ-WFDEF-17),
 /// for a command given no `--config`. Resolving it reads and creates nothing.
-fn runner_home() -> anyhow::Result<um_runner::RunnerHome> {
+fn runner_home() -> anyhow::Result<useful_runner::RunnerHome> {
     located_runner_home()?
-        .ok_or_else(|| unlocated_um_home(&um_execution::DefinitionError::HomeUnavailable))
+        .ok_or_else(|| unlocated_useful_home(&useful_execution::DefinitionError::HomeUnavailable))
 }
 
-/// The runner home of the `um` home the environment selects, `None` when
-/// neither `UM_HOME` nor `HOME` names one.
-fn located_runner_home() -> anyhow::Result<Option<um_runner::RunnerHome>> {
-    match um_execution::WorkflowHome::from_environment() {
-        Ok(um_home) => um_runner::RunnerHome::new(um_home.root())
+/// The runner home of the `useful` home the environment selects, `None` when
+/// neither `USEFUL_HOME` nor `HOME` names one.
+fn located_runner_home() -> anyhow::Result<Option<useful_runner::RunnerHome>> {
+    match useful_execution::WorkflowHome::from_environment() {
+        Ok(useful_home) => useful_runner::RunnerHome::new(useful_home.root())
             .map(Some)
             .map_err(runner_home_failure),
-        Err(um_execution::DefinitionError::HomeUnavailable) => Ok(None),
-        Err(error) => Err(unlocated_um_home(&error)),
+        Err(useful_execution::DefinitionError::HomeUnavailable) => Ok(None),
+        Err(error) => Err(unlocated_useful_home(&error)),
     }
 }
 
-fn unlocated_um_home(error: &um_execution::DefinitionError) -> anyhow::Error {
+fn unlocated_useful_home(error: &useful_execution::DefinitionError) -> anyhow::Error {
     anyhow::anyhow!(
-        "locate the um home: {error}\n\nSet UM_HOME or HOME, or name the runner operator configuration with --config PATH."
+        "locate the useful home: {error}\n\nSet USEFUL_HOME or HOME, or name the runner operator configuration with --config PATH."
     )
 }
 
-fn runner_home_failure(error: um_runner::RunnerHomeError) -> anyhow::Error {
-    use um_runner::RunnerHomeError;
+fn runner_home_failure(error: useful_runner::RunnerHomeError) -> anyhow::Error {
+    use useful_runner::RunnerHomeError;
     let remedy = match &error {
         RunnerHomeError::UnsafeDirectory { path, .. } => format!(
             "Make {} a directory owned by the current user with mode 0700, or name a runner operator configuration with --config PATH.",
@@ -375,12 +375,12 @@ fn runner_home_failure(error: um_runner::RunnerHomeError) -> anyhow::Error {
 
 enum CreateOutcome {
     Complete {
-        registration: um_api::RunnerRegistration,
-        issuance: um_api::RunnerActivationIssuance,
+        registration: useful_api::RunnerRegistration,
+        issuance: useful_api::RunnerActivationIssuance,
     },
     ActivationFailed {
-        registration: um_api::RunnerRegistration,
-        failure: um_api::RunnerFailure,
+        registration: useful_api::RunnerRegistration,
+        failure: useful_api::RunnerFailure,
     },
 }
 
@@ -394,7 +394,7 @@ impl CreateOutcome {
 }
 
 fn parse_member_id(value: &str) -> Result<String, String> {
-    if um_support::valid_typed_id(value, "prn_") {
+    if useful_support::valid_typed_id(value, "prn_") {
         Ok(value.to_owned())
     } else {
         Err("must be an exact member principal ID".to_owned())
@@ -516,7 +516,7 @@ impl CreateCommand {
 
 fn completed_cloud_result<T>(
     deployment: &Deployment,
-    result: Result<T, um_api::RunnerFailure>,
+    result: Result<T, useful_api::RunnerFailure>,
     authentication: super::PrincipalAuthenticationKind,
     json: bool,
 ) -> anyhow::Result<Result<T, ExitCode>> {
@@ -542,14 +542,14 @@ fn validate_activation_destination(destination: &str, json: bool) -> anyhow::Res
 
 fn write_activation_issuance(
     destination: &str,
-    issuance: &um_api::RunnerActivationIssuance,
-) -> anyhow::Result<um_runner::ActivationArtifact> {
+    issuance: &useful_api::RunnerActivationIssuance,
+) -> anyhow::Result<useful_runner::ActivationArtifact> {
     let artifact = host_activation_artifact(issuance).ok_or_else(|| {
         anyhow::anyhow!(
             "activation issuance replay omitted its secret; issue a replacement activation with a new command"
         )
     })?;
-    um_runner::write_activation_file(destination, &artifact)
+    useful_runner::write_activation_file(destination, &artifact)
         .map_err(|error| anyhow::anyhow!(error))?;
     Ok(artifact)
 }
@@ -558,11 +558,11 @@ fn write_activation_issuance(
 /// its secret; a replayed issuance carries none. The translation happens here
 /// because the runner crate never references the human API client.
 fn host_activation_artifact(
-    issuance: &um_api::RunnerActivationIssuance,
-) -> Option<um_runner::ActivationArtifact> {
+    issuance: &useful_api::RunnerActivationIssuance,
+) -> Option<useful_runner::ActivationArtifact> {
     let issued = issuance.artifact.as_ref()?;
-    Some(um_runner::ActivationArtifact::from_parts(
-        um_runner::ActivationArtifactParts {
+    Some(useful_runner::ActivationArtifact::from_parts(
+        useful_runner::ActivationArtifactParts {
             activation_url: issued.activation_url.clone(),
             activation_token: issued.activation_token.clone(),
             runner_id: issued.runner_id.clone(),
@@ -636,7 +636,7 @@ impl ModeCommand {
     fn execute(
         self,
         deployment: &Deployment,
-        mode: um_api::RunnerRegistrationMode,
+        mode: useful_api::RunnerRegistrationMode,
         outcome: &'static str,
         heading: &'static str,
     ) -> anyhow::Result<ExitCode> {
@@ -826,8 +826,8 @@ fn execute_deletion_blocking(
         &invocation.options.authentication,
         |api| {
             if !control.begin_dispatch() {
-                return Err(um_api::RunnerFailure::Unreachable(
-                    um_api::UnreachableCategory::Connection,
+                return Err(useful_api::RunnerFailure::Unreachable(
+                    useful_api::UnreachableCategory::Connection,
                 ));
             }
             match invocation.kind {
@@ -847,7 +847,8 @@ fn execute_deletion_blocking(
                 invocation.options.json,
             ),
             Err(
-                failure @ (um_api::RunnerFailure::Unreachable(_) | um_api::RunnerFailure::Protocol),
+                failure @ (useful_api::RunnerFailure::Unreachable(_)
+                | useful_api::RunnerFailure::Protocol),
             ) => {
                 let _ = failure;
                 cloud::write_deletion_unknown(
@@ -878,16 +879,16 @@ fn deletion_target<'a>(kind: DeletionKind, resource_id: &'a str) -> cloud::Delet
 
 pub(super) fn with_api<T>(
     deployment: &Deployment,
-    transport_policy: um_api::HttpTransportPolicy,
+    transport_policy: useful_api::HttpTransportPolicy,
     authentication: &super::PrincipalAuthenticationArgs,
-    operation: impl FnMut(&um_api::RunnerApi) -> Result<T, um_api::RunnerFailure>,
-) -> anyhow::Result<Result<T, um_api::RunnerFailure>> {
+    operation: impl FnMut(&useful_api::RunnerApi) -> Result<T, useful_api::RunnerFailure>,
+) -> anyhow::Result<Result<T, useful_api::RunnerFailure>> {
     cloud::with_api(deployment, transport_policy, authentication, operation)
 }
 
 pub(super) fn write_failure(
     deployment: &Deployment,
-    failure: &um_api::RunnerFailure,
+    failure: &useful_api::RunnerFailure,
     authentication: &super::PrincipalAuthenticationArgs,
     json: bool,
 ) -> anyhow::Result<ExitCode> {

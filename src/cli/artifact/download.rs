@@ -6,7 +6,7 @@ use serde::Serialize;
 
 use super::assembly::{ArtifactAssemblyError, AssembledArtifact, assemble_artifact_set};
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{ArtifactApi, ArtifactApiError};
+use useful_api::{ArtifactApi, ArtifactApiError};
 pub(super) const ABOUT: &str = "Download and verify a run's Artifact Set";
 
 pub(super) type Command = super::RemoteArtifactCommand<Operation>;
@@ -98,7 +98,7 @@ impl super::RemoteArtifactOperation for Operation {
                 };
                 let remedy = match &error {
                     ArtifactAssemblyError::Api(ArtifactApiError::Unauthenticated) => {
-                        authentication.rejected_remedy("Sign in first:\n  um auth login")
+                        authentication.rejected_remedy("Sign in first:\n  useful auth login")
                     }
                     ArtifactAssemblyError::DestinationExists => {
                         "Choose an output path that does not exist, then try again."

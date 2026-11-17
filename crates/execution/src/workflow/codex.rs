@@ -96,7 +96,7 @@ const TURN_START_REQUEST_ID: RequestId = RequestId(4);
 const TURN_INTERRUPT_REQUEST_ID: RequestId = RequestId(5);
 const CORRECTION_TURN_START_REQUEST_ID: RequestId = RequestId(6);
 const MAXIMUM_CORRECTION_TURNS: u8 = 1;
-const CLIENT_NAME: &str = "um";
+const CLIENT_NAME: &str = "useful";
 const SCHEMA_REJECTION_PREFIX: &str = "Result rejected by the workflow schema:\n";
 const CODEX_SCHEMA_CORRECTION_PREFIX: &str = "Correct the inner workflow JSON encoded in the outer `result` string; the harness owns the envelope. Schema diagnostics:\n";
 
@@ -855,7 +855,7 @@ impl CodexAppServerV1Parser {
         if frame.is_empty() {
             return Err(self.failure_for(CodexAppServerV1RejectionReason::FrameEmpty));
         }
-        let value = um_support::strict_json_from_slice(frame)
+        let value = useful_support::strict_json_from_slice(frame)
             .map_err(|_| self.failure_for(CodexAppServerV1RejectionReason::FrameDecodeFailed))?;
         let object = value
             .as_object()
@@ -2807,7 +2807,7 @@ impl<'de> Visitor<'de> for WeakResultEnvelopeVisitor {
 
 fn parse_weak_result_envelope(text: &str) -> Result<Value, ()> {
     let envelope = serde_json::from_str::<WeakResultEnvelope>(text).map_err(|_| ())?;
-    um_support::strict_json_from_str(&envelope.0).map_err(|_| ())
+    useful_support::strict_json_from_str(&envelope.0).map_err(|_| ())
 }
 
 fn codex_result_correction_feedback(feedback: Arc<str>, maximum_bytes: NonZeroU64) -> Arc<str> {

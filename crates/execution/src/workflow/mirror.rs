@@ -1,6 +1,6 @@
 //! The root workflow's `mirror` block (REQ-WFFORMAT-101): what Linear sees of a run of the
 //! root. Decoding keeps the authored strings; the template and guard grammars here parse
-//! them, which `um workflow definition validate` does with a location for each failure.
+//! them, which `useful workflow definition validate` does with a location for each failure.
 //! The `Mirror` driver performs a run's hooks through a `MirrorTarget` the CLI implements
 //! and appends each write's record under the run's `mirror/` (REQ-LOCALRUN-193).
 
@@ -406,7 +406,7 @@ impl MirrorWrite {
         action: MirrorAction,
         performed: Performed,
     ) -> Result<Self, LocalRunDirectoryError> {
-        let at = utc_timestamp(um_support::utc_now())
+        let at = utc_timestamp(useful_support::utc_now())
             .map_err(|_| LocalRunDirectoryError::MirrorWriteInvalid)?;
         let (outcome, reason, failure) = match performed {
             Performed::Written => (MirrorWriteOutcome::Written, None, None),
@@ -564,7 +564,7 @@ impl Mirror {
         self
     }
 
-    /// `onStart`, once when `um workflow run create` has made the run, skipped when the issue
+    /// `onStart`, once when `useful workflow run create` has made the run, skipped when the issue
     /// already links the run (`start_announced`, REQ-LOCALRUN-216).
     pub fn start(&self, target: &dyn MirrorTarget) -> Result<(), LocalRunDirectoryError> {
         self.comment(target, MirrorHook::Start, &[])
@@ -919,7 +919,7 @@ mod tests {
             operator: "saeed".to_owned(),
             id: "run_x".to_owned(),
             url: "file:///tmp/run_x".to_owned(),
-            reference: "um workflow run show run_x".to_owned(),
+            reference: "useful workflow run show run_x".to_owned(),
             external_url: None,
             directory: directory.to_owned(),
         }

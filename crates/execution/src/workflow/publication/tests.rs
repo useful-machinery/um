@@ -1151,7 +1151,7 @@ fn resource_checkpoint_seed_cloud_artifact() {
         std::io::BufWriter::new(fs::File::create(target.with_extension("failure.json")).unwrap());
     serde_json::to_writer(&mut failure_file, &failure).unwrap();
     std::io::Write::flush(&mut failure_file).unwrap();
-    let started = um_support::monotonic_now();
+    let started = useful_support::monotonic_now();
     let prepared = prepare_cloud_workflow_result(
         &run,
         "prj_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
@@ -1164,7 +1164,7 @@ fn resource_checkpoint_seed_cloud_artifact() {
     println!(
         "production_cloud_serialization_bytes={} elapsed={:?}",
         prepared.result_size_bytes,
-        um_support::monotonic_now().duration_since(started)
+        useful_support::monotonic_now().duration_since(started)
     );
     assert!(prepared.result_json.is_empty());
     let file = prepared

@@ -1,4 +1,4 @@
-//! `um workflow run event` (REQ-LOCALRUN-208): applies a delivered provider event to the
+//! `useful workflow run event` (REQ-LOCALRUN-208): applies a delivered provider event to the
 //! run's control trigger. The event acts only when its `issueUpdatedAt` is strictly later
 //! than the claim's admission observation; the issue is then read fresh through the mirror's
 //! Linear target, and the fresh state, never the event's own `to`, is `event.to` for the
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
-use um_execution::{
+use useful_execution::{
     ControlTrigger, DefinitionError, ResolvedWorkflow, WorkflowHome, WorkflowRunRecord,
     normalize_terminal_path, normalize_terminal_scalar, read_definition, read_revision_bindings,
     resolve_workflow_file,
@@ -28,7 +28,7 @@ use super::mirror::linear::{IssueObservation, LinearTarget};
 use crate::exit_code::ExitCode;
 
 pub(super) const ABOUT: &str = "Apply a delivered provider event to a run's control trigger";
-const COMMAND: &str = "um workflow run event";
+const COMMAND: &str = "useful workflow run event";
 /// The most bytes the command reads of the event or the claim file.
 const MAXIMUM_FILE_BYTES: u64 = 1024 * 1024;
 const ROOT_WORKFLOW_FILE: &str = "workflow.yaml";
@@ -307,7 +307,7 @@ struct Revision {
 }
 
 impl Revision {
-    /// The revision `record` names, read from the um home: `control_unavailable` for a run
+    /// The revision `record` names, read from the useful home: `control_unavailable` for a run
     /// with no definition or revision, or whose revision cannot be read, the latter with its
     /// cause's class.
     fn read(record: &WorkflowRunRecord) -> Result<Self, EventFailure> {
@@ -327,7 +327,7 @@ impl Revision {
         let stored_failure = |what: &'static str| {
             move |error: DefinitionError| unreadable(what, error.code(), Cause::of(&error))
         };
-        let home = WorkflowHome::from_environment().map_err(stored_failure("um home"))?;
+        let home = WorkflowHome::from_environment().map_err(stored_failure("useful home"))?;
         let stored = read_definition(&home, definition).map_err(stored_failure("record"))?;
         let listed = stored
             .record

@@ -5,11 +5,11 @@ use clap::{Args, ValueEnum};
 use zeroize::Zeroizing;
 
 use crate::exit_code::ExitCode;
-use um_api::{
+use useful_api::{
     AgentLogin, AgentLoginApi, AgentLoginFailure, AgentLoginImport, AgentLoginImportProvider,
     AgentLoginProvider, AgentLoginState,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 use super::super::super::grant::material::{read_claude_code_token, read_codex_login};
 use super::super::super::secret_file::FileMode;
@@ -181,7 +181,7 @@ impl Command {
             )));
         }
         let organization: &str = &self.organization;
-        let named = if um_support::valid_typed_id(organization, "org_") {
+        let named = if useful_support::valid_typed_id(organization, "org_") {
             organization.to_owned()
         } else {
             api.organization_id(organization)?
@@ -272,7 +272,8 @@ pub(super) fn store(
     send: impl Fn(&AgentLoginApi, &str) -> Result<AgentLogin, AgentLoginFailure>,
     write: impl FnOnce(&str, &AgentLogin, bool) -> anyhow::Result<ExitCode>,
 ) -> CommandResult {
-    let key = um_support::generate_idempotency_key().context("generate agent login request key")?;
+    let key =
+        useful_support::generate_idempotency_key().context("generate agent login request key")?;
     run_leaf(
         deployment,
         options,

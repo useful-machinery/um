@@ -20,8 +20,8 @@ use tokio::io::unix::AsyncFd;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
 #[cfg(test)]
-use um_execution::admit_workflow;
-use um_execution::{
+use useful_execution::admit_workflow;
+use useful_execution::{
     ActionId, AdmittedWorkflow, AgentExecution, AgentHarnessInstallationFailure, AgentInputStaging,
     ArtifactStaging, CancellationPolicy, CancellationReason, CancellationSource, ColorChoice,
     CommitFailure, CoordinationError, CoordinatorClock, DisplayDeadline, DurableDeadline,
@@ -51,11 +51,11 @@ use um_execution::{
     step_recovery_summary_v1, summary_disposition_matches, validate_workflow_tree,
     write_untested_harness_advisories,
 };
-use um_execution::{
+use useful_execution::{
     AgentProfileReplacementDocument, AgentProfileReplacementV1, ChildRunPresentation,
     MAXIMUM_AGENT_PROFILE_REPLACEMENT_BYTES,
 };
-use um_execution::{
+use useful_execution::{
     AttemptControls, CONTROL_CANCEL, CONTROL_INTERRUPT, CONTROL_STOP, CapturedValue,
     ChildCommitFailure, ChildInputValue, ChildRunControl, ChildRunDispatcher, ChildRunOutcome,
     ChildRunParent, ChildRunRequest, ChildRuns, ContinuationDefinitionMode, ContinuationEdgeV1,
@@ -66,7 +66,7 @@ use um_execution::{
     await_child_start_gate, await_release_gate, await_settled_gate, position_path, read_controls,
     read_numbered_controls, stop_in_force, wait_payload,
 };
-use um_execution::{
+use useful_execution::{
     DefinitionError, SubjectClaim, SubjectError, WITHDRAWN_OUTCOME, WorkflowHome, check_subject,
     chosen_outcome, failure_outcome, is_subject, read_definition,
 };
@@ -116,7 +116,7 @@ pub(super) struct Command {
     #[arg(
         value_name = "ID",
         required_unless_present = "path",
-        help = "Workflow definition id, as `um workflow definition list` prints it; with --cloud, a Cloud definition id"
+        help = "Workflow definition id, as `useful workflow definition list` prints it; with --cloud, a Cloud definition id"
     )]
     id: Option<String>,
 
@@ -1047,7 +1047,7 @@ struct AttemptTeardown {
     /// (REQ-WFEXEC-57).
     failure_outcome: String,
     signal_task: Option<SignalObservation>,
-    private_staging: Option<um_execution::AttemptPrivateStaging>,
+    private_staging: Option<useful_execution::AttemptPrivateStaging>,
     artifacts: Option<ArtifactStaging>,
     inputs: Option<InputStaging>,
     agents: Option<AgentInputStaging>,
@@ -1056,7 +1056,7 @@ struct AttemptTeardown {
     armed: bool,
     /// The edge the attempt ended `continued` on, which the attempt loop continues from
     /// (REQ-WFEXEC-64).
-    continued: Option<um_execution::TakenEdgeRecord>,
+    continued: Option<useful_execution::TakenEdgeRecord>,
     /// The root attempt's mirror (REQ-LOCALRUN-191), which writes `onOutcome` for the
     /// failure outcome too.
     mirror: Option<Arc<Mirror>>,
@@ -1377,7 +1377,7 @@ async fn execute_owned_attempt_with(
     let result = result.unwrap_or_else(|error| Err(error.into()));
     match (attempt.continued.take(), &result) {
         // REQ-LOCALRUN-135: an interruption holds back the next attempt, leaving the run
-        // `running` for `um workflow run resume` (REQ-CONTINUE-78).
+        // `running` for `useful workflow run resume` (REQ-CONTINUE-78).
         (Some(edge), Ok(ExitCode::Success))
             if !admitted
                 .execution()
@@ -1435,7 +1435,7 @@ impl std::fmt::Display for StateCommitFailed {
         write!(
             formatter,
             "\nclass: {}\n\nThe run is still running, and this attempt is not settled. \
-             Correct the cause, then continue the run:\n  um workflow run resume {}",
+             Correct the cause, then continue the run:\n  useful workflow run resume {}",
             self.failure.class.as_str(),
             normalize_terminal_path(&self.run_directory),
         )
@@ -2486,8 +2486,8 @@ impl ChildRecovery {
 /// (REQ-WFEXEC-65).
 fn entered_wait_record(
     wait: &EnteredWait,
-    inputs: &um_execution::ResolvedInputs,
-    steps: &BTreeMap<String, um_execution::StepState<CapturedValue>>,
+    inputs: &useful_execution::ResolvedInputs,
+    steps: &BTreeMap<String, useful_execution::StepState<CapturedValue>>,
     run_directory: &Path,
     dispatcher: Option<&LocalChildRunDispatcher>,
 ) -> anyhow::Result<WaitRecord> {
@@ -2525,9 +2525,16 @@ fn entered_wait_record(
             )
         });
     let payload = wait_payload(wait, steps, child.as_deref(), control.as_ref());
-    WaitRecord::entered(wait, item, payload, um_support::utc_now(), inputs, steps)
-        .map_err(anyhow::Error::new)
-        .context("record the local workflow wait")
+    WaitRecord::entered(
+        wait,
+        item,
+        payload,
+        useful_support::utc_now(),
+        inputs,
+        steps,
+    )
+    .map_err(anyhow::Error::new)
+    .context("record the local workflow wait")
 }
 
 /// The root run a run belongs to and the path from the root to that run, as a position names
@@ -2592,7 +2599,7 @@ struct LocalChildRunParent {
     execution_root: PathBuf,
     maximum_parallel_steps: usize,
     /// The parent's admitted environment, the launching environment of each child: its
-    /// admission drops the engine's `UM_` names again and its `environmentPassthrough`
+    /// admission drops the engine's `USEFUL_` names again and its `environmentPassthrough`
     /// selects among the names the root admitted.
     environment: EnvironmentSnapshot,
     /// The step a `control.retry` continues at and the agent-profile replacement its child
@@ -3057,7 +3064,7 @@ fn carried_wait_record(
 
 /// The next attempt of the nested run at `directory`, whose latest attempt ended `continued`
 /// on `edge` (REQ-WFEXEC-74): begun in the same run directory from the edge's target as
-/// `um workflow run resume` begins a root's (REQ-WFEXEC-64, REQ-CONTINUE-78), with reason
+/// `useful workflow run resume` begins a root's (REQ-WFEXEC-64, REQ-CONTINUE-78), with reason
 /// `edge`, its own definition and retained inputs and its unchanged tree copy, admitted under
 /// the parent's execution root, limits and environment. A limited edge is counted in the
 /// nested run's own `run.json` as the attempt begins. A refusal is the child's code.
@@ -3149,7 +3156,7 @@ fn child_execution_context(
     Ok(context.with_tree(tree))
 }
 
-fn child_admission_code(failure: &um_execution::AdmissionFailure) -> String {
+fn child_admission_code(failure: &useful_execution::AdmissionFailure) -> String {
     RejectionDiagnostic::from_admission(failure)
         .map_or("workflow_admission_invalid", |diagnostic| diagnostic.code)
         .to_owned()
@@ -3223,7 +3230,7 @@ pub(super) fn child_request_inputs(request: &ChildRunRequest) -> Result<Resolved
 }
 
 /// A new attempt of the child run at `directory` the parent's abandoned attempt left
-/// running (REQ-CONTINUE-76), as `um workflow run retry` on it would start: its own retry
+/// running (REQ-CONTINUE-76), as `useful workflow run retry` on it would start: its own retry
 /// settles the abandoned attempt, and it runs its retained definition and inputs from its
 /// unchanged tree copy under the parent's execution root, limits and environment.
 fn prepare_child_retry(
@@ -3443,7 +3450,7 @@ fn input_argument<'a>(value: Option<&'a OsString>, description: &str) -> anyhow:
 }
 
 fn validate_input_name(name: &str) -> anyhow::Result<()> {
-    if !um_execution::is_input_name(name) {
+    if !useful_execution::is_input_name(name) {
         return Err(anyhow!("invalid Workflow V1 input name"));
     }
     Ok(())
@@ -3970,7 +3977,7 @@ pub(super) fn start_signal_observation(
 }
 
 /// A cancel when no run directory is known yet or a watched journal holds a new
-/// `control.cancel`, which `um workflow run cancel` appends before it signals
+/// `control.cancel`, which `useful workflow run cancel` appends before it signals
 /// (REQ-LOCALRUN-186); otherwise an interruption (REQ-LOCALRUN-135).
 async fn signal_request(journals: &ControlJournals) -> SignalRequest {
     let watched = journals.watched();
@@ -4685,7 +4692,7 @@ fn build_run_result(
         // A step a stop kept from starting (REQ-WFEXEC-62) reached `starting` only to be
         // settled `not_run`, which records no timing.
         let timing = match timing.steps.get(id) {
-            _ if matches!(state, um_execution::StepState::NotRun { .. }) => None,
+            _ if matches!(state, useful_execution::StepState::NotRun { .. }) => None,
             None => None,
             Some(timing) => {
                 let finished = timing.finished.ok_or_else(invalid_terminal_result_error)?;
@@ -5021,7 +5028,7 @@ mod tests {
     use time::format_description::well_known::Rfc3339;
 
     use super::*;
-    use um_execution::{
+    use useful_execution::{
         ObservationTime, ObservedExecutions, SchedulingGate, StepStateKind, TransitionEvent,
         TransitionObservation, TransitionSequence, WorkflowState, resolve,
     };
@@ -5141,15 +5148,15 @@ mod tests {
 
     struct RestoringBoundary(Arc<AtomicBool>);
 
-    impl um_execution::TerminalBoundary for RestoringBoundary {
-        fn setup(&mut self) -> io::Result<um_execution::TerminalRect> {
-            Ok(um_execution::TerminalRect::new(0, 0, 120, 24))
+    impl useful_execution::TerminalBoundary for RestoringBoundary {
+        fn setup(&mut self) -> io::Result<useful_execution::TerminalRect> {
+            Ok(useful_execution::TerminalRect::new(0, 0, 120, 24))
         }
-        async fn next_event(&mut self) -> io::Result<um_execution::TerminalInputEvent> {
+        async fn next_event(&mut self) -> io::Result<useful_execution::TerminalInputEvent> {
             std::future::pending().await
         }
-        fn resize(&mut self) -> io::Result<um_execution::TerminalRect> {
-            Ok(um_execution::TerminalRect::new(0, 0, 120, 24))
+        fn resize(&mut self) -> io::Result<useful_execution::TerminalRect> {
+            Ok(useful_execution::TerminalRect::new(0, 0, 120, 24))
         }
         fn restore(&mut self) -> io::Result<()> {
             self.0.store(true, Ordering::SeqCst);
@@ -5157,11 +5164,11 @@ mod tests {
         }
     }
 
-    impl um_execution::WorkflowTerminalBoundary for RestoringBoundary {
+    impl useful_execution::WorkflowTerminalBoundary for RestoringBoundary {
         fn draw_workflow(
             &mut self,
-            _snapshot: &um_execution::WorkflowRunViewSnapshot,
-            _interaction: &mut um_execution::HostInteraction,
+            _snapshot: &useful_execution::WorkflowRunViewSnapshot,
+            _interaction: &mut useful_execution::HostInteraction,
             _color: bool,
         ) -> io::Result<()> {
             Ok(())
@@ -5409,8 +5416,8 @@ mod tests {
     // Any other execution failure leaves the record `running` and records nothing.
     #[tokio::test]
     async fn an_execution_failure_over_an_unsettled_attempt_leaves_the_run_running() {
-        let commit_failure = um_execution::CommitFailure {
-            class: um_execution::CommitFailureClass::StorageFull,
+        let commit_failure = useful_execution::CommitFailure {
+            class: useful_execution::CommitFailureClass::StorageFull,
             operation: Some("write temporary state"),
             os_error: Some(28),
         };
@@ -5504,7 +5511,7 @@ mod tests {
                     lines.last().map(|line| line.trim()),
                     Some(
                         format!(
-                            "um workflow run resume {}",
+                            "useful workflow run resume {}",
                             normalize_terminal_path(&run_directory)
                         )
                         .as_str()
@@ -5567,7 +5574,7 @@ mod tests {
         .unwrap();
         let home_root = root.join("home");
         let home = WorkflowHome::from_lookup(|name| {
-            (name == "UM_HOME").then(|| home_root.clone().into_os_string())
+            (name == "USEFUL_HOME").then(|| home_root.clone().into_os_string())
         })
         .unwrap();
         std::fs::create_dir_all(home.definition_directory(SUBJECT_DEFINITION)).unwrap();
@@ -5614,7 +5621,7 @@ mod tests {
             .unwrap_or(0);
         assert_eq!(runs, 0, "a run was left under the destination");
         assert_eq!(
-            um_execution::subject_slot(home, SUBJECT_DEFINITION, SUBJECT).unwrap(),
+            useful_execution::subject_slot(home, SUBJECT_DEFINITION, SUBJECT).unwrap(),
             None
         );
         failure
@@ -5666,9 +5673,9 @@ mod tests {
             tokio::task::spawn_blocking(move || creation.create(&creating_cancellation, &journals));
         let watched = observer.journals.clone();
         let watching = tokio::task::spawn_blocking(move || {
-            let deadline = um_support::monotonic_now() + std::time::Duration::from_secs(10);
-            while watched.watched().is_empty() && um_support::monotonic_now() < deadline {
-                um_support::sleep(std::time::Duration::from_millis(5));
+            let deadline = useful_support::monotonic_now() + std::time::Duration::from_secs(10);
+            while watched.watched().is_empty() && useful_support::monotonic_now() < deadline {
+                useful_support::sleep(std::time::Duration::from_millis(5));
             }
             !watched.watched().is_empty()
         })
@@ -6375,9 +6382,9 @@ mod tests {
                 "--exact",
                 "cli::workflow::run::create::tests::run_lock_probe_fixture",
             ])
-            .env("UM_TEST_RUN_LOCK_PATH", path)
+            .env("USEFUL_TEST_RUN_LOCK_PATH", path)
             .env(
-                "UM_TEST_RUN_LOCK_AVAILABLE",
+                "USEFUL_TEST_RUN_LOCK_AVAILABLE",
                 if expected { "true" } else { "false" },
             )
             .stdin(Stdio::null())
@@ -6394,9 +6401,9 @@ mod tests {
     #[test]
     #[ignore = "launched as a run.lock ownership probe"]
     fn run_lock_probe_fixture() {
-        let path = std::env::var_os("UM_TEST_RUN_LOCK_PATH")
-            .unwrap_or_else(|| panic!("UM_TEST_RUN_LOCK_PATH must be set"));
-        let expected = std::env::var("UM_TEST_RUN_LOCK_AVAILABLE").unwrap() == "true";
+        let path = std::env::var_os("USEFUL_TEST_RUN_LOCK_PATH")
+            .unwrap_or_else(|| panic!("USEFUL_TEST_RUN_LOCK_PATH must be set"));
+        let expected = std::env::var("USEFUL_TEST_RUN_LOCK_AVAILABLE").unwrap() == "true";
         let lock = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -6418,7 +6425,7 @@ mod tests {
         )
         .unwrap();
         let workflow = resolve(&source_root, Path::new("workflow.yaml")).unwrap();
-        let monotonic = um_support::monotonic_now();
+        let monotonic = useful_support::monotonic_now();
         let opened = timing_point(monotonic, "2026-08-02T12:01:43.5Z", 0);
         let initialized = timing_point(monotonic, "2026-08-02T12:01:44Z", 500);
         let terminal = timing_point(monotonic, "2026-08-02T12:01:44.03Z", 530);
@@ -6478,7 +6485,7 @@ mod tests {
 
     #[tokio::test]
     async fn timing_observer_excludes_presentation_opening_and_uses_terminal_transition() {
-        let monotonic = um_support::monotonic_now();
+        let monotonic = useful_support::monotonic_now();
         let opened = timing_point(monotonic, "2026-08-02T12:01:43.5Z", 0);
         let started = timing_point(monotonic, "2026-08-02T12:01:44Z", 500);
         let step_started = timing_point(monotonic, "2026-08-02T12:01:44.01Z", 510);
@@ -6525,7 +6532,7 @@ mod tests {
 
     #[tokio::test]
     async fn presentation_failure_requests_cancellation_without_replacing_a_signal() {
-        let monotonic = um_support::monotonic_now();
+        let monotonic = useful_support::monotonic_now();
         let cancellation = CancellationSource::new();
         assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
         let observed_at = timing_point(monotonic, "2026-08-02T12:01:44Z", 0);

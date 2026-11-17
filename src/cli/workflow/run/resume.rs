@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use clap::Args;
 use serde::Serialize;
-use um_execution::{
+use useful_execution::{
     AdmittedWorkflow, CONTROL_WITHDRAW, CancellationSource, ContinuationDefinitionMode,
     ContinuationEdgeV1, ContinuationReasonV1, ControlsLock, LocalAttemptOwner,
     LocalContinuationOpen, LocalRetryBeginError, PendingLocalContinuation, ResolvedBy,
@@ -26,12 +26,12 @@ pub(super) const AFTER_HELP: &str = "Select one or more ordinary steps with --fr
 
 Without --from, a waiting run continues once a control resolves its wait and otherwise reports the wait unchanged, and a run whose process died continues from the step it was running.
 
-With --cloud ORGANIZATION, RUN is a Cloud run ID: the command asks Cloud to continue that run under its own definition from the steps --from names, or with none from where its record stands, and reports the request as um run continue does. It reads and writes no local run.";
+With --cloud ORGANIZATION, RUN is a Cloud run ID: the command asks Cloud to continue that run under its own definition from the steps --from names, or with none from where its record stands, and reports the request as useful run continue does. It reads and writes no local run.";
 
-const COMMAND: &str = "um workflow run resume";
-const RETRY_COMMAND: &str = "um workflow run retry";
-const RESTART_COMMAND: &str = "um workflow run restart";
-const UPGRADE_COMMAND: &str = "um workflow run upgrade";
+const COMMAND: &str = "useful workflow run resume";
+const RETRY_COMMAND: &str = "useful workflow run retry";
+const RESTART_COMMAND: &str = "useful workflow run restart";
+const UPGRADE_COMMAND: &str = "useful workflow run upgrade";
 
 /// The command a continuation's own documents name.
 pub(super) fn command_name(leaf: ExecutionLeaf) -> &'static str {
@@ -44,10 +44,10 @@ pub(super) fn command_name(leaf: ExecutionLeaf) -> &'static str {
 }
 
 /// The output a refused continuation of the run at `run_directory` is reported on: as
-/// `um workflow run resume` reports it, under `restart`'s or `upgrade`'s name for those
+/// `useful workflow run resume` reports it, under `restart`'s or `upgrade`'s name for those
 /// (REQ-LOCALRUN-184, REQ-LOCALRUN-194, REQ-LOCALRUN-197).
 pub(super) fn continuation_output(
-    config: um_execution::PresentationConfig,
+    config: useful_execution::PresentationConfig,
     leaf: ExecutionLeaf,
     run_directory: &Path,
 ) -> WorkflowRunOutput<io::Stdout, io::Stderr> {
@@ -146,8 +146,8 @@ impl Command {
     }
 
     /// REQ-CONTINUE-85: asks Cloud to continue the run `RUN` names, under its own definition
-    /// and from the steps `--from` names or none, as `um run continue` submits it. `RUN` is
-    /// the Cloud run id as typed, and nothing under the `um` home is read or written.
+    /// and from the steps `--from` names or none, as `useful run continue` submits it. `RUN` is
+    /// the Cloud run id as typed, and nothing under the `useful` home is read or written.
     fn continue_in_cloud(
         self,
         organization: OrganizationArg,
@@ -226,15 +226,15 @@ pub(super) struct Continuation {
     pub(super) bridge: Option<ControlsLock>,
 }
 
-/// Continues the run as `um workflow run resume` does (REQ-CONTINUE-74 to REQ-CONTINUE-78):
+/// Continues the run as `useful workflow run resume` does (REQ-CONTINUE-74 to REQ-CONTINUE-78):
 /// without `--from`, from the wait a control resolves, the step an abandoned attempt was
 /// running or the target of the edge a `continued` attempt took, reporting a held wait
-/// unchanged. `um workflow run retry` on a repair wait continues through here once it
+/// unchanged. `useful workflow run retry` on a repair wait continues through here once it
 /// recorded its control (REQ-LOCALRUN-184), and the attempt loop continues here from the
 /// edge an attempt ended `continued` on (REQ-WFEXEC-64), so every command chains.
 pub(super) async fn continue_run(
     continuation: Continuation,
-    config: um_execution::PresentationConfig,
+    config: useful_execution::PresentationConfig,
     cancellation: CancellationSource,
     signal_task: super::create::SignalObservation,
 ) -> super::super::super::CommandResult {
@@ -416,7 +416,7 @@ pub(super) async fn continue_run(
                     Some(_) => None,
                     None => positioned_element(&run_directory, &step)?,
                 };
-                Ok::<_, um_execution::LocalRunDirectoryError>((step, latest, fresh))
+                Ok::<_, useful_execution::LocalRunDirectoryError>((step, latest, fresh))
             })
             .await;
             match latest {
@@ -692,7 +692,7 @@ pub(super) async fn continue_run(
     let attempt_number = owned.attempt_number();
     {
         let mut stderr = io::stderr().lock();
-        if config.mode() == um_execution::PresentationMode::Json {
+        if config.mode() == useful_execution::PresentationMode::Json {
             let event = serde_json::json!({
                 "event": "continuation_partition", "attemptNumber": attempt_number,
                 "continuation": record,
@@ -712,7 +712,7 @@ pub(super) async fn continue_run(
     }
     let (owned, admitted) = tokio::task::spawn_blocking(move || {
         let admitted = owned.bind_continuation_context(admitted)?;
-        Ok::<_, um_execution::LocalRunDirectoryError>((owned, admitted))
+        Ok::<_, useful_execution::LocalRunDirectoryError>((owned, admitted))
     })
     .await
     .map_err(anyhow::Error::new)?
@@ -738,7 +738,7 @@ enum Probed {
 /// the command ends, a resolved wait or an abandoned run continues, and anything else is
 /// refused.
 async fn probe(
-    config: um_execution::PresentationConfig,
+    config: useful_execution::PresentationConfig,
     requested: &Path,
     command: &'static str,
 ) -> Result<Probed, super::super::super::CommandFailure> {
@@ -811,7 +811,7 @@ async fn probe(
         }
         WaitInspection::Continued { edge } => Ok(Probed::Continue(Selection::Edge(edge))),
         WaitInspection::RuleInvalid { .. } => refuse(
-            um_execution::RuleError::CODE,
+            useful_execution::RuleError::CODE,
             "The wait's rule is not a conjunction of supported equalities; continue the run with --from STEP.",
         ),
         // REQ-CONTINUE-74: a condition that cannot be read is refused, never reported held.
@@ -883,10 +883,10 @@ fn repaired_child(
 pub(super) fn adopted_repair(
     pending: &PendingLocalContinuation,
     step: &str,
-    wait: &um_execution::WaitRecord,
-    control: Option<um_execution::ControlEvent>,
+    wait: &useful_execution::WaitRecord,
+    control: Option<useful_execution::ControlEvent>,
 ) -> anyhow::Result<Option<ChildRecovery>> {
-    if wait.kind != um_execution::WaitKind::Repair
+    if wait.kind != useful_execution::WaitKind::Repair
         || wait.then != step
         || wait.step.first().and_then(serde_json::Value::as_str) != Some(step)
     {
@@ -925,8 +925,10 @@ pub(super) fn adopted_repair(
             error.code.message()
         )
     })?;
-    if !matches!(child.recovery, um_execution::LocalRecoveryStatus::Settled)
-        || !child.status_state.succeeded_after(&wait.since)?
+    if !matches!(
+        child.recovery,
+        useful_execution::LocalRecoveryStatus::Settled
+    ) || !child.status_state.succeeded_after(&wait.since)?
     {
         return Ok(None);
     }
@@ -938,7 +940,7 @@ pub(super) fn adopted_repair(
 }
 
 fn refusal(
-    config: &um_execution::PresentationConfig,
+    config: &useful_execution::PresentationConfig,
     leaf: ExecutionLeaf,
     pending: &PendingLocalContinuation,
     code: &'static str,
@@ -955,14 +957,14 @@ fn refusal(
 /// Reports a resume that created no attempt and exits 0: a held wait (REQ-CONTINUE-74),
 /// with `--json` the waiting document, or a withdrawn run (REQ-CONTINUE-75).
 fn write_unattempted(
-    config: &um_execution::PresentationConfig,
+    config: &useful_execution::PresentationConfig,
     command: &'static str,
     outcome: &'static str,
     run_directory: &Path,
     attempt_number: u64,
     wait: Option<&WaitRecord>,
 ) -> super::super::super::CommandResult {
-    if config.mode() == um_execution::PresentationMode::Json {
+    if config.mode() == useful_execution::PresentationMode::Json {
         let run_directory = run_directory
             .to_str()
             .ok_or_else(|| anyhow::anyhow!("normalized run path is not UTF-8"))?;
@@ -1026,7 +1028,7 @@ pub(super) async fn admit_continuation(
     pending: &PendingLocalContinuation,
     candidate: ContinuationCandidate<'_>,
     cancellation: &CancellationSource,
-    output: (&um_execution::PresentationConfig, ExecutionLeaf),
+    output: (&useful_execution::PresentationConfig, ExecutionLeaf),
 ) -> Result<(AdmittedWorkflow, Vec<UntestedHarnessAdvisory>), Unadmitted> {
     admit_continuation_in(pending, candidate, None, cancellation, output).await
 }
@@ -1036,9 +1038,9 @@ pub(super) async fn admit_continuation(
 pub(super) async fn admit_continuation_in(
     pending: &PendingLocalContinuation,
     candidate: ContinuationCandidate<'_>,
-    environment: Option<um_execution::EnvironmentSnapshot>,
+    environment: Option<useful_execution::EnvironmentSnapshot>,
     cancellation: &CancellationSource,
-    (config, leaf): (&um_execution::PresentationConfig, ExecutionLeaf),
+    (config, leaf): (&useful_execution::PresentationConfig, ExecutionLeaf),
 ) -> Result<(AdmittedWorkflow, Vec<UntestedHarnessAdvisory>), Unadmitted> {
     let ContinuationCandidate {
         workflow,
@@ -1049,7 +1051,7 @@ pub(super) async fn admit_continuation_in(
     } = candidate;
     let selection = pending.partition(workflow, from);
     let input_admission_failures =
-        um_execution::local_continuation_input_failures(workflow, &inputs);
+        useful_execution::local_continuation_input_failures(workflow, &inputs);
     // Graph selection is independent of predecessor dispositions. Continue collecting
     // applicable profile and Git-admission failures even if inheritance was rejected.
     let candidate_reexecuted = pending.candidate_reexecuted_steps(workflow, from);
@@ -1079,7 +1081,7 @@ pub(super) async fn admit_continuation_in(
         None => context,
     };
     let untested_advisories = context.untested_harness_advisories();
-    let rejection = |admission: &[&um_execution::AdmissionFailure]| {
+    let rejection = |admission: &[&useful_execution::AdmissionFailure]| {
         Unadmitted::Rejected(
             continuation_output(config.clone(), leaf, pending.run_directory())
                 .render_continuation_admission_rejection(
@@ -1111,7 +1113,7 @@ pub(super) async fn admit_continuation_in(
                     .filter(|failure| {
                         installation_failures.is_empty()
                             || failure.kind()
-                                != um_execution::AdmissionFailureKind::AgentStepRuntimeUnsupported
+                                != useful_execution::AdmissionFailureKind::AgentStepRuntimeUnsupported
                     })
                     .collect::<Vec<_>>();
                 return Err(rejection(&admission_failures));
@@ -1154,7 +1156,7 @@ async fn error_after_settlement(
 async fn diagnose_after_settlement(
     pending: PendingLocalContinuation,
     signal_task: &super::create::SignalObservation,
-    error: um_execution::LocalRunDirectoryError,
+    error: useful_execution::LocalRunDirectoryError,
 ) -> super::super::super::CommandResult {
     settle(pending, signal_task).await?;
     super::create::diagnose(error)
@@ -1167,7 +1169,7 @@ async fn diagnose_after_settlement(
 pub(super) struct Unattempted {
     run_directory: PathBuf,
     attempt_number: u64,
-    mirror: Option<um_execution::Mirror>,
+    mirror: Option<useful_execution::Mirror>,
     output: WorkflowRunOutput<io::Stdout, io::Stderr>,
 }
 
@@ -1194,9 +1196,9 @@ impl Unattempted {
 async fn end_continuation_withdrawn(
     pending: PendingLocalContinuation,
     signal_task: &super::create::SignalObservation,
-    config: &um_execution::PresentationConfig,
+    config: &useful_execution::PresentationConfig,
     leaf: ExecutionLeaf,
-    end: impl FnOnce(PendingLocalContinuation) -> Result<(), um_execution::LocalRunDirectoryError>
+    end: impl FnOnce(PendingLocalContinuation) -> Result<(), useful_execution::LocalRunDirectoryError>
     + Send
     + 'static,
 ) -> super::super::super::CommandResult {
@@ -1222,7 +1224,7 @@ pub(super) async fn end_withdrawn<P: Send + 'static>(
     pending: P,
     unattempted: Unattempted,
     signal_task: &super::create::SignalObservation,
-    config: &um_execution::PresentationConfig,
+    config: &useful_execution::PresentationConfig,
     leaf: ExecutionLeaf,
     end: impl FnOnce(P) -> Result<(), LocalRetryBeginError> + Send + 'static,
 ) -> super::super::super::CommandResult {

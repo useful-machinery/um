@@ -960,7 +960,7 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
             ),
             EnvironmentSnapshot::new([
                 ("PATH", "/admitted/bin"),
-                ("UM_INHERITED", "must be removed"),
+                ("USEFUL_INHERITED", "must be removed"),
             ]),
             CancellationPolicy::new(cancellation, Duration::from_secs(15)),
         ),
@@ -1038,7 +1038,7 @@ fn admission_uses_only_the_resolved_snapshot_and_leaves_the_execution_root_uncha
         admitted
             .execution()
             .environment()
-            .variable(std::ffi::OsStr::new("UM_INHERITED"))
+            .variable(std::ffi::OsStr::new("USEFUL_INHERITED"))
             .is_none()
     );
     assert_eq!(
@@ -1604,9 +1604,9 @@ fn cloud_source_revision_replaces_inherited_reserved_values_while_local_has_none
     let fixture = WorkflowFixture::new(COMMAND_WORKFLOW);
     let environment = EnvironmentSnapshot::new([
         ("PATH", "/bin"),
-        ("UM_SOURCE_BRANCH", "inherited-branch"),
-        ("UM_SOURCE_COMMIT_OID", "inherited-commit"),
-        ("UM_OTHER", "inherited-other"),
+        ("USEFUL_SOURCE_BRANCH", "inherited-branch"),
+        ("USEFUL_SOURCE_COMMIT_OID", "inherited-commit"),
+        ("USEFUL_OTHER", "inherited-other"),
     ]);
     let context = ExecutionContext::new(
         fixture.execution_root.clone(),
@@ -1620,7 +1620,7 @@ fn cloud_source_revision_replaces_inherited_reserved_values_while_local_has_none
         context.clone(),
     )
     .unwrap();
-    for name in ["UM_SOURCE_BRANCH", "UM_SOURCE_COMMIT_OID"] {
+    for name in ["USEFUL_SOURCE_BRANCH", "USEFUL_SOURCE_COMMIT_OID"] {
         assert!(
             local
                 .execution()
@@ -1644,26 +1644,26 @@ fn cloud_source_revision_replaces_inherited_reserved_values_while_local_has_none
         cloud
             .execution()
             .environment()
-            .variable(OsStr::new("UM_SOURCE_BRANCH")),
+            .variable(OsStr::new("USEFUL_SOURCE_BRANCH")),
         Some(OsStr::new("refs/heads/exact-source"))
     );
     assert_eq!(
         cloud
             .execution()
             .environment()
-            .variable(OsStr::new("UM_SOURCE_COMMIT_OID")),
+            .variable(OsStr::new("USEFUL_SOURCE_COMMIT_OID")),
         Some(OsStr::new("0123456789abcdef0123456789abcdef01234567"))
     );
     assert!(
         cloud
             .execution()
             .environment()
-            .variable(OsStr::new("UM_OTHER"))
+            .variable(OsStr::new("USEFUL_OTHER"))
             .is_none()
     );
 }
 
-const REQUIRED_TOOL: &str = "no-such-tool-for-um-tests";
+const REQUIRED_TOOL: &str = "no-such-tool-for-useful-tests";
 
 fn tree_root_workflow(programs: &str) -> String {
     format!(
@@ -1734,7 +1734,7 @@ fn a_tree_run_rejects_a_missing_required_tool_by_name() {
 
 // REQ-WFEXEC-53
 #[test]
-fn a_bound_tree_copy_leads_path_and_sets_um_workflow_root() {
+fn a_bound_tree_copy_leads_path_and_sets_useful_workflow_root() {
     let fixture = WorkflowFixture::new(&tree_root_workflow("[bin, scripts]"));
     write_program(&fixture.source_root.join("bin").join(REQUIRED_TOOL), 0o755);
     write_program(&fixture.source_root.join("scripts/report"), 0o755);
@@ -1757,7 +1757,7 @@ fn a_bound_tree_copy_leads_path_and_sets_um_workflow_root() {
         environment_variable(&without_tree, "PATH"),
         Some(OsStr::new("/usr/bin:/bin"))
     );
-    assert!(environment_variable(&without_tree, "UM_WORKFLOW_ROOT").is_none());
+    assert!(environment_variable(&without_tree, "USEFUL_WORKFLOW_ROOT").is_none());
 
     let admitted = admit_local_workflow(
         fixture.resolve(),
@@ -1779,20 +1779,23 @@ fn a_bound_tree_copy_leads_path_and_sets_um_workflow_root() {
     expected.push(":/usr/bin:/bin");
     assert_eq!(environment_variable(&bound, "PATH"), Some(&*expected));
     assert_eq!(
-        environment_variable(&bound, "UM_WORKFLOW_ROOT"),
+        environment_variable(&bound, "USEFUL_WORKFLOW_ROOT"),
         Some(copy.as_os_str())
     );
 }
 
 // REQ-WFEXEC-22
 #[test]
-fn a_launching_um_workflow_root_never_reaches_a_step() {
+fn a_launching_useful_workflow_root_never_reaches_a_step() {
     let fixture = WorkflowFixture::new(&tree_root_workflow("[bin]"));
     write_program(&fixture.source_root.join("bin").join(REQUIRED_TOOL), 0o755);
     let context = ExecutionContext::new(
         fixture.execution_root.clone(),
         default_execution_policy_limits(1),
-        EnvironmentSnapshot::new([("PATH", "/bin"), ("UM_WORKFLOW_ROOT", "/launching/tree")]),
+        EnvironmentSnapshot::new([
+            ("PATH", "/bin"),
+            ("USEFUL_WORKFLOW_ROOT", "/launching/tree"),
+        ]),
         CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
     );
 
@@ -1802,7 +1805,7 @@ fn a_launching_um_workflow_root_never_reaches_a_step() {
         context.clone(),
     )
     .unwrap();
-    assert!(environment_variable(&without_tree, "UM_WORKFLOW_ROOT").is_none());
+    assert!(environment_variable(&without_tree, "USEFUL_WORKFLOW_ROOT").is_none());
 
     let admitted = admit_local_workflow(
         fixture.resolve(),
@@ -1810,11 +1813,11 @@ fn a_launching_um_workflow_root_never_reaches_a_step() {
         context.with_tree(validated_tree(&fixture.source_root)),
     )
     .unwrap();
-    assert!(environment_variable(&admitted, "UM_WORKFLOW_ROOT").is_none());
+    assert!(environment_variable(&admitted, "USEFUL_WORKFLOW_ROOT").is_none());
     let copy = fixture.execution_root.join("copy");
     let bound = admitted.with_tree_copy(&copy).unwrap();
     assert_eq!(
-        environment_variable(&bound, "UM_WORKFLOW_ROOT"),
+        environment_variable(&bound, "USEFUL_WORKFLOW_ROOT"),
         Some(copy.as_os_str())
     );
 }
@@ -1827,8 +1830,8 @@ fn direct_commit_selection_omits_workspace_branch_but_retains_definition_provena
         fixture.execution_root.clone(),
         default_execution_policy_limits(1),
         EnvironmentSnapshot::new([
-            ("UM_SOURCE_BRANCH", "untrusted"),
-            ("UM_WORKFLOW_SOURCE_COMMIT_OID", "untrusted"),
+            ("USEFUL_SOURCE_BRANCH", "untrusted"),
+            ("USEFUL_WORKFLOW_SOURCE_COMMIT_OID", "untrusted"),
         ]),
         CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
     )
@@ -1846,19 +1849,19 @@ fn direct_commit_selection_omits_workspace_branch_but_retains_definition_provena
     let environment = admitted.execution().environment();
     assert!(
         environment
-            .variable(OsStr::new("UM_SOURCE_BRANCH"))
+            .variable(OsStr::new("USEFUL_SOURCE_BRANCH"))
             .is_none()
     );
     assert_eq!(
-        environment.variable(OsStr::new("UM_SOURCE_COMMIT_OID")),
+        environment.variable(OsStr::new("USEFUL_SOURCE_COMMIT_OID")),
         Some(OsStr::new("fedcba9876543210fedcba9876543210fedcba98"))
     );
     assert_eq!(
-        environment.variable(OsStr::new("UM_WORKFLOW_SOURCE_BRANCH")),
+        environment.variable(OsStr::new("USEFUL_WORKFLOW_SOURCE_BRANCH")),
         Some(OsStr::new("main"))
     );
     assert_eq!(
-        environment.variable(OsStr::new("UM_WORKFLOW_SOURCE_COMMIT_OID")),
+        environment.variable(OsStr::new("USEFUL_WORKFLOW_SOURCE_COMMIT_OID")),
         Some(OsStr::new("0123456789abcdef0123456789abcdef01234567"))
     );
 }
@@ -1876,7 +1879,7 @@ fn workflow_admission_only_forwards_base_and_explicit_safe_names() {
         ("GIT_SSH_COMMAND", "local-ssh"),
         ("GH_TOKEN", "local-gh-token"),
         ("GITHUB_TOKEN", "local-github-token"),
-        ("UM_SOURCE_TOKEN_FD", "9"),
+        ("USEFUL_SOURCE_TOKEN_FD", "9"),
     ]);
 
     let filtered = environment.for_workflow_children(&["VISIBLE".to_owned()].into());
@@ -1897,7 +1900,7 @@ fn workflow_admission_only_forwards_base_and_explicit_safe_names() {
         "GIT_SSH_COMMAND",
         "GH_TOKEN",
         "GITHUB_TOKEN",
-        "UM_SOURCE_TOKEN_FD",
+        "USEFUL_SOURCE_TOKEN_FD",
     ] {
         assert!(filtered.variable(OsStr::new(name)).is_none(), "{name}");
     }
@@ -1909,10 +1912,10 @@ fn workflow_admission_forwards_only_the_declared_grant_token_names() {
     let environment = EnvironmentSnapshot::new([
         ("PATH", "/bin"),
         ("GH_TOKEN", "launching-gh-token"),
-        ("UM_LINEAR_ACCESS_TOKEN", "launching-linear-token"),
-        ("UM_LINEAR_ACCESS_TOKEN_FILE", "/launching/linear-token"),
+        ("USEFUL_LINEAR_ACCESS_TOKEN", "launching-linear-token"),
+        ("USEFUL_LINEAR_ACCESS_TOKEN_FILE", "/launching/linear-token"),
     ]);
-    let declared = ["GH_TOKEN", "UM_LINEAR_ACCESS_TOKEN_FILE"]
+    let declared = ["GH_TOKEN", "USEFUL_LINEAR_ACCESS_TOKEN_FILE"]
         .map(str::to_owned)
         .into();
 
@@ -1922,7 +1925,7 @@ fn workflow_admission_forwards_only_the_declared_grant_token_names() {
             .variables()
             .keys()
             .collect::<Vec<_>>(),
-        ["GH_TOKEN", "PATH", "UM_LINEAR_ACCESS_TOKEN_FILE"]
+        ["GH_TOKEN", "PATH", "USEFUL_LINEAR_ACCESS_TOKEN_FILE"]
     );
     assert_eq!(
         environment
@@ -1940,7 +1943,7 @@ fn node_narrowing_drops_only_root_names_the_node_omits() {
     let environment = EnvironmentSnapshot::new([
         ("PATH", "/bin"),
         ("TMPDIR", "/tmp/run"),
-        ("UM_WORKFLOW_ROOT", "/tree"),
+        ("USEFUL_WORKFLOW_ROOT", "/tree"),
         ("VISIBLE", "kept"),
         ("HIDDEN_FROM_NODE", "dropped"),
     ]);
@@ -1952,7 +1955,7 @@ fn node_narrowing_drops_only_root_names_the_node_omits() {
 
     assert_eq!(
         narrowed.variables().keys().collect::<Vec<_>>(),
-        ["PATH", "TMPDIR", "UM_WORKFLOW_ROOT", "VISIBLE"]
+        ["PATH", "TMPDIR", "USEFUL_WORKFLOW_ROOT", "VISIBLE"]
     );
 }
 
@@ -2002,7 +2005,7 @@ fn assert_failure(
 // REQ-OUTPUTS-13
 #[test]
 fn default_policy_admits_the_capture_and_agent_payload_limits() {
-    // The default policy is what `um workflow run create` and the runner hand to admission.
+    // The default policy is what `useful workflow run create` and the runner hand to admission.
     let fixture = WorkflowFixture::new(AGENT_WORKFLOW);
     let admitted = admit_workflow(
         fixture.resolve(),

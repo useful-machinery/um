@@ -1,7 +1,7 @@
-//! `um auth credential`: the member's provider grants and agent logins, each with its
+//! `useful auth credential`: the member's provider grants and agent logins, each with its
 //! availability and next action (REQ-GRANT-55). The group holds no state of its own: it
 //! reads the grant and agent-login lists and maps what Cloud returns through the projection
-//! `um grant list` shares.
+//! `useful grant list` shares.
 
 mod output;
 mod status;

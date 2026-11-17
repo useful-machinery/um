@@ -6,7 +6,7 @@ use time::OffsetDateTime;
 const MINIMUM_RETRY_DELAY_MILLISECONDS: u64 = 50;
 const RETRY_JITTER_MILLISECONDS: u64 = 100;
 #[cfg(feature = "test-fixtures")]
-const TEST_POLL_INTERVAL_MILLISECONDS: &str = "UM_TEST_POLL_INTERVAL_MILLISECONDS";
+const TEST_POLL_INTERVAL_MILLISECONDS: &str = "USEFUL_TEST_POLL_INTERVAL_MILLISECONDS";
 
 #[expect(
     clippy::disallowed_methods,

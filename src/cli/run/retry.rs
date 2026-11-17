@@ -5,11 +5,11 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::Args;
 use serde::Serialize;
-use um_api::{
+use useful_api::{
     RetryConflict, RunFailure, RunRetryFailureCode, RunRetryReceipt, RunRetryRejection,
     RunRetryState, UnreachableCategory,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 use crate::exit_code::ExitCode;
 
@@ -55,7 +55,7 @@ struct ResultDocument<'a> {
 
 impl Command {
     pub(super) fn execute(self, deployment: Deployment) -> super::super::CommandResult {
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate Cloud run retry request identity")?;
         let signal_deployment = deployment.clone();
         let timeout_deployment = deployment.clone();
@@ -548,7 +548,7 @@ fn render_with_holder(
                 Some("subject_busy") =>
                     "Wait for the holding run to finish, then request the retry again.",
                 Some("subject_settled") => {
-                    "Release the holding run with `um workflow run release --cloud`, then request the retry again."
+                    "Release the holding run with `useful workflow run release --cloud`, then request the retry again."
                 }
                 _ => "Show the run and known request before requesting another retry.",
             }

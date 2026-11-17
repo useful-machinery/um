@@ -57,11 +57,11 @@ use super::validated::{
 use super::value::CapturedValue;
 use super::workspace_snapshot::WorkspaceSnapshotV1;
 
-const COMMAND: &str = "um workflow run create";
-const RETRY_COMMAND: &str = "um workflow run retry";
-const RESUME_COMMAND: &str = "um workflow run resume";
-const RESTART_COMMAND: &str = "um workflow run restart";
-const UPGRADE_COMMAND: &str = "um workflow run upgrade";
+const COMMAND: &str = "useful workflow run create";
+const RETRY_COMMAND: &str = "useful workflow run retry";
+const RESUME_COMMAND: &str = "useful workflow run resume";
+const RESTART_COMMAND: &str = "useful workflow run restart";
+const UPGRADE_COMMAND: &str = "useful workflow run upgrade";
 const RESULT_FILE: &str = "result.json";
 const EXPORT_DIRECTORY: &str = "exports";
 const STAGING_ATTEMPTS: usize = 16;
@@ -808,13 +808,13 @@ impl WorkflowRunTerminalResultV1 {
         self.command = RESUME_COMMAND;
     }
 
-    /// Names `um workflow run restart`, whose successor's first own attempt this is
+    /// Names `useful workflow run restart`, whose successor's first own attempt this is
     /// (REQ-LOCALRUN-194).
     pub fn mark_restart(&mut self) {
         self.command = RESTART_COMMAND;
     }
 
-    /// Names `um workflow run upgrade`, which starts no attempt of its own; an attempt of an
+    /// Names `useful workflow run upgrade`, which starts no attempt of its own; an attempt of an
     /// upgraded successor is a `resume` or `retry` (REQ-LOCALRUN-197).
     pub fn mark_upgrade(&mut self) {
         self.command = UPGRADE_COMMAND;

@@ -1397,7 +1397,7 @@ async fn widget_panic_restores_pty_and_reports_on_stderr() {
     use std::os::unix::ffi::OsStrExt as _;
     use std::process::{Command, Stdio};
 
-    if std::env::var_os("UM_WIDGET_PANIC_CHILD").is_some() {
+    if std::env::var_os("USEFUL_WIDGET_PANIC_CHILD").is_some() {
         struct PanickingWidget(SystemTerminalBoundary);
         impl TerminalBoundary for PanickingWidget {
             fn setup(&mut self) -> io::Result<Rect> {
@@ -1476,7 +1476,7 @@ async fn widget_panic_restores_pty_and_reports_on_stderr() {
             "workflow::terminal_host::tests::widget_panic_restores_pty_and_reports_on_stderr",
             "--nocapture",
         ])
-        .env("UM_WIDGET_PANIC_CHILD", "1")
+        .env("USEFUL_WIDGET_PANIC_CHILD", "1")
         .stdin(Stdio::from(slave.try_clone().unwrap()))
         .stdout(Stdio::from(slave.try_clone().unwrap()))
         .stderr(Stdio::piped())
@@ -1886,7 +1886,7 @@ async fn full_view_renders_header_steps_inspector_and_selected_log_tail() {
     let clock = FixedClock {
         now: ObservationTime {
             utc: time::OffsetDateTime::UNIX_EPOCH,
-            monotonic: um_support::monotonic_now(),
+            monotonic: useful_support::monotonic_now(),
         },
     };
     let view = WorkflowRunViewModel::new(
@@ -2941,7 +2941,7 @@ fn scripted_host_view() -> (
     let workflow = resolution::resolve(temporary.path(), Path::new("workflow.yaml")).unwrap();
     let now = ObservationTime {
         utc: time::OffsetDateTime::UNIX_EPOCH,
-        monotonic: um_support::monotonic_now(),
+        monotonic: useful_support::monotonic_now(),
     };
     let clock = FixedClock { now };
     let view = WorkflowRunViewModel::new(&workflow, 1, RunTimingObservation::new(now), clock);

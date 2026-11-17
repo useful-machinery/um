@@ -10,9 +10,9 @@ use zeroize::Zeroizing;
 use crate::cli::runner::doctor::roots::Roots;
 use crate::cli::{CommandFailure, HttpOptions, NoAuthenticationArgs, OrganizationArg};
 use crate::exit_code::ExitCode;
-use um_api::{MemberGrant, MemberGrantApi, MemberGrantFailure, MemberGrantProvider};
-use um_human_auth::Deployment;
-use um_runner::{CredentialKind, WorkflowCredentials};
+use useful_api::{MemberGrant, MemberGrantApi, MemberGrantFailure, MemberGrantProvider};
+use useful_human_auth::Deployment;
+use useful_runner::{CredentialKind, WorkflowCredentials};
 
 use super::super::secret_file::FileMode;
 use super::consent::{Consent, ConsentProvider, Ended, Front, Options, write_refusal};
@@ -120,8 +120,8 @@ pub(super) struct Command {
     options: Options,
 }
 
-/// What the flow of `um grant create` reads of the command that runs it, besides the providers:
-/// `um grant create` builds it from its options, and `um runner doctor --workflow --connect`
+/// What the flow of `useful grant create` reads of the command that runs it, besides the providers:
+/// `useful grant create` builds it from its options, and `useful runner doctor --workflow --connect`
 /// from its own, taking the defaults for the rest (INV-CLI-15).
 #[derive(Default)]
 pub(in crate::cli) struct Flow<'a> {
@@ -157,7 +157,7 @@ impl Ending {
     }
 }
 
-/// A provider `um grant create` signs in to.
+/// A provider `useful grant create` signs in to.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum ProviderArg {
     Github,
@@ -169,7 +169,7 @@ enum ProviderArg {
     Codex,
 }
 
-/// The order `um grant create` signs in to several providers in (REQ-GRANT-75), that of
+/// The order `useful grant create` signs in to several providers in (REQ-GRANT-75), that of
 /// [`PROVIDERS`], whose wire names are the values of [`ProviderArg`]: the OAuth providers first,
 /// whose consents need only a browser anywhere, then the coding agents, whose sign-ins run on
 /// this machine.
@@ -226,13 +226,13 @@ enum SignIn {
 }
 
 /// A coding agent's login: read from a file or stream the member names, before any network
-/// use, or made by a sign-in `um` runs in a directory it made once the command has settled
+/// use, or made by a sign-in `useful` runs in a directory it made once the command has settled
 /// what the login replaces (INV-CLI-13).
 enum Login {
     Read(Zeroizing<Vec<u8>>),
     /// `codex` with these arguments.
     Codex(&'static [&'static str]),
-    /// `claude setup-token` on a terminal `um` owns.
+    /// `claude setup-token` on a terminal `useful` owns.
     ClaudeCode,
 }
 
@@ -576,7 +576,7 @@ impl Command {
                 option,
                 &format!(
                     "A {name} grant is made by the coding agent's own sign-in, which has no \
-                     consent to wait for:\n  um grant create {name}"
+                     consent to wait for:\n  useful grant create {name}"
                 ),
             ));
         }
@@ -609,7 +609,7 @@ impl Command {
                     return Err(unsuited(
                         option,
                         "Run Claude Code's sign-in, or import the token claude setup-token \
-                         printed with --token-file PATH:\n  um grant create claude_code",
+                         printed with --token-file PATH:\n  useful grant create claude_code",
                     ));
                 }
                 return Ok(SignIn::Native(match &self.token_file {
@@ -633,7 +633,7 @@ impl Command {
                 option,
                 &format!(
                     "A {name} grant is made by the provider's consent and is yours alone:\n  \
-                     um grant create {name}"
+                     useful grant create {name}"
                 ),
             ));
         }
@@ -648,7 +648,7 @@ impl Command {
         let roots = Roots::find(
             &self.workflows,
             self.source_root.as_deref(),
-            "um grant create --workflow FILE --source-root ROOT",
+            "useful grant create --workflow FILE --source-root ROOT",
         )?;
         let Some(credentials) = roots.derive(&roots.origin_remote(), self.options.json)? else {
             return Ok(ExitCode::GeneralFailure);
@@ -670,8 +670,8 @@ impl Flow<'_> {
         }
     }
 
-    /// The flow over a derivation of workflow files, which `um grant create --workflow` and
-    /// `um runner doctor --workflow --connect` both run (INV-CLI-15): signs in to the providers
+    /// The flow over a derivation of workflow files, which `useful grant create --workflow` and
+    /// `useful runner doctor --workflow --connect` both run (INV-CLI-15): signs in to the providers
     /// the files call for that the member lacks (REQ-GRANT-76), and to those whose every held
     /// grant needs reconnecting once their replacement is settled (REQ-GRANT-79). A tree that
     /// calls for no provider is not taken to Cloud. Each replacement is settled once the grants
@@ -884,7 +884,7 @@ impl Flow<'_> {
     /// the plan: a settled one is signed in to again, its consent run or its coding agent's
     /// sign-in stored as its grant's next generation, and reported `replaced`, and one not
     /// settled is passed over as `reconnect_required` (REQ-GRANT-79). A sign-in that fails
-    /// does not stop the ones after it; a signal does, whether `um` received it or it ended a
+    /// does not stop the ones after it; a signal does, whether `useful` received it or it ended a
     /// coding agent's sign-in on its own terminal. A coding agent the deployment does not serve,
     /// or one no organization was resolved for, is reported and passed over without a sign-in.
     /// Exits 0 when each provider ended with a grant or was passed over, as unavailable, for
@@ -1062,7 +1062,8 @@ impl Flow<'_> {
             }
         };
         let provider = provider.grant();
-        let key = um_support::generate_idempotency_key().context("generate grant request key")?;
+        let key =
+            useful_support::generate_idempotency_key().context("generate grant request key")?;
         let stored = self.with_api(deployment, |api| {
             replayed(|| match target {
                 Some(grant) => api.replace(&grant.id, &material, &key),
@@ -1116,7 +1117,7 @@ impl Flow<'_> {
                 api,
                 self.organization,
                 name,
-                &format!("um grant create {name} --organization ORGANIZATION"),
+                &format!("useful grant create {name} --organization ORGANIZATION"),
             )? {
                 Ok(organization) => organization,
                 Err(refusal) => return Ok(Err(refusal)),

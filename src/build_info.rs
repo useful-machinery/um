@@ -5,10 +5,11 @@
         reason = "this is the canonical fallback for the resolved build version"
     )
 )]
-pub(crate) const VERSION: &str = select_value(option_env!("UM_VERSION"), env!("CARGO_PKG_VERSION"));
+pub(crate) const VERSION: &str =
+    select_value(option_env!("USEFUL_VERSION"), env!("CARGO_PKG_VERSION"));
 pub(crate) const BUILD_IDENTITY: &str = select_value(
-    option_env!("UM_RELEASE_COMMIT"),
-    select_value(option_env!("UM_BUILD_IDENTITY"), "unknown"),
+    option_env!("USEFUL_RELEASE_COMMIT"),
+    select_value(option_env!("USEFUL_BUILD_IDENTITY"), "unknown"),
 );
 
 const fn select_value<'a>(injected: Option<&'a str>, fallback: &'a str) -> &'a str {

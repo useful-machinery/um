@@ -150,7 +150,7 @@ fn signup_human_with_timeout(
             }
         }
         if attempt + 1 < MAX_ATTEMPTS {
-            um_support::sleep(um_support::short_retry_delay());
+            useful_support::sleep(useful_support::short_retry_delay());
         }
     }
 

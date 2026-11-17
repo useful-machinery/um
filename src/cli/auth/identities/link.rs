@@ -5,11 +5,11 @@ use anyhow::{Context, anyhow};
 use clap::Args;
 
 use crate::exit_code::OutcomeClass;
-use um_api::{ListIdentitiesOutcome, link_identity, list_identities};
-use um_human_auth::AuthorizationError;
-use um_human_auth::Cancellation;
-use um_human_auth::Deployment;
-use um_human_auth::{DeviceFlowError, DeviceFlowOutcome, DeviceFlowPhase};
+use useful_api::{ListIdentitiesOutcome, link_identity, list_identities};
+use useful_human_auth::AuthorizationError;
+use useful_human_auth::Cancellation;
+use useful_human_auth::Deployment;
+use useful_human_auth::{DeviceFlowError, DeviceFlowOutcome, DeviceFlowPhase};
 
 use super::{
     BoundHumanSession, OutputOptions, output, with_bound_human_session, with_human_session_binding,
@@ -96,7 +96,7 @@ impl Command {
             }
         };
 
-        let proof = um_human_auth::identity_proof(
+        let proof = useful_human_auth::identity_proof(
             &client,
             deployment,
             cancellation,
@@ -138,7 +138,7 @@ impl Command {
             }
         };
 
-        let idempotency_key = um_support::generate_idempotency_key()
+        let idempotency_key = useful_support::generate_idempotency_key()
             .context("generate identity-link request identity")?;
         let outcome =
             with_bound_human_session(&client, deployment, &acting_session, |access_token| {
@@ -203,10 +203,10 @@ impl Command {
                 .cancelled(deployment.fingerprint().api_url())
                 .map_err(Into::into);
         };
-        let client = um_api::HttpClient::new(self.common.http.transport_policy())
+        let client = useful_api::HttpClient::new(self.common.http.transport_policy())
             .map_err(|error| anyhow!(error))
             .context("prepare identity networking")?;
-        let idempotency_key = um_support::generate_idempotency_key()
+        let idempotency_key = useful_support::generate_idempotency_key()
             .context("generate identity-link request identity")?;
         // This ownership claim is the authorization boundary for dispatch. The network send
         // cannot be atomic with an OS signal, so a claim that wins preserves bounded completion.
@@ -230,7 +230,7 @@ impl Command {
             .api_outcome(
                 deployment.fingerprint().api_url(),
                 &outcome,
-                um_human_auth::LocalCredentialState::Retained,
+                useful_human_auth::LocalCredentialState::Retained,
                 true,
             )
             .map_err(Into::into)

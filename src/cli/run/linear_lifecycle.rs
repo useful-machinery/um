@@ -4,9 +4,9 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::exit_code::ExitCode;
-use um_api::{RunFailure, RunLinearLifecycle, RunLinearLifecycleUpdate};
-use um_execution::visible_text;
-use um_human_auth::Deployment;
+use useful_api::{RunFailure, RunLinearLifecycle, RunLinearLifecycleUpdate};
+use useful_execution::visible_text;
+use useful_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Manage a run's Linear state updates";
 const NAME: &str = "linear";

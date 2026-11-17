@@ -1,4 +1,4 @@
-//! The run mirror end to end (REQ-LOCALRUN-191, REQ-LOCALRUN-192, REQ-LOCALRUN-186): `um`
+//! The run mirror end to end (REQ-LOCALRUN-191, REQ-LOCALRUN-192, REQ-LOCALRUN-186): `useful`
 //! performs a root workflow's `mirror` writes against a loopback stand-in for Linear's GraphQL
 //! API and records each under the run's `mirror/`.
 
@@ -61,7 +61,7 @@ bindings:
 mirror:
   linear:
     issue: inputs.ticket
-    onStart: {comment: "Engineering started by {{operator}}. Run {{run.id}}: `um workflow run show {{run.id}}`"}
+    onStart: {comment: "Engineering started by {{operator}}. Run {{run.id}}: `useful workflow run show {{run.id}}`"}
     onStage: {comment: "{{stage}}: {{summary}}"}
     onWait: {comment: "Waiting for {{wait.kind}}: {{wait.summary}}"}
     onOutcome:
@@ -133,9 +133,9 @@ impl LinearStub {
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
                 // The thread is detached and holds the listener for the whole test, so a panic
-                // here would release the address while the test's `um` processes still aim at it
+                // here would release the address while the test's `useful` processes still aim at it
                 // (INV-TESTING-22): an unreadable connection is skipped and the next one served.
-                let request = match um_test_support::try_read_request(&mut stream) {
+                let request = match useful_test_support::try_read_request(&mut stream) {
                     Ok(request) => request,
                     Err(error) => {
                         eprintln!("LinearStub skipped an unreadable request: {error}");
@@ -266,7 +266,7 @@ impl LinearStub {
     pub(super) fn point<'a>(&self, command: &'a mut Command) -> &'a mut Command {
         command
             .env("LINEAR_API_KEY", "test")
-            .env("UM_LINEAR_API_URL", &self.base)
+            .env("USEFUL_LINEAR_API_URL", &self.base)
             .env("NO_PROXY", "127.0.0.1")
             .env("no_proxy", "127.0.0.1")
             .env("USER", MIRROR_OPERATOR)
@@ -349,7 +349,7 @@ impl StubState {
 /// when the body is not JSON), or `None` when the peer closed before a complete head or the
 /// request line names no path.
 fn parse_request(request: &[u8]) -> Option<(String, String, Value)> {
-    let (head, body) = um_test_support::split_request(request)?;
+    let (head, body) = useful_test_support::split_request(request)?;
     let head = String::from_utf8_lossy(head);
     let path = head.split(' ').nth(1)?.to_owned();
     let authorization = head
@@ -388,7 +388,7 @@ fn engineering_tree(mirrored: bool) -> Tree {
     tree
 }
 
-/// `um workflow run create` of the definition for `ticket`, its command adjusted by `adjust`:
+/// `useful workflow run create` of the definition for `ticket`, its command adjusted by `adjust`:
 /// the run directory.
 fn create(
     published: &Published,
@@ -399,7 +399,7 @@ fn create(
     PathBuf::from(terminal["runDirectory"].as_str().unwrap())
 }
 
-/// The `um workflow run create --json` command of the definition for `ticket`.
+/// The `useful workflow run create --json` command of the definition for `ticket`.
 fn creation(published: &Published, ticket: &str) -> Command {
     let execution_root = published.execution_root();
     published.command(&[
@@ -576,15 +576,15 @@ fn a_failed_mirror_write_is_recorded_and_never_fails_the_run() {
 }
 
 /// The variable naming the file that holds the run's Linear grant token (REQ-LOCALRUN-192).
-const TOKEN_FILE_VARIABLE: &str = "UM_LINEAR_ACCESS_TOKEN_FILE";
+const TOKEN_FILE_VARIABLE: &str = "USEFUL_LINEAR_ACCESS_TOKEN_FILE";
 
 /// The variable holding the run's Linear grant token (REQ-LOCALRUN-192).
-const TOKEN_VARIABLE: &str = "UM_LINEAR_ACCESS_TOKEN";
+const TOKEN_VARIABLE: &str = "USEFUL_LINEAR_ACCESS_TOKEN";
 
 // REQ-LOCALRUN-192: the mirror writes with the first Linear credential the environment
-// offers, read anew for each hook: the token in the file `UM_LINEAR_ACCESS_TOKEN_FILE` names,
-// sent as `Bearer` before `UM_LINEAR_ACCESS_TOKEN` and `LINEAR_API_KEY`, and sent replaced by
-// a hook after the file is replaced; else `UM_LINEAR_ACCESS_TOKEN` as `Bearer`, a missing
+// offers, read anew for each hook: the token in the file `USEFUL_LINEAR_ACCESS_TOKEN_FILE` names,
+// sent as `Bearer` before `USEFUL_LINEAR_ACCESS_TOKEN` and `LINEAR_API_KEY`, and sent replaced by
+// a hook after the file is replaced; else `USEFUL_LINEAR_ACCESS_TOKEN` as `Bearer`, a missing
 // file being skipped; else `LINEAR_API_KEY` bare.
 #[test]
 fn the_mirror_writes_with_the_first_linear_credential_the_environment_offers() {
@@ -646,10 +646,10 @@ fn the_mirror_writes_with_the_first_linear_credential_the_environment_offers() {
 }
 
 /// The `design` stage's program in `a_failed_state_commit_writes_no_outcome_to_the_mirror`,
-/// run in the execution root: while `um-runs` there names the definition's runs directory, it
+/// run in the execution root: while `useful-runs` there names the definition's runs directory, it
 /// moves the `state.json` of the run that has not exited aside, so the root's next commit, the
-/// step's settlement, finds none, and forgets `um-runs`. It always fails.
-const STATE_MOVING_DESIGN: &str = r#"if [ -e um-runs ]; then for state in "$(cat um-runs)"/*/state.json; do case "$(cat "${state%state.json}run.json")" in *exited*) ;; *) mv "$state" root-state.json ;; esac; done; rm um-runs; fi; exit 1"#;
+/// step's settlement, finds none, and forgets `useful-runs`. It always fails.
+const STATE_MOVING_DESIGN: &str = r#"if [ -e useful-runs ]; then for state in "$(cat useful-runs)"/*/state.json; do case "$(cat "${state%state.json}run.json")" in *exited*) ;; *) mv "$state" root-state.json ;; esac; done; rm useful-runs; fi; exit 1"#;
 
 /// `contents` with its one `from` replaced by `to`.
 fn replaced(contents: &str, from: &str, to: &str) -> String {
@@ -712,7 +712,7 @@ fn a_failed_state_commit_writes_no_outcome_to_the_mirror() {
 
     stub.clear();
     fs::write(
-        execution_root.join("um-runs"),
+        execution_root.join("useful-runs"),
         published.runs_directory().to_str().unwrap(),
     )
     .unwrap();
@@ -847,7 +847,7 @@ fn run_reference_is_the_external_url_else_the_show_command() {
     let id = run_record(&run)["id"].as_str().unwrap().to_owned();
     assert_eq!(
         comments(&stub)[0],
-        format!("Engineering started by {MIRROR_OPERATOR}. Run: um workflow run show {id}")
+        format!("Engineering started by {MIRROR_OPERATOR}. Run: useful workflow run show {id}")
     );
 
     stub.clear();
@@ -1016,13 +1016,13 @@ fn with_a_resolution_record_the_guard_holds_by_state_id() {
     );
 }
 
-/// `um workflow run show --json`'s document.
+/// `useful workflow run show --json`'s document.
 fn shown_document(output: &Output) -> Value {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-/// The `mirror` section of `um workflow run show`'s plain output, which follows `controls`:
+/// The `mirror` section of `useful workflow run show`'s plain output, which follows `controls`:
 /// its lines from its heading to the end.
 fn shown_mirror(output: &Output) -> Vec<String> {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
@@ -1071,7 +1071,7 @@ impl MirroredWaitTree {
         }
     }
 
-    /// `um workflow run ARGS` under the home, pointed at `stub`.
+    /// `useful workflow run ARGS` under the home, pointed at `stub`.
     fn run(&self, stub: &LinearStub, args: &[&str]) -> Output {
         self.run_adjusted(stub, args, |command| command)
     }
@@ -1092,7 +1092,7 @@ impl MirroredWaitTree {
         let mut full = vec!["workflow".to_owned(), "run".to_owned()];
         full.extend(args.iter().map(|arg| (*arg).to_owned()));
         let mut command = isolated_command(&full);
-        command.env("UM_HOME", self.home.path());
+        command.env("USEFUL_HOME", self.home.path());
         stub.point(&mut command);
         command
     }
@@ -1121,7 +1121,7 @@ impl MirroredWaitTree {
         ]);
         let mut command = isolated_command(&full);
         command
-            .env("UM_HOME", self.home.path())
+            .env("USEFUL_HOME", self.home.path())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1177,7 +1177,7 @@ fn a_tickets_lifecycle_is_mirrored_and_show_lists_every_write() {
     let run = tree.waiting(&stub, "AUTO-1");
     let run_id = run_record(&run)["id"].as_str().unwrap().to_owned();
     let start = format!(
-        "Engineering started by {MIRROR_OPERATOR}. Run {run_id}: `um workflow run show {run_id}`"
+        "Engineering started by {MIRROR_OPERATOR}. Run {run_id}: `useful workflow run show {run_id}`"
     );
     assert_eq!(
         comments(&stub),
@@ -1291,7 +1291,7 @@ fn a_live_withdrawn_run_fires_its_withdrawn_outcome_once() {
         "--json".to_owned(),
     ]);
     command
-        .env("UM_HOME", tree.home.path())
+        .env("USEFUL_HOME", tree.home.path())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
@@ -1638,8 +1638,8 @@ fn ending_a_mirrored_waiting_run_without_the_key_is_refused_before_anything_chan
 
 // SC-LOCALRUN-17, REQ-LOCALRUN-204, REQ-LOCALRUN-192: the check before `withdraw` ends a
 // mirrored waiting run is for any Linear credential: a token file that is missing and an
-// empty `UM_LINEAR_ACCESS_TOKEN` are none, so it still refuses, and from a shell whose only
-// credential is `UM_LINEAR_ACCESS_TOKEN` it proceeds and moves the issue with that token.
+// empty `USEFUL_LINEAR_ACCESS_TOKEN` are none, so it still refuses, and from a shell whose only
+// credential is `USEFUL_LINEAR_ACCESS_TOKEN` it proceeds and moves the issue with that token.
 #[test]
 fn ending_a_mirrored_waiting_run_with_only_the_linear_access_token_proceeds() {
     let tree = MirroredWaitTree::publish(MIRRORED_WAIT_HEADER);

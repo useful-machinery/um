@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use um_api::HumanPrincipal;
+use useful_api::HumanPrincipal;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -17,7 +17,7 @@ impl<'a> PrincipalResult<'a> {
         Self::new(&principal.id, "human", principal.display_name.as_deref())
     }
 
-    pub(super) fn from_profile(principal: &'a um_api::PrincipalProfile) -> Self {
+    pub(super) fn from_profile(principal: &'a useful_api::PrincipalProfile) -> Self {
         Self::new(
             &principal.id,
             principal.r#type,

@@ -13,7 +13,7 @@ use rustix::io::Errno;
 use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const TEST_WORKER_EXECUTABLE: &str = "UM_TEST_INTERNAL_WORKER_EXECUTABLE";
+const TEST_WORKER_EXECUTABLE: &str = "USEFUL_TEST_INTERNAL_WORKER_EXECUTABLE";
 
 /// Set when the running executable asks, at startup, whether it was launched in an internal
 /// worker role: that executable dispatches the worker roles and may be its own worker.
@@ -57,7 +57,7 @@ fn dispatches_internal_worker_roles() -> bool {
 }
 
 /// A test build takes a supplied worker when it is a file. Unsupplied, an executable that
-/// dispatches the worker roles at startup (the `um` binary or the `internal-worker` example)
+/// dispatches the worker roles at startup (the `useful` binary or the `internal-worker` example)
 /// is its own worker; any other executable is a test harness, which would run its suite in a
 /// worker role and launch itself again, so it takes the example beside it (INV-TESTING-20).
 fn test_build_internal_worker_executable(
@@ -78,10 +78,10 @@ fn test_build_internal_worker_executable(
 }
 
 /// The `internal-worker` example beside a test harness, `<profile>/examples/internal-worker`
-/// for a harness at `<profile>/deps/<crate>-<hash>`, which a plain `cargo test -p um-execution`
+/// for a harness at `<profile>/deps/<crate>-<hash>`, which a plain `cargo test -p useful-execution`
 /// builds and no other package's test command does. A `--all-targets` build compiles the
 /// example as a test harness instead, so such a run builds the ordinary example and names it in
-/// `UM_TEST_INTERNAL_WORKER_EXECUTABLE`, as `cli/scripts/check-suite` does.
+/// `USEFUL_TEST_INTERNAL_WORKER_EXECUTABLE`, as `cli/scripts/check-suite` does.
 fn test_build_worker_example(test_executable: &Path) -> io::Result<PathBuf> {
     let example = test_executable
         .parent()
@@ -91,7 +91,7 @@ fn test_build_worker_example(test_executable: &Path) -> io::Result<PathBuf> {
         Some(example) if example.is_file() => Ok(example),
         _ => Err(io::Error::other(
             "test internal-worker executable not supplied: set \
-             UM_TEST_INTERNAL_WORKER_EXECUTABLE or build the um-execution internal-worker example",
+             USEFUL_TEST_INTERNAL_WORKER_EXECUTABLE or build the useful-execution internal-worker example",
         )),
     }
 }
@@ -260,17 +260,17 @@ impl CommandRunner for SystemCommandRunner {
         let stdout_thread =
             thread::spawn(move || drain_stdout(stdout, command.maximum_stdout_bytes));
         let stderr_thread = thread::spawn(move || drain(stderr));
-        let started = um_support::monotonic_now();
+        let started = useful_support::monotonic_now();
 
         let success = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status.success(),
-                Ok(None) if um_support::elapsed(started) >= command.timeout => {
+                Ok(None) if useful_support::elapsed(started) >= command.timeout => {
                     child.terminate();
                     let _ = join_readers(stdout_thread, stderr_thread);
                     return Err(CommandProbeError::Timeout);
                 }
-                Ok(None) => um_support::sleep(WAIT_POLL_INTERVAL),
+                Ok(None) => useful_support::sleep(WAIT_POLL_INTERVAL),
                 Err(_) => {
                     child.terminate();
                     let _ = join_readers(stdout_thread, stderr_thread);
@@ -379,7 +379,7 @@ mod tests {
 
     const FIXTURE_STDOUT_LIMIT: usize = 8 * 1024;
 
-    /// A target directory with a test harness at `<profile>/deps/um-0123abcd`, a supplied
+    /// A target directory with a test harness at `<profile>/deps/useful-0123abcd`, a supplied
     /// worker file, and, when `example_is_file`, the `internal-worker` example beside it.
     struct WorkerLayout {
         _target: tempfile::TempDir,
@@ -393,7 +393,7 @@ mod tests {
         let profile = target.path().join("debug");
         std::fs::create_dir_all(profile.join("deps")).unwrap();
         std::fs::create_dir_all(profile.join("examples")).unwrap();
-        let harness = profile.join("deps").join("um-0123abcd");
+        let harness = profile.join("deps").join("useful-0123abcd");
         std::fs::write(&harness, b"").unwrap();
         let example = profile.join("examples").join("internal-worker");
         if example_is_file {
@@ -420,7 +420,7 @@ mod tests {
         assert_ne!(worker, layout.harness);
 
         let layout = worker_layout(false);
-        for harness in [layout.harness.as_path(), Path::new("/um-0123abcd")] {
+        for harness in [layout.harness.as_path(), Path::new("/useful-0123abcd")] {
             let error = test_build_internal_worker_executable(None, false, harness).unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::Other);
             assert_eq!(error.raw_os_error(), None);

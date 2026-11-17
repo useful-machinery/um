@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use serde::{Deserialize, Serialize};
-use um_support::{Availability, CredentialStatus, NextAction};
+use useful_support::{Availability, CredentialStatus, NextAction};
 
 pub(crate) const REQUEST_LIMIT: usize = 4_096;
 pub(crate) const RESPONSE_LIMIT: usize = 65_536;
@@ -94,7 +94,7 @@ pub struct StatusSnapshot {
     pub last_connection_failure: Option<ConnectionFailure>,
     /// Each provider's readiness, once the runner has set up agent logins
     /// (REQ-RUNNERENROLL-42). Absent until the first pass records it, seconds
-    /// after the runner starts; from then on a `um runner status` older than
+    /// after the runner starts; from then on a `useful runner status` older than
     /// agent logins refuses the answer, the replaced-binary case chapter 11
     /// documents.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,7 +139,7 @@ impl AgentLoginProvider {
     }
 
     /// An OAuth provider's name as a grant's provider, which the grant-token
-    /// route and `um grant` take: GitLab is the instance `gitlab.com`.
+    /// route and `useful grant` take: GitLab is the instance `gitlab.com`.
     /// `None` for an installable provider.
     pub const fn grant_provider(self) -> Option<&'static str> {
         match self {
@@ -1146,7 +1146,7 @@ mod tests {
     #[test]
     fn an_oauth_entry_projects_like_an_agent_login_and_never_fails_readiness() {
         use AgentLoginState as S;
-        use um_support::{Availability as A, NextAction as N};
+        use useful_support::{Availability as A, NextAction as N};
         for (state, availability, next_action) in [
             (S::Ready, A::Available, N::None),
             (S::ReconnectRequired, A::ReconnectRequired, N::Reconnect),
@@ -1166,7 +1166,7 @@ mod tests {
                 }
                 assert_eq!(
                     entry.credential_status(),
-                    um_support::CredentialStatus {
+                    useful_support::CredentialStatus {
                         availability,
                         next_action,
                     },
@@ -1184,14 +1184,14 @@ mod tests {
         refused.last_use = Some(AgentLoginUse::Refused);
         assert_eq!(
             refused.credential_status().availability,
-            um_support::Availability::Available
+            useful_support::Availability::Available
         );
     }
 
     // REQ-GRANT-53, REQ-GRANT-88
     #[test]
     fn an_ended_oauth_entry_that_was_ready_is_unverified_and_no_other_state_changes() {
-        use um_support::{Availability as A, CredentialStatus, NextAction as N};
+        use useful_support::{Availability as A, CredentialStatus, NextAction as N};
         for state in GRANT_STATES {
             for selected in [Some(true), Some(false), None] {
                 let current = grant_entry(state, selected);
@@ -1252,7 +1252,7 @@ mod tests {
     #[test]
     fn each_readiness_maps_to_one_availability_and_next_action() {
         use AgentLoginState as S;
-        use um_support::{Availability as A, NextAction as N};
+        use useful_support::{Availability as A, NextAction as N};
         let accepted = Some(AgentLoginUse::Accepted);
         let refused = Some(AgentLoginUse::Refused);
         for (state, selected, last_use, availability, next_action) in [
@@ -1337,7 +1337,7 @@ mod tests {
             };
             assert_eq!(
                 entry.credential_status(),
-                um_support::CredentialStatus {
+                useful_support::CredentialStatus {
                     availability,
                     next_action,
                 },

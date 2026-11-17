@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "command": "um workflow run view",
+  "command": "useful workflow run view",
   "outcome": "view",
   "exitStatus": 0,
   "runDirectory": "/tmp/run",

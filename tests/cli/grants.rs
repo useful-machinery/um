@@ -120,7 +120,7 @@ fn list_returns_one_page_of_grants_without_material() {
     );
     // The earlier command names its replacement on standard error, and only that
     // (REQ-GRANT-77).
-    assert_eq!(after_notice(&output, "um grant list"), "");
+    assert_eq!(after_notice(&output, "useful grant list"), "");
     assert_no_secret_output(&output, &[SENTINEL]);
     let request = server.finish().pop().unwrap();
     assert!(request.starts_with("GET /api/v1/me/grants?limit=2&cursor=page-before HTTP/1.1\r\n"));
@@ -225,7 +225,7 @@ fn uses_lists_the_tokens_issued_from_one_grant() {
     // that replaces it (REQ-GRANT-8, REQ-GRANT-77).
     let stderr = String::from_utf8(output.stderr.clone()).unwrap();
     let (notice, rest) = stderr.split_once('\n').unwrap_or((&stderr, ""));
-    for command in ["um auth grant uses", "um grant list GRANT"] {
+    for command in ["useful auth grant uses", "useful grant list GRANT"] {
         assert!(notice.contains(command), "{stderr}");
     }
     assert_eq!(rest, "", "{stderr}");

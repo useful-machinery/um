@@ -22,13 +22,13 @@ boundary, mirror contents, CI workflow, or implementation are welcome.
 
 The human credential store contains one-hour OAuth access tokens and rotating refresh
 tokens without application-level encryption. Normal operation protects the
-`~/.um/` application home with mode `0700` and `credentials.json` with mode `0600`.
+`~/.useful/` application home with mode `0700` and `credentials.json` with mode `0600`.
 The CLI refuses unsafe ownership, permissions, symbolic links, malformed schemas, and
 unbounded token values rather than silently repairing or replacing them. Human
 credentials are never runner credentials.
 
 Treat the credential file as a secret. Do not copy it into bug reports, command output,
-logs, repositories, or runner configuration. Use `um auth logout` to remove
+logs, repositories, or runner configuration. Use `useful auth logout` to remove
 the active deployment's local credential.
 
 `auth login` requests `openid profile email offline_access`, requires both access and

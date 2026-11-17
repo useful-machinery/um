@@ -1,4 +1,4 @@
-//! A fresh Claude Code sign-in, `claude setup-token`, run on a pseudo-terminal `um` owns in a
+//! A fresh Claude Code sign-in, `claude setup-token`, run on a pseudo-terminal `useful` owns in a
 //! private temporary configuration directory, its prompts passed to the member and the token it
 //! prints taken out of what the member sees (REQ-GRANT-71, REQ-GRANT-74, INV-CLI-13,
 //! INV-CLI-14).
@@ -6,7 +6,7 @@
 //! Only the provider's documented names are used: the command `claude setup-token`, the
 //! variable `CLAUDE_CONFIG_DIR` and the form of the token `CLAUDE_CODE_OAUTH_TOKEN` takes. The
 //! member's own Claude Code configuration is never read: the child's `CLAUDE_CONFIG_DIR`
-//! replaces it, and `um` reads and writes no file in the directory it made: the token comes
+//! replaces it, and `useful` reads and writes no file in the directory it made: the token comes
 //! from the sign-in's output alone.
 
 use std::fmt;
@@ -45,7 +45,7 @@ pub(in crate::cli) enum Failure {
     NoTerminal,
     NotFound,
     Exited(ExitStatus),
-    /// A signal `um` received was passed to the sign-in.
+    /// A signal `useful` received was passed to the sign-in.
     Interrupted(Stop),
     NoToken,
     Unusable(anyhow::Error),
@@ -55,7 +55,7 @@ impl Failure {
     const fn remedy(&self) -> &'static str {
         match self {
             Self::NoTerminal => {
-                "Run claude setup-token where you can answer it and import the token it prints:\n  um grant create claude_code --token-file -"
+                "Run claude setup-token where you can answer it and import the token it prints:\n  useful grant create claude_code --token-file -"
             }
             Self::NotFound => {
                 "Install Claude Code so that claude is on your PATH, or import the token claude setup-token printed with --token-file PATH."
@@ -69,7 +69,7 @@ impl Failure {
         }
     }
 
-    /// The signal that ended the sign-in, when one asked for it to stop: one `um` passed to
+    /// The signal that ended the sign-in, when one asked for it to stop: one `useful` passed to
     /// it, or SIGINT, SIGTERM or SIGHUP ending it.
     pub(super) fn stop(&self) -> Option<Stop> {
         match self {
@@ -105,7 +105,7 @@ impl fmt::Display for Failure {
 }
 
 /// The failure a sign-in ends in before anything is run, read or sent when the member could
-/// not answer it: standard input is not a terminal (REQ-GRANT-71). `um grant create
+/// not answer it: standard input is not a terminal (REQ-GRANT-71). `useful grant create
 /// claude_code` asks this before its first request, and [`sign_in`] before anything else.
 pub(in crate::cli) fn unanswerable() -> Option<Failure> {
     (!io::stdin().is_terminal()).then_some(Failure::NoTerminal)
@@ -124,14 +124,14 @@ pub(in crate::cli) fn sign_in() -> anyhow::Result<Result<Zeroizing<Vec<u8>>, Fai
         return Ok(Err(Failure::NotFound));
     };
     let directory = tempfile::Builder::new()
-        .prefix("um-claude-setup-token-")
+        .prefix("useful-claude-setup-token-")
         .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir()
         .context("create temporary Claude Code configuration directory")?;
     let path = directory.path().to_owned();
     let result = sign_in_at(&claude, &path);
     if let Err(error) = directory.close() {
-        // `um` wrote nothing there, but the sign-in may have.
+        // `useful` wrote nothing there, but the sign-in may have.
         let _ = writeln!(
             io::stderr().lock(),
             "warning: remove temporary Claude Code configuration directory {}: {error}\n\nDelete that directory; it may hold Claude Code sign-in state.",
@@ -143,7 +143,7 @@ pub(in crate::cli) fn sign_in() -> anyhow::Result<Result<Zeroizing<Vec<u8>>, Fai
 
 /// Runs the sign-in on its own terminal: the member's input is relayed to it, and its output
 /// to standard error through [`Withhold`], so that a `--json` result stays one document and the
-/// token is never shown. A signal that would stop `um` is passed to the child instead, so the
+/// token is never shown. A signal that would stop `useful` is passed to the child instead, so the
 /// directory is still removed. However it ends, the child has been waited for and the relay
 /// reads no more of the member's input when this returns.
 fn sign_in_at(
@@ -159,7 +159,7 @@ fn sign_in_at(
             Signals::observe().context("observe signals during the Claude Code sign-in")?;
         let mut child = match spawn(claude, directory, secondary) {
             Ok(child) => child,
-            // A `claude` that cannot be started is the sign-in failing, not a fault of `um`.
+            // A `claude` that cannot be started is the sign-in failing, not a fault of `useful`.
             Err(error) => {
                 return Ok((
                     Err(Failure::Unusable(
@@ -207,7 +207,7 @@ async fn or_stop<T>(
     started
 }
 
-/// Kills a sign-in `um` no longer follows and waits for it, so that it has ended before its
+/// Kills a sign-in `useful` no longer follows and waits for it, so that it has ended before its
 /// directory is removed.
 async fn stop(child: &mut tokio::process::Child) {
     // It may already have ended; either way it has been waited for.
@@ -216,7 +216,7 @@ async fn stop(child: &mut tokio::process::Child) {
 
 /// After the sign-in has ended, how long its terminal's output may stay idle, and how much more
 /// of it is relayed, before the relay stops: a descendant still holding the terminal does not
-/// keep `um` waiting.
+/// keep `useful` waiting.
 const DRAIN_IDLE: Timespec = Timespec {
     tv_sec: 0,
     tv_nsec: 200_000_000,

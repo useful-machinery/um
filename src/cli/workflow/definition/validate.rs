@@ -8,12 +8,12 @@ use serde::Serialize;
 
 use super::report::{JsonTree, display, display_members, display_path, write_invalid, write_json};
 use crate::exit_code::ExitCode;
-use um_execution::{
+use useful_execution::{
     BindingValue, OwnerDeclaration, OwnerSource, StopBefore, ValidatedTree, validate_workflow_tree,
 };
 
 pub(super) const ABOUT: &str = "Validate a local workflow tree and print its digest";
-const COMMAND_NAME: &str = "um workflow definition validate";
+const COMMAND_NAME: &str = "useful workflow definition validate";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {

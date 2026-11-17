@@ -16,19 +16,19 @@
 use std::path::Path;
 
 use serde_json::{Map, Value, json};
-use um_execution::{
+use useful_execution::{
     CancellationReason, LocalRunDirectoryError, MirrorAction, MirrorHook, MirrorSkipReason,
     MirrorWrite, MirrorWriteOutcome, WaitQuestions, read_durable_record, wait_identity,
     wait_questions,
 };
-use um_runner_protocol::{TreeExit, TreeProgressWaitQuestion, TreeProgressWaitQuestions};
-use um_support::is_diagnostic_slug;
+use useful_runner_protocol::{TreeExit, TreeProgressWaitQuestion, TreeProgressWaitQuestions};
+use useful_support::is_diagnostic_slug;
 
 /// The most mirror results one finish carries, the protocol's bound.
 const MAXIMUM_MIRROR_RESULTS: usize = 1024;
 
 /// Reads `<run directory>/<name>` as JSON through the engine's own reader of its durable
-/// records (`um_execution::read_durable_record`), `name` a path beneath the run directory:
+/// records (`useful_execution::read_durable_record`), `name` a path beneath the run directory:
 /// a regular file opened, as each directory on the way to it, without following a symbolic
 /// link and without waiting on a FIFO, of at most the engine's bound; `None` for a file
 /// that is absent, behind a link, of another kind, larger or not JSON.
@@ -159,7 +159,7 @@ pub(in crate::service) fn read_wait(run_directory: &Path) -> Option<TreeWait> {
     })
 }
 
-/// The questions an `answer` wait's `payload` asks, read as `um workflow run answer` reads
+/// The questions an `answer` wait's `payload` asks, read as `useful workflow run answer` reads
 /// them (REQ-RUNNERENROLL-119): the listed questions, or the one question with id `1` that a
 /// payload without a list asks; `None` when they break a bound Cloud admits, so the wait is
 /// reported without them and nothing is truncated.
@@ -499,9 +499,9 @@ pub(in crate::service) enum ClassifiedEnd {
 /// The run's first command the runtime refused.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::service) enum RefusedCommand {
-    /// `um workflow run create`, which made no run.
+    /// `useful workflow run create`, which made no run.
     Create,
-    /// An adopted run's `um workflow run resume --from`.
+    /// An adopted run's `useful workflow run resume --from`.
     Resume,
 }
 

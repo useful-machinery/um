@@ -18,7 +18,7 @@ VERIFY_ISOLATED = PUBLIC_ROOT / "scripts/verify-release-package-isolated"
 TARGET = "x86_64-unknown-linux-gnu"
 VERSION = "1.2.3"
 DEVELOPMENT_VERSION = "0.0.0-dev"
-TEST_VARIABLE = "UM_TEST_INTERNAL_WORKER_EXECUTABLE"
+TEST_VARIABLE = "USEFUL_TEST_INTERNAL_WORKER_EXECUTABLE"
 REFERENCE = """# Workflow V1 authoring reference
 
 Authoring guide: <https://docs.usefulmachinery.com/agent/workflow-authoring.md>
@@ -93,7 +93,7 @@ if arguments == ["workflow", "reference"]:
     )
 """
 
-    # A test-fixtures build of `um` names the variables its seams read.
+    # A test-fixtures build of `useful` names the variables its seams read.
     test_seam = f"TEST_SEAM = {TEST_VARIABLE!r}\n" if mutation == "test-build" else ""
 
     path.write_text(
@@ -105,7 +105,7 @@ from pathlib import Path
 {test_seam}arguments = sys.argv[1:]
 {state_write}
 if arguments == ["--version"]:
-    output = {f"um {version}\n".encode()!r}
+    output = {f"useful {version}\n".encode()!r}
 elif arguments == ["workflow", "--help"]:
     output = {help_output!r}
 elif arguments == ["workflow", "reference"]:
@@ -133,7 +133,7 @@ def create_source(root: Path) -> tuple[Path, Path, Path]:
     (root / "README.md").write_text("fixture README\n", encoding="utf-8")
     (root / "docs/workflow-v1.md").write_text(REFERENCE, encoding="utf-8")
     (root / "schemas/workflow-v1.schema.json").write_text(SCHEMA, encoding="utf-8")
-    return scripts / PACKAGE.name, scripts / VERIFY_ISOLATED.name, root / "um"
+    return scripts / PACKAGE.name, scripts / VERIFY_ISOLATED.name, root / "useful"
 
 
 def archive(
@@ -152,7 +152,7 @@ def archive(
             version,
         ]
     )
-    return output / f"um-{version}-{TARGET}.tar.gz"
+    return output / f"useful-{version}-{TARGET}.tar.gz"
 
 
 def verify(
@@ -222,7 +222,7 @@ def main() -> None:
             verifier, state_write, "state-writing packaged authoring command"
         )
 
-        # INV-RELEASE-42: a release version refuses a `um` that names a test
+        # INV-RELEASE-42: a release version refuses a `useful` that names a test
         # variable; the development version `check-suite` packs its test-built
         # debug binary at accepts the same executable.
         write_binary(binary, "test-build")

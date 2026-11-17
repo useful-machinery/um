@@ -8,13 +8,13 @@ use clap::Args;
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_execution::{
+use useful_execution::{
     ArtifactDiagnostic, ArtifactValidationSummary, PortableArtifactValidation,
     PortableArtifactValidationFailure, validate_portable_artifact_set, visible_text,
 };
 
 pub(super) const ABOUT: &str = "Validate a portable workflow artifact directory";
-const COMMAND: &str = "um artifact validate";
+const COMMAND: &str = "useful artifact validate";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {

@@ -1,12 +1,12 @@
-//! The `um` commands a tree run supervises (REQ-RUNNERENROLL-91): `um workflow
-//! definition publish` into the run-scoped home, `um workflow run create` and `um
-//! workflow run resume` under the assignment's lease, `um workflow run cancel` when
-//! the assignment is cancelled, and `um workflow run event` for each trigger delivery, with
-//! `um workflow run stop` and `lift` once the offer's deliveries are applied
-//! (REQ-TRIGGER-136), and the `um workflow run` control command each Cloud control names
+//! The `useful` commands a tree run supervises (REQ-RUNNERENROLL-91): `useful workflow
+//! definition publish` into the run-scoped home, `useful workflow run create` and `useful
+//! workflow run resume` under the assignment's lease, `useful workflow run cancel` when
+//! the assignment is cancelled, and `useful workflow run event` for each trigger delivery, with
+//! `useful workflow run stop` and `lift` once the offer's deliveries are applied
+//! (REQ-TRIGGER-136), and the `useful workflow run` control command each Cloud control names
 //! (REQ-RUNNERENROLL-90).
 //! Each runs with the daemon's environment whole, with the agent logins offered to the
-//! assignment (REQ-GRANT-37, REQ-GRANT-44), and `UM_HOME` set to the run-scoped
+//! assignment (REQ-GRANT-37, REQ-GRANT-44), and `USEFUL_HOME` set to the run-scoped
 //! home; the runtime's own admission applies the root's passthrough to each step
 //! (REQ-WFEXEC-22), so no step sees a runner-private name.
 //!
@@ -35,18 +35,18 @@ use tokio::process::ChildStderr;
 use super::super::Sleeper;
 use super::super::run_inputs::PreparationDeadline;
 use serde_json::Value;
-use um_execution::{
+use useful_execution::{
     CONTROL_ANSWER, CONTROL_APPROVE, CONTROL_HAND_BACK, CONTROL_LIFT, CONTROL_RETRY,
     CancellationReason, CancellationSource, CaptureCancellation, ControlEvent, EnvironmentSnapshot,
     LocalRunDirectoryError, wait_identity,
 };
-use um_runner_protocol::{
+use useful_runner_protocol::{
     RunControlAction, RunControlAnswer, RunControlOutcome, TriggerDelivery, TriggerDeliveryAction,
     TriggerDeliveryApplication, TriggerDeliveryOutcome, TriggerIssueObservation,
 };
-use um_support::is_diagnostic_slug;
+use useful_support::is_diagnostic_slug;
 
-/// The longest a short `um` command (the publication, an `event`, a control command, the
+/// The longest a short `useful` command (the publication, an `event`, a control command, the
 /// start's stop and lift, or `cancel`) may run before the runner abandons it and kills its
 /// process group. Each records one thing and returns, so a minute is ample.
 pub(super) const SHORT_COMMAND_BOUND: Duration = Duration::from_secs(60);
@@ -64,7 +64,7 @@ const LOG_CHUNK_BYTES: usize = 64 * 1024;
 const MAXIMUM_CAPTURED_DOCUMENT_BYTES: u64 = 16 * 1024 * 1024;
 const PUBLISH_OUTPUT_LIMIT: u64 = 1024 * 1024;
 const RUN_DIRECTORY_POLL: Duration = Duration::from_millis(50);
-/// The code an application reports when `um workflow run event` could not be run or
+/// The code an application reports when `useful workflow run event` could not be run or
 /// answered with no document it could report.
 const EVENT_COMMAND_FAILED: &str = "event_command_failed";
 /// The reason the start's own stop is recorded with when the runner puts it back.
@@ -87,10 +87,10 @@ const MAXIMUM_ACTION_OUTCOME_CHARACTERS: usize = 64;
 const MAXIMUM_OBSERVED_ID_BYTES: usize = 255;
 const MAXIMUM_OBSERVED_TIME_BYTES: usize = 64;
 
-/// A `um` command line in the run-scoped home, its output appended to the run's log, each
+/// A `useful` command line in the run-scoped home, its output appended to the run's log, each
 /// short one abandoned once `bound` passes on `sleeper`.
 #[derive(Clone)]
-pub(in crate::service) struct UmCommand {
+pub(in crate::service) struct UsefulCommand {
     pub(in crate::service) executable: PathBuf,
     pub(in crate::service) environment: EnvironmentSnapshot,
     pub(in crate::service) home: PathBuf,
@@ -99,7 +99,7 @@ pub(in crate::service) struct UmCommand {
     pub(in crate::service) bound: Duration,
 }
 
-impl UmCommand {
+impl UsefulCommand {
     /// Spawns `arguments` in its own process group, stdout to `stdout` and stderr copied to
     /// the log. The group is killed if the child is dropped before it is reaped.
     fn spawn(
@@ -114,7 +114,7 @@ impl UmCommand {
             .args(arguments)
             .env_clear()
             .envs(self.environment.variables())
-            .env("UM_HOME", &self.home)
+            .env("USEFUL_HOME", &self.home)
             .stdin(Stdio::null())
             .stdout(stdout)
             .stderr(Stdio::piped())
@@ -252,10 +252,10 @@ enum ShortEnd {
     Abandoned,
 }
 
-/// Runs one short `um` command line in its own process group until it exits, `bound`
+/// Runs one short `useful` command line in its own process group until it exits, `bound`
 /// passes or `abandon` completes; in the last two cases its group is killed.
 async fn run_short(
-    um: &UmCommand,
+    useful: &UsefulCommand,
     arguments: Vec<OsString>,
     output: ShortOutput,
     bound: Duration,
@@ -265,7 +265,7 @@ async fn run_short(
         ShortOutput::File(file) => (Stdio::from(file), None),
         ShortOutput::Captured(limit) => (Stdio::piped(), Some(limit)),
     };
-    let (mut child, pump) = um.spawn(&arguments, stdout)?;
+    let (mut child, pump) = useful.spawn(&arguments, stdout)?;
     let exited = async {
         let mut captured = Vec::new();
         // The pipe closes once the limit is read, so a command printing more cannot block
@@ -280,10 +280,10 @@ async fn run_short(
         biased;
         exited = exited => exited?,
         () = abandon => ShortEnd::Abandoned,
-        () = um.sleeper.sleep(bound) => ShortEnd::TimedOut,
+        () = useful.sleeper.sleep(bound) => ShortEnd::TimedOut,
     };
     if matches!(end, ShortEnd::Exited { .. }) {
-        pump.drain(um.sleeper.as_ref()).await;
+        pump.drain(useful.sleeper.as_ref()).await;
     } else {
         child.kill_group();
     }
@@ -295,7 +295,7 @@ async fn cancelled(cancellation: &CancellationSource) {
     cancellation.wait_for_cancellation().await;
 }
 
-/// What `um workflow definition publish --json` reports.
+/// What `useful workflow definition publish --json` reports.
 #[derive(Debug, Eq, PartialEq)]
 pub(in crate::service) struct Published {
     /// The definition the run-scoped home created for the tree.
@@ -308,7 +308,7 @@ pub(in crate::service) struct Published {
 
 #[derive(Debug, Eq, PartialEq)]
 pub(in crate::service) enum PublishFailure {
-    /// The `um` executable could not be started or its output read.
+    /// The `useful` executable could not be started or its output read.
     Launch,
     /// The command refused the tree or printed no publication, with what its report said
     /// of the first failure it lists.
@@ -365,7 +365,7 @@ impl RefusalReport {
 /// home (REQ-WFDEF-22), on the calling blocking worker, abandoning it at the short-command
 /// bound, the preparation's deadline or its cancellation.
 pub(in crate::service) fn publish(
-    um: &UmCommand,
+    useful: &UsefulCommand,
     tree: &Path,
     bindings: &Path,
     cancellation: &CaptureCancellation,
@@ -374,7 +374,7 @@ pub(in crate::service) fn publish(
     let bound = deadline
         .remaining()
         .ok_or(PublishFailure::Abandoned)?
-        .min(um.bound);
+        .min(useful.bound);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -390,7 +390,7 @@ pub(in crate::service) fn publish(
     ];
     let end = runtime
         .block_on(run_short(
-            um,
+            useful,
             arguments,
             ShortOutput::Captured(PUBLISH_OUTPUT_LIMIT),
             bound,
@@ -473,14 +473,14 @@ impl Drop for SupervisedChild {
     }
 }
 
-/// `um workflow run resume RUN --json`: continues a resolved wait, an abandoned attempt
+/// `useful workflow run resume RUN --json`: continues a resolved wait, an abandoned attempt
 /// or an unchained `continued` edge, and reports a held wait unchanged (REQ-CONTINUE-74
 /// to REQ-CONTINUE-78).
 pub(in crate::service) fn resume_arguments(run_directory: &Path) -> Vec<OsString> {
     resume_from_arguments(run_directory, &[])
 }
 
-/// `um workflow run resume RUN --from STEP... --json`, one `--from` per step in order:
+/// `useful workflow run resume RUN --from STEP... --json`, one `--from` per step in order:
 /// starts the next attempt of a finished run from the named steps and inherits the rest
 /// (REQ-CONTINUE-1); with no step, `resume_arguments`.
 pub(in crate::service) fn resume_from_arguments(
@@ -503,7 +503,7 @@ pub(in crate::service) fn resume_from_arguments(
 /// Whether the runner stops a run for `reason` without ending its record: its shutdown
 /// and lease loss interrupt the attempt and leave the record as it stands, for a later
 /// attempt to continue (REQ-RUNNERENROLL-73, REQ-RUNNERENROLL-89), while a cancellation
-/// of the assignment ends the run with `um workflow run cancel`.
+/// of the assignment ends the run with `useful workflow run cancel`.
 pub(in crate::service) const fn leaves_record(reason: CancellationReason) -> bool {
     matches!(
         reason,
@@ -511,14 +511,14 @@ pub(in crate::service) const fn leaves_record(reason: CancellationReason) -> boo
     )
 }
 
-/// Runs a `um workflow run create` or `resume` command line in its own process group
-/// until it exits, its stdout in `documents`. A requested cancellation runs `um workflow
+/// Runs a `useful workflow run create` or `resume` command line in its own process group
+/// until it exits, its stdout in `documents`. A requested cancellation runs `useful workflow
 /// run cancel` for the run, which signals the process (REQ-LOCALRUN-186); a force abort,
 /// or a cancellation the process has not honored within `grace`, kills its group, after
 /// which `cancel` ends the abandoned record. The runner's shutdown and lease loss kill the
 /// group and leave the record as the process left it (`leaves_record`).
 pub(in crate::service) async fn supervise(
-    um: &UmCommand,
+    useful: &UsefulCommand,
     arguments: Vec<OsString>,
     runs: PathBuf,
     documents: &Path,
@@ -534,10 +534,10 @@ pub(in crate::service) async fn supervise(
         .mode(0o600)
         .open(documents)
         .map_err(|_| CommandFailure::Launch)?;
-    let (mut child, pump) = um
+    let (mut child, pump) = useful
         .spawn(&arguments, Stdio::from(stdout))
         .map_err(|_| CommandFailure::Launch)?;
-    let sleeper = &um.sleeper;
+    let sleeper = &useful.sleeper;
 
     let mut applied = None;
     let mut canceller = None;
@@ -561,7 +561,7 @@ pub(in crate::service) async fn supervise(
                     killed = true;
                 } else {
                     kill_at = Some(sleeper.now() + grace);
-                    canceller = Some(tokio::spawn(cancel_when_created(um.clone(), runs.clone())));
+                    canceller = Some(tokio::spawn(cancel_when_created(useful.clone(), runs.clone())));
                 }
             }
             () = sleep_or_pending(sleeper.as_ref(), grace_remaining), if !killed => {
@@ -582,10 +582,10 @@ pub(in crate::service) async fn supervise(
         // A process that exited before honoring the cancellation, or was killed, leaves its
         // record `running`; `cancel` ends that abandoned record `canceled` and refuses an
         // exited one.
-        let _ = cancel_run(um, &runs).await;
+        let _ = cancel_run(useful, &runs).await;
     }
     let documents = documents.to_owned();
-    let log = um.log.clone();
+    let log = useful.log.clone();
     let document = tokio::task::spawn_blocking(move || last_document(&documents, &log))
         .await
         .ok()
@@ -633,7 +633,7 @@ async fn sleep_or_pending(sleeper: &dyn Sleeper, duration: Option<Duration>) {
     }
 }
 
-async fn cancel_when_created(um: UmCommand, runs: PathBuf) {
+async fn cancel_when_created(useful: UsefulCommand, runs: PathBuf) {
     loop {
         let found = {
             let runs = runs.clone();
@@ -643,16 +643,16 @@ async fn cancel_when_created(um: UmCommand, runs: PathBuf) {
                 .flatten()
         };
         if found.is_some() {
-            let _ = cancel_run(&um, &runs).await;
+            let _ = cancel_run(&useful, &runs).await;
             return;
         }
-        um.sleeper.sleep(RUN_DIRECTORY_POLL).await;
+        useful.sleeper.sleep(RUN_DIRECTORY_POLL).await;
     }
 }
 
-/// Runs `um workflow run cancel RUN --json` for the home's run, output to the log. It is the
+/// Runs `useful workflow run cancel RUN --json` for the home's run, output to the log. It is the
 /// cancellation's own command, so only its bound abandons it.
-pub(in crate::service) async fn cancel_run(um: &UmCommand, runs: &Path) -> io::Result<()> {
+pub(in crate::service) async fn cancel_run(useful: &UsefulCommand, runs: &Path) -> io::Result<()> {
     let directory = {
         let runs = runs.to_owned();
         tokio::task::spawn_blocking(move || only_entry(&runs))
@@ -668,15 +668,15 @@ pub(in crate::service) async fn cancel_run(um: &UmCommand, runs: &Path) -> io::R
         "--json".into(),
     ];
     let end = run_short(
-        um,
+        useful,
         arguments,
         ShortOutput::Captured(CONTROL_OUTPUT_LIMIT),
-        um.bound,
+        useful.bound,
         std::future::pending(),
     )
     .await?;
     if let ShortEnd::Exited { captured, .. } = end {
-        let log = um.log.clone();
+        let log = useful.log.clone();
         tokio::task::spawn_blocking(move || log.append(&captured))
             .await
             .map_err(io::Error::other)??;
@@ -684,7 +684,7 @@ pub(in crate::service) async fn cancel_run(um: &UmCommand, runs: &Path) -> io::R
     Ok(())
 }
 
-/// Applies `deliveries` in order to the run at `run_directory`, each with `um workflow run
+/// Applies `deliveries` in order to the run at `run_directory`, each with `useful workflow run
 /// event RUN --event FILE --claim FILE --json` over its event and claim written under the
 /// home's `deliveries/<deliveryId>/` (REQ-TRIGGER-136). The command's `applied` document
 /// gives the action and its `refused` one the code, each with the fresh read it reports; a
@@ -693,21 +693,21 @@ pub(in crate::service) async fn cancel_run(um: &UmCommand, runs: &Path) -> io::R
 /// `cancellation` abandons the command running and those after it, which are reported as
 /// nothing.
 pub(in crate::service) async fn apply_deliveries(
-    um: &UmCommand,
+    useful: &UsefulCommand,
     run_directory: PathBuf,
     deliveries: Vec<TriggerDelivery>,
     cancellation: &CancellationSource,
 ) -> Vec<TriggerDeliveryApplication> {
     let mut applications = Vec::with_capacity(deliveries.len());
     for delivery in deliveries {
-        let document = match run_event(um, &run_directory, &delivery, cancellation).await {
+        let document = match run_event(useful, &run_directory, &delivery, cancellation).await {
             Answered::Abandoned => break,
             Answered::Ended { document, .. } => document,
         };
         let (outcome, observation) = match document.as_ref().ok().and_then(application) {
             Some(reported) => reported,
             None => {
-                log_failure(&um.log, EVENT_COMMAND_FAILED, unanswered(&document)).await;
+                log_failure(&useful.log, EVENT_COMMAND_FAILED, unanswered(&document)).await;
                 let code = EVENT_COMMAND_FAILED.to_owned();
                 (TriggerDeliveryOutcome::Refused { code }, None)
             }
@@ -811,27 +811,27 @@ impl Answered {
     }
 }
 
-/// Runs `um workflow run event` for `delivery`, `Answered::launch` with the I/O error's kind
+/// Runs `useful workflow run event` for `delivery`, `Answered::launch` with the I/O error's kind
 /// when its files could not be written, it could not be launched or its output could not be
 /// read back.
 async fn run_event(
-    um: &UmCommand,
+    useful: &UsefulCommand,
     run_directory: &Path,
     delivery: &TriggerDelivery,
     cancellation: &CancellationSource,
 ) -> Answered {
-    event_command(um, run_directory, delivery, cancellation)
+    event_command(useful, run_directory, delivery, cancellation)
         .await
         .unwrap_or_else(|error| Answered::launch(error.kind()))
 }
 
 async fn event_command(
-    um: &UmCommand,
+    useful: &UsefulCommand,
     run_directory: &Path,
     delivery: &TriggerDelivery,
     cancellation: &CancellationSource,
 ) -> io::Result<Answered> {
-    let directory = um.home.join("deliveries").join(&delivery.delivery_id);
+    let directory = useful.home.join("deliveries").join(&delivery.delivery_id);
     let (event, claim, output) = (
         directory.join("event.json"),
         directory.join("claim.json"),
@@ -871,14 +871,14 @@ async fn event_command(
         "--json".into(),
     ];
     let end = run_short(
-        um,
+        useful,
         arguments,
         ShortOutput::File(stdout),
-        um.bound,
+        useful.bound,
         cancelled(cancellation),
     )
     .await?;
-    let log = um.log.clone();
+    let log = useful.log.clone();
     let document = tokio::task::spawn_blocking(move || last_document(&output, &log))
         .await
         .map_err(io::Error::other)?;
@@ -942,29 +942,34 @@ fn write_synced(path: &Path, bytes: &[u8]) -> io::Result<()> {
     file.sync_all()
 }
 
-/// `um workflow run stop RUN --before STEP --reason TEXT --json`: puts back the start's own
+/// `useful workflow run stop RUN --before STEP --reason TEXT --json`: puts back the start's own
 /// stop once the runner lifts the one it created the run with. True when the stop was
 /// recorded; false when it was not, as `start_control` logs, or the command was abandoned.
 pub(in crate::service) async fn stop_before(
-    um: &UmCommand,
+    useful: &UsefulCommand,
     run_directory: &Path,
     step: &str,
     cancellation: &CancellationSource,
 ) -> bool {
     let arguments = stop_arguments(run_directory, step, START_STOP_REASON);
-    start_control(um, arguments, cancellation).await
+    start_control(useful, arguments, cancellation).await
 }
 
-/// `um workflow run lift RUN --before STEP --json`: lifts the stop before the first step the
+/// `useful workflow run lift RUN --before STEP --json`: lifts the stop before the first step the
 /// runner created the run with. True when the lift was recorded; false when it was not, as
 /// `start_control` logs, or the command was abandoned.
 pub(in crate::service) async fn lift(
-    um: &UmCommand,
+    useful: &UsefulCommand,
     run_directory: &Path,
     step: &str,
     cancellation: &CancellationSource,
 ) -> bool {
-    start_control(um, lift_arguments(run_directory, Some(step)), cancellation).await
+    start_control(
+        useful,
+        lift_arguments(run_directory, Some(step)),
+        cancellation,
+    )
+    .await
 }
 
 /// Runs the start's own stop or the runner's lift, true when it exited 0. One that ended
@@ -972,23 +977,23 @@ pub(in crate::service) async fn lift(
 /// class: its `Unanswered` class, or `exit_status` when it exited unsuccessfully having
 /// printed a document.
 async fn start_control(
-    um: &UmCommand,
+    useful: &UsefulCommand,
     arguments: Vec<OsString>,
     cancellation: &CancellationSource,
 ) -> bool {
-    let document = match control(um, arguments, cancellation).await {
+    let document = match control(useful, arguments, cancellation).await {
         Answered::Ended { success: true, .. } => return true,
         Answered::Abandoned => return false,
         Answered::Ended { document, .. } => document,
     };
     match document {
-        Err(class) => log_failure(&um.log, PENDING_STOP_UNLIFTED, class).await,
-        Ok(_) => log_failure(&um.log, PENDING_STOP_UNLIFTED, "class=exit_status").await,
+        Err(class) => log_failure(&useful.log, PENDING_STOP_UNLIFTED, class).await,
+        Ok(_) => log_failure(&useful.log, PENDING_STOP_UNLIFTED, "class=exit_status").await,
     }
     false
 }
 
-/// Applies a Cloud control's `action` to the run at `run_directory` with the `um workflow
+/// Applies a Cloud control's `action` to the run at `run_directory` with the `useful workflow
 /// run` command it names (REQ-RUNNERENROLL-90): `answer --question ID --text TEXT`, once
 /// per answer in order and ending at the first that is not applied, `approve`, `hand-back
 /// --notes TEXT`, `lift [--before STEP]` or `stop --before STEP --reason TEXT`, each reported
@@ -996,7 +1001,7 @@ async fn start_control(
 /// instead (`retry_arguments`). `None` when the assignment's `cancellation` abandoned a
 /// command, which leaves nothing to report.
 pub(in crate::service) async fn apply_control(
-    um: &UmCommand,
+    useful: &UsefulCommand,
     run_directory: &Path,
     action: &RunControlAction,
     cancellation: &CancellationSource,
@@ -1006,12 +1011,12 @@ pub(in crate::service) async fn apply_control(
         .into_iter()
         .enumerate()
     {
-        let document = match control(um, arguments, cancellation).await {
+        let document = match control(useful, arguments, cancellation).await {
             Answered::Abandoned => return None,
             Answered::Ended { document, .. } => document,
         };
         let recorded = Recorded::of(action, index);
-        outcome = control_outcome(&um.log, document, run_directory, recorded).await;
+        outcome = control_outcome(&useful.log, document, run_directory, recorded).await;
         if !matches!(outcome, RunControlOutcome::Applied { .. }) {
             break;
         }
@@ -1083,7 +1088,7 @@ impl Recorded {
     async fn held_by(self, run_directory: &Path) -> Result<bool, ControlsUnread> {
         let run_directory = run_directory.to_owned();
         tokio::task::spawn_blocking(move || {
-            um_execution::read_controls(&run_directory)
+            useful_execution::read_controls(&run_directory)
                 .map(|controls| controls.iter().any(|control| self.holds(control)))
                 .map_err(ControlsUnread::Read)
         })
@@ -1193,7 +1198,7 @@ fn option(name: &str, value: &str) -> OsString {
     format!("{name}={value}").into()
 }
 
-/// `um workflow run retry RUN --json`: on the run's `repair` wait, records the retry and
+/// `useful workflow run retry RUN --json`: on the run's `repair` wait, records the retry and
 /// continues the run as `resume` does (REQ-LOCALRUN-184).
 pub(in crate::service) fn retry_arguments(run_directory: &Path) -> Vec<OsString> {
     vec![
@@ -1300,14 +1305,14 @@ async fn control_outcome(
 /// `run_directory`, as `control_outcome` reads it for the `control.retry` naming `wait`, the
 /// identity of the wait it resolves.
 pub(in crate::service) async fn retry_outcome(
-    um: &UmCommand,
+    useful: &UsefulCommand,
     document: Option<Value>,
     run_directory: &Path,
     wait: String,
 ) -> RunControlOutcome {
     let document = document.ok_or(Unanswered::NoDocument);
     control_outcome(
-        &um.log,
+        &useful.log,
         document,
         run_directory,
         Some(Recorded::retry(wait)),
@@ -1325,15 +1330,15 @@ fn command_failed() -> RunControlOutcome {
 /// appended to the log: `Answered::launch` with the I/O error's kind when it could not be
 /// launched or its output could not be read back.
 async fn control(
-    um: &UmCommand,
+    useful: &UsefulCommand,
     arguments: Vec<OsString>,
     cancellation: &CancellationSource,
 ) -> Answered {
     let mut end = match run_short(
-        um,
+        useful,
         arguments,
         ShortOutput::Captured(CONTROL_OUTPUT_LIMIT),
-        um.bound,
+        useful.bound,
         cancelled(cancellation),
     )
     .await
@@ -1345,7 +1350,7 @@ async fn control(
         ShortEnd::Exited { captured, .. } => std::mem::take(captured),
         ShortEnd::TimedOut | ShortEnd::Abandoned => Vec::new(),
     };
-    let log = um.log.clone();
+    let log = useful.log.clone();
     match tokio::task::spawn_blocking(move || logged_last_document(&captured, &log)).await {
         Ok(document) => Answered::of(&end, document),
         // The worker reading it back did not finish; there is no I/O error to name.

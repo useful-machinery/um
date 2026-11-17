@@ -10,10 +10,10 @@ use std::{
     io::{self, Read},
     path::{Path, PathBuf},
 };
-use um_api::{
+use useful_api::{
     HttpClient, WebhookApi, WebhookDelivery, WebhookFailure, WebhookMutation, WebhookSubscription,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 use zeroize::Zeroizing;
 
 #[derive(Debug, Args)]
@@ -313,7 +313,7 @@ impl Leaf {
     }
 }
 fn key() -> anyhow::Result<String> {
-    um_support::generate_idempotency_key().context("generate webhook request identity")
+    useful_support::generate_idempotency_key().context("generate webhook request identity")
 }
 fn change(
     deployment: &Deployment,
@@ -462,7 +462,7 @@ fn subscription_result(
             }
             if expected.is_some_and(|id| id != value.id)
                 || value.project_id != project
-                || !um_support::valid_typed_id(&value.id, "whs_")
+                || !useful_support::valid_typed_id(&value.id, "whs_")
                 || value.version < 1
             {
                 return failure_result_with_context(
@@ -881,7 +881,7 @@ fn acquire(path: &Path, patch: bool, credential_stdin: bool) -> anyhow::Result<M
             "error: webhook config exceeds 64 KiB\n\nUse a smaller config."
         ));
     }
-    let value = um_support::strict_json_from_slice(&bytes).map_err(|_| {
+    let value = useful_support::strict_json_from_slice(&bytes).map_err(|_| {
         anyhow!("error: config is not strict JSON\n\nRemove duplicate members and check syntax.")
     })?;
     let map = value.as_object().ok_or_else(|| {
@@ -1019,11 +1019,11 @@ fn acquire(path: &Path, patch: bool, credential_stdin: bool) -> anyhow::Result<M
     if patch {
         let mut document = map.clone();
         document.insert("expectedVersion".to_owned(), Value::from(1));
-        let _: um_api::PatchWebhookSubscriptionRequest =
+        let _: useful_api::PatchWebhookSubscriptionRequest =
             serde_json::from_value(Value::Object(document))
                 .map_err(|_| anyhow!("error: invalid webhook selection"))?;
     } else {
-        let _: um_api::CreateWebhookSubscriptionRequest = serde_json::from_value(value.clone())
+        let _: useful_api::CreateWebhookSubscriptionRequest = serde_json::from_value(value.clone())
             .map_err(|_| anyhow!("error: invalid webhook selection"))?;
     }
     Ok(map.clone())

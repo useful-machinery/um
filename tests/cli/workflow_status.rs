@@ -116,7 +116,7 @@ steps:
             - -c
             - |
               : > repaired
-              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired","reason":"recheck unchanged target"}' > "$UM_RECOVERY_RESULT"
+              printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired","reason":"recheck unchanged target"}' > "$USEFUL_RECOVERY_RESULT"
     command:
       argv: [/bin/sh, -c, 'test -f repaired || exit 75']
 "#,
@@ -546,7 +546,7 @@ fn status_json_and_plain_are_closed_read_only_snapshots() {
         ]
     );
     assert_eq!(result["schemaVersion"], 1);
-    assert_eq!(result["command"], "um workflow run status");
+    assert_eq!(result["command"], "useful workflow run status");
     assert_eq!(result["outcome"], "status");
     assert_eq!(result["exitStatus"], 0);
     assert_eq!(result["record"], serde_json::Value::Null);
@@ -1106,7 +1106,7 @@ fn status_and_view_report_a_waiting_run() {
 
 const ADDRESSED_ROOT_WORKFLOW: &str = "schemaVersion: 1\nname: addressed\nprograms: [scripts]\nsteps:\n  complete:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
 
-/// `um workflow run ARGS` against the `um` home `home`.
+/// `useful workflow run ARGS` against the `useful` home `home`.
 fn run_under_home(home: &Home, args: &[&str]) -> std::process::Output {
     let args = ["workflow", "run"]
         .iter()
@@ -1114,7 +1114,7 @@ fn run_under_home(home: &Home, args: &[&str]) -> std::process::Output {
         .map(|arg| (*arg).to_owned())
         .collect::<Vec<_>>();
     isolated_command(&args)
-        .env("UM_HOME", home.path())
+        .env("USEFUL_HOME", home.path())
         .output()
         .unwrap()
 }
@@ -1160,7 +1160,7 @@ fn status_addresses_a_run_under_the_home_by_its_id() {
     assert_eq!(by_id.status.code(), Some(0), "{by_id:?}");
     let by_id: serde_json::Value = serde_json::from_slice(&by_id.stdout).unwrap();
     assert!(status_schema().is_valid(&by_id), "{by_id}");
-    assert_eq!(by_id["command"], "um workflow run status");
+    assert_eq!(by_id["command"], "useful workflow run status");
     assert_eq!(by_id["runDirectory"], created["runDirectory"]);
     assert_eq!(by_id["record"]["id"], id.as_str());
 
@@ -1168,7 +1168,7 @@ fn status_addresses_a_run_under_the_home_by_its_id() {
     let missing = run_under_home(&home, &["status", unknown, "--json"]);
     assert_eq!(missing.status.code(), Some(1), "{missing:?}");
     let missing: serde_json::Value = serde_json::from_slice(&missing.stdout).unwrap();
-    assert_eq!(missing["command"], "um workflow run status");
+    assert_eq!(missing["command"], "useful workflow run status");
     assert_eq!(missing["outcome"], "error");
     assert_eq!(missing["exitStatus"], 1);
     assert_eq!(missing["error"]["code"], "run_not_found", "{missing}");

@@ -5,13 +5,13 @@ use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
-use um_api::{
+use useful_api::{
     ArtifactApiError, ArtifactCapabilityMember, ArtifactInventoryPage, ArtifactMember,
     ArtifactSource,
 };
-use um_support::valid_typed_id;
+use useful_support::valid_typed_id;
 
-use um_execution::{PortableArtifactValidationFailure, validate_portable_artifact_set};
+use useful_execution::{PortableArtifactValidationFailure, validate_portable_artifact_set};
 
 const INVENTORY_PAGE_LIMIT: u16 = 200;
 const CAPABILITY_BATCH_SIZE: usize = 100;
@@ -74,7 +74,7 @@ pub(crate) fn assemble_artifact_set(
         organization,
         run_id,
         destination,
-        um_support::utc_now,
+        useful_support::utc_now,
         File::sync_all,
     )
 }
@@ -94,7 +94,7 @@ fn assemble_artifact_set_with_clock(
         return Err(ArtifactAssemblyError::DestinationExists);
     }
     let staging = tempfile::Builder::new()
-        .prefix(".um-artifact-download-")
+        .prefix(".useful-artifact-download-")
         .tempdir_in(&parent)
         .map_err(|_| ArtifactAssemblyError::StagingUnavailable)?;
     std::fs::create_dir(staging.path().join("exports"))
@@ -381,7 +381,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use um_api::{ArtifactCapabilities, DownloadedMember};
+    use useful_api::{ArtifactCapabilities, DownloadedMember};
 
     struct FakeSource {
         inventory: VecDeque<ArtifactInventoryPage>,
@@ -741,7 +741,7 @@ mod tests {
             },
             "commandOutputPolicy": {
                 "encoding": "base64",
-                "maximumRetainedBytesPerStream": um_execution::MAXIMUM_RETAINED_BYTES_PER_STREAM
+                "maximumRetainedBytesPerStream": useful_execution::MAXIMUM_RETAINED_BYTES_PER_STREAM
             },
             "outcome": "succeeded",
             "forceAbort": null,

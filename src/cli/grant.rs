@@ -1,4 +1,4 @@
-//! `um grant`: what Useful Machinery may do as the member at other providers, a grant of
+//! `useful grant`: what Useful Machinery may do as the member at other providers, a grant of
 //! either kind over the grants resource (REQ-GRANT-64 to REQ-GRANT-74). The resource admits only active humans, so every leaf takes a human session
 //! only.
 
@@ -31,11 +31,11 @@ use anyhow::Context;
 use clap::{Args, Subcommand};
 
 use crate::exit_code::ExitCode;
-use um_api::{
+use useful_api::{
     MEMBER_GRANT_PAGE, MemberGrant, MemberGrantApi, MemberGrantFailure, MemberGrantKind,
     MemberGrantState,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 use confirmation::Stated;
 
@@ -85,12 +85,12 @@ impl Command {
 
 impl super::HumanSessionApi for MemberGrantApi {
     type Failure = MemberGrantFailure;
-    type BuildError = um_api::MemberGrantApiError;
+    type BuildError = useful_api::MemberGrantApiError;
 
     fn build(
         api_url: &str,
         token: &str,
-        policy: um_api::HttpTransportPolicy,
+        policy: useful_api::HttpTransportPolicy,
     ) -> Result<Self, Self::BuildError> {
         Self::new(api_url, token, policy)
     }
@@ -103,7 +103,7 @@ impl super::HumanSessionApi for MemberGrantApi {
         MemberGrantFailure::Unauthenticated
     }
 
-    fn unreachable(category: um_api::UnreachableCategory) -> MemberGrantFailure {
+    fn unreachable(category: useful_api::UnreachableCategory) -> MemberGrantFailure {
         MemberGrantFailure::Unreachable { category }
     }
 }
@@ -120,16 +120,16 @@ fn with_api<T, F: super::JsonOutputKind>(
 
 const GRANT_HELP: &str = "Grant ID, or the provider of your one grant of it";
 const RUNNER_HELP: &str =
-    "Runner ID, as um runner list prints it; omit to choose from the runners offered";
+    "Runner ID, as useful runner list prints it; omit to choose from the runners offered";
 
 /// A runner as a command names it: by ID, since the member's API has no organization in its
 /// path to resolve a runner name in (REQ-GRANT-65).
 pub(super) fn parse_runner_id(value: &str) -> Result<String, String> {
-    if um_support::valid_typed_id(value, "rnr_") {
+    if useful_support::valid_typed_id(value, "rnr_") {
         Ok(value.to_owned())
     } else {
         Err(
-            "runner must be an exact rnr_ identifier; um runner list ORGANIZATION prints it"
+            "runner must be an exact rnr_ identifier; useful runner list ORGANIZATION prints it"
                 .to_owned(),
         )
     }
@@ -144,7 +144,9 @@ enum GrantArg {
 }
 
 fn parse_grant(value: &str) -> Result<GrantArg, String> {
-    if um_support::valid_typed_id(value, "pgr_") || um_support::valid_typed_id(value, "agl_") {
+    if useful_support::valid_typed_id(value, "pgr_")
+        || useful_support::valid_typed_id(value, "agl_")
+    {
         return Ok(GrantArg::Id(value.to_owned()));
     }
     projection::PROVIDERS
@@ -153,7 +155,7 @@ fn parse_grant(value: &str) -> Result<GrantArg, String> {
         .find(|name| *name == value)
         .map(GrantArg::Provider)
         .ok_or_else(|| {
-            "grant must be an exact pgr_ or agl_ identifier, as um grant list prints it, or one of \
+            "grant must be an exact pgr_ or agl_ identifier, as useful grant list prints it, or one of \
              github, gitlab.com, linear, claude_code and codex"
                 .to_owned()
         })
@@ -190,12 +192,12 @@ fn resolve(api: &MemberGrantApi, grant: &GrantArg) -> Result<Resolved, MemberGra
     }
 }
 
-/// The signed-in member's unrevoked grants of both kinds, read as `um grant list` reads them
+/// The signed-in member's unrevoked grants of both kinds, read as `useful grant list` reads them
 /// with the human session alone; with `organization`, an ID or a slug, only that
 /// organization's among the coding agents' grants (REQ-CREDREADY-22).
 pub(super) fn held(
     deployment: &Deployment,
-    policy: um_api::HttpTransportPolicy,
+    policy: useful_api::HttpTransportPolicy,
     organization: Option<&str>,
 ) -> anyhow::Result<Result<Vec<MemberGrant>, MemberGrantFailure>> {
     super::with_human_session_api(deployment, policy, |api: &MemberGrantApi| {
@@ -232,8 +234,8 @@ fn every_grant(api: &MemberGrantApi) -> Result<Vec<MemberGrant>, MemberGrantFail
 
 /// Reads a list to its last page, following each page's next cursor; `read` lists the page at
 /// a cursor as its items and the next cursor. A next cursor already followed would page
-/// forever, and is refused as `invalid`. The grant commands, `um auth credentials status` and
-/// `um runner doctor --readiness` all page through this one loop.
+/// forever, and is refused as `invalid`. The grant commands, `useful auth credentials status` and
+/// `useful runner doctor --readiness` all page through this one loop.
 pub(super) fn every_page<T, E>(
     invalid: E,
     mut read: impl FnMut(Option<&str>) -> Result<(Vec<T>, Option<String>), E>,
@@ -413,7 +415,7 @@ fn each_under_its_key<I, T>(
 ) -> anyhow::Result<(Vec<T>, Option<MemberGrantFailure>)> {
     let keys = items
         .iter()
-        .map(|_| um_support::generate_idempotency_key())
+        .map(|_| useful_support::generate_idempotency_key())
         .collect::<Result<Vec<_>, _>>()
         .context("generate a request key for each request")?;
     let mut outcomes = Vec::with_capacity(keys.len());

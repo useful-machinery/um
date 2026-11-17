@@ -4,7 +4,7 @@
 
 use clap::Args;
 
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 use super::super::super::CommandResult;
 use super::import::{self, Provider, Source};

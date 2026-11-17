@@ -1123,13 +1123,13 @@ impl AgentProtocolRejectionDiagnostic {
     pub(crate) fn reason_name(&self) -> Option<String> {
         match &self.profile {
             AgentProtocolRejectionProfile::PiJsonV1(rejection) => {
-                um_support::wire_name(rejection.reason())
+                useful_support::wire_name(rejection.reason())
             }
             AgentProtocolRejectionProfile::ClaudeCodeStreamJsonV1(rejection) => {
-                um_support::wire_name(rejection.reason())
+                useful_support::wire_name(rejection.reason())
             }
             AgentProtocolRejectionProfile::CodexAppServerV1(rejection) => {
-                um_support::wire_name(rejection.reason())
+                useful_support::wire_name(rejection.reason())
             }
         }
     }

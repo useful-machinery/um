@@ -97,7 +97,7 @@ fn send(
         return Err(error(format!("{url:?} is not an https URL")));
     }
     authorization.set_sensitive(true);
-    um_support::install_provider();
+    useful_support::install_provider();
     let client = blocking_client_builder(transport_policy, timeout)
         .build()
         .map_err(|cause| error(format!("the HTTP client could not start: {cause}")))?;
@@ -122,7 +122,7 @@ fn send(
     reason = "provider request unit tests use Rust test assertions and fixture extraction"
 )]
 mod tests {
-    use um_test_support::ScriptedHttpServer;
+    use useful_test_support::ScriptedHttpServer;
 
     use super::*;
 

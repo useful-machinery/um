@@ -94,7 +94,7 @@ documentation-test target; formatting, Clippy, and structural checks remain expl
 broader local suite rather than Nix package checks. The local suite packages and verifies the
 release archive from the binary its integration tests already built rather than compiling an
 optimized binary; optimized builds are produced only by the Nix package and release builds.
-When `UM_CLI_SUITE_TESTS_RUN_BY` names a step, `./scripts/check` skips the workspace build, the
+When `USEFUL_CLI_SUITE_TESTS_RUN_BY` names a step, `./scripts/check` skips the workspace build, the
 nextest run, and the release-archive check; it is the private pipeline's switch for a step that
 already ran the suite on the same source, and the public workflow never sets it.
 

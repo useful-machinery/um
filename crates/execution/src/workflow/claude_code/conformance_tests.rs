@@ -237,7 +237,7 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
         settings["hooks"]["UserPromptSubmit"][0]["hooks"]
             .as_array_mut().unwrap().push(json!({
                 "type": "command",
-                "command": format!("{} {}", std::env::var("UM_CLAUDE_CODE_CONFORMANCE_SHELL").unwrap(), concurrent_hook.display())
+                "command": format!("{} {}", std::env::var("USEFUL_CLAUDE_CODE_CONFORMANCE_SHELL").unwrap(), concurrent_hook.display())
             }));
         fs::write(settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
         let expected_cwd = fs::canonicalize(root.project()).unwrap();
@@ -1115,7 +1115,7 @@ async fn pinned_real_claude_code_06d_prompt_hook_deny_prevents_provider_request(
         fs::create_dir_all(settings.parent().unwrap()).unwrap();
         fs::write(settings, serde_json::to_vec(&json!({
             "hooks": {"UserPromptSubmit": [{"hooks": [{"type": "command",
-                "command": format!("{} {}", std::env::var("UM_CLAUDE_CODE_CONFORMANCE_SHELL").unwrap(), hook.display())
+                "command": format!("{} {}", std::env::var("USEFUL_CLAUDE_CODE_CONFORMANCE_SHELL").unwrap(), hook.display())
             }]}]}
         })).unwrap()).unwrap();
         let running = RunningProductionClaudeCode::launch(
@@ -1151,7 +1151,7 @@ async fn pinned_real_claude_code_06c_background_completion_continuation() {
         fs::write(operations.join("remove.txt"), b"remove me\n").unwrap();
         // The synthetic root's /usr/bin:/bin PATH has no coreutils on NixOS.
         // Supply only this command's pinned tools without changing fixture isolation.
-        let tools_path = std::env::var("UM_CLAUDE_CODE_CONFORMANCE_TOOLS_PATH")
+        let tools_path = std::env::var("USEFUL_CLAUDE_CODE_CONFORMANCE_TOOLS_PATH")
             .expect("CLI Devenv must supply the native conformance tools");
         let observations = RecordingObservationSink::default();
         let mut running = launch_recorded_response_lifecycle(

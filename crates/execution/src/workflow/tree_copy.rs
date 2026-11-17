@@ -1,5 +1,5 @@
 //! The read-only copy of a validated workflow tree, shared by a run directory's
-//! `workflow/tree/` (REQ-LOCALRUN-170) and the `um` home's `trees/sha256/<hex>/`
+//! `workflow/tree/` (REQ-LOCALRUN-170) and the `useful` home's `trees/sha256/<hex>/`
 //! (REQ-WFDEF-17), with the descriptor-relative file operations it is written through.
 
 use std::collections::BTreeMap;

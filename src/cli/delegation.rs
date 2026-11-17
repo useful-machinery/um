@@ -6,14 +6,14 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{
+use useful_api::{
     AcceptDelegationOutcome, CommonDelegationFailure, Delegation, DelegationApiError,
     DelegationPage, DelegationState, DelegationTerminalReason, EndDelegationOutcome,
     GetDelegationOutcome, HttpClient, ListDelegationsOutcome, ProposeDelegationOutcome,
     accept_delegation, end_delegation, get_delegation, list_current_principal_delegations,
     propose_delegation,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Manage Useful Machinery delegations";
 const NAME: &str = "delegation";
@@ -90,7 +90,7 @@ impl DelegationOptions {
     where
         O: super::HumanCredentialOutcome<Error = DelegationApiError>,
     {
-        let idempotency_key = um_support::generate_idempotency_key()
+        let idempotency_key = useful_support::generate_idempotency_key()
             .context("generate delegation mutation request identity")?;
         self.execute(
             deployment,
@@ -210,7 +210,7 @@ impl ListCommand {
 
 impl ProposeCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let idempotency_key = um_support::generate_idempotency_key()
+        let idempotency_key = useful_support::generate_idempotency_key()
             .context("generate delegation proposal request identity")?;
         let outcome = super::execute_with_human_credential(
             deployment,
@@ -255,7 +255,7 @@ impl ShowCommand {
 impl AcceptCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let api_key = self.options.authentication.api_key()?;
-        let idempotency_key = um_support::generate_idempotency_key()
+        let idempotency_key = useful_support::generate_idempotency_key()
             .context("generate delegation acceptance request identity")?;
         let client = HttpClient::new(self.options.http.transport_policy())
             .map_err(|error| anyhow!(error))
@@ -296,7 +296,7 @@ impl EndCommand {
 }
 
 fn parse_principal_id(value: &str) -> Result<String, String> {
-    if um_support::valid_typed_id(value, "prn_") {
+    if useful_support::valid_typed_id(value, "prn_") {
         Ok(value.to_owned())
     } else {
         Err("must be an exact service principal ID".to_owned())
@@ -304,7 +304,7 @@ fn parse_principal_id(value: &str) -> Result<String, String> {
 }
 
 fn parse_delegation_id(value: &str) -> Result<String, String> {
-    if um_support::valid_typed_id(value, "dlg_") {
+    if useful_support::valid_typed_id(value, "dlg_") {
         Ok(value.to_owned())
     } else {
         Err("must be an exact delegation ID".to_owned())
@@ -321,7 +321,7 @@ macro_rules! impl_delegation_credential_outcome {
                     Self::Common(CommonDelegationFailure::Unauthenticated)
                 }
 
-                fn unreachable(category: um_api::UnreachableCategory) -> Self {
+                fn unreachable(category: useful_api::UnreachableCategory) -> Self {
                     Self::Common(CommonDelegationFailure::Unreachable(category))
                 }
 
@@ -503,7 +503,7 @@ fn write_common(
             None,
             authentication
                 .rejected_error(
-                    "error: delegation management requires sign-in\n\nSign in first:\n  um auth login",
+                    "error: delegation management requires sign-in\n\nSign in first:\n  useful auth login",
                 )
                 .to_owned(),
             OutcomeClass::Unauthenticated,

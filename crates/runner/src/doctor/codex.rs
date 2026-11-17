@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use super::{CheckDescriptor, CompatibleHarness, DoctorCheck, Outcome, compatible_harness_outcome};
-use um_execution::{
+use useful_execution::{
     AgentCompatibilityProfile, CODEX_APP_SERVER_V1_QUALIFICATION_VERSION,
     CODEX_APP_SERVER_V1_SUPPORTED_RANGE, CodexIncompatibility, CodexInstallationFailure,
     CodexProbe, discover_and_validate_codex_installation,

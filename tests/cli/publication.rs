@@ -81,7 +81,7 @@ fn publication_body() -> serde_json::Value {
             "kind": "new_change_request",
             "repositoryConnectionId": REPOSITORY_CONNECTION_ID,
             "providerRepositoryId": "123456",
-            "fullName": "scherzo-systems/um",
+            "fullName": "scherzo-systems/useful",
             "baseBranch": "main",
             "branchVersion": 2, "destinationBranch": format!("um/{RUN_ID}/{EXPORT_NAME}")
         },
@@ -128,7 +128,7 @@ fn gitlab_publication_body() -> serde_json::Value {
 #[test]
 #[ignore = "requires the worker-backed response supplied by the GitLab integration harness"]
 fn worker_backed_gitlab_publication_through_cli() {
-    let response = std::env::var("UM_PUBLICATION_TEST_API_RESPONSE_JSON")
+    let response = std::env::var("USEFUL_PUBLICATION_TEST_API_RESPONSE_JSON")
         .expect("GitLab integration harness must supply its API response");
     let body: serde_json::Value = serde_json::from_str(&response).expect("worker-backed API JSON");
     let organization = body["organizationId"].as_str().expect("organization id");
@@ -365,12 +365,12 @@ fn succeeded_publication(outcome: &str) -> serde_json::Value {
         publication["branch"] = serde_json::json!({
             "headOid": publication["artifact"]["headOid"].clone(),
             "disposition": if merged { "reused" } else { "created" },
-            "url": "https://github.example/scherzo-systems/um/tree/changes"
+            "url": "https://github.example/scherzo-systems/useful/tree/changes"
         });
         publication["pullRequest"] = serde_json::json!({
             "providerId": "987654",
             "number": 17,
-            "url": "https://github.example/scherzo-systems/um/pulls/17",
+            "url": "https://github.example/scherzo-systems/useful/pulls/17",
             "disposition": if merged { "reused" } else { "created" },
             "state": if merged { "merged" } else { "open" }
         });
@@ -647,7 +647,7 @@ fn publication_create_sends_the_closed_request_and_renders_plain_and_json_receip
                 format!("run: {RUN_ID}"),
                 format!("export: {EXPORT_NAME}"),
                 "state: queued".to_owned(),
-                "repository: scherzo-systems/um".to_owned(),
+                "repository: scherzo-systems/useful".to_owned(),
                 format!("destination branch: um/{RUN_ID}/{EXPORT_NAME}"),
                 format!("idempotency key: {CALLER_KEY}"),
             ] {
@@ -1719,7 +1719,7 @@ fn create_wait_timeout_and_signal_after_acceptance_stop_only_observation() {
         );
         let environment =
             deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
         command
             .args(create_wait_args(true, true, timeout))
             .stdin(Stdio::null())
@@ -1795,7 +1795,7 @@ fn timeout_and_signals_stop_only_local_publication_show_observation() {
         );
         let environment =
             deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
         command
             .args(show_wait_args(true, timeout))
             .stdin(Stdio::null())
@@ -1868,7 +1868,7 @@ fn signal_during_session_acquisition_emits_no_false_publication_receipt() {
         &server.issuer,
         credential_path.to_str().unwrap(),
     );
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args(create_args(true, false))
         .stdin(Stdio::null())

@@ -1,4 +1,4 @@
-//! Workflow definitions under the `um` home (REQ-WFDEF-17 to REQ-WFDEF-22): the home's
+//! Workflow definitions under the `useful` home (REQ-WFDEF-17 to REQ-WFDEF-22): the home's
 //! location, the `definition.json` records and their `revisions/<n>/bindings.json`
 //! snapshots under `workflows/<id>/`, each with the optional `resolution.json` of provider
 //! ids beside it that the Cloud runner writes and publishing never does (REQ-WFDEF-32), and
@@ -34,9 +34,9 @@ use super::tree::ValidatedTree;
 use super::tree_copy::{self, FileOperationError, TreeCopyError, write_tree_copy};
 use crate::owned_tree::remove_open_tree_at;
 
-const UM_HOME_VARIABLE: &str = "UM_HOME";
+const USEFUL_HOME_VARIABLE: &str = "USEFUL_HOME";
 const HOME_VARIABLE: &str = "HOME";
-const DEFAULT_HOME_DIRECTORY: &str = ".um";
+const DEFAULT_HOME_DIRECTORY: &str = ".useful";
 const WORKFLOWS_DIRECTORY: &str = "workflows";
 const TREES_DIRECTORY: &str = "trees";
 const SHA256_DIRECTORY: &str = "sha256";
@@ -59,7 +59,7 @@ const UNKNOWN_PUBLISHER: &str = "unknown";
 const MAXIMUM_RECORD_BYTES: u64 = 16 * 1024 * 1024;
 const MAXIMUM_BINDINGS_BYTES: u64 = 1024 * 1024;
 
-/// The `um` home: `$UM_HOME` when set and not empty, otherwise `$HOME/.um` (REQ-WFDEF-17).
+/// The `useful` home: `$USEFUL_HOME` when set and not empty, otherwise `$HOME/.useful` (REQ-WFDEF-17).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct WorkflowHome {
     root: PathBuf,
@@ -71,7 +71,7 @@ impl WorkflowHome {
     }
 
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<OsString>) -> Result<Self, DefinitionError> {
-        if let Some(root) = lookup(UM_HOME_VARIABLE).filter(|value| !value.is_empty()) {
+        if let Some(root) = lookup(USEFUL_HOME_VARIABLE).filter(|value| !value.is_empty()) {
             return Ok(Self {
                 root: PathBuf::from(root),
             });
@@ -542,7 +542,7 @@ pub fn publish(
     let snapshot_bytes = snapshot
         .canonical_bytes()
         .map_err(|source| unavailable(home.root(), "encode bindings snapshot", source))?;
-    let published_at = utc_timestamp(um_support::utc_now()).map_err(|source| {
+    let published_at = utc_timestamp(useful_support::utc_now()).map_err(|source| {
         unavailable(home.root(), "format publish time", io::Error::other(source))
     })?;
 
@@ -888,7 +888,7 @@ impl DefinitionError {
 impl fmt::Display for DefinitionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::HomeUnavailable => formatter.write_str("neither UM_HOME nor HOME is set"),
+            Self::HomeUnavailable => formatter.write_str("neither USEFUL_HOME nor HOME is set"),
             Self::NameMissing => formatter.write_str("the root workflow declares no name"),
             Self::IdInvalid { .. } => formatter.write_str("the id is not a definition id"),
             Self::NotFound { id } => write!(formatter, "no definition has the id {id}"),

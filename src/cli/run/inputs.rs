@@ -11,11 +11,11 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 
 use crate::exit_code::ExitCode;
-use um_api::{
+use useful_api::{
     RetainedRunInputs, RunFailure, UnreachableCategory, capability_batches, retained_manifest,
     transfer_capability_batch,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Manage retained run inputs";
 
@@ -259,7 +259,7 @@ enum DownloadTransferFailure {
 fn download_selected(
     deployment: &Deployment,
     command: &DownloadCommand,
-    cancellation: &um_api::HttpCancellation,
+    cancellation: &useful_api::HttpCancellation,
     commit_control: &DownloadCommitControl,
 ) -> anyhow::Result<Result<DownloadedInputs, DownloadFailure>> {
     let (parent, destination_name) = match destination_parent(&command.output) {
@@ -299,7 +299,7 @@ fn download_selected(
     };
     let total_size_bytes = members.iter().map(|member| member.size_bytes).sum();
     let staging = match tempfile::Builder::new()
-        .prefix(".um-input-download-")
+        .prefix(".useful-input-download-")
         .tempdir_in(&parent)
     {
         Ok(staging) => staging,
@@ -384,7 +384,7 @@ fn download_selected(
                         DownloadTransferFailure::Download(DownloadFailure::StagingUnavailable)
                     })
             },
-            um_support::utc_now,
+            useful_support::utc_now,
             || {
                 DownloadTransferFailure::Download(download_api_failure(
                     RunFailure::Unreachable(UnreachableCategory::Server),
@@ -456,9 +456,9 @@ fn destination_parent(destination: &Path) -> Result<(PathBuf, &std::ffi::OsStr),
 }
 
 fn select_members(
-    all_members: Vec<um_api::RunInputObjectMetadata>,
+    all_members: Vec<useful_api::RunInputObjectMetadata>,
     requested: &[String],
-) -> Result<Vec<um_api::RunInputObjectMetadata>, RunFailure> {
+) -> Result<Vec<useful_api::RunInputObjectMetadata>, RunFailure> {
     if requested.is_empty() {
         return Ok(all_members);
     }
@@ -494,7 +494,7 @@ fn sync_tree(root: &Path) -> io::Result<()> {
 
 impl DeleteCommand {
     fn execute(self, deployment: Deployment) -> super::super::CommandResult {
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate retained input deletion identity")?;
         let signal_deployment = deployment.clone();
         let signal_organization = self.run.organization.clone();

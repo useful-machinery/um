@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, anyhow};
 use serde::Serialize;
 use serde_json::{Map, Value};
-use um_execution::{
+use useful_execution::{
     ControlEvent, LocalRunDirectoryError, NoConditions, ResolvedWorkflow, RunState, ValidatedStep,
     WaitInspection, WaitKind, WaitRecord, WorkflowRunRecord, append_control, inspect_wait,
     normalize_terminal_path, normalize_terminal_scalar, read_local_run_status,
@@ -26,7 +26,7 @@ pub(super) type JsonOutput = super::super::super::JsonArgs<super::super::super::
 pub(super) struct ControlTarget {
     pub(super) run_directory: PathBuf,
     pub(super) record: WorkflowRunRecord,
-    /// The run's `state.json`, as `um workflow run status` reads it.
+    /// The run's `state.json`, as `useful workflow run status` reads it.
     pub(super) state: Value,
     pub(super) inspection: WaitInspection,
     /// The run's copy of the tree it was admitted from (REQ-LOCALRUN-170).

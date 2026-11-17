@@ -29,8 +29,8 @@ use crate::agent_login::grant_token::AssignmentGrantTokens;
 use crate::control_protocol::AssignmentCounts;
 use crate::telemetry::{Event as TelemetryEvent, Outcome as TelemetryOutcome};
 #[cfg(test)]
-use um_execution::RUNNER_TERMINAL_FRAME_BYTES;
-use um_execution::{
+use useful_execution::RUNNER_TERMINAL_FRAME_BYTES;
+use useful_execution::{
     AdmissionFailure, AdmissionFailureKind, AdmittedWorkflow, CancellationPolicy,
     CancellationReason, CancellationSource, CaptureCancellation, CloudGitCaptureProjection,
     ConditionCapacityBounds, EnvironmentSnapshot, ExecutionContext, HarnessLoginObserver,
@@ -40,7 +40,7 @@ use um_execution::{
     ValidatedCodexInstallation, ValidatedPiInstallation, WorkflowCapacityBudget,
     admit_runner_workflow, default_execution_policy_limits, valid_condition_capacity,
 };
-use um_runner_protocol::{
+use useful_runner_protocol::{
     AssignmentDecline, CancellationApplicationDisposition, CancellationMode, ContinuationOffer,
     ExecutionLeaseGrant, ExecutionLeasePolicy, ExecutionSpecInvalidReason,
     ExecutionSpecV1RunnerProjection, MAXIMUM_CONDITION_TRANSITION_FRAME_BYTES,
@@ -198,7 +198,7 @@ pub(super) struct AcceptedAssignment {
 }
 
 /// What an accepted assignment executes: an admitted workflow on the embedded engine,
-/// or a published tree through the `um` commands (REQ-RUNNERENROLL-91).
+/// or a published tree through the `useful` commands (REQ-RUNNERENROLL-91).
 #[derive(Clone)]
 pub(super) enum AcceptedExecution {
     Engine(Box<AdmittedWorkflow>),
@@ -1566,14 +1566,15 @@ pub(super) mod test_support {
     ) {
         let digest = &workflow.capacity.source_closure_digest;
         let requirements = workflow.capacity.requirements;
-        let projected_digest = um_runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection {
-            algorithm: digest.algorithm.as_str().to_owned(),
-            value: digest.value.clone(),
-        };
+        let projected_digest =
+            useful_runner_protocol::WorkflowSourceClosureDigestV1RunnerProjection {
+                algorithm: digest.algorithm.as_str().to_owned(),
+                value: digest.value.clone(),
+            };
         execution_spec
             .workflow_definition_source
             .workflow_source_closure_digest = projected_digest.clone();
-        execution_spec.capacity = um_runner_protocol::ExecutionCapacityV1RunnerProjection {
+        execution_spec.capacity = useful_runner_protocol::ExecutionCapacityV1RunnerProjection {
             execution_contract: "workflow_v1_cloud_inputs_artifacts@1".to_owned(),
             source_closure_digest: projected_digest,
             general_maximum_transitions: requirements.general_maximum_transitions,
@@ -1641,7 +1642,7 @@ pub(super) mod test_support {
                 repository_url: Arc::clone(&self.read_url),
                 canonical_repository_url: Some(Arc::from(GITLAB_CANONICAL_URL)),
                 token: ProviderSecret(format!("grg_fixture-grant-{sequence}").into_bytes()),
-                expires_at: um_support::utc_now() + time::Duration::hours(1),
+                expires_at: useful_support::utc_now() + time::Duration::hours(1),
             }
         }
     }
@@ -1658,7 +1659,7 @@ pub(super) mod test_support {
             let sequence = self.issued_preparation.fetch_add(1, Ordering::SeqCst);
             let mut credential = self.grant(sequence);
             if sequence == 0 {
-                credential.expires_at = um_support::utc_now() + time::Duration::seconds(5);
+                credential.expires_at = useful_support::utc_now() + time::Duration::seconds(5);
             }
             Ok(credential)
         }
@@ -1717,7 +1718,7 @@ pub(super) mod test_support {
                 .to_string_lossy()
                 .starts_with("source-askpass-")
         }));
-        let credential_config = um_test_support::fixture_git_command("git")
+        let credential_config = useful_test_support::fixture_git_command("git")
             .current_dir(workspace)
             .args(["config", "--local", "--get-regexp", "^credential\\."])
             .output()

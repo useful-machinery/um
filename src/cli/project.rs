@@ -6,25 +6,25 @@ use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand, builder::NonEmptyStringValueParser};
 
 use crate::exit_code::ExitCode;
-use um_api::{
+use useful_api::{
     CreateProjectInput, HttpClient, HttpTransportPolicy, Project, ProjectApi, ProjectFailure,
     ProjectRepositorySelector, RunnerFailure,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 use super::{
     GitLabConnectionArg, InstallationArg, OrganizationArg, PoolArg, ProjectArg, RepositoryArg,
 };
 
-/// How `um project show` joins readiness blockers, shared with run creation's
+/// How `useful project show` joins readiness blockers, shared with run creation's
 /// `project-not-ready` rejection.
 pub(super) use output::blocker_list;
 
 pub(super) const ABOUT: &str = "Manage Useful Machinery projects";
 /// What to do about a refusal that names an archived project, shared by the
-/// commands whose refusal is not a project outcome of its own: `um project
-/// webhook`, `um project action` and run creation.
-pub(super) const ARCHIVED_REMEDY: &str = "The project is archived. As an organization owner, unarchive it with `um project unarchive` first.";
+/// commands whose refusal is not a project outcome of its own: `useful project
+/// webhook`, `useful project action` and run creation.
+pub(super) const ARCHIVED_REMEDY: &str = "The project is archived. As an organization owner, unarchive it with `useful project unarchive` first.";
 const NAME: &str = "project";
 
 #[derive(Debug, Args)]
@@ -390,7 +390,7 @@ impl CreateCommand {
             None => None,
         };
         let selector = self.repository.selector()?;
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate project creation request identity")?;
         let result = with_api(
             deployment,
@@ -468,7 +468,7 @@ impl ShowCommand {
 
 impl RenameCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate project rename request identity")?;
         let result = with_api(
             deployment,
@@ -523,7 +523,7 @@ impl ArchiveCommand {
         outcome: &'static str,
         heading: &'static str,
     ) -> anyhow::Result<ExitCode> {
-        let key = um_support::generate_idempotency_key().context(key_context)?;
+        let key = useful_support::generate_idempotency_key().context(key_context)?;
         let result = with_api(
             deployment,
             self.options.http.transport_policy(),
@@ -568,7 +568,7 @@ impl RepositoryShowCommand {
 impl RepositorySetCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let selector = self.repository.selector()?;
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate project repository request identity")?;
         let result = with_api(
             deployment,
@@ -598,7 +598,7 @@ impl RepositorySetCommand {
 
 impl RepositoryUpdateCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate project repository update request identity")?;
         let result = with_api(
             deployment,
@@ -626,7 +626,7 @@ impl RepositoryUpdateCommand {
 
 impl RepositoryRemoveCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate project repository detachment request identity")?;
         let result = with_api(
             deployment,
@@ -672,7 +672,7 @@ impl RunnerPoolSetCommand {
                 runner_pool_ids.push(pool_id);
             }
         }
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate project runner pool request identity")?;
         let result = with_api(
             deployment,
@@ -700,7 +700,7 @@ impl RunnerPoolSetCommand {
 
 impl RunnerPoolRemoveCommand {
     fn execute(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate project runner pool removal request identity")?;
         let result = with_api(
             deployment,

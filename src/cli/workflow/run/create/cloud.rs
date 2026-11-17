@@ -1,11 +1,11 @@
-//! `um workflow run create ID --cloud ORGANIZATION --project PROJECT` (REQ-RUN-94): a Cloud
+//! `useful workflow run create ID --cloud ORGANIZATION --project PROJECT` (REQ-RUN-94): a Cloud
 //! run of the Cloud definition `ID`, created and reported as every Cloud run creation is.
 
 use std::path::PathBuf;
 
 use anyhow::anyhow;
 use clap::Args;
-use um_api::RunDefinitionSelection;
+use useful_api::RunDefinitionSelection;
 
 use crate::cli::run::{
     Creation, CreationOptions, INTEGRATION_CONTEXT_FILE_HELP, RunOptions, RunWaitArgs,
@@ -79,7 +79,7 @@ impl Options {
 
 impl super::Command {
     /// Asks Cloud to create a run of the Cloud definition `ID`, sent as given, and the
-    /// workflow file `--workflow` names in its tree. Nothing under the `um` home and no
+    /// workflow file `--workflow` names in its tree. Nothing under the `useful` home and no
     /// execution root is read.
     pub(super) fn create_in_cloud(self, organization: OrganizationArg) -> CommandResult {
         let usage = |error| CommandFailure::with_exit_code(error, ExitCode::UsageError);

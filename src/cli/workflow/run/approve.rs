@@ -1,16 +1,16 @@
-//! `um workflow run approve` and `um workflow run hand-back` (REQ-LOCALRUN-183); with `--cloud
+//! `useful workflow run approve` and `useful workflow run hand-back` (REQ-LOCALRUN-183); with `--cloud
 //! ORGANIZATION`, the control is carried to the Cloud run's runner instead (REQ-LOCALRUN-210).
 
 use clap::Args;
 use serde_json::{Map, Value};
-use um_execution::{CONTROL_APPROVE, CONTROL_HAND_BACK, WaitKind};
+use useful_execution::{CONTROL_APPROVE, CONTROL_HAND_BACK, WaitKind};
 
 use super::control::{Acted, ControlFailure, ControlTarget};
 
 pub(super) const APPROVE_ABOUT: &str = "Approve a run waiting for approval";
 pub(super) const HAND_BACK_ABOUT: &str = "Hand a run waiting for approval back with notes";
-const APPROVE_COMMAND: &str = "um workflow run approve";
-const HAND_BACK_COMMAND: &str = "um workflow run hand-back";
+const APPROVE_COMMAND: &str = "useful workflow run approve";
+const HAND_BACK_COMMAND: &str = "useful workflow run hand-back";
 
 #[derive(Debug, Args)]
 pub(super) struct Approve {

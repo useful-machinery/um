@@ -3,10 +3,10 @@ use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{ArgMatches, Args, FromArgMatches};
 
 use crate::exit_code::ExitCode;
-use um_api::{
+use useful_api::{
     MemberGrant, MemberGrantAuthorization, MemberGrantFailure, MemberGrantKind, MemberGrantProvider,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 use super::authorization::{AuthorizationView, Holder, write_authorized};
 use super::confirmation::{self, Confirmation, NATIVE_AUTHORIZE, Stated, Statement};
@@ -19,11 +19,11 @@ use super::{
 
 pub(super) const ABOUT: &str = "Authorize a runner to use one of your grants, or all of them";
 
-/// The remedy for a Codex grant authorized for another runner (REQ-GRANT-66), which `um grant
-/// authorize` and the earlier `um auth agent-login authorize` both report: a Codex grant serves
+/// The remedy for a Codex grant authorized for another runner (REQ-GRANT-66), which `useful grant
+/// authorize` and the earlier `useful auth agent-login authorize` both report: a Codex grant serves
 /// one runner, and another sign-in cannot make a second grant for another runner, since a held
 /// grant is refused or replaced in place (REQ-GRANT-73).
-pub(in crate::cli) const MOVE_CODEX_GRANT: &str = "A Codex grant serves one runner at a time. To move it to this runner, end its authorization for the other, which `um grant list GRANT` names, then authorize this one:\n  um grant deauthorize GRANT RUNNER --yes";
+pub(in crate::cli) const MOVE_CODEX_GRANT: &str = "A Codex grant serves one runner at a time. To move it to this runner, end its authorization for the other, which `useful grant list GRANT` names, then authorize this one:\n  useful grant deauthorize GRANT RUNNER --yes";
 
 /// The leaf's arguments as clap reads them. `--all` takes the place of `GRANT`, so after it the
 /// first positional is the runner: clap fills positionals in order, whatever they hold, so the
@@ -75,7 +75,7 @@ enum Target {
     All,
 }
 
-/// `um grant authorize GRANT [RUNNER]` or `um grant authorize --all [RUNNER]`; given no
+/// `useful grant authorize GRANT [RUNNER]` or `useful grant authorize --all [RUNNER]`; given no
 /// `RUNNER` it offers the runners instead (REQ-GRANT-81).
 #[derive(Debug)]
 pub(in crate::cli) struct Command {
@@ -176,7 +176,7 @@ impl FromArgMatches for Command {
 /// of such a run can read the token, while a native grant's login is the runner's to every run
 /// and step (REQ-GRANT-35).
 impl Stated for Command {
-    const COMMAND: &'static str = "um grant authorize";
+    const COMMAND: &'static str = "useful grant authorize";
     type Usage = Self;
     const STATEMENT: Statement = Statement::ByKind {
         oauth: &[
@@ -302,7 +302,7 @@ impl Command {
                 );
             }
         };
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate grant authorization request key")?;
         state_then_act::<Self, _>(
             deployment,
@@ -385,7 +385,7 @@ impl Command {
 
 /// Authorizes `runner_id` for `grant` under `key`, once more when the answer was lost.
 fn authorize(
-    api: &um_api::MemberGrantApi,
+    api: &useful_api::MemberGrantApi,
     grant: &MemberGrant,
     runner_id: &str,
     key: &str,
@@ -411,7 +411,7 @@ fn write(
 /// Authorizes `runner_id` for `grant` unless it already is, reporting a refusal of this one
 /// grant as its outcome.
 fn authorize_one(
-    api: &um_api::MemberGrantApi,
+    api: &useful_api::MemberGrantApi,
     grant: &MemberGrant,
     runner_id: &str,
     key: &str,

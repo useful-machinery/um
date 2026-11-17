@@ -243,7 +243,7 @@ pub(super) fn after_notice(output: &Output, replacement: &str) -> String {
     rest.to_owned()
 }
 
-/// Every command a printed next action names is a `um grant` or `um runner grant` command, and
+/// Every command a printed next action names is a `useful grant` or `useful runner grant` command, and
 /// none of the earlier commands is named anywhere in `text` (REQ-GRANT-77).
 pub(super) fn assert_next_actions_name_the_grant_commands(text: &str) {
     let mut commands = 0;
@@ -251,16 +251,16 @@ pub(super) fn assert_next_actions_name_the_grant_commands(text: &str) {
         for command in line.split('`').skip(1).step_by(2) {
             commands += 1;
             assert!(
-                command.starts_with("um grant ") || command.starts_with("um runner grant "),
+                command.starts_with("useful grant ") || command.starts_with("useful runner grant "),
                 "{line}"
             );
         }
     }
     assert!(commands > 0, "no next action names a command in\n{text}");
     for earlier in [
-        "um auth agent-login",
-        "um auth grant",
-        "um runner agent-login",
+        "useful auth agent-login",
+        "useful auth grant",
+        "useful runner agent-login",
     ] {
         assert!(!text.contains(earlier), "{earlier} in\n{text}");
     }
@@ -481,7 +481,9 @@ fn list_names_the_command_that_authorizes_a_runner_for_an_oauth_grant_with_none(
     );
     assert_eq!(
         commands,
-        [format!("um grant authorize {OAUTH_GRANT_ID} RUNNER --yes")],
+        [format!(
+            "useful grant authorize {OAUTH_GRANT_ID} RUNNER --yes"
+        )],
         "{line}"
     );
     server.finish();
@@ -1150,7 +1152,7 @@ fn refusal_without_yes(server: &ScriptedServer, credential: &Path, args: &[&str]
     let text = stderr(&output);
     assert!(text.contains("--yes"), "{args:?}: {text}");
     assert!(
-        text.contains(&format!("um grant {}", args[0])),
+        text.contains(&format!("useful grant {}", args[0])),
         "{args:?}: {text}"
     );
     text
@@ -1513,7 +1515,7 @@ fn authorize_all_exits_1_when_a_grant_is_refused_for_another_reason() {
     assert_eq!(human.status.code(), Some(1));
     let text = format!("{}{}", stdout(&human), stderr(&human));
     assert!(text.contains("runner_holds_login"), "{text}");
-    assert!(text.contains("um grant deauthorize"), "{text}");
+    assert!(text.contains("useful grant deauthorize"), "{text}");
     assert_eq!(server.finish().len(), 8);
 }
 
@@ -1581,7 +1583,7 @@ fn authorize_all_tells_a_codex_grant_authorized_elsewhere_from_one_authorized_he
     );
     // The refusal's remedy names the command that frees the grant.
     assert!(
-        stderr(&human).contains("um grant deauthorize"),
+        stderr(&human).contains("useful grant deauthorize"),
         "{}",
         stderr(&human)
     );
@@ -1942,7 +1944,7 @@ fn revoke_erases_a_native_grant_and_reports_each_runners_removal_and_stop() {
         notes
             .iter()
             .flat_map(|note| note.lines())
-            .any(|line| line.trim() == "um run cancel ORGANIZATION RUN --wait"),
+            .any(|line| line.trim() == "useful run cancel ORGANIZATION RUN --wait"),
         "{text}"
     );
 
@@ -2030,7 +2032,7 @@ fn each_refusal_these_leaves_meet_exits_1_with_its_remedy() {
             &["revoke", NATIVE_GRANT_ID, "--yes"],
             vec![problem("404 Not Found", 404, "grant-not-found")],
             "grant_not_found",
-            Some("um grant list"),
+            Some("useful grant list"),
         ),
         (
             authorize,
@@ -2049,7 +2051,7 @@ fn each_refusal_these_leaves_meet_exits_1_with_its_remedy() {
                 problem("404 Not Found", 404, "grant-runner-not-found"),
             ],
             "runner_not_found",
-            Some("um runner list"),
+            Some("useful runner list"),
         ),
         (
             authorize,
@@ -2058,14 +2060,14 @@ fn each_refusal_these_leaves_meet_exits_1_with_its_remedy() {
                 problem("409 Conflict", 409, "grant-runner-conflict"),
             ],
             "runner_holds_login",
-            Some("um grant deauthorize"),
+            Some("useful grant deauthorize"),
         ),
         // The runner holds no authorization in force, so nothing is deleted.
         (
             &["deauthorize", NATIVE_GRANT_ID, RUNNER_ID, "--yes"],
             vec![native()],
             "authorization_not_found",
-            Some("um grant list"),
+            Some("useful grant list"),
         ),
     ];
     for (args, responses, outcome, remedy) in cases {
@@ -2081,7 +2083,7 @@ fn each_refusal_these_leaves_meet_exits_1_with_its_remedy() {
         let commands: Vec<_> = text
             .lines()
             .map(str::trim_start)
-            .filter(|line| line.starts_with("um "))
+            .filter(|line| line.starts_with("useful "))
             .collect();
         match remedy {
             Some(command) => assert!(
@@ -2122,12 +2124,12 @@ fn a_codex_grant_authorized_for_another_runner_names_the_deauthorize_that_moves_
     assert_eq!(human.status.code(), Some(1));
     let text = stderr(&human);
     assert!(
-        text.contains("um grant deauthorize GRANT RUNNER --yes"),
+        text.contains("useful grant deauthorize GRANT RUNNER --yes"),
         "{text}"
     );
     // Another sign-in cannot serve the other runner: the held grant is refused or replaced
     // in place (REQ-GRANT-73).
-    assert!(!text.contains("um grant create codex"), "{text}");
+    assert!(!text.contains("useful grant create codex"), "{text}");
     let requests = server.finish();
     assert_member_requests(&requests);
     assert_eq!(requests.len(), 4);
@@ -2138,7 +2140,7 @@ fn a_codex_grant_authorized_for_another_runner_names_the_deauthorize_that_moves_
     );
 }
 
-// `um grant authorize` and `deauthorize` given no `RUNNER`, run here with a null standard
+// `useful grant authorize` and `deauthorize` given no `RUNNER`, run here with a null standard
 // input, where they cannot prompt (REQ-GRANT-81).
 const GLOBEX_RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abf";
 const LIST_ACME_RUNNERS: &str = "GET /api/v1/organizations/org_01k0z6r1w8f4jy2m7q9v3x5abc/runner-registrations?limit=200 HTTP/1.1";
@@ -2239,7 +2241,9 @@ fn authorize_without_a_runner_where_it_cannot_prompt_names_each_runner_it_offers
     let text = stderr(&human);
     let last = text.lines().last().unwrap_or_default();
     assert!(
-        last.contains("um grant authorize") && last.contains(RUNNER_ID) && last.contains("--yes"),
+        last.contains("useful grant authorize")
+            && last.contains(RUNNER_ID)
+            && last.contains("--yes"),
         "{text}"
     );
 
@@ -2450,10 +2454,10 @@ fn a_command_with_no_runner_to_offer_exits_1_with_why() {
     }
 }
 
-// `um grant authorize` and `deauthorize` given no `RUNNER` on a terminal, where they show the
+// `useful grant authorize` and `deauthorize` given no `RUNNER` on a terminal, where they show the
 // runners as a list to choose from (REQ-GRANT-82).
 
-/// `um grant` with `args`, to run on a terminal: as the leader of a new session whose
+/// `useful grant` with `args`, to run on a terminal: as the leader of a new session whose
 /// controlling terminal is its standard input, the terminal the list measures to draw on. The
 /// CLI test environment includes Python.
 fn grant_on_terminal(server: &ScriptedServer, credential: &Path, args: &[&str]) -> Command {
@@ -2463,7 +2467,7 @@ fn grant_on_terminal(server: &ScriptedServer, credential: &Path, args: &[&str]) 
             "-c",
             "import fcntl, os, sys, termios; os.setsid(); \
              fcntl.ioctl(0, termios.TIOCSCTTY, 0); os.execv(sys.argv[1], sys.argv[1:])",
-            env!("CARGO_BIN_EXE_um"),
+            env!("CARGO_BIN_EXE_useful"),
             "grant",
         ])
         .args(args)
@@ -2635,7 +2639,7 @@ fn deauthorize_on_a_terminal_without_a_runner_offers_only_the_authorized_runner(
     );
 }
 
-// `um grant authorize` and `deauthorize` given no `RUNNER` on a terminal, offered more than one
+// `useful grant authorize` and `deauthorize` given no `RUNNER` on a terminal, offered more than one
 // runner, also offer all of them as one choice (REQ-GRANT-83).
 
 // How the list's last entry, the one that stands for all the runners, begins.
@@ -2725,7 +2729,7 @@ fn authorize_with_all_runners_chosen_authorizes_each_under_its_own_key() {
             assert_eq!(output.status.code(), Some(1), "{shown}");
             let after = &shown[shown.rfind(NEW_RUNNER_ID).unwrap()..];
             assert!(
-                after.contains("um grant deauthorize GRANT RUNNER --yes"),
+                after.contains("useful grant deauthorize GRANT RUNNER --yes"),
                 "{shown}"
             );
         } else {
@@ -2860,7 +2864,7 @@ fn a_codex_grants_list_and_a_list_of_one_runner_offer_no_choice_of_all() {
     }
 }
 
-// `um grant create`. Each case sets in its own environment whether this machine has a
+// `useful grant create`. Each case sets in its own environment whether this machine has a
 // browser, so no case can open a real one: the only opener on `PATH` is a fake that records
 // what it is given.
 
@@ -2883,7 +2887,7 @@ const BROWSER_VARIABLES: [&str; 5] = [
 const LIST_OAUTH: &str = "GET /api/v1/me/grants?kind=oauth&limit=200 HTTP/1.1";
 const START_CONSENT: &str = "POST /api/v1/me/grants HTTP/1.1";
 
-/// Where `um grant create` runs.
+/// Where `useful grant create` runs.
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Place {
     /// No SSH variable, and on Linux a display.
@@ -2945,8 +2949,8 @@ impl Opener {
         );
     }
 
-    /// What the openers recorded, sorted, once at least `count` have: `um` starts an opener
-    /// and goes on without it, so an opener may record after `um` has returned.
+    /// What the openers recorded, sorted, once at least `count` have: `useful` starts an opener
+    /// and goes on without it, so an opener may record after `useful` has returned.
     pub(super) fn opened(&self, count: usize) -> Vec<String> {
         let mut opened = poll_until(
             "the opener recording its arguments",
@@ -2962,9 +2966,9 @@ impl Opener {
     }
 }
 
-/// The leading words of `um grant create`.
+/// The leading words of `useful grant create`.
 const GRANT_CREATE: &[&str] = &["grant", "create"];
-/// The leading words of `um runner doctor`.
+/// The leading words of `useful runner doctor`.
 const RUNNER_DOCTOR: &[&str] = &["runner", "doctor"];
 
 fn create_command(
@@ -2983,7 +2987,7 @@ fn create_command(
     )
 }
 
-/// `um` with `arguments`, where `place` decides whether this machine has a browser and the
+/// `useful` with `arguments`, where `place` decides whether this machine has a browser and the
 /// only opener on `PATH` is `opener`.
 pub(super) fn opener_command(
     server: &ScriptedServer,
@@ -2992,7 +2996,7 @@ pub(super) fn opener_command(
     place: Place,
     arguments: &[&str],
 ) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command.args(arguments).arg("--allow-insecure-http");
     for variable in DEPLOYMENT_VARIABLES
         .into_iter()
@@ -3019,7 +3023,7 @@ pub(super) fn opener_command(
     command
 }
 
-/// Runs `um grant create` with standard input that is not a terminal.
+/// Runs `useful grant create` with standard input that is not a terminal.
 fn run_create(
     server: &ScriptedServer,
     credential: &Path,
@@ -3147,7 +3151,7 @@ fn create_starts_the_consent_opens_its_url_and_waits_for_the_grant() {
 #[test]
 #[expect(
     clippy::disallowed_methods,
-    reason = "the bound on um's return is far below the opener's own life, so real time only separates returning from waiting for the opener"
+    reason = "the bound on useful's return is far below the opener's own life, so real time only separates returning from waiting for the opener"
 )]
 fn an_opener_that_waits_for_the_browser_to_quit_does_not_keep_the_consent_waiting() {
     let mut responses = vec![nothing_held()];
@@ -3175,7 +3179,7 @@ fn an_opener_that_waits_for_the_browser_to_quit_does_not_keep_the_consent_waitin
     });
     let returned = exit.recv_timeout(Duration::from_secs(20)).is_ok();
     opener.end();
-    assert!(returned, "um waited for the opener to return");
+    assert!(returned, "useful waited for the opener to return");
     let output = waiter.join().unwrap().unwrap();
 
     assert_no_secret_output(&output, &[SENTINEL, TOKEN]);
@@ -3502,9 +3506,9 @@ fn create_on_a_terminal_asks_before_it_replaces_a_held_grant() {
     }
 }
 
-// `um grant create codex`: Codex's own sign-in in a private home, or an auth.json the member
+// `useful grant create codex`: Codex's own sign-in in a private home, or an auth.json the member
 // names, imported for one organization. The fake `codex` and the member's home with its
-// ambient Codex login are the `um auth agent-login` tests'.
+// ambient Codex login are the `useful auth agent-login` tests'.
 
 const GLOBEX_ORGANIZATION_ID: &str = "org_01k0z6r1w8f4jy2m7q9v3x5abe";
 const THIRD_NATIVE_GRANT_ID: &str = "agl_01k0z6r1w8f4jy2m7q9v3x5abe";
@@ -3601,7 +3605,7 @@ fn stored_in(
     )
 }
 
-/// Runs `um grant create` from the member's `home` with the fake `program`, when there is one,
+/// Runs `useful grant create` from the member's `home` with the fake `program`, when there is one,
 /// and the opener on `PATH`, and standard input `input`. Whatever the outcome, the
 /// member's home is as it was, the temporary sign-in directory is gone and no login reached
 /// the output (REQ-GRANT-74, INV-CLI-13, INV-CLI-14).
@@ -3666,14 +3670,14 @@ struct Fakes<'a> {
     checkout: Option<Checkout<'a>>,
 }
 
-/// The directory `um` runs in and the directory of the fake `git` it finds there.
+/// The directory `useful` runs in and the directory of the fake `git` it finds there.
 #[derive(Clone, Copy)]
 struct Checkout<'a> {
     directory: &'a Path,
     git: &'a Path,
 }
 
-/// What `um` reads on its standard input.
+/// What `useful` reads on its standard input.
 #[derive(Clone, Copy)]
 enum Input<'a> {
     /// Nothing: standard input is null, so it is no terminal.
@@ -3701,7 +3705,7 @@ fn typed_output(command: &mut Command, typed: &[u8]) -> Output {
     output
 }
 
-/// Runs `um` with `arguments`, its command's leading words first, from the member's `home` with
+/// Runs `useful` with `arguments`, its command's leading words first, from the member's `home` with
 /// `fakes` and standard input `input`, and checks what [`run_native`] promises of its outcome.
 fn run_programs(
     server: &ScriptedServer,
@@ -4246,7 +4250,7 @@ fn create_codex_starts_no_sign_in_without_a_session() {
     assert!(server.finish().is_empty());
 }
 
-// `um grant create claude_code`: `claude setup-token` on a terminal `um` owns, its prompts
+// `useful grant create claude_code`: `claude setup-token` on a terminal `useful` owns, its prompts
 // passed through and the token it prints taken out of what the member sees, or a token the
 // member names, imported for one organization.
 
@@ -4419,7 +4423,7 @@ fn create_claude_code_without_a_terminal_starts_no_sign_in_and_names_the_token_f
     assert_eq!(claude.recorded("arguments"), None);
 }
 
-/// `um grant create claude_code` with the fake `claude` on `PATH` in the browser flow, standard
+/// `useful grant create claude_code` with the fake `claude` on `PATH` in the browser flow, standard
 /// input `input`, a terminal's secondary side, and its outputs piped, started but not waited
 /// for.
 fn spawn_claude_sign_in(
@@ -4469,7 +4473,7 @@ fn input_written_after_the_claude_sign_in_ends_is_left_for_the_next_reader() {
     let claude = FakeProgram::claude(SetupToken::Prints);
     let home = AmbientHome::new();
     let pty = open_test_pty(None).unwrap();
-    // The test keeps its own copy of the terminal's secondary side, so what `um` leaves unread
+    // The test keeps its own copy of the terminal's secondary side, so what `useful` leaves unread
     // stays readable.
     let kept = fs::File::from(pty.slave.try_clone().unwrap());
     let child = spawn_claude_sign_in(
@@ -4517,9 +4521,9 @@ fn input_written_after_the_claude_sign_in_ends_is_left_for_the_next_reader() {
 #[test]
 #[expect(
     clippy::disallowed_methods,
-    reason = "the bound on um's return is far below the descendant's own life, so real time only separates returning from waiting for the descendant"
+    reason = "the bound on useful's return is far below the descendant's own life, so real time only separates returning from waiting for the descendant"
 )]
-fn a_descendant_of_the_claude_sign_in_holding_its_terminal_does_not_keep_um_running() {
+fn a_descendant_of_the_claude_sign_in_holding_its_terminal_does_not_keep_useful_running() {
     use super::pi_installation::quote;
     let (server, _directory, credential) = prepared(vec![
         serving_every(),
@@ -4569,7 +4573,7 @@ fn a_descendant_of_the_claude_sign_in_holding_its_terminal_does_not_keep_um_runn
     );
     assert!(
         returned,
-        "um waited for the descendant holding the terminal"
+        "useful waited for the descendant holding the terminal"
     );
     let output = waiter.join().unwrap().unwrap();
 
@@ -4588,8 +4592,8 @@ fn a_descendant_of_the_claude_sign_in_holding_its_terminal_does_not_keep_um_runn
 // REQ-GRANT-71
 // INV-CLI-14
 #[test]
-fn the_claude_sign_in_leads_its_own_session_with_the_terminal_um_owns_as_its_controlling_terminal()
-{
+fn the_claude_sign_in_leads_its_own_session_with_the_terminal_useful_owns_as_its_controlling_terminal()
+ {
     use super::pi_installation::quote;
     const ON_ITS_TERMINAL: &str = "claude-wrote-to-its-controlling-terminal";
     let (server, _directory, credential) = prepared(vec![
@@ -4600,7 +4604,7 @@ fn the_claude_sign_in_leads_its_own_session_with_the_terminal_um_owns_as_its_con
     ]);
     // A `claude` that goes on only when it leads its own session and has a controlling
     // terminal, which it writes to; what it writes there reaches the member only when that
-    // terminal is the one `um` relays.
+    // terminal is the one `useful` relays.
     let fake = tempfile::tempdir().unwrap();
     let bin = fake.path().join("bin");
     fs::create_dir(&bin).unwrap();
@@ -4718,7 +4722,7 @@ fn create_claude_code_stores_the_token_as_the_held_grants_next_generation_with_r
     );
 }
 
-// `um grant create` with no provider: every provider the member lacks, one after another.
+// `useful grant create` with no provider: every provider the member lacks, one after another.
 
 const LIST_EVERY_KIND: &str = LIST_FIRST_PAGE;
 
@@ -4765,7 +4769,7 @@ fn holding(oauth: &[&str], natives: bool) -> Vec<u8> {
     page(&grants, None)
 }
 
-/// Runs `um grant create` with the fake opener, `codex` and `claude` on `PATH` and a terminal as
+/// Runs `useful grant create` with the fake opener, `codex` and `claude` on `PATH` and a terminal as
 /// its standard input.
 fn run_every(
     server: &ScriptedServer,
@@ -5070,9 +5074,9 @@ fn signalled_claude(then: &str) -> tempfile::TempDir {
 // REQ-GRANT-71
 #[test]
 fn a_signal_that_ends_the_claude_sign_in_stops_the_command_with_its_status() {
-    // How the sign-in ends, and the status and outcome it stops `um grant create` with: the
+    // How the sign-in ends, and the status and outcome it stops `useful grant create` with: the
     // member's interrupt reaches the sign-in's own terminal, so `claude` alone receives it,
-    // while a signal sent to `um` is passed to `claude`.
+    // while a signal sent to `useful` is passed to `claude`.
     let cases = [
         ("kill -INT $$", 130, "interrupted"),
         ("kill -TERM $$", 143, "terminated"),
@@ -5350,7 +5354,7 @@ fn a_deployment_that_predates_the_served_providers_read_is_signed_in_to_as_befor
     );
 }
 
-/// The report that ends the human output of `um grant create` without a provider, whose first
+/// The report that ends the human output of `useful grant create` without a provider, whose first
 /// outcome line names `first`: its verdict line, then the lines after it.
 fn summary_report<'a>(text: &'a str, first: &str) -> Vec<&'a str> {
     let lines: Vec<_> = text.lines().collect();
@@ -5425,7 +5429,7 @@ fn a_summary_of_consents_only_started_is_no_success_verdict_and_names_where_to_s
     assert!(
         remedies(&report)
             .iter()
-            .any(|line| line.trim() == "um grant list"),
+            .any(|line| line.trim() == "useful grant list"),
         "{text}"
     );
     assert_eq!(
@@ -5456,11 +5460,16 @@ fn a_summary_with_codex_missing_names_installing_it_before_running_the_command_a
     let remedies = remedies(&report);
     assert!(
         remedies.iter().any(|line| {
-            !line.trim_start().starts_with("um ") && line.contains("codex") && line.contains("PATH")
+            !line.trim_start().starts_with("useful ")
+                && line.contains("codex")
+                && line.contains("PATH")
         }),
         "{text}"
     );
-    for command in ["um grant create codex --from-file PATH", "um grant create"] {
+    for command in [
+        "useful grant create codex --from-file PATH",
+        "useful grant create",
+    ] {
         assert!(
             remedies.iter().any(|line| line.trim() == command),
             "{command}: {text}"
@@ -5560,7 +5569,7 @@ fn an_unresolved_organization_passes_over_the_coding_agents_and_the_consents_sti
             } else {
                 let text = stderr(&output);
                 assert!(
-                    text.contains("um grant create --organization ORGANIZATION"),
+                    text.contains("useful grant create --organization ORGANIZATION"),
                     "{case}: {text}"
                 );
             }
@@ -5733,7 +5742,7 @@ fn a_coding_agent_refuses_the_options_that_wait_for_a_consent_which_still_apply_
     assert!(
         shown
             .lines()
-            .any(|line| line.trim() == "um grant create claude_code"),
+            .any(|line| line.trim() == "useful grant create claude_code"),
         "{shown}"
     );
 
@@ -6159,7 +6168,7 @@ fn create_workflow_replaces_a_grant_that_needs_reconnecting_off_a_terminal_only_
     let report = stdout(&told);
     for provider in ["linear", "claude_code"] {
         assert!(
-            report.contains(&format!("um grant create {provider} --replace")),
+            report.contains(&format!("useful grant create {provider} --replace")),
             "{report}"
         );
     }
@@ -6395,7 +6404,7 @@ fn create_all_selects_nothing_for_a_grant_that_needs_reconnecting() {
     assert_eq!(request_lines(&server.finish()), [LIST_EVERY_KIND]);
 }
 
-// `um runner doctor --workflow FILE --connect`: the flow of `um grant create --workflow` over the
+// `useful runner doctor --workflow FILE --connect`: the flow of `useful grant create --workflow` over the
 // doctor's derivation, then the doctor's report of the member's grants, read again.
 
 /// What one command run in a checkout of a tree left: its output, the requests its deployment
@@ -6447,7 +6456,7 @@ fn events_elsewhere(output: &Output) -> Vec<serde_json::Value> {
 }
 
 /// The `report` event that ends the doctor's output, once each event before it is checked to
-/// be the one `um grant create` printed in its place against the same script (INV-CLI-15).
+/// be the one `useful grant create` printed in its place against the same script (INV-CLI-15).
 fn report_after(create: &Output, doctor: &Output) -> serde_json::Value {
     let mut events = events(doctor);
     let report = events.pop().unwrap();
@@ -7028,23 +7037,23 @@ fn connecting_what_a_workflow_needs_leaves_grants_one_command_authorizes_a_runne
         })
         .collect();
     let (server, _directory, credential) = prepared(vec![
-        // um grant create --workflow workflow.yaml
+        // useful grant create --workflow workflow.yaml
         page(&[github], None),
         serving_every(),
         only_acme(),
         json_http_response("201 Created", consent_of("linear", "pending")),
         polled(consented),
         stored(CLAUDE_CODE, "201 Created", 1),
-        // um grant list
+        // useful grant list
         page(&held, None),
         organization(),
         identities(ada()),
-        // um grant authorize --all RUNNER --yes
+        // useful grant authorize --all RUNNER --yes
         page(&held, None),
         authorized(OAUTH_GRANT_ID, RUNNER_ID),
         authorized(LINEAR_GRANT_ID, RUNNER_ID),
         authorized(NATIVE_GRANT_ID, RUNNER_ID),
-        // um grant list
+        // useful grant list
         page(&after, None),
         organization(),
         identities(ada()),
@@ -7260,9 +7269,9 @@ fn connecting_what_a_tree_lacks_from_the_doctor_reports_the_grants_it_made_on_th
     consented["resultGrant"]["id"] = LINEAR_GRANT_ID.into();
     let after = page(&[github, linear, codex_refused_at(3)], None);
     let (server, _directory, credential) = prepared(vec![
-        // um runner doctor --workflow workflow.yaml --grants --runner-id RUNNER
+        // useful runner doctor --workflow workflow.yaml --grants --runner-id RUNNER
         before.clone(),
-        // um runner doctor --workflow workflow.yaml --connect --replace --runner-id RUNNER
+        // useful runner doctor --workflow workflow.yaml --connect --replace --runner-id RUNNER
         before,
         serving_every(),
         json_http_response("201 Created", consent_of("linear", "pending")),
@@ -7294,7 +7303,7 @@ fn connecting_what_a_tree_lacks_from_the_doctor_reports_the_grants_it_made_on_th
     };
 
     // The report without a grant read, which contacts nothing.
-    let offline = Command::new(env!("CARGO_BIN_EXE_um"))
+    let offline = Command::new(env!("CARGO_BIN_EXE_useful"))
         .args(["runner", "doctor", "--workflow", "workflow.yaml", "--json"])
         .current_dir(&tree.root)
         .env_clear()
@@ -7568,7 +7577,7 @@ fn a_file_in_no_repository_or_that_does_not_resolve_or_with_a_provider_starts_no
             stderr(&output)
         );
         if args[1] == "absent.yaml" {
-            // The rejection is the one `um workflow validate` prints.
+            // The rejection is the one `useful workflow validate` prints.
             let mut validate = vec!["workflow", "validate", "--source-root", "."];
             validate.extend(&args[2..]);
             validate.push("absent.yaml");

@@ -1,4 +1,4 @@
-//! `um workflow definition show` (REQ-WFDEF-26).
+//! `useful workflow definition show` (REQ-WFDEF-26).
 
 use std::io::{self, Write};
 
@@ -6,13 +6,13 @@ use clap::Args;
 use serde::Serialize;
 
 use super::report::{display, display_members, write_json};
-use um_execution::{
+use useful_execution::{
     BindingValue, BindingsSnapshot, DefinitionError, ListedRun, RevisionRecord, RunState,
     StoredDefinition, WorkflowHome, list_runs, read_current_bindings, read_definition,
 };
 
 pub(super) const ABOUT: &str = "Show a local workflow definition and its revisions";
-const COMMAND_NAME: &str = "um workflow definition show";
+const COMMAND_NAME: &str = "useful workflow definition show";
 const REFUSED: &str = "Show refused.";
 const TREE_ROOT_FILE: &str = "workflow.yaml";
 

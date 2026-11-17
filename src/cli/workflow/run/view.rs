@@ -5,7 +5,7 @@ use anyhow::{Context, anyhow};
 use clap::Args;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_execution::{
+use useful_execution::{
     ArchivedAttemptLoadError, ArchivedTerminalHostExit, ArchivedViewOutput,
     ArchivedWorkflowTerminalHost, PresentationConfig, PresentationFailure, PresentationMode,
     TerminalCapabilities, ineligibility_code, load_local_archived_attempt, normalize_terminal_path,
@@ -14,7 +14,7 @@ use um_execution::{
 
 pub(super) const ABOUT: &str = "View a published local workflow attempt";
 
-const COMMAND: &str = "um workflow run view";
+const COMMAND: &str = "useful workflow run view";
 pub(super) const AFTER_HELP: &str = "Presentation mode:
   Without an explicit mode, an eligible terminal opens the interactive viewer. Every
   other stream arrangement receives a frozen plain summary.

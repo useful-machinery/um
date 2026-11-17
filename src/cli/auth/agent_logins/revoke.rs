@@ -2,8 +2,8 @@ use anyhow::Context;
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use um_api::AgentLoginFailure;
-use um_human_auth::Deployment;
+use useful_api::AgentLoginFailure;
+use useful_human_auth::Deployment;
 
 use crate::cli::grant::confirmation::NATIVE_REVOKE;
 
@@ -25,7 +25,7 @@ pub(super) struct Command {
 
 /// The stop Cloud requests of each runner's run (REQ-GRANT-48).
 impl Stated for Command {
-    const COMMAND: &'static str = "um grant revoke";
+    const COMMAND: &'static str = "useful grant revoke";
     type Usage = crate::cli::grant::revoke::Command;
     const STATEMENT: Statement = Statement::Fixed(NATIVE_REVOKE);
     const ACTION: &'static str = "to revoke the agent login";
@@ -37,7 +37,7 @@ impl Command {
             format_args!("Revoking agent login {}:", self.agent_login_id),
             NATIVE_REVOKE,
         )?;
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate agent login revocation request key")?;
         run_leaf(
             deployment,

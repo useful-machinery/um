@@ -9,8 +9,8 @@ use std::{
     io::{self, Write},
     path::PathBuf,
 };
-use um_api::{ActionApi, ActionFailure, ActionLifecycle, ActionRead, GoogleDocsAction};
-use um_human_auth::Deployment;
+use useful_api::{ActionApi, ActionFailure, ActionLifecycle, ActionRead, GoogleDocsAction};
+use useful_human_auth::Deployment;
 
 type ResultCode = anyhow::Result<ExitCode>;
 #[derive(Debug, Args)]
@@ -225,7 +225,7 @@ impl Leaf {
     }
 }
 fn key() -> anyhow::Result<String> {
-    um_support::generate_idempotency_key().context("generate action request identity")
+    useful_support::generate_idempotency_key().context("generate action request identity")
 }
 fn lifecycle(
     d: &Deployment,
@@ -277,7 +277,7 @@ fn call<T>(
     mut operation: impl FnMut(&ActionApi) -> Result<T, ActionFailure>,
 ) -> anyhow::Result<Result<T, ActionFailure>> {
     let policy = options.http.transport_policy();
-    let client = um_api::HttpClient::new(policy)
+    let client = useful_api::HttpClient::new(policy)
         .map_err(|error| anyhow!(error))
         .context("prepare human session networking")?;
     let mut ambiguous = false;

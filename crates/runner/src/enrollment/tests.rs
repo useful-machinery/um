@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use um_test_support::ScriptedHttpServer;
+use useful_test_support::ScriptedHttpServer;
 
 use super::registration::read_registration_record;
 use super::*;
@@ -511,7 +511,7 @@ fn an_ambiguous_enrollment_names_its_cause() {
         };
         assert_eq!(cause, expected);
         assert_eq!(cause.code(), code);
-        // The failure `um runner enroll` prints is this error's message.
+        // The failure `useful runner enroll` prints is this error's message.
         assert!(error.to_string().contains(code), "{error}");
         assert!(fixture.journal_path().is_file(), "journal kept for {code}");
         server.finish_one();
@@ -971,13 +971,13 @@ fn request_header<'a>(request: &'a str, expected_name: &str) -> &'a str {
 }
 
 fn future_time() -> String {
-    (um_support::utc_now() + time::Duration::days(1))
+    (useful_support::utc_now() + time::Duration::days(1))
         .format(&Rfc3339)
         .expect("format future time")
 }
 
 fn expired_time() -> String {
-    (um_support::utc_now() - time::Duration::days(3))
+    (useful_support::utc_now() - time::Duration::days(3))
         .format(&Rfc3339)
         .expect("format expired time")
 }
@@ -1292,7 +1292,7 @@ fn a_join_refused_gone_clears_its_journal_and_says_whether_it_was_resent() {
 // REQ-RUNNERENROLL-97
 #[test]
 fn a_staged_join_refused_unauthorized_names_its_journal_without_the_resend_remedy() {
-    let journal = PathBuf::from("/var/lib/um/runner-state.join.json");
+    let journal = PathBuf::from("/var/lib/useful/runner-state.join.json");
     let resend = ResendRemedy {
         journal: &journal,
         join_key_id: JOIN_KEY_ID,
@@ -1677,7 +1677,7 @@ fn write_record(fixture: &EnrollmentFixture, record: &serde_json::Value) -> Vec<
 }
 
 fn staged_at_days_ago(days: i64) -> String {
-    (um_support::utc_now() - time::Duration::days(days))
+    (useful_support::utc_now() - time::Duration::days(days))
         .format(&Rfc3339)
         .expect("format staging time")
 }

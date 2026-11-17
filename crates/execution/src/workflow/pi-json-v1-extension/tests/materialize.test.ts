@@ -7,8 +7,8 @@ import type { PiJsonV1ExtensionConfig } from "../src/pi-json-v1-extension.ts";
 
 const templateUrl = new URL("../src/pi-json-v1-extension.ts", import.meta.url);
 const fixedConfig: PiJsonV1ExtensionConfig = {
-  toolName: "um_result_unit_fixed",
-  socketPath: "/tmp/um/unit-fixed/result.sock",
+  toolName: "useful_result_unit_fixed",
+  socketPath: "/tmp/useful/unit-fixed/result.sock",
   parameters: {
     type: "object",
     properties: {
@@ -27,7 +27,7 @@ test("materialization is byte-identical for fixed inputs", async () => {
 
   assert.equal(first, second);
   assert.ok(first.includes(JSON.stringify(JSON.stringify(fixedConfig))));
-  assert.ok(!first.includes("__UM_PI_JSON_V1_CONFIG_JSON__"));
+  assert.ok(!first.includes("__USEFUL_PI_JSON_V1_CONFIG_JSON__"));
 });
 
 test("materialization rejects a template without exactly one marker", () => {

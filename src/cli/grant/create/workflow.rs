@@ -1,5 +1,5 @@
-//! The plan `um grant create --workflow` prints before any sign-in (REQ-GRANT-76): the providers
-//! a workflow tree calls for, derived by `um runner doctor --workflow`'s grouping
+//! The plan `useful grant create --workflow` prints before any sign-in (REQ-GRANT-76): the providers
+//! a workflow tree calls for, derived by `useful runner doctor --workflow`'s grouping
 //! ([`Roots`](crate::cli::runner::doctor::roots::Roots)).
 
 use std::io::{self, Write};
@@ -10,7 +10,7 @@ use serde::Serialize;
 use crate::cli::runner::doctor::workflow::{
     self as doctor, JsonDeclaration, describe, group_label,
 };
-use um_runner::{CredentialRequirement, Declaration, WorkflowCredentials};
+use useful_runner::{CredentialRequirement, Declaration, WorkflowCredentials};
 
 /// A provider the tree calls for: what the run does about it, and the requirement whose origins
 /// call for it.
@@ -122,7 +122,7 @@ fn write_human_plan_to(
 }
 
 /// `<key>: <workflow file> · <node> · <declaration> [<name>]`, as the doctor names a declaration.
-fn write_declaration<K: um_runner::DeclarationKind + doctor::HumanLabel>(
+fn write_declaration<K: useful_runner::DeclarationKind + doctor::HumanLabel>(
     output: &mut impl Write,
     key: &str,
     entry: &Declaration<K>,
@@ -135,7 +135,7 @@ fn write_declaration<K: um_runner::DeclarationKind + doctor::HumanLabel>(
     )
 }
 
-/// The first event of `um grant create --workflow --json`.
+/// The first event of `useful grant create --workflow --json`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JsonPlan<'a> {

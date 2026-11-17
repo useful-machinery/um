@@ -20,7 +20,7 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, header};
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
-use um_test_support::watchdog::{FIXTURE_WAIT_BASE, WatchdogExpired, host_scaled_timeout};
+use useful_test_support::watchdog::{FIXTURE_WAIT_BASE, WatchdogExpired, host_scaled_timeout};
 
 use crate::agent_login::ServiceEnvironment;
 use crate::agent_login::check::{LoginCheck, LoginCheckOutcome};
@@ -43,12 +43,12 @@ use crate::telemetry::Recorder;
 
 pub(crate) type FixtureSocket = WebSocketStream<TcpStream>;
 
-const INTERNAL_WORKER_EXECUTABLE_VARIABLE: &str = "UM_TEST_INTERNAL_WORKER_EXECUTABLE";
+const INTERNAL_WORKER_EXECUTABLE_VARIABLE: &str = "USEFUL_TEST_INTERNAL_WORKER_EXECUTABLE";
 
 /// The built `internal-worker` example that guards every command step a runner test
 /// executes, as `cli/scripts/check-suite` exports it. Without it the execution crate
 /// takes the example beside this test binary, never the binary itself (INV-TESTING-20),
-/// and `cargo test -p um-runner` does not build that example, so every step would fail
+/// and `cargo test -p useful-runner` does not build that example, so every step would fail
 /// at launch. A runner fixture therefore refuses to exist while the variable is unset,
 /// failing once with the build command before any step can launch.
 pub(crate) fn require_internal_worker_executable() -> PathBuf {
@@ -71,7 +71,7 @@ pub(crate) fn require_internal_worker_executable() -> PathBuf {
 /// Runs fixture Git in `repository` and returns its trimmed standard output; a failed
 /// command panics with Git's standard error.
 pub(crate) fn run_fixture_git(repository: &Path, arguments: &[&str]) -> String {
-    let output = um_test_support::fixture_git_command("git")
+    let output = useful_test_support::fixture_git_command("git")
         .current_dir(repository)
         .args(arguments)
         .output()

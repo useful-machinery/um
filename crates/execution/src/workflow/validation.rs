@@ -994,7 +994,7 @@ fn validate_step_target(
         .ok_or(ValidationFailureKind::EdgeTargetUnknown)
 }
 
-/// An `external` wait's authored rule (REQ-WFFORMAT-97): a provider other than `um`, at
+/// An `external` wait's authored rule (REQ-WFFORMAT-97): a provider other than `useful`, at
 /// least one event, a `where` in the matcher's grammar, and each `inputs.<name>` a declared
 /// `text` input and each `outputs.<step>.<output>` a `text` export of a `workflow` step
 /// earlier than the waiting one, the values the wait record resolves.

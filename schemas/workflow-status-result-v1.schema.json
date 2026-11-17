@@ -3069,7 +3069,7 @@
           "const": 1
         },
         "command": {
-          "const": "um workflow run status"
+          "const": "useful workflow run status"
         },
         "outcome": {
           "const": "status"
@@ -3175,7 +3175,7 @@
           "const": 1
         },
         "command": {
-          "const": "um workflow run status"
+          "const": "useful workflow run status"
         },
         "outcome": {
           "const": "error"

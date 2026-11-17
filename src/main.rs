@@ -19,14 +19,14 @@ use std::env;
 use crate::exit_code::ExitCode;
 
 fn main() -> ExitCode {
-    if um_execution::child_guard_worker_requested() {
-        return um_execution::run_child_guard_worker().into();
+    if useful_execution::child_guard_worker_requested() {
+        return useful_execution::run_child_guard_worker().into();
     }
-    if um_execution::result_validation_worker_requested() {
-        return um_execution::run_result_validation_worker().into();
+    if useful_execution::result_validation_worker_requested() {
+        return useful_execution::run_result_validation_worker().into();
     }
-    if um_runner::workflow_git_helper_requested() {
-        return if um_runner::run_workflow_git_helper() {
+    if useful_runner::workflow_git_helper_requested() {
+        return if useful_runner::run_workflow_git_helper() {
             ExitCode::Success
         } else {
             ExitCode::GeneralFailure

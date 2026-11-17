@@ -107,7 +107,7 @@ pub(super) mod continuation_command_tests {
         execute_with_env(steps, args, &[])
     }
 
-    /// Runs `um` with `args` and `environment` against a server that answers one accepted
+    /// Runs `useful` with `args` and `environment` against a server that answers one accepted
     /// socket per step. Each accepted socket is a scripted response barrier, not a timed race.
     /// Besides the named fixtures, `submitted` admits the POSTed request as it was sent, as
     /// Cloud admits a definition-backed run (REQ-CONTINUE-84), and `violation:CODE` refuses it
@@ -336,7 +336,7 @@ pub(super) mod continuation_command_tests {
         assert!(!text.contains("effective commit:"));
 
         // A receipt admitted before the replacement pair was retired keeps its replaced
-        // definition, and both the waiting command and `um run show` still render it.
+        // definition, and both the waiting command and `useful run show` still render it.
         args.push("--wait");
         let (waited, _) = execute(&["preparing", "third"], &args);
         let (shown, _) = execute(
@@ -439,7 +439,7 @@ pub(super) mod continuation_command_tests {
             (captured, observed)
         });
         let environment = deployment_environment(&api_url, credentials.to_str().unwrap());
-        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
         let mut args = args();
         args.push("--wait");
         command
@@ -1177,7 +1177,7 @@ mod retry_command_tests {
                 requests
             });
             let env = deployment_environment(&api_url, credentials_path.to_str().unwrap());
-            let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+            let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
             command
                 .args(args())
                 .stdin(Stdio::null())
@@ -1443,7 +1443,7 @@ fn list_runs_filters_and_renders_text_and_json() {
         String::from_utf8_lossy(&text.stderr)
     );
     let report = String::from_utf8(text.stdout).unwrap();
-    println!("um run list {ORGANIZATION} [filters]:\n{report}");
+    println!("useful run list {ORGANIZATION} [filters]:\n{report}");
     assert!(
         report.contains(RUN_ID)
             && report.contains("build-runner")
@@ -1460,7 +1460,7 @@ fn list_runs_filters_and_renders_text_and_json() {
     );
     let parsed: serde_json::Value = serde_json::from_slice(&structured.stdout).unwrap();
     println!(
-        "um run list {ORGANIZATION} [filters] --json:\n{}",
+        "useful run list {ORGANIZATION} [filters] --json:\n{}",
         String::from_utf8_lossy(&structured.stdout)
     );
     assert_eq!(parsed, body);
@@ -1779,7 +1779,7 @@ fn run_show_preserves_the_bound_existing_request_in_handoff_history() {
     server.finish();
 }
 
-// SC-RUN-6, REQ-RUN-82: `um run show` shows the run's actor, passes it through in JSON,
+// SC-RUN-6, REQ-RUN-82: `useful run show` shows the run's actor, passes it through in JSON,
 // and reports a run without a well-formed actor as an invalid response.
 #[test]
 fn run_show_reports_the_run_actor() {
@@ -1841,7 +1841,7 @@ fn generated_client_requests_name_the_cli_version_in_the_user_agent() {
     let request = server.finish().pop().unwrap();
     assert_eq!(
         header_value(&request, "user-agent"),
-        format!("um/{BUILD_VERSION}")
+        format!("useful/{BUILD_VERSION}")
     );
 }
 
@@ -1920,7 +1920,7 @@ fn cancellation_signal_before_acceptance_preserves_key_and_never_observes() {
         "2999-01-01T00:00:00Z",
     );
     let environment = deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args([
             "run",
@@ -1987,7 +1987,7 @@ fn cancellation_signal_after_acceptance_stops_observation_without_new_post() {
         "2999-01-01T00:00:00Z",
     );
     let environment = deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args([
             "run",
@@ -2655,7 +2655,7 @@ fn cancellation_retry_can_observe_pending_receipt_with_prior_failed_attempt() {
     )));
 }
 
-/// `um workflow run create DEFINITION --cloud ORGANIZATION --project PROJECT`, the command
+/// `useful workflow run create DEFINITION --cloud ORGANIZATION --project PROJECT`, the command
 /// that creates a Cloud run (REQ-RUN-94), with a source branch and a display name.
 pub(super) fn create_args(json: bool) -> Vec<&'static str> {
     let mut args = vec![
@@ -2996,7 +2996,7 @@ fn show_wait_separates_failed_publication_handoff_from_execution() {
                 assert!(report.find("actor_authority_lost").unwrap() < report.find(*fact).unwrap());
             }
             if wait {
-                assert!(report.contains("um publication create"));
+                assert!(report.contains("useful publication create"));
             }
         }
         assert_eq!(server.finish().len(), 1);
@@ -3092,7 +3092,7 @@ fn human_run_observation_reports_failed_automatic_publication() {
                 .unwrap_or_else(|| panic!("missing {text} in {report}"));
             assert!(report.find("provider_unavailable").unwrap() < report.find(*fact).unwrap());
         }
-        assert!(report.contains("um publication show"));
+        assert!(report.contains("useful publication show"));
         assert_eq!(server.finish().len(), 2);
     }
 }
@@ -3422,7 +3422,7 @@ fn publication_observation_signal_stops_show_wait_and_retains_handoff() {
     let path = directory.path().join("credentials.json");
     write_credential_fixture(&path, &server.api_url, TOKEN, "2999-01-01T00:00:00Z");
     let environment = deployment_environment(&server.api_url, path.to_str().unwrap());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args([
             "run",
@@ -3808,7 +3808,7 @@ fn input_set_mutation_commands_upload_seal_and_delete_with_fresh_requests() {
     let seal_key = header_value(&requests[1], "idempotency-key");
     assert_eq!(seal_key.len(), 64);
 
-    let unconfirmed = Command::new(env!("CARGO_BIN_EXE_um"))
+    let unconfirmed = Command::new(env!("CARGO_BIN_EXE_useful"))
         .args(["run", "input-set", "delete", ORGANIZATION, INPUT_SET_ID])
         .output()
         .unwrap();
@@ -4539,7 +4539,7 @@ fn retained_inputs_download_accepts_a_relative_destination() {
     ]);
     let environment = deployment_environment(&server.api_url, &credential_path);
     let current_directory = tempfile::tempdir().unwrap();
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args([
             "run",
@@ -4586,7 +4586,7 @@ fn retained_inputs_json_download_rejects_an_unrepresentable_destination_before_t
     let destination = destination_parent
         .path()
         .join(std::ffi::OsString::from_vec(b"download-\xff".to_vec()));
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args(["run", "input", "download", ORGANIZATION, RUN_ID, "--output"])
         .arg(&destination)
@@ -4706,7 +4706,7 @@ fn interrupted_retained_input_download_removes_verified_private_staging() {
     let environment = deployment_environment(&server.api_url, &credential_path);
     let destination_parent = tempfile::tempdir().unwrap();
     let destination = destination_parent.path().join("must-not-be-committed");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args([
             "run",
@@ -4774,7 +4774,7 @@ fn interrupted_retained_input_download_removes_verified_private_staging() {
 // REQ-RUNINPUT-67
 #[test]
 fn retained_input_deletion_requires_confirmation_and_sends_one_idempotent_request() {
-    let unconfirmed = Command::new(env!("CARGO_BIN_EXE_um"))
+    let unconfirmed = Command::new(env!("CARGO_BIN_EXE_useful"))
         .args(["run", "input", "delete", ORGANIZATION, RUN_ID])
         .output()
         .unwrap();
@@ -5414,7 +5414,7 @@ fn run_show_json_keeps_harness_failure_and_input_size_diagnostic() {
     }
 }
 
-/// A run a runner rejected because its `um` refused the run's workflow tree, its
+/// A run a runner rejected because its `useful` refused the run's workflow tree, its
 /// diagnostic holding the refusal's validation facts (REQ-DIAG-42).
 fn workflow_validation_rejection() -> serde_json::Value {
     serde_json::json!({
@@ -6224,7 +6224,7 @@ fn signals_stop_only_active_cloud_run_show_observation() {
             "--json",
             "--allow-insecure-http",
         ];
-        let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
         command
             .args(args)
             .stdin(Stdio::null())
@@ -6285,7 +6285,7 @@ fn signalled_input_set_create_reports_unknown_without_an_invented_id() {
         "2999-01-01T00:00:00Z",
     );
     let environment = deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args([
             "run",
@@ -6362,7 +6362,7 @@ fn signalled_input_set_seal_reports_one_unknown_receipt() {
         "2999-01-01T00:00:00Z",
     );
     let environment = deployment_environment(&server.api_url, credential_path.to_str().unwrap());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_um"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
         .args([
             "run",
@@ -6413,9 +6413,9 @@ fn signalled_input_set_seal_reports_one_unknown_receipt() {
     assert!(server.finish().is_empty());
 }
 
-/// `um workflow run show RUN --cloud ORGANIZATION`, `um workflow run release RUN --cloud
-/// ORGANIZATION` and the control leaves with `--cloud` against the scripted Gateway the `um
-/// run` tests use: `RUN` is a Cloud run id, and nothing under the `um` home is read or
+/// `useful workflow run show RUN --cloud ORGANIZATION`, `useful workflow run release RUN --cloud
+/// ORGANIZATION` and the control leaves with `--cloud` against the scripted Gateway the `useful
+/// run` tests use: `RUN` is a Cloud run id, and nothing under the `useful` home is read or
 /// written.
 mod workflow_run_cloud {
     use super::*;
@@ -6524,8 +6524,8 @@ mod workflow_run_cloud {
         )
     }
 
-    /// `um workflow run LEAF RUN --cloud ORGANIZATION ARGS --allow-insecure-http` against a
-    /// Gateway answering `responses` in order, with `UM_HOME` at `home`: the output and the
+    /// `useful workflow run LEAF RUN --cloud ORGANIZATION ARGS --allow-insecure-http` against a
+    /// Gateway answering `responses` in order, with `USEFUL_HOME` at `home`: the output and the
     /// requests served.
     fn cloud(
         leaf: &str,
@@ -6536,7 +6536,7 @@ mod workflow_run_cloud {
     ) -> (Output, Vec<String>) {
         let (server, _directory, credential_path) = prepared_run(responses);
         let mut environment = deployment_environment(&server.api_url, &credential_path).to_vec();
-        environment.push(("UM_HOME", home.to_str().unwrap()));
+        environment.push(("USEFUL_HOME", home.to_str().unwrap()));
         let mut all = vec!["workflow", "run", leaf, run, "--cloud", ORGANIZATION];
         all.extend_from_slice(args);
         all.push("--allow-insecure-http");
@@ -6584,7 +6584,7 @@ mod workflow_run_cloud {
             ]
         );
         let shown = document(&output);
-        assert_eq!(shown["command"], "um workflow run show");
+        assert_eq!(shown["command"], "useful workflow run show");
         assert_eq!(shown["outcome"], "shown");
         assert_eq!(shown["exitStatus"], 0);
         assert_eq!(shown["organizationRef"], ORGANIZATION);
@@ -6917,7 +6917,7 @@ mod workflow_run_cloud {
         assert_eq!(reported(&text, "waiting"), Some("runners_asleep"), "{text}");
     }
 
-    // REQ-RUN-101: `um run show` names the same owner, route and waiting reason.
+    // REQ-RUN-101: `useful run show` names the same owner, route and waiting reason.
     #[test]
     fn run_show_reports_a_runs_owner_route_and_what_it_waits_for() {
         let (server, _directory, credential_path) = prepared_run(vec![run_response(
@@ -7020,7 +7020,7 @@ mod workflow_run_cloud {
         assert!(!key.is_empty());
         assert_eq!(header_value(&requests[1], "idempotency-key"), key);
         let released = document(&output);
-        assert_eq!(released["command"], "um workflow run release");
+        assert_eq!(released["command"], "useful workflow run release");
         assert_eq!(released["outcome"], "released");
         assert_eq!(released["exitStatus"], 0);
         assert_eq!(released["runId"], RUN_ID);
@@ -7152,7 +7152,7 @@ mod workflow_run_cloud {
 
     // REQ-LOCALRUN-210, REQ-RUN-91: Cloud answer reads the run, sends one control naming the
     // run's current wait under one fresh key, sent again when the response is lost, and
-    // reports the accepted control; nothing under the `um` home is read or written.
+    // reports the accepted control; nothing under the `useful` home is read or written.
     #[test]
     fn cloud_answer_sends_the_runs_current_wait_under_one_key_and_reports_the_control() {
         let home = tempfile::tempdir().unwrap();
@@ -7186,7 +7186,7 @@ mod workflow_run_cloud {
         assert!(!key.is_empty());
         assert_eq!(header_value(&requests[2], "idempotency-key"), key);
         let accepted = document(&output);
-        assert_eq!(accepted["command"], "um workflow run answer");
+        assert_eq!(accepted["command"], "useful workflow run answer");
         assert_eq!(accepted["outcome"], "accepted");
         assert_eq!(accepted["exitStatus"], 0);
         assert_eq!(accepted["organizationRef"], ORGANIZATION);
@@ -7270,7 +7270,7 @@ mod workflow_run_cloud {
             assert_eq!(route(posted), controls_route(), "{leaf}");
             assert_eq!(body(posted), request, "{leaf}");
             let accepted = document(&output);
-            assert_eq!(accepted["command"], format!("um workflow run {leaf}"));
+            assert_eq!(accepted["command"], format!("useful workflow run {leaf}"));
             assert_eq!(accepted["outcome"], "accepted", "{leaf}");
             assert_eq!(accepted["control"]["kind"], kind, "{leaf}");
         }

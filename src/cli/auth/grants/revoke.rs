@@ -2,8 +2,8 @@ use anyhow::Context;
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use um_api::GrantFailure;
-use um_human_auth::Deployment;
+use useful_api::GrantFailure;
+use useful_human_auth::Deployment;
 
 use super::{Options, output, with_api};
 
@@ -23,7 +23,7 @@ pub(super) struct Command {
 
 impl Command {
     pub(super) fn run(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
-        let key = um_support::generate_idempotency_key()
+        let key = useful_support::generate_idempotency_key()
             .context("generate provider grant revocation request key")?;
         let result = with_api(deployment, &self.options, |api| {
             // A lost response may have revoked the grant. Replay only this key, once.

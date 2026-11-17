@@ -19,9 +19,9 @@ use zeroize::Zeroizing;
 use super::deployment::DeploymentFingerprint;
 use super::token::{SecretToken, TokenSource};
 
-const CREDENTIALS_FILE_VARIABLE: &str = "UM_CREDENTIALS_FILE";
+const CREDENTIALS_FILE_VARIABLE: &str = "USEFUL_CREDENTIALS_FILE";
 const HOME_VARIABLE: &str = "HOME";
-const APPLICATION_HOME_DIRECTORY_NAME: &str = ".um";
+const APPLICATION_HOME_DIRECTORY_NAME: &str = ".useful";
 const NORMAL_FILE_NAME: &str = "credentials.json";
 const SCHEMA_VERSION: u64 = 1;
 const DIRECTORY_MODE: u32 = 0o700;
@@ -354,14 +354,14 @@ impl CredentialStore {
         let directory = self.directory()?;
         ensure_private_directory(directory)?;
         let file = open_or_create_private_file(path)?;
-        let start = um_support::monotonic_now();
+        let start = useful_support::monotonic_now();
 
         loop {
-            let elapsed = um_support::elapsed(start);
+            let elapsed = useful_support::elapsed(start);
             let remaining = timeout
                 .saturating_sub(elapsed)
                 .min(deadline.map_or(timeout, |end| {
-                    end.saturating_duration_since(um_support::monotonic_now())
+                    end.saturating_duration_since(useful_support::monotonic_now())
                 }));
             if remaining.is_zero() {
                 return Err(if refresh {
@@ -373,7 +373,7 @@ impl CredentialStore {
             match FileExt::try_lock(&file) {
                 Ok(()) => return Ok(CredentialLock { file }),
                 Err(TryLockError::WouldBlock) => {
-                    um_support::sleep(LOCK_RETRY_INTERVAL.min(remaining));
+                    useful_support::sleep(LOCK_RETRY_INTERVAL.min(remaining));
                 }
                 Err(TryLockError::Error(source)) => {
                     return Err(CredentialError::Io {

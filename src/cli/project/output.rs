@@ -4,7 +4,9 @@ use anyhow::{Context, anyhow};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::{Project, ProjectFailure, ProjectList, ProjectReadinessBlocker, ProjectRepository};
+use useful_api::{
+    Project, ProjectFailure, ProjectList, ProjectReadinessBlocker, ProjectRepository,
+};
 
 pub(super) fn write_project(
     deployment: &str,
@@ -268,7 +270,7 @@ fn write_failure(
             None,
             authentication
                 .rejected_error(
-                    "error: Useful Machinery access requires sign-in\n\nSign in first:\n  um auth login",
+                    "error: Useful Machinery access requires sign-in\n\nSign in first:\n  useful auth login",
                 )
                 .to_owned(),
             OutcomeClass::Unauthenticated,
@@ -294,7 +296,7 @@ fn write_failure(
         ProjectFailure::RepositoryNotBound => (
             "repository_not_bound",
             None,
-            "error: project has no repository binding\n\nBind a repository first:\n  um project repository set <ORGANIZATION> <PROJECT> --installation-id <INSTALLATION> --repository-id <REPOSITORY>".to_owned(),
+            "error: project has no repository binding\n\nBind a repository first:\n  useful project repository set <ORGANIZATION> <PROJECT> --installation-id <INSTALLATION> --repository-id <REPOSITORY>".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
         ProjectFailure::NameUnavailable => (
@@ -346,7 +348,7 @@ fn write_failure(
         ProjectFailure::ProjectArchived => (
             "project_archived",
             None,
-            "error: project is archived\n\nAs an organization owner, unarchive the project first:\n  um project unarchive <ORGANIZATION> <PROJECT>".to_owned(),
+            "error: project is archived\n\nAs an organization owner, unarchive the project first:\n  useful project unarchive <ORGANIZATION> <PROJECT>".to_owned(),
             OutcomeClass::GeneralFailure,
         ),
         ProjectFailure::Conflict => (

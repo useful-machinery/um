@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
-use um_execution::{
+use useful_execution::{
     DefinitionError, LocalRunDirectoryError, Mirror, MirrorFailure, MirrorRun, MirrorTarget,
     ResolvedInput, ResolvedInputs, ValidatedWorkflow, WorkflowHome, WorkflowRunRecord,
     read_revision_bindings,
@@ -92,7 +92,7 @@ pub(super) fn mirror_for_run(
     });
     let run_reference = external_url
         .cloned()
-        .unwrap_or_else(|| format!("um workflow run show {}", record.id));
+        .unwrap_or_else(|| format!("useful workflow run show {}", record.id));
     let mirror = Mirror::new(
         block.clone(),
         issue.unwrap_or_default(),
@@ -126,7 +126,7 @@ pub(super) fn run_mirror(
 /// The run record `run.json` of the run at `run_directory`, for a command that holds the run
 /// but not its record; `None` for a run without one or one that cannot be read.
 pub(super) fn read_run_record(run_directory: &Path) -> Option<WorkflowRunRecord> {
-    um_execution::read_local_run_status(run_directory)
+    useful_execution::read_local_run_status(run_directory)
         .ok()
         .and_then(|snapshot| snapshot.record)
         .and_then(|record| serde_json::from_value(record).ok())
@@ -134,8 +134,8 @@ pub(super) fn read_run_record(run_directory: &Path) -> Option<WorkflowRunRecord>
 
 /// The message a command refuses with when `outcome_credentials` fails (REQ-LOCALRUN-204).
 pub(super) const CREDENTIALS_REFUSAL: &str = "No Linear credential is set, so the run's mirror \
-    cannot update its issue in Linear; the run is unchanged. Set UM_LINEAR_ACCESS_TOKEN_FILE, \
-    UM_LINEAR_ACCESS_TOKEN or LINEAR_API_KEY and run the command again.";
+    cannot update its issue in Linear; the run is unchanged. Set USEFUL_LINEAR_ACCESS_TOKEN_FILE, \
+    USEFUL_LINEAR_ACCESS_TOKEN or LINEAR_API_KEY and run the command again.";
 
 /// The check a command makes before it ends a run itself with `outcome` and then performs
 /// `onOutcome` (REQ-LOCALRUN-204): `mirror_credentials_unavailable` when the run's mirror maps

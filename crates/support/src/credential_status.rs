@@ -1,6 +1,6 @@
 //! The credential status vocabulary (REQ-GRANT-53): the one availability
 //! and the one next action every surface reports for a credential. Each side
-//! maps its own facts to it: `um-runner` a provider's readiness, the `um`
+//! maps its own facts to it: `useful-runner` a provider's readiness, the `useful`
 //! binary what Cloud's API returns for an agent login's authorization and for
 //! a provider grant. The vocabulary holds no provider and no state of either.
 

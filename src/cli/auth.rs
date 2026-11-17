@@ -8,7 +8,7 @@ mod status;
 
 use clap::{Args, Subcommand};
 
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 pub(super) const ABOUT: &str = "Manage your Useful Machinery sign-in";
 const NAME: &str = "auth";
@@ -21,7 +21,7 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
-    // The earlier families `um grant` replaces, kept for one release out of help
+    // The earlier families `useful grant` replaces, kept for one release out of help
     // (REQ-GRANT-77).
     #[command(about = agent_logins::ABOUT, hide = true)]
     AgentLogin(agent_logins::Command),

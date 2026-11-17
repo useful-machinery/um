@@ -77,7 +77,7 @@ fn environment_selects_override_or_normal_home_path() -> anyhow::Result<()> {
     check_eq!(override_store.path, PathBuf::from(&override_path));
     check_eq!(
         home_store.path,
-        PathBuf::from("/private/home/.um/credentials.json")
+        PathBuf::from("/private/home/.useful/credentials.json")
     );
     Ok(())
 }
@@ -523,12 +523,12 @@ fn busy_lock_respects_the_configured_deadline() -> anyhow::Result<()> {
     let lock = open_or_create_private_file(&fixture.store.lock_path)
         .context("fixture value should exist")?;
     FileExt::lock(&lock).context("fixture value should exist")?;
-    let started = um_support::monotonic_now();
+    let started = useful_support::monotonic_now();
 
     let result = fixture.store.remove(&fingerprint("primary"));
 
     check!(matches!(result, Err(CredentialError::LockTimeout)));
-    check!(um_support::elapsed(started) >= fixture.store.lock_timeout);
+    check!(useful_support::elapsed(started) >= fixture.store.lock_timeout);
     FileExt::unlock(&lock).context("fixture value should exist")?;
     Ok(())
 }

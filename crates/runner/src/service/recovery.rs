@@ -12,8 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use super::workspace::{AssignmentRoot, WorkRootAuthority};
 
-const ROOT: &str = ".um-recovery-root-v1.json";
-const MANIFEST: &str = ".um-recovery-manifest-v1.json";
+const ROOT: &str = ".useful-recovery-root-v1.json";
+const MANIFEST: &str = ".useful-recovery-manifest-v1.json";
 const LIMIT: u64 = 1024 * 1024;
 const MAX_GENERATION: u64 = 9_007_199_254_740_991;
 
@@ -268,10 +268,10 @@ impl Manifest {
         }
         let mut seen = BTreeSet::new();
         for link in &self.lineage {
-            if !um_runner_protocol::valid_boot_id(&link.boot_id)
-                || !um_runner_protocol::valid_assignment_id(&link.assignment_id)
-                || !um_runner_protocol::valid_run_id(&link.run_id)
-                || !um_runner_protocol::valid_attempt_id(&link.attempt_id)
+            if !useful_runner_protocol::valid_boot_id(&link.boot_id)
+                || !useful_runner_protocol::valid_assignment_id(&link.assignment_id)
+                || !useful_runner_protocol::valid_run_id(&link.run_id)
+                || !useful_runner_protocol::valid_attempt_id(&link.attempt_id)
                 || link.run_id != origin.run_id
                 || !seen.insert(link.assignment_id.as_str())
             {
@@ -281,9 +281,9 @@ impl Manifest {
         if let Some(claim) = &self.claim
             && (claim.claim_generation == 0
                 || claim.claim_generation != self.last_claim_generation
-                || !um_runner_protocol::valid_assignment_id(&claim.assignment_id)
-                || !um_runner_protocol::valid_attempt_id(&claim.attempt_id)
-                || !um_runner_protocol::valid_boot_id(&claim.runner_boot_id))
+                || !useful_runner_protocol::valid_assignment_id(&claim.assignment_id)
+                || !useful_runner_protocol::valid_attempt_id(&claim.attempt_id)
+                || !useful_runner_protocol::valid_boot_id(&claim.runner_boot_id))
         {
             return Err(invalid("claim"));
         }
@@ -343,7 +343,7 @@ fn persist<T: Serialize>(
     let mut nonce = [0_u8; 16];
     getrandom::fill(&mut nonce).map_err(|_| invalid("nonce"))?;
     let temporary = format!(
-        ".um-recovery-{}",
+        ".useful-recovery-{}",
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(nonce)
     );
     let mut file = File::from(
@@ -455,7 +455,7 @@ impl RecoveryStore {
             &authority.shared.directory_lock,
             host.as_ref(),
         )?;
-        if !valid_id(runner_id, "rnr_") || !um_runner_protocol::valid_boot_id(boot_id) {
+        if !valid_id(runner_id, "rnr_") || !useful_runner_protocol::valid_boot_id(boot_id) {
             return Err(invalid("runner identity"));
         }
         let store = Self {
@@ -512,10 +512,10 @@ impl RecoveryStore {
         let mut locations = BTreeSet::new();
         for entry in &root.catalog {
             if !valid_id(&entry.workspace_id, "rws_")
-                || !um_runner_protocol::valid_boot_id(&entry.origin_boot_id)
-                || !um_runner_protocol::valid_assignment_id(&entry.origin_assignment_id)
-                || !um_runner_protocol::valid_run_id(&entry.origin_run_id)
-                || !um_runner_protocol::valid_attempt_id(&entry.origin_attempt_id)
+                || !useful_runner_protocol::valid_boot_id(&entry.origin_boot_id)
+                || !useful_runner_protocol::valid_assignment_id(&entry.origin_assignment_id)
+                || !useful_runner_protocol::valid_run_id(&entry.origin_run_id)
+                || !useful_runner_protocol::valid_attempt_id(&entry.origin_attempt_id)
                 || entry.execution_root
                     != self
                         .authority
@@ -1051,7 +1051,7 @@ fn orphan_manifest(root: &Path) -> Result<bool, RecoveryError> {
         let Some(name) = boot.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        if !um_runner_protocol::valid_boot_id(&name) {
+        if !useful_runner_protocol::valid_boot_id(&name) {
             continue;
         }
         if !boot.file_type().map_err(RecoveryError::Identity)?.is_dir() {
@@ -1068,7 +1068,7 @@ fn orphan_manifest(root: &Path) -> Result<bool, RecoveryError> {
             let Some(name) = assignment.file_name().to_str().map(str::to_owned) else {
                 continue;
             };
-            if !um_runner_protocol::valid_assignment_id(&name) {
+            if !useful_runner_protocol::valid_assignment_id(&name) {
                 continue;
             }
             if !assignment

@@ -22,9 +22,9 @@ in
     channel = "stable";
     version = rustVersion;
   };
-  env.UM_MSRV_CARGO = "${msrvToolchain}/bin/cargo";
-  env.UM_MSRV_RUSTC = "${msrvToolchain}/bin/rustc";
-  env.UM_CLAUDE_CODE_CONFORMANCE_TOOLS_PATH = pkgs.lib.makeBinPath [
+  env.USEFUL_MSRV_CARGO = "${msrvToolchain}/bin/cargo";
+  env.USEFUL_MSRV_RUSTC = "${msrvToolchain}/bin/rustc";
+  env.USEFUL_CLAUDE_CODE_CONFORMANCE_TOOLS_PATH = pkgs.lib.makeBinPath [
     pkgs.gnused
     pkgs.coreutils
   ];

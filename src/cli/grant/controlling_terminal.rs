@@ -1,6 +1,6 @@
 //! The internal helper that runs a program as the leader of a new session whose controlling
 //! terminal is the helper's standard input, so that the Claude Code sign-in's `claude
-//! setup-token` has the pseudo-terminal `um` opened as its own (INV-CLI-14).
+//! setup-token` has the pseudo-terminal `useful` opened as its own (INV-CLI-14).
 //!
 //! A process takes a controlling terminal only for itself, so the sign-in starts this
 //! executable again with [`REQUEST`] set rather than running code in a forked child before it
@@ -17,8 +17,8 @@ use anyhow::{Context, anyhow};
 
 use crate::exit_code::ExitCode;
 
-/// Requests the helper. Only `um` sets it, for its own child, and the program never sees it.
-const REQUEST: &str = "UM_INTERNAL_CONTROLLING_TERMINAL_HELPER";
+/// Requests the helper. Only `useful` sets it, for its own child, and the program never sees it.
+const REQUEST: &str = "USEFUL_INTERNAL_CONTROLLING_TERMINAL_HELPER";
 const REQUESTED: &str = "1";
 
 pub(crate) fn requested() -> bool {

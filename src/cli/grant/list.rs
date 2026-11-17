@@ -4,12 +4,12 @@ use std::io::{self, Write as _};
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use um_api::{
+use useful_api::{
     CommonIdentityFailure, GrantApi, GrantFailure, GrantUseList, HttpTransportPolicy,
     IdentityApiError, ListIdentitiesOutcome, MemberGrant, MemberGrantApi, MemberGrantFailure,
     MemberGrantKind, list_identities,
 };
-use um_human_auth::Deployment;
+use useful_human_auth::Deployment;
 
 use super::output::{self, Accounts};
 use super::{GRANT_HELP, GrantArg, Options, Resolved, every_grant, every_page, resolve, unrevoked};
@@ -116,7 +116,7 @@ impl Command {
                 api_url,
                 provider,
                 ids,
-                |id| format!("um grant list {id}"),
+                |id| format!("useful grant list {id}"),
                 json,
             ),
         }
@@ -179,7 +179,7 @@ fn organization_slugs(api: &MemberGrantApi, grants: &[MemberGrant]) -> BTreeMap<
     slugs
 }
 
-/// Each of the member's linked identities by ID, named as `um auth identity list` shows it: by
+/// Each of the member's linked identities by ID, named as `useful auth identity list` shows it: by
 /// the email the identity asserted, or else by its subject. A failed read names none, so each
 /// OAuth grant's account is then printed by ID, and says so on standard error.
 fn identity_names(
@@ -260,7 +260,7 @@ impl super::super::HumanCredentialOutcome for ListIdentitiesOutcome {
         Self::Common(CommonIdentityFailure::Unauthenticated)
     }
 
-    fn unreachable(category: um_api::UnreachableCategory) -> Self {
+    fn unreachable(category: useful_api::UnreachableCategory) -> Self {
         Self::Common(CommonIdentityFailure::Unreachable(category))
     }
 

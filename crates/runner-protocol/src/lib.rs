@@ -417,7 +417,7 @@ fn tree_step_observation_value(observation: &TreeStepObservation) -> Value {
 /// `trigger_delivery` effect or, for a delivery accepted while the run was queued, in the
 /// offer's `workflowTree.pendingDeliveries`. `event` is the shared event `{source, event,
 /// at, payload}` and `claim` is `{connection, issue, observation?}`, each as Cloud sent it,
-/// for `um workflow run event`'s `--event` and `--claim` files (REQ-TRIGGER-136).
+/// for `useful workflow run event`'s `--event` and `--claim` files (REQ-TRIGGER-136).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TriggerDelivery {
     pub delivery_id: String,
@@ -442,7 +442,7 @@ impl TriggerDeliveryAction {
     }
 }
 
-/// How `um workflow run event` answered a delivery: applied with its action, or refused with
+/// How `useful workflow run event` answered a delivery: applied with its action, or refused with
 /// its code (`^[a-z][a-z0-9_]{0,63}$`).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TriggerDeliveryOutcome {
@@ -479,7 +479,7 @@ pub struct RunControl {
     pub action: RunControlAction,
 }
 
-/// What a control asks of the run, each kind with only its own members: the `um workflow
+/// What a control asks of the run, each kind with only its own members: the `useful workflow
 /// run` command it names (`answer`, `approve`, `hand-back`, `lift`, `stop` or `retry`) and
 /// the wait it resolves, when it names one.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4359,7 +4359,7 @@ mod tests {
         );
         assert_eq!(delivery.delivery_id, "wtd_01k0z6r1w8f4jy2m7q9v3x5abt");
         assert_eq!(delivery.claim_id, "wsc_01k0z6r1w8f4jy2m7q9v3x5abv");
-        // The event and claim reach the runner as Cloud sent them, for `um workflow run event`.
+        // The event and claim reach the runner as Cloud sent them, for `useful workflow run event`.
         assert_eq!(delivery.event, delivered["payload"]["event"]);
         assert_eq!(delivery.claim, delivered["payload"]["claim"]);
 

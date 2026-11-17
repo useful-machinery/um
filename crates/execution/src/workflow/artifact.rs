@@ -1428,7 +1428,7 @@ impl ArtifactStaging {
                         CaptureFailureKind::InvalidJson,
                     ))
                 })?;
-                if um_support::strict_json_from_slice(&source).is_err() {
+                if useful_support::strict_json_from_slice(&source).is_err() {
                     return Err(CaptureAttemptFailure::Capture(CaptureFailure::new(
                         Arc::clone(output_identity),
                         CaptureFailureKind::DuplicateJsonMember,

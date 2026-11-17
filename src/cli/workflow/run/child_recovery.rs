@@ -12,12 +12,12 @@
 //!
 //! An abandoned root's nested run (REQ-CONTINUE-91) is settled by its record:
 //! `prepare_abandoned` carries the wait of one that reads `waiting` and admits the in-place
-//! continuation of one that reads `running`, as `um workflow run resume` continues an
+//! continuation of one that reads `running`, as `useful workflow run resume` continues an
 //! abandoned root.
 
 use std::path::PathBuf;
 
-use um_execution::{
+use useful_execution::{
     AdmittedWorkflow, AttemptControls, CancellationSource, ChildRunRequest,
     ContinuationDefinitionMode, ContinuationEdgeV1, ContinuationReasonV1, ControlContext,
     FailedAttemptRestart, LocalAttemptOwner, LocalContinuationOpen, LocalRetryRejection,
@@ -157,7 +157,7 @@ enum Refusal {
 async fn prepare(
     repair: Repair<'_>,
     cancellation: &CancellationSource,
-    output: (&um_execution::PresentationConfig, ExecutionLeaf),
+    output: (&useful_execution::PresentationConfig, ExecutionLeaf),
 ) -> Result<Option<ChildRecovery>, Unprepared> {
     prepare_stage(repair, None, cancellation, output).await
 }
@@ -168,7 +168,7 @@ async fn prepare_stage(
     repair: Repair<'_>,
     root: Option<NestedRoot>,
     cancellation: &CancellationSource,
-    output: (&um_execution::PresentationConfig, ExecutionLeaf),
+    output: (&useful_execution::PresentationConfig, ExecutionLeaf),
 ) -> Result<Option<ChildRecovery>, Unprepared> {
     let Repair {
         parent,
@@ -313,7 +313,7 @@ pub(super) async fn prepare_wait(
     repair: Repair<'_>,
     reason: ContinuationReasonV1,
     cancellation: &CancellationSource,
-    output: (&um_execution::PresentationConfig, ExecutionLeaf),
+    output: (&useful_execution::PresentationConfig, ExecutionLeaf),
 ) -> Result<Option<ChildRecovery>, Unprepared> {
     let wait = match repair.parent.wait() {
         Ok(wait) => wait,
@@ -351,7 +351,7 @@ async fn prepare_nested(
     wait: WaitRecord,
     reason: ContinuationReasonV1,
     cancellation: &CancellationSource,
-    output: (&um_execution::PresentationConfig, ExecutionLeaf),
+    output: (&useful_execution::PresentationConfig, ExecutionLeaf),
 ) -> Result<Option<ChildRecovery>, Unprepared> {
     let Repair {
         parent,
@@ -539,7 +539,7 @@ async fn prepare_nested(
 /// The child run an abandoned root's step left `running` or `waiting`, which the abandonment
 /// path chose to retry in place (REQ-CONTINUE-76), settled by its record when it is a nested
 /// run (REQ-CONTINUE-91): one that reads `waiting` is carried as the wait it recorded, starting
-/// nothing (REQ-WFEXEC-75), and one that reads `running` is continued in place as `um workflow
+/// nothing (REQ-WFEXEC-75), and one that reads `running` is continued in place as `useful workflow
 /// run resume` continues an abandoned root, from the edge its latest attempt ended `continued`
 /// on, uncounted (REQ-CONTINUE-78), or from its single running `workflow` step, whose latest
 /// stage is adopted, retried in place or run afresh. Its own definition and retained inputs are
@@ -550,7 +550,7 @@ pub(super) async fn prepare_abandoned(
     parent: &PendingLocalContinuation,
     admitted: &AdmittedWorkflow,
     cancellation: &CancellationSource,
-    output: (&um_execution::PresentationConfig, ExecutionLeaf),
+    output: (&useful_execution::PresentationConfig, ExecutionLeaf),
 ) -> Result<Option<ChildRecovery>, Unprepared> {
     let ChildRecovery::Retry {
         step,
@@ -827,7 +827,7 @@ fn open_waiting_nested(
 fn rendered_refusal(
     refusal: Refusal,
     refuse: &dyn Fn(&'static str) -> Unprepared,
-    output: (&um_execution::PresentationConfig, ExecutionLeaf),
+    output: (&useful_execution::PresentationConfig, ExecutionLeaf),
 ) -> Unprepared {
     match refusal {
         Refusal::Unowned(message) => refuse(message),
@@ -875,7 +875,7 @@ fn check_mapped_inputs(
     mapped: Mapped<'_>,
     pending: &PendingLocalContinuation,
     controls: &mut ControlContext,
-    output: (&um_execution::PresentationConfig, ExecutionLeaf),
+    output: (&useful_execution::PresentationConfig, ExecutionLeaf),
     unowned: &'static str,
 ) -> Result<(), Unprepared> {
     let Mapped {
@@ -986,7 +986,7 @@ fn owned_child(
     pending: &PendingLocalContinuation,
     expected: &Expected,
     unowned: &'static str,
-) -> Result<um_execution::WorkflowRunRecord, Box<Refusal>> {
+) -> Result<useful_execution::WorkflowRunRecord, Box<Refusal>> {
     if pending.run_directory() != expected.directory {
         return Err(Box::new(Refusal::Unowned(unowned)));
     }

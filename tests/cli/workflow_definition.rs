@@ -78,8 +78,8 @@ fn validate(directory: &str, json: bool) -> std::process::Output {
     run_offline(&args, &[])
 }
 
-/// Runs `um` with unusable credentials and a network sentinel that fails the test when the
-/// command opens a connection; `environment` adds pairs such as `UM_HOME`.
+/// Runs `useful` with unusable credentials and a network sentinel that fails the test when the
+/// command opens a connection; `environment` adds pairs such as `USEFUL_HOME`.
 fn run_offline(args: &[&str], environment: &[(&str, &str)]) -> std::process::Output {
     let listener = TcpListener::bind("127.0.0.1:0").expect("network sentinel should bind");
     listener
@@ -91,13 +91,16 @@ fn run_offline(args: &[&str], environment: &[(&str, &str)]) -> std::process::Out
             CREDENTIALS_FILE_VARIABLE,
             "/dev/null/workflow-definition-credentials.json",
         ),
-        ("UM_API_URL", api_url.as_str()),
-        ("UM_AUTH_ISSUER", "http://auth.workflow-definition.invalid/"),
+        ("USEFUL_API_URL", api_url.as_str()),
         (
-            "UM_AUTH_AUDIENCE",
+            "USEFUL_AUTH_ISSUER",
+            "http://auth.workflow-definition.invalid/",
+        ),
+        (
+            "USEFUL_AUTH_AUDIENCE",
             "https://api.workflow-definition.invalid",
         ),
-        ("UM_AUTH_CLIENT_ID", "workflow-definition-client"),
+        ("USEFUL_AUTH_CLIENT_ID", "workflow-definition-client"),
     ];
     pairs.extend_from_slice(environment);
     let output = run_with_env(args, &pairs);
@@ -127,7 +130,7 @@ fn rejection_codes(directory: &str) -> Vec<(String, Value)> {
     assert_no_content(&output);
     let report = report(&output);
     assert_eq!(report["outcome"], "invalid");
-    assert_eq!(report["command"], "um workflow definition validate");
+    assert_eq!(report["command"], "useful workflow definition validate");
     report["diagnostics"]
         .as_array()
         .expect("diagnostics should be a list")
@@ -161,7 +164,7 @@ fn engineering_tree_validates_with_digest_files_triggers_and_bindings() {
     let report = report(&output);
 
     assert_eq!(report["schemaVersion"], 1);
-    assert_eq!(report["command"], "um workflow definition validate");
+    assert_eq!(report["command"], "useful workflow definition validate");
     assert_eq!(report["outcome"], "valid");
     assert!(report["tree"]["path"].is_string());
     assert_eq!(report["name"], "engineering");
@@ -665,9 +668,9 @@ fn every_failure_in_a_tree_is_listed() {
     );
 }
 
-const PUBLISH_COMMAND: &str = "um workflow definition publish";
+const PUBLISH_COMMAND: &str = "useful workflow definition publish";
 
-/// An empty `um` home in a temporary directory, passed to a command as `UM_HOME`.
+/// An empty `useful` home in a temporary directory, passed to a command as `USEFUL_HOME`.
 pub(super) struct Home {
     _temporary: TempDir,
     root: PathBuf,
@@ -689,14 +692,14 @@ impl Home {
             .expect("temporary home path should be UTF-8")
     }
 
-    /// Runs `um workflow definition ARGS` offline against this home.
+    /// Runs `useful workflow definition ARGS` offline against this home.
     fn run(&self, args: &[&str]) -> std::process::Output {
         let mut full = vec!["workflow", "definition"];
         full.extend_from_slice(args);
-        run_offline(&full, &[("UM_HOME", self.path())])
+        run_offline(&full, &[("USEFUL_HOME", self.path())])
     }
 
-    /// `um workflow definition publish DIR ARGS --json`, asserting it publishes; the report.
+    /// `useful workflow definition publish DIR ARGS --json`, asserting it publishes; the report.
     pub(super) fn publish(&self, tree: &Tree, args: &[&str]) -> Value {
         let mut full = vec!["publish", tree.path()];
         full.extend_from_slice(args);
@@ -705,7 +708,7 @@ impl Home {
         report
     }
 
-    /// `um workflow definition publish DIR ARGS --json`, asserting it is refused with `code`;
+    /// `useful workflow definition publish DIR ARGS --json`, asserting it is refused with `code`;
     /// the one diagnostic.
     fn refused(&self, tree: &Tree, args: &[&str], code: &str) -> Value {
         let mut full = vec!["publish", tree.path()];
@@ -1156,7 +1159,7 @@ fn start_policies_and_schedule_triggers_are_reported_and_start_nothing() {
 }
 
 impl Home {
-    /// `um workflow definition ARGS --json`, asserting it exits 0; the report.
+    /// `useful workflow definition ARGS --json`, asserting it exits 0; the report.
     pub(super) fn json(&self, args: &[&str]) -> Value {
         let mut full = args.to_vec();
         full.push("--json");
@@ -1166,7 +1169,7 @@ impl Home {
         report(&output)
     }
 
-    /// `um workflow definition ARGS --json`, asserting it is refused with `code`; the one
+    /// `useful workflow definition ARGS --json`, asserting it is refused with `code`; the one
     /// diagnostic.
     fn refused_command(&self, args: &[&str], command: &str, code: &str) -> Value {
         let mut full = args.to_vec();
@@ -1186,7 +1189,7 @@ impl Home {
         diagnostics[0].clone()
     }
 
-    /// `um workflow definition ARGS` in the human form, asserting its exit status; stdout.
+    /// `useful workflow definition ARGS` in the human form, asserting its exit status; stdout.
     fn human(&self, args: &[&str], status: i32) -> String {
         let output = self.run(args);
         assert_eq!(output.status.code(), Some(status), "{output:?}");
@@ -1229,7 +1232,7 @@ fn enable_and_disable_set_only_the_enabled_flag() {
 
     let disabled = home.json(&["disable", &id]);
     assert_eq!(disabled["schemaVersion"], 1);
-    assert_eq!(disabled["command"], "um workflow definition disable");
+    assert_eq!(disabled["command"], "useful workflow definition disable");
     assert_eq!(disabled["outcome"], "disabled");
     assert_eq!(disabled["definition"]["id"], id.as_str());
     assert_eq!(disabled["definition"]["name"], "engineering");
@@ -1259,20 +1262,20 @@ fn enable_and_disable_set_only_the_enabled_flag() {
     assert_contains_all(&stdout, &[&id, "engineering", "enabled"]);
     assert_eq!(read_json(&record_path), before);
     let enabled = home.json(&["enable", &id]);
-    assert_eq!(enabled["command"], "um workflow definition enable");
+    assert_eq!(enabled["command"], "useful workflow definition enable");
     assert_eq!(enabled["outcome"], "enabled");
     assert_eq!(enabled["definition"]["enabled"], true);
     assert_eq!(enabled["definition"]["changed"], false);
 
     let not_found = home.refused_command(
         &["disable", UNKNOWN_ID],
-        "um workflow definition disable",
+        "useful workflow definition disable",
         "definition_not_found",
     );
     assert_eq!(not_found["definition"], UNKNOWN_ID);
     let invalid = home.refused_command(
         &["show", "engineering"],
-        "um workflow definition show",
+        "useful workflow definition show",
         "definition_id_invalid",
     );
     assert_eq!(invalid["definition"], "engineering");
@@ -1287,7 +1290,7 @@ fn list_prints_every_definition_sorted_by_name_then_id() {
     let home = Home::new();
     let empty = home.json(&["list"]);
     assert_eq!(empty["schemaVersion"], 1);
-    assert_eq!(empty["command"], "um workflow definition list");
+    assert_eq!(empty["command"], "useful workflow definition list");
     assert_eq!(empty["definitions"], json!([]));
     assert_eq!(
         home.human(&["list"], 0).trim_end(),
@@ -1410,7 +1413,7 @@ fn show_prints_the_record_its_revisions_and_the_current_bindings() {
 
     let shown = home.json(&["show", &id]);
     assert_eq!(shown["schemaVersion"], 1);
-    assert_eq!(shown["command"], "um workflow definition show");
+    assert_eq!(shown["command"], "useful workflow definition show");
     assert_eq!(
         shown["definition"],
         json!({
@@ -1528,13 +1531,13 @@ fn list_and_show_refuse_a_record_not_of_the_published_shape() {
 
     let listed = home.refused_command(
         &["list"],
-        "um workflow definition list",
+        "useful workflow definition list",
         "definition_record_invalid",
     );
     assert_eq!(listed["path"], record);
     let shown = home.refused_command(
         &["show", &id],
-        "um workflow definition show",
+        "useful workflow definition show",
         "definition_record_invalid",
     );
     assert_eq!(shown["path"], record);
@@ -1665,7 +1668,7 @@ struct FakeDefinition {
 }
 
 /// A loopback fake of the Gateway's tree and definition operations and of signed storage,
-/// serving one `um` invocation at a time with a stored human session for `CLOUD_TOKEN`. A
+/// serving one `useful` invocation at a time with a stored human session for `CLOUD_TOKEN`. A
 /// tree upload reports missing the files under `scripts/` and `policy/` the organization
 /// does not yet retain.
 pub(super) struct FakeGateway {
@@ -1746,7 +1749,7 @@ impl FakeGateway {
         );
     }
 
-    /// Runs `um ARGS` against this Gateway and `home`; the output and the requests served.
+    /// Runs `useful ARGS` against this Gateway and `home`; the output and the requests served.
     pub(super) fn run(
         &self,
         home: &Home,
@@ -1772,7 +1775,7 @@ impl FakeGateway {
         });
         let mut environment =
             super::deployment_environment(&self.api_url, &self.credentials).to_vec();
-        environment.push(("UM_HOME", home.path()));
+        environment.push(("USEFUL_HOME", home.path()));
         let output = run_with_env(args, &environment);
         stop.store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = std::net::TcpStream::connect(address);
@@ -3635,7 +3638,7 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
     let listed = report(&output);
     assert_eq!(
         listed["command"],
-        "um workflow definition cloud evaluation list"
+        "useful workflow definition cloud evaluation list"
     );
     assert_eq!(listed["outcome"], "listed", "{listed}");
     assert_eq!(listed["organizationRef"], CLOUD_ORGANIZATION);

@@ -482,7 +482,7 @@ fn validate(
     project: &str,
     id: Option<&str>,
 ) -> Result<GoogleDocsAction, ActionFailure> {
-    if !um_support::valid_typed_id(&value.id, "gda_")
+    if !useful_support::valid_typed_id(&value.id, "gda_")
         || value.project_id != project
         || id.is_some_and(|id| value.id != id)
         || value.version < 1

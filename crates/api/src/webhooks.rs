@@ -472,7 +472,7 @@ impl WebhookApi {
     }
 }
 fn valid_subscription(value: &WebhookSubscription, project: &str, allow_secret: bool) -> bool {
-    um_support::valid_typed_id(&value.id, "whs_")
+    useful_support::valid_typed_id(&value.id, "whs_")
         && value.project_id == project
         && value.version > 0
         && (allow_secret || value.secret.is_none())
@@ -502,19 +502,19 @@ fn valid_delivery(value: &WebhookDelivery) -> bool {
             | "publication.unavailable"
     );
     let step = value.event_type.starts_with("step.");
-    um_support::valid_typed_id(&value.id, "whd_")
-        && um_support::valid_typed_id(&value.event_id, "evt_")
+    useful_support::valid_typed_id(&value.id, "whd_")
+        && useful_support::valid_typed_id(&value.event_id, "evt_")
         && value.subscription_version > 0
         && !value.created_at.is_empty()
         && if lifecycle {
             value
                 .run_id
                 .as_deref()
-                .is_some_and(|id| um_support::valid_typed_id(id, "run_"))
+                .is_some_and(|id| useful_support::valid_typed_id(id, "run_"))
                 && value
                     .attempt_id
                     .as_deref()
-                    .is_some_and(|id| um_support::valid_typed_id(id, "atm_"))
+                    .is_some_and(|id| useful_support::valid_typed_id(id, "atm_"))
                 && value
                     .workflow_path
                     .as_deref()
@@ -542,7 +542,7 @@ fn valid_delivery(value: &WebhookDelivery) -> bool {
             cycles.iter().all(|cycle| {
                 cycle.number > 0
                     && cycle.attempts.iter().all(|attempt| {
-                        um_support::valid_typed_id(&attempt.id, "wha_")
+                        useful_support::valid_typed_id(&attempt.id, "wha_")
                             && attempt.current_key_version > 0
                     })
             })

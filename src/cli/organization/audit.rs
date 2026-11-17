@@ -2,8 +2,8 @@ use clap::{Args, Subcommand};
 
 use crate::cli::OrganizationArg;
 use crate::exit_code::ExitCode;
-use um_api::{HttpClient, list_organization_audit_records};
-use um_human_auth::Deployment;
+use useful_api::{HttpClient, list_organization_audit_records};
+use useful_human_auth::Deployment;
 
 use super::{LeafOptions, output};
 

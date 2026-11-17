@@ -106,9 +106,9 @@ pub(in crate::service) fn validate_effective_spec(
         ));
     }
     let valid_workflow_connection =
-        um_runner_protocol::valid_repository_connection_id(&workflow.repository_connection_id);
+        useful_runner_protocol::valid_repository_connection_id(&workflow.repository_connection_id);
     let valid_primary_connection =
-        um_runner_protocol::valid_repository_connection_id(&primary.repository_connection_id);
+        useful_runner_protocol::valid_repository_connection_id(&primary.repository_connection_id);
     let valid_path = !workflow.workflow_path.is_empty()
         && workflow.workflow_path.chars().count() <= MAXIMUM_WORKFLOW_PATH_CHARACTERS
         && !workflow.workflow_path.starts_with('/')
@@ -218,7 +218,7 @@ pub(in crate::service) fn validate_effective_spec(
 
 /// The tree's declared files are distinct paths that stay under the tree directory,
 /// and the workflow it runs is one of them.
-fn valid_workflow_tree(tree: &um_runner_protocol::WorkflowTreeV1RunnerProjection) -> bool {
+fn valid_workflow_tree(tree: &useful_runner_protocol::WorkflowTreeV1RunnerProjection) -> bool {
     let mut paths = BTreeSet::new();
     tree.digest
         .strip_prefix("sha256:")
@@ -258,7 +258,7 @@ pub(in crate::service) fn validate_source_identity_pair(
 }
 
 fn valid_workspace_membership(
-    membership: &um_runner_protocol::WorkspaceMembership,
+    membership: &useful_runner_protocol::WorkspaceMembership,
     primary: &PrimaryWorkspaceSourceV1RunnerProjection,
 ) -> bool {
     let witness = &membership.witness;

@@ -4,9 +4,9 @@ use anyhow::{Context, anyhow};
 use serde::Serialize;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
-use um_api::HttpClient;
-use um_human_auth::Deployment;
-use um_human_auth::{AuthenticationState, AuthenticationStatus};
+use useful_api::HttpClient;
+use useful_human_auth::Deployment;
+use useful_human_auth::{AuthenticationState, AuthenticationStatus};
 
 use super::super::principal::PrincipalResult;
 
@@ -28,9 +28,9 @@ impl Command {
         let service_api_key = self.authentication.service_api_key()?;
         let status = match service_api_key {
             Some(api_key) => {
-                um_human_auth::check_with_service_api_key(&client, deployment, api_key.expose())
+                useful_human_auth::check_with_service_api_key(&client, deployment, api_key.expose())
             }
-            None => um_human_auth::check_auth_status(&client, deployment),
+            None => useful_human_auth::check_auth_status(&client, deployment),
         }
         .map_err(|error| anyhow!(error))
         .with_context(|| {
@@ -175,7 +175,7 @@ pub(super) fn write_human_status(
             ) {
                 writeln!(
                     stdout,
-                    "\nTo keep an account scheduled for deletion, cancel before its deadline:\n  um account deletion cancel"
+                    "\nTo keep an account scheduled for deletion, cancel before its deadline:\n  useful account deletion cancel"
                 )
                 .context("write sign-in status")?;
             }

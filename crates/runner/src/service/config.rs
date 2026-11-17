@@ -7,7 +7,7 @@ use url::Url;
 
 use crate::credential::Credential;
 use crate::enrollment::{PendingCredential, RunnerStateAccess};
-use um_execution::{
+use useful_execution::{
     ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, ValidatedPiInstallation,
 };
 
