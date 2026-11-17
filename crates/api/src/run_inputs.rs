@@ -546,16 +546,16 @@ impl RunApi<'_> {
         if !begin_dispatch() {
             return Err(RunFailure::Interrupted);
         }
-        let status =
-            self.storage_transport
-                .signed_storage_put(&capability.url, headers, bytes, STORAGE_REQUEST_TIMEOUT)
-                .map_err(|error| match error {
-                    SignedStorageRequestError::Build
-                    | SignedStorageRequestError::InvalidRequest => RunFailure::protocol(false),
-                    SignedStorageRequestError::Unreachable(category) => {
-                        RunFailure::Unreachable(category)
-                    }
-                })?;
+        let status = self
+            .storage_transport
+            .signed_storage_put(&capability.url, headers, bytes, STORAGE_REQUEST_TIMEOUT)
+            .map_err(|error| match error {
+                SignedStorageRequestError::Build(_)
+                | SignedStorageRequestError::InvalidRequest(_) => RunFailure::protocol(false),
+                SignedStorageRequestError::Unreachable(category) => {
+                    RunFailure::Unreachable(category)
+                }
+            })?;
         if status == StatusCode::PRECONDITION_FAILED {
             return Ok(StorageUploadOutcome::VerificationRequired);
         }

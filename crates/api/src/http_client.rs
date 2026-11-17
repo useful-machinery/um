@@ -177,7 +177,7 @@ impl HttpClient {
     ) -> Result<StatusCode, SignedStorageRequestError> {
         let connector = HttpsConnectorBuilder::new()
             .try_with_platform_verifier()
-            .map_err(|_| SignedStorageRequestError::Build)?;
+            .map_err(SignedStorageRequestError::Build)?;
         let connector = match self.transport_policy {
             HttpTransportPolicy::HttpsOnly => connector.https_only(),
             HttpTransportPolicy::AllowInsecureHttp => connector.https_or_http(),
@@ -190,7 +190,7 @@ impl HttpClient {
             .method(Method::PUT)
             .uri(url.as_str())
             .body(Full::new(Bytes::copy_from_slice(bytes)))
-            .map_err(|_| SignedStorageRequestError::InvalidRequest)?;
+            .map_err(SignedStorageRequestError::InvalidRequest)?;
         *request.headers_mut() = headers;
         match self.run(timeout, client.request(request)) {
             Ok(Ok(response)) => Ok(response.status()),
@@ -290,8 +290,10 @@ impl Drop for HttpClient {
 
 #[derive(Debug)]
 pub(super) enum SignedStorageRequestError {
-    Build,
-    InvalidRequest,
+    /// The platform certificate verifier could not be formed.
+    Build(rustls::Error),
+    /// The request could not be formed from the capability's URL.
+    InvalidRequest(hyper::http::Error),
     Unreachable(super::UnreachableCategory),
 }
 

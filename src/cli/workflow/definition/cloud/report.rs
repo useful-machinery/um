@@ -1,7 +1,8 @@
 //! What the `um workflow definition cloud` leaves print (REQ-CLOUDDEF-15): with `--json`, one
 //! document naming the command, the organization and project, the `outcome` and the result,
 //! or for a failure the failure name with a refusal's status, problem slug and `workflow`
-//! safe facts; without it, a plain report on stdout or the failure on stderr.
+//! safe facts or an invalid response's `diagnostic` (REQ-CLOUDDEF-28); without it, a plain
+//! report on stdout or the failure on stderr with the same facts as labelled lines.
 
 use std::collections::BTreeMap;
 use std::io::{self, Write};
@@ -10,7 +11,9 @@ use anyhow::Context;
 use serde::Serialize;
 use serde_json::Value;
 
-use super::super::publish::cloud_failure;
+use super::super::publish::{
+    InvalidResponseDiagnostic, cloud_failure, invalid_response_diagnostic,
+};
 use super::super::report::{display, display_members, write_json};
 use crate::exit_code::ExitCode;
 use um_api::{
@@ -221,6 +224,7 @@ fn failed(scope: &Scope<'_>, failure: &WorkflowDefinitionFailure) -> anyhow::Res
         WorkflowDefinitionFailure::Refused(refusal) => Some(refusal),
         _ => None,
     };
+    let diagnostic = invalid_response_diagnostic(failure);
     if scope.json {
         return scope.write(
             name,
@@ -228,6 +232,7 @@ fn failed(scope: &Scope<'_>, failure: &WorkflowDefinitionFailure) -> anyhow::Res
                 status: refusal.map(|refusal| refusal.status),
                 problem: refusal.map(|refusal| refusal.problem.as_str()),
                 workflow: refusal.and_then(|refusal| refusal.workflow.as_ref()),
+                diagnostic,
             },
         );
     }
@@ -238,6 +243,9 @@ fn failed(scope: &Scope<'_>, failure: &WorkflowDefinitionFailure) -> anyhow::Res
             "error: Cloud workflow definition {} failed: {name}",
             scope.leaf
         )?;
+        if let Some(diagnostic) = diagnostic {
+            diagnostic.write(&mut stderr)?;
+        }
         writeln!(
             stderr,
             "\nCheck your session and the deployment, then try again."
@@ -336,4 +344,6 @@ struct FailedBody<'a> {
     problem: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workflow: Option<&'a WorkflowProblemDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<InvalidResponseDiagnostic>,
 }

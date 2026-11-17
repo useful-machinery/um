@@ -219,9 +219,10 @@ pub use webhooks::{
 };
 pub use workflow_definitions::{
     WorkflowBindingValues, WorkflowDefinition, WorkflowDefinitionApi, WorkflowDefinitionApiError,
-    WorkflowDefinitionEvaluation, WorkflowDefinitionFailure, WorkflowDefinitionPublication,
-    WorkflowDefinitionRevision, WorkflowEvaluationFilter, WorkflowProblemDetail,
-    WorkflowPublication, WorkflowRefusal, WorkflowTree, WorkflowTreeFile,
+    WorkflowDefinitionCheck, WorkflowDefinitionEvaluation, WorkflowDefinitionFailure,
+    WorkflowDefinitionPublication, WorkflowDefinitionRevision, WorkflowDefinitionStage,
+    WorkflowEvaluationFilter, WorkflowInvalidResponse, WorkflowProblemDetail, WorkflowPublication,
+    WorkflowRefusal, WorkflowTree, WorkflowTreeFile,
 };
 
 // OpenAPI Generator emits a library-shaped client; keep its public declarations

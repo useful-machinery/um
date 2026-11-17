@@ -394,6 +394,45 @@ pub(super) const fn cloud_failure(failure: &WorkflowDefinitionFailure) -> (&'sta
     }
 }
 
+/// Where an invalid response was detected (REQ-CLOUDDEF-28): the JSON `diagnostic` of the
+/// failure, or none for every other failure. It holds the slugs and the status alone, never
+/// the error the failure retains.
+pub(super) fn invalid_response_diagnostic(
+    failure: &WorkflowDefinitionFailure,
+) -> Option<InvalidResponseDiagnostic> {
+    match failure {
+        WorkflowDefinitionFailure::InvalidResponse(invalid) => Some(InvalidResponseDiagnostic {
+            stage: invalid.stage().slug(),
+            check: invalid.check().slug(),
+            http_status: invalid.status(),
+        }),
+        _ => None,
+    }
+}
+
+/// The stage and check an invalid response failed, with the status a check of the status
+/// judged.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct InvalidResponseDiagnostic {
+    stage: &'static str,
+    check: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    http_status: Option<u16>,
+}
+
+impl InvalidResponseDiagnostic {
+    /// Writes the stage, the check and the status as labelled lines under an error.
+    pub(super) fn write(&self, out: &mut impl Write) -> io::Result<()> {
+        writeln!(out, "stage: {}", self.stage)?;
+        writeln!(out, "check: {}", self.check)?;
+        if let Some(status) = self.http_status {
+            writeln!(out, "http status: {status}")?;
+        }
+        Ok(())
+    }
+}
+
 fn write_cloud_published(
     published: &Published,
     target: &CloudTarget,
@@ -424,6 +463,7 @@ fn write_cloud_published(
             status: refusal.map(|refusal| refusal.status),
             problem: refusal.map(|refusal| refusal.problem.as_str()),
             workflow: refusal.and_then(|refusal| refusal.workflow.as_ref()),
+            diagnostic: reached.as_ref().err().and_then(invalid_response_diagnostic),
         };
         return write_json(
             &published_report(published, Some(cloud)),
@@ -485,11 +525,16 @@ fn write_cloud_published(
                         writeln!(stderr, "cloud definitions: {}", ids.join(", "))?;
                     }
                 }
-                None => writeln!(
-                    stderr,
-                    "error: {publication} failed: {}",
-                    cloud_failure(failure).0
-                )?,
+                None => {
+                    writeln!(
+                        stderr,
+                        "error: {publication} failed: {}",
+                        cloud_failure(failure).0
+                    )?;
+                    if let Some(diagnostic) = invalid_response_diagnostic(failure) {
+                        diagnostic.write(&mut stderr)?;
+                    }
+                }
             }
             let ambiguous =
                 refusal.is_some_and(|refusal| refusal.problem == DEFINITION_REUSE_AMBIGUOUS);
@@ -599,7 +644,7 @@ struct JsonPublished<'a> {
 /// The Cloud half of `--cloud`: the existing definition it was addressed to, the definition
 /// and revision it reached with whether it was created, reused or published to and whether
 /// the tree was reused (REQ-CLOUDDEF-22), or its failure with a refusal's status, problem
-/// slug and `workflow` safe facts.
+/// slug and `workflow` safe facts or an invalid response's diagnostic (REQ-CLOUDDEF-28).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JsonCloud<'a> {
@@ -633,6 +678,8 @@ struct JsonCloud<'a> {
     problem: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workflow: Option<&'a WorkflowProblemDetail>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostic: Option<InvalidResponseDiagnostic>,
 }
 
 #[derive(Serialize)]

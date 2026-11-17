@@ -119,13 +119,33 @@ pub(crate) fn validate_mutation_key(
     Ok(())
 }
 
+/// `body` decoded closed, any refusal collapsed to an invalid response.
 pub(crate) fn decode_closed_json<T: serde::de::DeserializeOwned + serde::Serialize>(
     body: &[u8],
 ) -> Result<T, ResourceFailure> {
-    let raw: serde_json::Value = serde_json::from_slice(body).map_err(|_| invalid())?;
-    let decoded: T = serde_json::from_value(raw.clone()).map_err(|_| invalid())?;
-    if serde_json::to_value(&decoded).map_err(|_| invalid())? != raw {
-        return Err(invalid());
+    try_decode_closed_json(body).map_err(|_| invalid())
+}
+
+/// Why [`try_decode_closed_json`] refused a body, with the decoding error where there was one.
+pub(crate) enum ClosedJsonError {
+    /// The body is not JSON.
+    Syntax(serde_json::Error),
+    /// The JSON does not fit the model.
+    Shape(serde_json::Error),
+    /// The decoded model does not encode again.
+    Encode(serde_json::Error),
+    /// The decoded model encodes to other JSON: the body carries what the model does not know.
+    Differs,
+}
+
+/// `body` decoded into `T`, which must encode again to the same JSON.
+pub(crate) fn try_decode_closed_json<T: serde::de::DeserializeOwned + serde::Serialize>(
+    body: &[u8],
+) -> Result<T, ClosedJsonError> {
+    let raw: serde_json::Value = serde_json::from_slice(body).map_err(ClosedJsonError::Syntax)?;
+    let decoded: T = serde_json::from_value(raw.clone()).map_err(ClosedJsonError::Shape)?;
+    if serde_json::to_value(&decoded).map_err(ClosedJsonError::Encode)? != raw {
+        return Err(ClosedJsonError::Differs);
     }
     Ok(decoded)
 }

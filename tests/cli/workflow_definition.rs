@@ -1588,8 +1588,9 @@ impl GatewayRequest {
 /// retains, the sealed tree digests, each definition, whether the next publication to an id
 /// loses a race to another publisher or is forbidden, whether the reply to the next create
 /// or publication is lost after it is applied, the problems the next keyed definition
-/// requests are answered with before they are applied, and each create or publication reply,
-/// with its status, by its `Idempotency-Key`.
+/// requests are answered with before they are applied, the fault the next request on the
+/// route it names is answered with, and each create or publication reply, with its status, by
+/// its `Idempotency-Key`.
 #[derive(Default)]
 struct GatewayState {
     retained: std::collections::BTreeSet<String>,
@@ -1599,10 +1600,16 @@ struct GatewayState {
     forbid_next_publication: bool,
     drop_next_publication_reply: bool,
     keyed_problems: std::collections::VecDeque<(&'static str, u16, &'static str)>,
+    fault: Option<Fault>,
     publications: std::collections::BTreeMap<String, (&'static str, Value)>,
 }
 
 impl GatewayState {
+    /// Whether the next request on `fault`'s route is to be answered with it, consuming it.
+    fn fault(&mut self, fault: Fault) -> bool {
+        self.fault.take_if(|next| *next == fault).is_some()
+    }
+
     /// The reply to a create or publication keyed `key`: the one recorded under the key with
     /// its status, or `publish`'s, recorded and, when the next reply is to be lost, not sent
     /// (no bytes).
@@ -1627,6 +1634,24 @@ impl GatewayState {
         keyed(status, published)
     }
 }
+
+/// A faulty answer to the next request on the route a fault names.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Fault {
+    /// The tree upload's capability URLs carry a user and `CAPABILITY_PASSWORD`.
+    UploadCapabilityCredentials,
+    /// The seal is applied and answered without its `Idempotency-Key`.
+    SealWithoutKey,
+    /// The create is answered 404 with an HTML page, applying nothing.
+    CreateHtmlNotFound,
+    /// A definition read is answered with the definition under `CLOUD_TARGET`'s id.
+    ReadOtherDefinition,
+    /// A setting change is applied and answered without its `Idempotency-Key`.
+    ChangeWithoutKey,
+}
+
+/// The password a faulty upload capability URL carries.
+const CAPABILITY_PASSWORD: &str = "unique-capability-password-sentinel";
 
 /// One Cloud definition the fake Gateway holds: its current revision, what that revision
 /// published (`publication_of` the request) and its settings.
@@ -1703,6 +1728,11 @@ impl FakeGateway {
             .unwrap()
             .keyed_problems
             .push_back((line, status, slug));
+    }
+
+    /// Answers the next request on the route `fault` names with it.
+    pub(super) fn answer_next_with(&self, fault: Fault) {
+        self.state.lock().unwrap().fault = Some(fault);
     }
 
     /// Holds definition `id` at revision `current`, active, disabled and with no principal.
@@ -1814,11 +1844,15 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
         let manifest = request.json();
         let digest = text(&manifest["digest"], "manifest digest").to_owned();
         let sealed = state.sealed.contains(&digest);
-        let capabilities =
-            if sealed {
-                Vec::new()
-            } else {
-                manifest["files"]
+        let authority = if state.fault(Fault::UploadCapabilityCredentials) {
+            format!("owner:{CAPABILITY_PASSWORD}@{address}")
+        } else {
+            address.to_owned()
+        };
+        let capabilities = if sealed {
+            Vec::new()
+        } else {
+            manifest["files"]
                 .as_array()
                 .expect("manifest files should be a list")
                 .iter()
@@ -1835,7 +1869,7 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
                         .collect::<Vec<_>>();
                     json!({
                         "sha256": sha256,
-                        "url": format!("http://{address}/storage/{sha256}?X-Amz-Signature=fixture"),
+                        "url": format!("http://{authority}/storage/{sha256}?X-Amz-Signature=fixture"),
                         "requiredHeaders": {
                             "contentLength": file["sizeBytes"].to_string(),
                             "contentType": "application/octet-stream",
@@ -1846,7 +1880,7 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
                     })
                 })
                 .collect()
-            };
+        };
         let expires = if capabilities.is_empty() {
             Value::Null
         } else {
@@ -1881,6 +1915,9 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
     {
         let digest = digest.replace("%3A", ":").replace("%3a", ":");
         state.sealed.insert(digest.clone());
+        if state.fault(Fault::SealWithoutKey) {
+            return super::json_http_response("200 OK", gateway_tree(&digest, true));
+        }
         return keyed("200 OK", gateway_tree(&digest, true));
     }
     if request.header("idempotency-key").is_some()
@@ -1893,6 +1930,13 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
         );
     }
     if route == format!("POST {definitions}") {
+        if state.fault(Fault::CreateHtmlNotFound) {
+            return super::http_response(
+                "404 Not Found",
+                Some("text/html"),
+                b"<html><body>Not Found</body></html>",
+            );
+        }
         let body = request.json();
         return state.publication(&key, keyed, |state| {
             let published = publication_of(&body);
@@ -1962,9 +2006,14 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
         );
     }
     if let Some(id) = route.strip_prefix(&format!("GET {definitions}/")) {
+        let answered = if state.fault(Fault::ReadOtherDefinition) {
+            CLOUD_TARGET
+        } else {
+            id
+        };
         return match state.definitions.get(id) {
             Some(definition) => {
-                super::json_http_response("200 OK", gateway_definition(id, definition))
+                super::json_http_response("200 OK", gateway_definition(answered, definition))
             }
             None => gateway_not_found(),
         };
@@ -2349,9 +2398,10 @@ fn publish_cloud_resends_a_lost_publication_once_and_publishes_executable_bits()
     assert_eq!(published["executablePaths"], json!([]));
 }
 
-// REQ-CLOUDDEF-14, REQ-CLOUDDEF-25: a create or publication answered with a transient problem
-// is sent once more under its key; a second such answer leaves the local revision recorded
-// and is reported as Cloud being unavailable, and a 503 naming its own cause is refused.
+// REQ-CLOUDDEF-14, REQ-CLOUDDEF-25, REQ-CLOUDDEF-28: a create or publication answered with a
+// transient problem is sent once more under its key; a second such answer leaves the local
+// revision recorded and is reported as Cloud being unavailable, and a 503 naming its own cause
+// is refused, neither with a diagnostic.
 #[test]
 fn publish_cloud_resends_a_create_or_publication_answered_with_a_transient_problem_once() {
     let home = Home::new();
@@ -2393,7 +2443,7 @@ fn publish_cloud_resends_a_create_or_publication_answered_with_a_transient_probl
     let failed = report(&output);
     assert_eq!(failed["outcome"], "cloud_failed", "{failed}");
     assert_eq!(failed["cloud"]["failure"], "unavailable", "{failed}");
-    for member in ["status", "problem", "workflow"] {
+    for member in ["status", "problem", "workflow", "diagnostic"] {
         assert!(failed["cloud"].get(member).is_none(), "{failed}");
     }
     assert_eq!(failed["revision"]["n"], 2);
@@ -2415,12 +2465,85 @@ fn publish_cloud_resends_a_create_or_publication_answered_with_a_transient_probl
     let refused = report(&output);
     assert_eq!(refused["cloud"]["failure"], "refused", "{refused}");
     assert_eq!(refused["cloud"]["status"], 503);
+    assert!(refused["cloud"].get("diagnostic").is_none(), "{refused}");
     assert_eq!(
         refused["cloud"]["problem"],
         "binding-resolution-unavailable"
     );
     assert_eq!(keyed_to(&requests, &publications).len(), 1);
     assert_eq!(gateway_definitions(&gateway), vec![(cloud_id, 1)]);
+}
+
+// REQ-CLOUDDEF-28, REQ-CLOUDDEF-23: an answer failing a check at the tree upload, the seal or
+// the create is an invalid response reported with the stage and check that failed (and the
+// status of a status check), and nothing of the signed URL, the session or the body.
+#[test]
+fn publish_cloud_reports_the_stage_and_check_of_an_invalid_response() {
+    let home = Home::new();
+    let tree = Tree::engineering();
+    let bindings = tree.engineering_bindings();
+    let gateway = FakeGateway::new();
+    let organization = format!("/api/v1/organizations/{CLOUD_ORGANIZATION}");
+    let create = format!("POST {organization}/projects/{CLOUD_PROJECT}/workflow-definitions");
+    let withheld = [CAPABILITY_PASSWORD, "X-Amz-Signature", CLOUD_TOKEN];
+
+    gateway.answer_next_with(Fault::UploadCapabilityCredentials);
+    let (output, _) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &[]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    super::assert_no_secret_output(&output, &withheld);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_contains_all(&stderr, &["file_upload", "capability_url_policy"]);
+
+    for (fault, diagnostic) in [
+        (
+            Fault::UploadCapabilityCredentials,
+            json!({"stage": "file_upload", "check": "capability_url_policy"}),
+        ),
+        (
+            Fault::SealWithoutKey,
+            json!({"stage": "tree_seal", "check": "idempotency_key"}),
+        ),
+        (
+            Fault::CreateHtmlNotFound,
+            json!({"stage": "definition_create", "check": "problem_decode", "httpStatus": 404}),
+        ),
+    ] {
+        gateway.answer_next_with(fault);
+        let (output, requests) =
+            gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        super::assert_no_secret_output(&output, &withheld);
+        let failed = report(&output);
+        assert_eq!(failed["outcome"], "cloud_failed", "{failed}");
+        assert_eq!(failed["cloud"]["failure"], "invalid_response", "{failed}");
+        assert_eq!(failed["cloud"]["diagnostic"], diagnostic, "{failed}");
+        for member in ["status", "problem", "workflow"] {
+            assert!(failed["cloud"].get(member).is_none(), "{failed}");
+        }
+        let record = published_record(&home, &failed);
+        assert_eq!(record["current"], failed["revision"]["n"], "{record}");
+        assert_eq!(record["cloudId"], Value::Null, "{record}");
+        let sent = routes(&requests);
+        let seal = |route: &String| route.starts_with("POST ") && route.ends_with("/seal");
+        match fault {
+            Fault::UploadCapabilityCredentials => {
+                assert!(
+                    !sent
+                        .iter()
+                        .any(|route| route.starts_with("PUT /storage/") || seal(route)),
+                    "{sent:?}"
+                );
+            }
+            Fault::SealWithoutKey => assert!(sent.iter().any(seal), "{sent:?}"),
+            _ => {}
+        }
+        assert_eq!(
+            sent.iter().filter(|route| **route == create).count(),
+            usize::from(fault == Fault::CreateHtmlNotFound),
+            "{sent:?}"
+        );
+    }
+    assert!(gateway_definitions(&gateway).is_empty());
 }
 
 // REQ-CLOUDDEF-14, REQ-WFDEF-19
@@ -3130,7 +3253,11 @@ fn respond_settings(
         }
         _ => return None,
     }
-    Some(keyed("200 OK", gateway_definition(id, definition)))
+    let changed = gateway_definition(id, definition);
+    if state.fault(Fault::ChangeWithoutKey) {
+        return Some(super::json_http_response("200 OK", changed));
+    }
+    Some(keyed("200 OK", changed))
 }
 
 // REQ-CLOUDDEF-15
@@ -3362,7 +3489,7 @@ fn cloud_group_resends_a_change_answered_with_a_transient_problem_once() {
         assert_eq!(output.status.code(), Some(4), "{slug}: {output:?}");
         let unavailable = report(&output);
         assert_eq!(unavailable["outcome"], "unavailable", "{unavailable}");
-        for member in ["status", "problem", "workflow"] {
+        for member in ["status", "problem", "workflow", "diagnostic"] {
             assert!(unavailable.get(member).is_none(), "{unavailable}");
         }
         one_key(&requests);
@@ -3385,6 +3512,74 @@ fn cloud_group_resends_a_change_answered_with_a_transient_problem_once() {
     assert_eq!(routes(&requests), vec![disable.clone()]);
     assert!(gateway.state.lock().unwrap().definitions[&id].automatic_starts);
     assert!(home.workflow_entries().is_empty());
+}
+
+// REQ-CLOUDDEF-28, REQ-CLOUDDEF-23: a `cloud` leaf whose answer fails a check reports
+// `invalid_response` with the stage and the check that failed.
+#[test]
+fn cloud_group_reports_the_stage_and_check_of_an_invalid_response() {
+    let home = Home::new();
+    let gateway = FakeGateway::new();
+    let id = format!("{CLOUD_ID_STEM}c");
+    gateway.define(&id, 2);
+    gateway
+        .state
+        .lock()
+        .unwrap()
+        .definitions
+        .get_mut(&id)
+        .expect("seeded definition")
+        .principal = Some(CLOUD_PRINCIPAL.to_owned());
+    let leaf = |leaf: &'static str, json: bool| {
+        let mut args = vec![
+            "workflow",
+            "definition",
+            "cloud",
+            leaf,
+            CLOUD_ORGANIZATION,
+            id.as_str(),
+            "--project-id",
+            CLOUD_PROJECT,
+            "--allow-insecure-http",
+        ];
+        if json {
+            args.push("--json");
+        }
+        args
+    };
+
+    for (fault, args, diagnostic) in [
+        (
+            Fault::ReadOtherDefinition,
+            leaf("show", true),
+            json!({"stage": "definition_read", "check": "identity"}),
+        ),
+        (
+            Fault::ChangeWithoutKey,
+            leaf("enable", true),
+            json!({"stage": "definition_change", "check": "idempotency_key"}),
+        ),
+    ] {
+        gateway.answer_next_with(fault);
+        let (output, _) = gateway.run(&home, &args);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        super::assert_no_secret_output(&output, &[CLOUD_TOKEN]);
+        let failed = report(&output);
+        assert_eq!(failed["outcome"], "invalid_response", "{failed}");
+        assert_eq!(failed["diagnostic"], diagnostic, "{failed}");
+        for member in ["status", "problem", "workflow"] {
+            assert!(failed.get(member).is_none(), "{failed}");
+        }
+    }
+
+    gateway.answer_next_with(Fault::ReadOtherDefinition);
+    let (output, _) = gateway.run(&home, &leaf("show", false));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_contains_all(
+        &stderr,
+        &["invalid_response", "definition_read", "identity"],
+    );
 }
 
 // REQ-CLOUDDEF-15: `evaluation list` sends its filters and page as typed and `evaluation

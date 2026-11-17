@@ -8,20 +8,26 @@
 //! the `workflow` safe facts for the caller to report. A definition, revision, evaluation or
 //! publication answer is decoded into its generated model, which ignores a member this
 //! release does not know, and then checked against the request (REQ-CLOUDDEF-23); the tree
-//! upload and seal answers are decoded closed.
+//! upload and seal answers are decoded closed. An answer, or a value the request must carry,
+//! that fails a check is an invalid response naming the exchange and the check that failed and
+//! retaining the error received, which is never formatted (INV-CLI-18, REQ-CLOUDDEF-23).
 use std::collections::HashMap;
 use std::fmt;
+use std::num::TryFromIntError;
 use std::time::Duration;
 
 use base64::Engine as _;
-use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, IF_NONE_MATCH};
+use reqwest::header::{
+    CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, IF_NONE_MATCH, InvalidHeaderValue,
+};
 use reqwest::{Method, StatusCode, Url};
 
 use super::generated::{apis, models};
 use super::http_client::{SignedStorageRequestError, zeroize_generated_bearer_access_token};
 use super::resource::{
-    RawResponse, ResourceFailure, decode_closed_json, mutation_request, receive_raw,
-    resource_configuration, validate_json_media_type, validate_mutation_key,
+    ClosedJsonError, RawResponse, ResourceFailure, mutation_request, receive_raw,
+    resource_configuration, try_decode_closed_json, validate_json_media_type,
+    validate_mutation_key,
 };
 use super::{HttpClient, UnreachableCategory, problem};
 
@@ -98,7 +104,7 @@ pub struct WorkflowRefusal {
     pub workflow: Option<WorkflowProblemDetail>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum WorkflowDefinitionFailure {
     Unauthenticated,
     Refused(Box<WorkflowRefusal>),
@@ -112,26 +118,267 @@ pub enum WorkflowDefinitionFailure {
     RateLimited {
         retry_after: Option<u64>,
     },
-    InvalidResponse {
-        credential_rejected: bool,
-    },
+    /// An answer, or a value the request must carry, that fails a check (REQ-CLOUDDEF-23).
+    InvalidResponse(Box<WorkflowInvalidResponse>),
 }
 
 impl WorkflowDefinitionFailure {
+    pub fn credential_rejected(&self) -> bool {
+        match self {
+            Self::Unauthenticated => true,
+            Self::InvalidResponse(invalid) => invalid.credential_rejected,
+            Self::Refused(_)
+            | Self::UploadRejected { .. }
+            | Self::Unreachable { .. }
+            | Self::RateLimited { .. } => false,
+        }
+    }
+}
+
+impl From<WorkflowInvalidResponse> for WorkflowDefinitionFailure {
+    fn from(invalid: WorkflowInvalidResponse) -> Self {
+        Self::InvalidResponse(Box::new(invalid))
+    }
+}
+
+/// The exchange with Cloud or signed storage whose boundary an invalid response failed: the
+/// public method's request, or for a tree upload the part of it (REQ-CLOUDDEF-28).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkflowDefinitionStage {
+    /// The manifest and the upload answer, up to and including the capability lookup.
+    TreeUpload,
+    /// One file's signed upload capability and its upload.
+    FileUpload,
+    TreeSeal,
+    DefinitionCreate,
+    RevisionPublish,
+    DefinitionRead,
+    DefinitionList,
+    RevisionRead,
+    RevisionList,
+    EvaluationRead,
+    EvaluationList,
+    /// Enable, disable, archive, unarchive and the execution principal.
+    DefinitionChange,
+}
+
+impl WorkflowDefinitionStage {
+    /// The stage's published slug.
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::TreeUpload => "tree_upload",
+            Self::FileUpload => "file_upload",
+            Self::TreeSeal => "tree_seal",
+            Self::DefinitionCreate => "definition_create",
+            Self::RevisionPublish => "revision_publish",
+            Self::DefinitionRead => "definition_read",
+            Self::DefinitionList => "definition_list",
+            Self::RevisionRead => "revision_read",
+            Self::RevisionList => "revision_list",
+            Self::EvaluationRead => "evaluation_read",
+            Self::EvaluationList => "evaluation_list",
+            Self::DefinitionChange => "definition_change",
+        }
+    }
+}
+
+/// What failed at an invalid response's stage (REQ-CLOUDDEF-28).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorkflowDefinitionCheck {
+    /// A value the request must carry cannot be sent: a file's size or the next revision.
+    RequestValue,
+    /// The answer is larger than the CLI reads.
+    ResponseSize,
+    /// An answer under a status the request does not accept is not a problem response.
+    ProblemDecode,
+    /// A problem response names no refusal, or under 401 is other than `unauthorized`.
+    ProblemType,
+    /// A keyed answer does not carry the request's `Idempotency-Key`.
+    IdempotencyKey,
+    /// The answer is not `application/json`.
+    MediaType,
+    /// The body is not JSON.
+    BodySyntax,
+    /// A known member is missing, of another type or outside its vocabulary.
+    BodyShape,
+    /// A tree upload or seal answer carries what this release does not know.
+    BodyClosed,
+    /// The answer names something other than what was asked.
+    Identity,
+    /// An upload capability's required headers are not the file's.
+    CapabilityHeaders,
+    /// An upload capability's URL does not parse.
+    CapabilityUrlSyntax,
+    /// The transport policy refuses an upload capability's URL, or it has no host, a user or
+    /// password, or a fragment.
+    CapabilityUrlPolicy,
+    /// A required header value cannot be sent.
+    CapabilityHeaderValue,
+    /// The signed storage client could not be formed.
+    StorageClient,
+    /// The signed storage request could not be formed.
+    StorageRequest,
+}
+
+impl WorkflowDefinitionCheck {
+    /// The check's published slug.
+    pub const fn slug(self) -> &'static str {
+        match self {
+            Self::RequestValue => "request_value",
+            Self::ResponseSize => "response_size",
+            Self::ProblemDecode => "problem_decode",
+            Self::ProblemType => "problem_type",
+            Self::IdempotencyKey => "idempotency_key",
+            Self::MediaType => "media_type",
+            Self::BodySyntax => "body_syntax",
+            Self::BodyShape => "body_shape",
+            Self::BodyClosed => "body_closed",
+            Self::Identity => "identity",
+            Self::CapabilityHeaders => "capability_headers",
+            Self::CapabilityUrlSyntax => "capability_url_syntax",
+            Self::CapabilityUrlPolicy => "capability_url_policy",
+            Self::CapabilityHeaderValue => "capability_header_value",
+            Self::StorageClient => "storage_client",
+            Self::StorageRequest => "storage_request",
+        }
+    }
+}
+
+use WorkflowDefinitionCheck as Check;
+use WorkflowDefinitionStage as Stage;
+
+/// An invalid response: where it was detected, the status a check of the status judged, and
+/// the error received, its [`std::error::Error::source`]. `Debug` and `Display` print the
+/// stage, the check and the status alone, since the error's text can quote the response.
+pub struct WorkflowInvalidResponse {
+    stage: Stage,
+    check: Check,
+    status: Option<u16>,
+    credential_rejected: bool,
+    cause: Option<Cause>,
+}
+
+/// The error an invalid response received.
+enum Cause {
+    Size(TryFromIntError),
+    Json(serde_json::Error),
+    Url(url::ParseError),
+    HeaderValue(InvalidHeaderValue),
+    StorageClient(rustls::Error),
+    StorageRequest(hyper::http::Error),
+}
+
+impl Cause {
+    fn error(&self) -> &(dyn std::error::Error + 'static) {
+        match self {
+            Self::Size(error) => error,
+            Self::Json(error) => error,
+            Self::Url(error) => error,
+            Self::HeaderValue(error) => error,
+            Self::StorageClient(error) => error,
+            Self::StorageRequest(error) => error,
+        }
+    }
+}
+
+impl WorkflowInvalidResponse {
+    fn caused_by(self, cause: Cause) -> Self {
+        Self {
+            cause: Some(cause),
+            ..self
+        }
+    }
+
+    pub const fn stage(&self) -> Stage {
+        self.stage
+    }
+
+    pub const fn check(&self) -> Check {
+        self.check
+    }
+
+    /// The HTTP status answered, for `problem_decode` and `problem_type`.
+    pub const fn status(&self) -> Option<u16> {
+        self.status
+    }
+
+    /// Whether the answer was a 401, which rejects the session.
     pub const fn credential_rejected(&self) -> bool {
-        matches!(
-            self,
-            Self::Unauthenticated
-                | Self::InvalidResponse {
-                    credential_rejected: true
-                }
+        self.credential_rejected
+    }
+}
+
+/// An invalid response at `stage` failing `check`, with nothing received.
+const fn check_failed(stage: Stage, check: Check) -> WorkflowInvalidResponse {
+    WorkflowInvalidResponse {
+        stage,
+        check,
+        status: None,
+        credential_rejected: false,
+        cause: None,
+    }
+}
+
+/// A body at `stage` that `serde_json` refused: `body_shape` when it is JSON that does not fit
+/// the model, `body_syntax` otherwise.
+fn undecodable(stage: Stage, error: serde_json::Error) -> WorkflowInvalidResponse {
+    let check = match error.classify() {
+        serde_json::error::Category::Data => Check::BodyShape,
+        serde_json::error::Category::Io
+        | serde_json::error::Category::Syntax
+        | serde_json::error::Category::Eof => Check::BodySyntax,
+    };
+    check_failed(stage, check).caused_by(Cause::Json(error))
+}
+
+impl PartialEq for WorkflowInvalidResponse {
+    /// The safe facts alike; the received error is not compared.
+    fn eq(&self, other: &Self) -> bool {
+        (
+            self.stage,
+            self.check,
+            self.status,
+            self.credential_rejected,
+        ) == (
+            other.stage,
+            other.check,
+            other.status,
+            other.credential_rejected,
         )
     }
 }
 
-const fn invalid() -> WorkflowDefinitionFailure {
-    WorkflowDefinitionFailure::InvalidResponse {
-        credential_rejected: false,
+impl fmt::Debug for WorkflowInvalidResponse {
+    /// The stage, the check and the status, never the received error.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("WorkflowInvalidResponse")
+            .field("stage", &self.stage.slug())
+            .field("check", &self.check.slug())
+            .field("status", &self.status)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for WorkflowInvalidResponse {
+    /// The stage, the check and the status, never the received error.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid response at {}: {}",
+            self.stage.slug(),
+            self.check.slug()
+        )?;
+        if let Some(status) = self.status {
+            write!(formatter, " (HTTP {status})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for WorkflowInvalidResponse {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.cause.as_ref().map(Cause::error)
     }
 }
 
@@ -178,7 +425,10 @@ impl<'a> WorkflowDefinitionApi<'a> {
             files
                 .iter()
                 .map(|file| {
-                    let size = i64::try_from(file.bytes.len()).map_err(|_| invalid())?;
+                    let size = i64::try_from(file.bytes.len()).map_err(|error| {
+                        check_failed(Stage::TreeUpload, Check::RequestValue)
+                            .caused_by(Cause::Size(error))
+                    })?;
                     Ok(models::WorkflowTreeManifestFile::new(
                         file.path.to_owned(),
                         size,
@@ -192,9 +442,9 @@ impl<'a> WorkflowDefinitionApi<'a> {
         let request = super::generated_api_request(&self.configuration, Method::POST, &endpoint)
             .json(&manifest);
         let issued: models::WorkflowTreeUploadCapabilities =
-            receive_closed(request, StatusCode::OK, None)?;
+            receive_closed(request, StatusCode::OK, None, Stage::TreeUpload)?;
         if issued.tree.digest != digest {
-            return Err(invalid());
+            return Err(check_failed(Stage::TreeUpload, Check::Identity).into());
         }
         for capability in &issued.capabilities {
             let file = files
@@ -202,7 +452,7 @@ impl<'a> WorkflowDefinitionApi<'a> {
                 .zip(&manifest.files)
                 .find(|(_, entry)| entry.sha256 == capability.sha256)
                 .map(|(file, _)| file)
-                .ok_or_else(invalid)?;
+                .ok_or(check_failed(Stage::TreeUpload, Check::Identity))?;
             self.put_object(capability, file.bytes)?;
         }
         if issued.tree.state == models::workflow_tree::State::Sealed {
@@ -210,9 +460,10 @@ impl<'a> WorkflowDefinitionApi<'a> {
         }
         let endpoint = self.endpoint(organization, &["workflow-trees", digest, "seal"]);
         let request = mutation_request(&self.configuration, Method::POST, &endpoint, key);
-        let sealed: WorkflowTree = receive_closed(request, StatusCode::OK, Some(key))?;
+        let sealed: WorkflowTree =
+            receive_closed(request, StatusCode::OK, Some(key), Stage::TreeSeal)?;
         if sealed.digest != digest || sealed.state != models::workflow_tree::State::Sealed {
-            return Err(invalid());
+            return Err(check_failed(Stage::TreeSeal, Check::Identity).into());
         }
         Ok((sealed, false))
     }
@@ -226,8 +477,9 @@ impl<'a> WorkflowDefinitionApi<'a> {
     ) -> Result<WorkflowDefinition, WorkflowDefinitionFailure> {
         let endpoint = self.definitions_endpoint(organization, project, &[id]);
         let request = super::generated_api_request(&self.configuration, Method::GET, &endpoint);
-        let definition: WorkflowDefinition = receive(request, StatusCode::OK, None)?;
-        validate_definition(&definition, project, Some(id))?;
+        let stage = Stage::DefinitionRead;
+        let definition: WorkflowDefinition = receive(request, StatusCode::OK, None, stage)?;
+        validate_definition(&definition, project, Some(id), stage)?;
         Ok(definition)
     }
 
@@ -241,13 +493,15 @@ impl<'a> WorkflowDefinitionApi<'a> {
         cursor: Option<&str>,
     ) -> Result<(Vec<WorkflowDefinition>, Option<String>), WorkflowDefinitionFailure> {
         let endpoint = self.definitions_endpoint(organization, project, &[]);
+        let stage = Stage::DefinitionList;
         let list: models::WorkflowDefinitionList = receive(
             self.page_request(&endpoint, limit, cursor),
             StatusCode::OK,
             None,
+            stage,
         )?;
         for definition in &list.items {
-            validate_definition(definition, project, None)?;
+            validate_definition(definition, project, None, stage)?;
         }
         Ok((list.items, list.next_cursor))
     }
@@ -263,13 +517,15 @@ impl<'a> WorkflowDefinitionApi<'a> {
         cursor: Option<&str>,
     ) -> Result<(Vec<WorkflowDefinitionRevision>, Option<String>), WorkflowDefinitionFailure> {
         let endpoint = self.definitions_endpoint(organization, project, &[id, "revisions"]);
+        let stage = Stage::RevisionList;
         let list: models::WorkflowDefinitionRevisionList = receive(
             self.page_request(&endpoint, limit, cursor),
             StatusCode::OK,
             None,
+            stage,
         )?;
         for revision in &list.items {
-            validate_revision(revision, id, None)?;
+            validate_revision(revision, id, None, stage)?;
         }
         Ok((list.items, list.next_cursor))
     }
@@ -286,8 +542,9 @@ impl<'a> WorkflowDefinitionApi<'a> {
         let endpoint =
             self.definitions_endpoint(organization, project, &[id, "revisions", &number_segment]);
         let request = super::generated_api_request(&self.configuration, Method::GET, &endpoint);
-        let revision: WorkflowDefinitionRevision = receive(request, StatusCode::OK, None)?;
-        validate_revision(&revision, id, Some(number))?;
+        let stage = Stage::RevisionRead;
+        let revision: WorkflowDefinitionRevision = receive(request, StatusCode::OK, None, stage)?;
+        validate_revision(&revision, id, Some(number), stage)?;
         Ok(revision)
     }
 
@@ -311,10 +568,11 @@ impl<'a> WorkflowDefinitionApi<'a> {
         if let Some(run_id) = filter.run_id {
             request = request.query(&[("runId", run_id)]);
         }
+        let stage = Stage::EvaluationList;
         let list: models::WorkflowDefinitionEvaluationList =
-            receive(request, StatusCode::OK, None)?;
+            receive(request, StatusCode::OK, None, stage)?;
         for evaluation in &list.items {
-            validate_evaluation(evaluation, id, None)?;
+            validate_evaluation(evaluation, id, None, stage)?;
         }
         Ok((list.items, list.next_cursor))
     }
@@ -330,8 +588,9 @@ impl<'a> WorkflowDefinitionApi<'a> {
         let endpoint =
             self.definitions_endpoint(organization, project, &[id, "evaluations", evaluation]);
         let request = super::generated_api_request(&self.configuration, Method::GET, &endpoint);
-        let read: WorkflowDefinitionEvaluation = receive(request, StatusCode::OK, None)?;
-        validate_evaluation(&read, id, Some(evaluation))?;
+        let stage = Stage::EvaluationRead;
+        let read: WorkflowDefinitionEvaluation = receive(request, StatusCode::OK, None, stage)?;
+        validate_evaluation(&read, id, Some(evaluation), stage)?;
         Ok(read)
     }
 
@@ -422,8 +681,9 @@ impl<'a> WorkflowDefinitionApi<'a> {
                 &models::SetWorkflowDefinitionExecutionPrincipalRequest::new(principal.to_owned()),
             );
         }
-        let definition: WorkflowDefinition = receive(request, StatusCode::OK, Some(key))?;
-        validate_definition(&definition, project, Some(id))?;
+        let stage = Stage::DefinitionChange;
+        let definition: WorkflowDefinition = receive(request, StatusCode::OK, Some(key), stage)?;
+        validate_definition(&definition, project, Some(id), stage)?;
         let archived = definition.state == models::workflow_definition::State::Archived;
         let shown = match change {
             Change::Enable => definition.automatic_starts && !archived,
@@ -435,7 +695,7 @@ impl<'a> WorkflowDefinitionApi<'a> {
             }
         };
         if !shown {
-            return Err(invalid());
+            return Err(check_failed(stage, Check::Identity).into());
         }
         Ok(definition)
     }
@@ -466,8 +726,9 @@ impl<'a> WorkflowDefinitionApi<'a> {
         } else {
             &[StatusCode::CREATED]
         };
+        let stage = Stage::DefinitionCreate;
         let (status, published): (_, WorkflowDefinitionPublication) =
-            receive_one_of(request, accepted, Some(key))?;
+            receive_one_of(request, accepted, Some(key), stage)?;
         let reused = status == StatusCode::OK;
         // A reuse answers the definition's current revision, whatever its number.
         let revision = if reused {
@@ -475,7 +736,14 @@ impl<'a> WorkflowDefinitionApi<'a> {
         } else {
             1
         };
-        validate_publication(&published, project, None, revision, publication.tree_digest)?;
+        validate_publication(
+            &published,
+            project,
+            None,
+            revision,
+            publication.tree_digest,
+            stage,
+        )?;
         Ok((published, reused))
     }
 
@@ -495,22 +763,32 @@ impl<'a> WorkflowDefinitionApi<'a> {
         body.tree_digest = Some(publication.tree_digest.to_owned());
         body.bindings = publication.bindings.cloned();
         body.executable_paths = publication.executable_paths.map(<[String]>::to_vec);
+        let stage = Stage::RevisionPublish;
         let next = expected_current_revision
             .checked_add(1)
-            .ok_or_else(invalid)?;
+            .ok_or(check_failed(stage, Check::RequestValue))?;
         let endpoint = self.definitions_endpoint(organization, project, &[id, "revisions"]);
         let request =
             mutation_request(&self.configuration, Method::POST, &endpoint, key).json(&body);
-        let published = receive(request, StatusCode::CREATED, Some(key))?;
-        validate_publication(&published, project, Some(id), next, publication.tree_digest)?;
+        let published = receive(request, StatusCode::CREATED, Some(key), stage)?;
+        validate_publication(
+            &published,
+            project,
+            Some(id),
+            next,
+            publication.tree_digest,
+            stage,
+        )?;
         Ok(published)
     }
 
+    /// Puts `bytes` to the signed upload `capability`, all of it the `file_upload` stage.
     fn put_object(
         &self,
         capability: &models::WorkflowTreeUploadCapability,
         bytes: &[u8],
     ) -> Result<(), WorkflowDefinitionFailure> {
+        let stage = Stage::FileUpload;
         let required = &capability.required_headers;
         if required.content_length != bytes.len().to_string()
             || required.if_none_match
@@ -518,18 +796,25 @@ impl<'a> WorkflowDefinitionApi<'a> {
             || required.x_amz_checksum_sha256
                 != base64::engine::general_purpose::STANDARD.encode(sha256(bytes))
         {
-            return Err(invalid());
+            return Err(check_failed(stage, Check::CapabilityHeaders).into());
         }
-        let url = Url::parse(&capability.url).map_err(|_| invalid())?;
+        let url = Url::parse(&capability.url).map_err(|error| {
+            check_failed(stage, Check::CapabilityUrlSyntax).caused_by(Cause::Url(error))
+        })?;
         if !self.storage.transport_policy().permits(&url)
             || url.host_str().is_none()
             || !url.username().is_empty()
             || url.password().is_some()
             || url.fragment().is_some()
         {
-            return Err(invalid());
+            return Err(check_failed(stage, Check::CapabilityUrlPolicy).into());
         }
-        let header = |value: &str| HeaderValue::from_str(value).map_err(|_| invalid());
+        let header = |value: &str| {
+            HeaderValue::from_str(value).map_err(|error| {
+                check_failed(stage, Check::CapabilityHeaderValue)
+                    .caused_by(Cause::HeaderValue(error))
+            })
+        };
         let mut headers = HeaderMap::with_capacity(4);
         headers.insert(CONTENT_LENGTH, header(&required.content_length)?);
         headers.insert(CONTENT_TYPE, header(&required.content_type)?);
@@ -538,16 +823,24 @@ impl<'a> WorkflowDefinitionApi<'a> {
             "x-amz-checksum-sha256",
             header(&required.x_amz_checksum_sha256)?,
         );
-        let status =
-            self.storage
-                .signed_storage_put(&url, headers, bytes, STORAGE_REQUEST_TIMEOUT)
-                .map_err(|error| match error {
-                    SignedStorageRequestError::Build
-                    | SignedStorageRequestError::InvalidRequest => invalid(),
-                    SignedStorageRequestError::Unreachable(category) => {
-                        WorkflowDefinitionFailure::Unreachable { category }
-                    }
-                })?;
+        let status = self
+            .storage
+            .signed_storage_put(&url, headers, bytes, STORAGE_REQUEST_TIMEOUT)
+            .map_err(|error| match error {
+                SignedStorageRequestError::Build(error) => {
+                    check_failed(stage, Check::StorageClient)
+                        .caused_by(Cause::StorageClient(error))
+                        .into()
+                }
+                SignedStorageRequestError::InvalidRequest(error) => {
+                    check_failed(stage, Check::StorageRequest)
+                        .caused_by(Cause::StorageRequest(error))
+                        .into()
+                }
+                SignedStorageRequestError::Unreachable(category) => {
+                    WorkflowDefinitionFailure::Unreachable { category }
+                }
+            })?;
         // An object already present fails `If-None-Match: *`; the seal confirms its bytes.
         if matches!(
             status,
@@ -617,8 +910,9 @@ fn receive<T: serde::de::DeserializeOwned>(
     request: reqwest::blocking::RequestBuilder,
     expected: StatusCode,
     key: Option<&str>,
+    stage: Stage,
 ) -> Result<T, WorkflowDefinitionFailure> {
-    receive_one_of(request, &[expected], key).map(|(_, body)| body)
+    receive_one_of(request, &[expected], key, stage).map(|(_, body)| body)
 }
 
 /// The status and JSON body of a response whose status is one of `accepted`, its key
@@ -630,9 +924,10 @@ fn receive_one_of<T: serde::de::DeserializeOwned>(
     request: reqwest::blocking::RequestBuilder,
     accepted: &[StatusCode],
     key: Option<&str>,
+    stage: Stage,
 ) -> Result<(StatusCode, T), WorkflowDefinitionFailure> {
-    let response = receive_accepted(request, accepted, key)?;
-    let body = serde_json::from_slice(&response.body).map_err(|_| invalid())?;
+    let response = receive_accepted(request, accepted, key, stage)?;
+    let body = serde_json::from_slice(&response.body).map_err(|error| undecodable(stage, error))?;
     Ok((response.status, body))
 }
 
@@ -643,9 +938,24 @@ fn receive_closed<T: serde::de::DeserializeOwned + serde::Serialize>(
     request: reqwest::blocking::RequestBuilder,
     expected: StatusCode,
     key: Option<&str>,
+    stage: Stage,
 ) -> Result<T, WorkflowDefinitionFailure> {
-    let response = receive_accepted(request, &[expected], key)?;
-    decode_closed_json(&response.body).map_err(|_| invalid())
+    let response = receive_accepted(request, &[expected], key, stage)?;
+    try_decode_closed_json(&response.body).map_err(|error| {
+        match error {
+            ClosedJsonError::Syntax(error) => {
+                check_failed(stage, Check::BodySyntax).caused_by(Cause::Json(error))
+            }
+            ClosedJsonError::Shape(error) => {
+                check_failed(stage, Check::BodyShape).caused_by(Cause::Json(error))
+            }
+            ClosedJsonError::Encode(error) => {
+                check_failed(stage, Check::BodyClosed).caused_by(Cause::Json(error))
+            }
+            ClosedJsonError::Differs => check_failed(stage, Check::BodyClosed),
+        }
+        .into()
+    })
 }
 
 /// A JSON response whose status is one of `accepted`, its key confirmed when `key` is given,
@@ -654,29 +964,33 @@ fn receive_accepted(
     request: reqwest::blocking::RequestBuilder,
     accepted: &[StatusCode],
     key: Option<&str>,
+    stage: Stage,
 ) -> Result<RawResponse, WorkflowDefinitionFailure> {
+    // `receive_raw` fails only unreachable or, for a body over the bound, as an invalid
+    // response that keeps a 401's rejected session.
     let response = receive_raw(request).map_err(|failure| match failure {
         ResourceFailure::Unreachable { category } => {
             WorkflowDefinitionFailure::Unreachable { category }
         }
-        ResourceFailure::InvalidResponse {
-            credential_rejected,
-        } => WorkflowDefinitionFailure::InvalidResponse {
-            credential_rejected,
-        },
-        _ => invalid(),
+        failure => WorkflowInvalidResponse {
+            credential_rejected: failure.credential_rejected(),
+            ..check_failed(stage, Check::ResponseSize)
+        }
+        .into(),
     })?;
     if !accepted.contains(&response.status) {
-        return Err(classify(&response));
+        return Err(classify(&response, stage));
     }
     if let Some(key) = key {
-        validate_mutation_key(&response.headers, key).map_err(|_| invalid())?;
+        validate_mutation_key(&response.headers, key)
+            .map_err(|_| check_failed(stage, Check::IdempotencyKey))?;
     }
-    validate_json_media_type(&response.headers).map_err(|_| invalid())?;
+    validate_json_media_type(&response.headers)
+        .map_err(|_| check_failed(stage, Check::MediaType))?;
     Ok(response)
 }
 
-fn classify(response: &RawResponse) -> WorkflowDefinitionFailure {
+fn classify(response: &RawResponse, stage: Stage) -> WorkflowDefinitionFailure {
     let status = response.status;
     if status == StatusCode::TOO_MANY_REQUESTS {
         return WorkflowDefinitionFailure::RateLimited {
@@ -688,24 +1002,29 @@ fn classify(response: &RawResponse) -> WorkflowDefinitionFailure {
         status,
         response.headers.get(reqwest::header::CONTENT_TYPE),
     );
+    // A check of the status keeps it, and a 401 keeps rejecting the session.
+    let judged = |check| -> WorkflowDefinitionFailure {
+        WorkflowInvalidResponse {
+            status: Some(status.as_u16()),
+            credential_rejected: status == StatusCode::UNAUTHORIZED,
+            ..check_failed(stage, check)
+        }
+        .into()
+    };
     let Ok(decoded) = decoded else {
         return if status.is_server_error() {
             WorkflowDefinitionFailure::Unreachable {
                 category: UnreachableCategory::Server,
             }
         } else {
-            WorkflowDefinitionFailure::InvalidResponse {
-                credential_rejected: status == StatusCode::UNAUTHORIZED,
-            }
+            judged(Check::ProblemDecode)
         };
     };
     if status == StatusCode::UNAUTHORIZED {
         return if decoded.r#type == problem::UNAUTHORIZED {
             WorkflowDefinitionFailure::Unauthenticated
         } else {
-            WorkflowDefinitionFailure::InvalidResponse {
-                credential_rejected: true,
-            }
+            judged(Check::ProblemType)
         };
     }
     // A transient problem under its declared status is Cloud being unable to serve the
@@ -739,7 +1058,7 @@ fn classify(response: &RawResponse) -> WorkflowDefinitionFailure {
                 workflow: decoded.workflow.map(|detail| *detail),
             }))
         }
-        _ => invalid(),
+        _ => judged(Check::ProblemType),
     }
 }
 
@@ -747,13 +1066,14 @@ fn validate_definition(
     value: &WorkflowDefinition,
     project: &str,
     id: Option<&str>,
-) -> Result<(), WorkflowDefinitionFailure> {
+    stage: Stage,
+) -> Result<(), WorkflowInvalidResponse> {
     if !um_support::valid_typed_id(&value.id, DEFINITION_ID_PREFIX)
         || id.is_some_and(|id| value.id != id)
         || value.project_id != project
         || value.current_revision < 1
     {
-        return Err(invalid());
+        return Err(check_failed(stage, Check::Identity));
     }
     Ok(())
 }
@@ -762,12 +1082,13 @@ fn validate_revision(
     value: &WorkflowDefinitionRevision,
     id: &str,
     number: Option<i32>,
-) -> Result<(), WorkflowDefinitionFailure> {
+    stage: Stage,
+) -> Result<(), WorkflowInvalidResponse> {
     if value.definition_id != id
         || value.number < 1
         || number.is_some_and(|number| value.number != number)
     {
-        return Err(invalid());
+        return Err(check_failed(stage, Check::Identity));
     }
     Ok(())
 }
@@ -776,13 +1097,14 @@ fn validate_evaluation(
     value: &WorkflowDefinitionEvaluation,
     definition: &str,
     id: Option<&str>,
-) -> Result<(), WorkflowDefinitionFailure> {
+    stage: Stage,
+) -> Result<(), WorkflowInvalidResponse> {
     if !um_support::valid_typed_id(&value.id, EVALUATION_ID_PREFIX)
         || id.is_some_and(|id| value.id != id)
         || value.definition_id != definition
         || value.revision < 1
     {
-        return Err(invalid());
+        return Err(check_failed(stage, Check::Identity));
     }
     Ok(())
 }
@@ -793,14 +1115,15 @@ fn validate_publication(
     id: Option<&str>,
     revision: i32,
     tree_digest: &str,
-) -> Result<(), WorkflowDefinitionFailure> {
-    validate_definition(&value.definition, project, id)?;
+    stage: Stage,
+) -> Result<(), WorkflowInvalidResponse> {
+    validate_definition(&value.definition, project, id, stage)?;
     if value.revision.definition_id != value.definition.id
         || value.revision.number != revision
         || value.definition.current_revision != revision
         || value.revision.tree_digest != tree_digest
     {
-        return Err(invalid());
+        return Err(check_failed(stage, Check::Identity));
     }
     Ok(())
 }
@@ -847,32 +1170,96 @@ mod tests {
 
     use um_test_support::{REQUEST_IDEMPOTENCY_KEY_ECHO, ScriptedHttpServer};
 
+    use std::error::Error as _;
+    use std::fmt;
+
+    use base64::Engine as _;
+
     use super::super::resource::{RawResponse, problem_fixture};
     use super::{
-        WorkflowDefinitionApi, WorkflowDefinitionFailure, WorkflowEvaluationFilter,
-        WorkflowPublication, WorkflowRefusal, classify,
+        WorkflowDefinitionApi, WorkflowDefinitionCheck as Check, WorkflowDefinitionFailure,
+        WorkflowDefinitionStage as Stage, WorkflowEvaluationFilter, WorkflowInvalidResponse,
+        WorkflowPublication, WorkflowRefusal, WorkflowTreeFile, classify, lowercase_hex, sha256,
     };
     use crate::{HttpClient, HttpTransportPolicy, UnreachableCategory};
 
-    fn problem(status: u16, kind: &str) -> RawResponse {
+    /// A value an answer carries that no output of a failure may print.
+    const SENTINEL: &str = "sentinel-a1b2c3";
+
+    fn raw(status: u16, content_type: &'static str, body: Vec<u8>) -> RawResponse {
         let mut headers = HeaderMap::new();
-        headers.insert(
-            CONTENT_TYPE,
-            HeaderValue::from_static("application/problem+json"),
-        );
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
         RawResponse {
             status: StatusCode::from_u16(status).expect("status"),
-            body: problem_fixture(status, kind),
+            body,
             headers,
             retry_after: None,
         }
     }
 
+    fn problem(status: u16, kind: &str) -> RawResponse {
+        raw(
+            status,
+            "application/problem+json",
+            problem_fixture(status, kind),
+        )
+    }
+
+    /// The kind of error an invalid response retains as its source.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Source {
+        None,
+        Json,
+        Url,
+        HeaderValue,
+        Other,
+    }
+
+    /// The invalid response `failed` is, checked to name `stage` and `check`, to retain a
+    /// `source` of that kind, and to print nothing of [`SENTINEL`] through `Debug` or
+    /// `Display`.
+    fn invalid_response<T: fmt::Debug>(
+        failed: Result<T, WorkflowDefinitionFailure>,
+        stage: Stage,
+        check: Check,
+        source: Source,
+    ) -> Box<WorkflowInvalidResponse> {
+        let failure = failed.expect_err("an invalid response");
+        let debug = format!("{failure:?}");
+        let invalid = match failure {
+            WorkflowDefinitionFailure::InvalidResponse(invalid) => Some(invalid),
+            _ => None,
+        };
+        assert!(invalid.is_some(), "not an invalid response: {debug}");
+        let invalid = invalid.expect("an invalid response");
+        assert_eq!(
+            (invalid.stage().slug(), invalid.check().slug()),
+            (stage.slug(), check.slug()),
+            "{debug}"
+        );
+        let retained = match invalid.source() {
+            None => Source::None,
+            Some(error) if error.is::<serde_json::Error>() => Source::Json,
+            Some(error) if error.is::<url::ParseError>() => Source::Url,
+            Some(error) if error.is::<reqwest::header::InvalidHeaderValue>() => Source::HeaderValue,
+            Some(_) => Source::Other,
+        };
+        assert_eq!(retained, source, "{debug}");
+        let display = invalid.to_string();
+        assert!(!debug.contains(SENTINEL), "{debug}");
+        assert!(!display.contains(SENTINEL), "{display}");
+        invalid
+    }
+
     // REQ-CLOUDDEF-14: a refusal keeps its problem slug for the command to report.
+    // INV-CLI-18: an answer under a status the request does not accept that is no problem
+    // response, or whose type is no refusal, names the check and keeps the status, and a 401
+    // keeps rejecting the session.
     #[test]
     fn a_problem_response_is_a_refusal_naming_its_slug_unless_it_is_unauthorized() {
+        let stage = Stage::DefinitionCreate;
         assert_eq!(
-            classify(&problem(409, "definition-revision-conflict")),
+            classify(&problem(409, "definition-revision-conflict"), stage),
             WorkflowDefinitionFailure::Refused(Box::new(WorkflowRefusal {
                 status: 409,
                 problem: "definition-revision-conflict".to_owned(),
@@ -880,7 +1267,7 @@ mod tests {
             }))
         );
         assert_eq!(
-            classify(&problem(503, "workflow-validator-unavailable")),
+            classify(&problem(503, "workflow-validator-unavailable"), stage),
             WorkflowDefinitionFailure::Refused(Box::new(WorkflowRefusal {
                 status: 503,
                 problem: "workflow-validator-unavailable".to_owned(),
@@ -888,13 +1275,32 @@ mod tests {
             }))
         );
         assert_eq!(
-            classify(&problem(401, "unauthorized")),
+            classify(&problem(401, "unauthorized"), stage),
             WorkflowDefinitionFailure::Unauthenticated
         );
-        assert!(matches!(
-            classify(&problem(409, "Not A Slug")),
-            WorkflowDefinitionFailure::InvalidResponse { .. }
-        ));
+        let html = || b"<html>not found</html>".to_vec();
+        for (response, check, status, credential_rejected) in [
+            (problem(409, "Not A Slug"), Check::ProblemType, 409, false),
+            (
+                raw(404, "text/html", html()),
+                Check::ProblemDecode,
+                404,
+                false,
+            ),
+            (
+                raw(401, "text/html", html()),
+                Check::ProblemDecode,
+                401,
+                true,
+            ),
+            (problem(401, "forbidden"), Check::ProblemType, 401, true),
+        ] {
+            let failure = classify(&response, stage);
+            assert_eq!(failure.credential_rejected(), credential_rejected);
+            let invalid = invalid_response(Err::<(), _>(failure), stage, check, Source::None);
+            assert_eq!(invalid.status(), Some(status));
+            assert_eq!(invalid.credential_rejected(), credential_rejected);
+        }
     }
 
     // REQ-CLOUDDEF-25: the three transient problems, each under its declared status, are
@@ -908,7 +1314,7 @@ mod tests {
             (500, "internal-server-error"),
         ] {
             assert_eq!(
-                classify(&problem(status, kind)),
+                classify(&problem(status, kind), Stage::RevisionPublish),
                 WorkflowDefinitionFailure::Unreachable {
                     category: UnreachableCategory::Server,
                 },
@@ -924,7 +1330,7 @@ mod tests {
             (503, "internal-server-error"),
         ] {
             assert_eq!(
-                classify(&problem(status, kind)),
+                classify(&problem(status, kind), Stage::RevisionPublish),
                 WorkflowDefinitionFailure::Refused(Box::new(WorkflowRefusal {
                     status,
                     problem: kind.to_owned(),
@@ -934,7 +1340,7 @@ mod tests {
             );
         }
         assert_eq!(
-            classify(&problem(429, "rate-limit-exceeded")),
+            classify(&problem(429, "rate-limit-exceeded"), Stage::RevisionPublish),
             WorkflowDefinitionFailure::RateLimited { retry_after: None }
         );
     }
@@ -972,13 +1378,15 @@ mod tests {
             executable_paths: None,
         };
 
-        assert_eq!(
+        // INV-CLI-18: the 200 is a status the create did not accept, and no problem response.
+        let invalid = invalid_response(
             api.create_definition("acme", project, "create-key", publication, false)
                 .map(|(_, reused)| reused),
-            Err(WorkflowDefinitionFailure::InvalidResponse {
-                credential_rejected: false
-            })
+            Stage::DefinitionCreate,
+            Check::ProblemDecode,
+            Source::None,
         );
+        assert_eq!(invalid.status(), Some(200));
         let (published, reused) = api
             .create_definition("acme", project, "reuse-key", publication, true)
             .expect("a reuse the create asked for");
@@ -1132,7 +1540,15 @@ mod tests {
         echo_key: bool,
         body: &serde_json::Value,
     ) -> Vec<u8> {
-        let body = serde_json::to_vec(body).expect("answer");
+        response_bytes(
+            status,
+            content_type,
+            echo_key,
+            &serde_json::to_vec(body).expect("answer"),
+        )
+    }
+
+    fn response_bytes(status: &str, content_type: &str, echo_key: bool, body: &[u8]) -> Vec<u8> {
         let key = if echo_key {
             format!("Idempotency-Key: {REQUEST_IDEMPOTENCY_KEY_ECHO}\r\n")
         } else {
@@ -1143,7 +1559,7 @@ mod tests {
             body.len()
         )
         .into_bytes();
-        response.extend_from_slice(&body);
+        response.extend_from_slice(body);
         response
     }
 
@@ -1204,6 +1620,21 @@ mod tests {
 
         const fn keyed(self) -> bool {
             matches!(self, Self::Create | Self::Publish | Self::Enable)
+        }
+
+        /// The stage an invalid answer to this request names.
+        const fn stage(self) -> Stage {
+            match self {
+                Self::Definition => Stage::DefinitionRead,
+                Self::Definitions => Stage::DefinitionList,
+                Self::Revision => Stage::RevisionRead,
+                Self::Revisions => Stage::RevisionList,
+                Self::Evaluation => Stage::EvaluationRead,
+                Self::Evaluations => Stage::EvaluationList,
+                Self::Create => Stage::DefinitionCreate,
+                Self::Publish => Stage::RevisionPublish,
+                Self::Enable => Stage::DefinitionChange,
+            }
         }
 
         /// Sends the request to a server answering `response`: what the client returned,
@@ -1297,32 +1728,63 @@ mod tests {
         MediaType(&'static str),
         /// The keyed answer does not echo the request's `Idempotency-Key`.
         NoKeyEcho,
+        /// The answer's body is these bytes, which are not JSON.
+        Body(&'static [u8]),
     }
 
     // REQ-CLOUDDEF-23: what this release knows of an answer is still checked: its shape, its
     // identity against the request, its media type and a keyed change's key echo.
+    // INV-CLI-18: each failed check names the read's stage and the check, a body that is not
+    // JSON or does not fit the model retains its decoding error, and none prints the answer.
     #[test]
     fn an_additive_answer_failing_a_known_check_is_an_invalid_response() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let other_digest = format!("sha256:{}", "b".repeat(64));
         let cases = [
-            (Read::Definition, Fault::Remove("currentRevision")),
-            (Read::Definition, Fault::Remove("executionPrincipalId")),
             (
                 Read::Definition,
-                Fault::Set("/currentRevision", serde_json::json!("3")),
+                Fault::Remove("currentRevision"),
+                Check::BodyShape,
+            ),
+            (
+                Read::Definition,
+                Fault::Remove("executionPrincipalId"),
+                Check::BodyShape,
+            ),
+            (
+                Read::Definition,
+                Fault::Set("/currentRevision", serde_json::json!(SENTINEL)),
+                Check::BodyShape,
             ),
             (
                 Read::Definition,
                 Fault::Set("/state", serde_json::json!("deleted")),
+                Check::BodyShape,
+            ),
+            (
+                Read::Revisions,
+                Fault::Set("/items/0/number", serde_json::json!(SENTINEL)),
+                Check::BodyShape,
+            ),
+            (
+                Read::Create,
+                Fault::Body(b"<html>sentinel-a1b2c3</html>"),
+                Check::BodySyntax,
+            ),
+            (
+                Read::Evaluation,
+                Fault::Body(br#"{"id": "wev_"#),
+                Check::BodySyntax,
             ),
             (
                 Read::Definitions,
                 Fault::Set("/items/1/id", serde_json::json!(PROJECT)),
+                Check::Identity,
             ),
             (
                 Read::Definition,
                 Fault::Set("/id", serde_json::json!("def_01k0z6r1w8f4jy2m7q9v3x5xyz")),
+                Check::Identity,
             ),
             (
                 Read::Definition,
@@ -1330,6 +1792,7 @@ mod tests {
                     "/projectId",
                     serde_json::json!("prj_01k0z6r1w8f4jy2m7q9v3x5xyz"),
                 ),
+                Check::Identity,
             ),
             (
                 Read::Revision,
@@ -1337,26 +1800,43 @@ mod tests {
                     "/definitionId",
                     serde_json::json!("def_01k0z6r1w8f4jy2m7q9v3x5xyz"),
                 ),
+                Check::Identity,
             ),
-            (Read::Revision, Fault::Set("/number", serde_json::json!(4))),
+            (
+                Read::Revision,
+                Fault::Set("/number", serde_json::json!(4)),
+                Check::Identity,
+            ),
             (
                 Read::Evaluations,
                 Fault::Set(
                     "/items/0/id",
                     serde_json::json!("run_01k0z6r1w8f4jy2m7q9v3x5abc"),
                 ),
+                Check::Identity,
             ),
             (
                 Read::Publish,
                 Fault::Set("/revision/treeDigest", serde_json::json!(other_digest)),
+                Check::Identity,
             ),
-            (Read::Enable, Fault::NoKeyEcho),
-            (Read::Definition, Fault::MediaType("text/plain")),
+            (
+                Read::Enable,
+                Fault::Set("/automaticStarts", serde_json::json!(false)),
+                Check::Identity,
+            ),
+            (Read::Enable, Fault::NoKeyEcho, Check::IdempotencyKey),
+            (
+                Read::Definition,
+                Fault::MediaType("text/plain"),
+                Check::MediaType,
+            ),
         ];
-        for (read, fault) in cases {
+        for (read, fault, check) in cases {
             let mut answer = read.answer();
             let mut content_type = "application/json";
             let mut echo_key = read.keyed();
+            let mut body = None;
             match &fault {
                 Fault::Remove(member) => {
                     answer
@@ -1369,34 +1849,67 @@ mod tests {
                 }
                 Fault::MediaType(media_type) => content_type = media_type,
                 Fault::NoKeyEcho => echo_key = false,
+                Fault::Body(bytes) => body = Some(*bytes),
             }
+            let response = match body {
+                Some(body) => response_bytes(read.status(), content_type, echo_key, body),
+                None => response(read.status(), content_type, echo_key, &answer),
+            };
+            let source = if matches!(check, Check::BodySyntax | Check::BodyShape) {
+                Source::Json
+            } else {
+                Source::None
+            };
+            let invalid = invalid_response(read.send(response), read.stage(), check, source);
             assert_eq!(
-                read.send(response(read.status(), content_type, echo_key, &answer)),
-                Err(WorkflowDefinitionFailure::InvalidResponse {
-                    credential_rejected: false
-                }),
+                (invalid.status(), invalid.credential_rejected()),
+                (None, false),
                 "{read:?} {fault:?}"
             );
         }
     }
 
+    fn tree_answer(digest: &str, state: &str, sealed_at: Option<&str>) -> serde_json::Value {
+        serde_json::json!({
+            "digest": digest, "state": state, "sizeBytes": 0, "fileCount": 0,
+            "name": null, "createdAt": AT, "sealedAt": sealed_at,
+        })
+    }
+
+    fn upload_answer(
+        tree: serde_json::Value,
+        capabilities: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "tree": tree, "capabilityExpiresAt": null, "capabilities": capabilities,
+        })
+    }
+
+    /// Uploads the tree of `files` against a server answering `responses` in turn, one for
+    /// each request the upload sends: the sealed tree's digest and whether it was sealed
+    /// already.
+    fn upload(
+        files: &[WorkflowTreeFile<'_>],
+        responses: Vec<Vec<u8>>,
+    ) -> Result<(String, bool), WorkflowDefinitionFailure> {
+        let server = ScriptedHttpServer::respond_in_sequence(responses);
+        let storage = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).expect("client");
+        let api =
+            WorkflowDefinitionApi::new(&server.api_url, "fixture-token", &storage).expect("api");
+        let uploaded = api
+            .upload_tree(ORGANIZATION, &tree_digest(), files, "seal-key")
+            .map(|(tree, already_sealed)| (tree.digest, already_sealed));
+        server.finish();
+        uploaded
+    }
+
     // REQ-CLOUDDEF-23: the tree upload and seal answers stay closed, since the CLI sends the
     // upload answer's signed capabilities' required headers exactly.
+    // INV-CLI-18: a refused upload or seal answer names its stage.
     #[test]
     fn a_tree_upload_or_seal_answer_carrying_a_member_this_release_does_not_know_is_refused() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let digest = tree_digest();
-        let tree = |state: &str, sealed_at: Option<&str>| {
-            serde_json::json!({
-                "digest": digest, "state": state, "sizeBytes": 0, "fileCount": 0,
-                "name": null, "createdAt": AT, "sealedAt": sealed_at,
-            })
-        };
-        let issued = |tree: serde_json::Value| {
-            serde_json::json!({
-                "tree": tree, "capabilityExpiresAt": null, "capabilities": [],
-            })
-        };
         let additive = |mut answer: serde_json::Value| {
             answer
                 .as_object_mut()
@@ -1411,27 +1924,158 @@ mod tests {
                 .enumerate()
                 .map(|(index, answer)| response("200 OK", "application/json", index == 1, answer))
                 .collect();
-            let server = ScriptedHttpServer::respond_in_sequence(responses);
-            let storage = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).expect("client");
-            let api = WorkflowDefinitionApi::new(&server.api_url, "fixture-token", &storage)
-                .expect("api");
-            let uploaded = api
-                .upload_tree(ORGANIZATION, &digest, &[], "seal-key")
-                .map(|(tree, already_sealed)| (tree.digest, already_sealed));
-            server.finish();
-            uploaded
+            upload(&[], responses)
         };
-        let refused = Err(WorkflowDefinitionFailure::InvalidResponse {
-            credential_rejected: false,
-        });
 
-        let already_sealed = issued(tree("sealed", Some(AT)));
+        let already_sealed = upload_answer(tree_answer(&digest, "sealed", Some(AT)), vec![]);
         assert_eq!(upload(&[&already_sealed]), Ok((digest.clone(), true)));
-        assert_eq!(upload(&[&additive(already_sealed)]), refused);
+        invalid_response(
+            upload(&[&additive(already_sealed)]),
+            Stage::TreeUpload,
+            Check::BodyClosed,
+            Source::None,
+        );
 
-        let uploading = issued(tree("uploading", None));
-        let sealed = tree("sealed", Some(AT));
+        let uploading = upload_answer(tree_answer(&digest, "uploading", None), vec![]);
+        let sealed = tree_answer(&digest, "sealed", Some(AT));
         assert_eq!(upload(&[&uploading, &sealed]), Ok((digest.clone(), false)));
-        assert_eq!(upload(&[&uploading, &additive(sealed)]), refused);
+        invalid_response(
+            upload(&[&uploading, &additive(sealed)]),
+            Stage::TreeSeal,
+            Check::BodyClosed,
+            Source::None,
+        );
+    }
+
+    // INV-CLI-18, REQ-CLOUDDEF-23: a tree upload whose answer, signed upload capability or
+    // seal answer fails a check names the stage and the check, retains the error a capability
+    // value was refused with, and prints nothing of the capability's URL or of the answer.
+    #[test]
+    fn a_signed_tree_upload_failing_a_check_names_its_stage_and_check() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let digest = tree_digest();
+        let bytes = b"name: engineering\n";
+        let file = WorkflowTreeFile {
+            path: "workflow.yaml",
+            bytes,
+            executable: false,
+        };
+        let sha = lowercase_hex(&sha256(bytes));
+        let length = bytes.len().to_string();
+        let signed = format!("http://127.0.0.1:9/storage/{sha}?X-Amz-Signature={SENTINEL}");
+        let capability = |sha: &str, url: &str, length: &str, content_type: &str| {
+            serde_json::json!({
+                "sha256": sha, "url": url,
+                "requiredHeaders": {
+                    "contentLength": length, "contentType": content_type, "ifNoneMatch": "*",
+                    "xAmzChecksumSha256":
+                        base64::engine::general_purpose::STANDARD.encode(sha256(bytes)),
+                },
+            })
+        };
+        let uploading = |capabilities| {
+            response(
+                "200 OK",
+                "application/json",
+                false,
+                &upload_answer(tree_answer(&digest, "uploading", None), capabilities),
+            )
+        };
+        let issued = |url: &str, length: &str, content_type: &str| {
+            uploading(vec![capability(&sha, url, length, content_type)])
+        };
+        let seal = |echo_key, state, sealed_at| {
+            response(
+                "200 OK",
+                "application/json",
+                echo_key,
+                &tree_answer(&digest, state, sealed_at),
+            )
+        };
+        let mut mistyped = upload_answer(tree_answer(&digest, "uploading", None), vec![]);
+        *mistyped.pointer_mut("/tree/fileCount").expect("member") = serde_json::json!(SENTINEL);
+        let octets = "application/octet-stream";
+        let cases = [
+            (
+                vec![response(
+                    "200 OK",
+                    "application/json",
+                    false,
+                    &upload_answer(
+                        tree_answer(&format!("sha256:{}", "b".repeat(64)), "uploading", None),
+                        vec![],
+                    ),
+                )],
+                Stage::TreeUpload,
+                Check::Identity,
+                Source::None,
+            ),
+            (
+                vec![uploading(vec![capability(
+                    &"b".repeat(64),
+                    &signed,
+                    &length,
+                    octets,
+                )])],
+                Stage::TreeUpload,
+                Check::Identity,
+                Source::None,
+            ),
+            (
+                vec![response("200 OK", "application/json", false, &mistyped)],
+                Stage::TreeUpload,
+                Check::BodyShape,
+                Source::Json,
+            ),
+            (
+                vec![issued(&format!("http//{SENTINEL}"), &length, octets)],
+                Stage::FileUpload,
+                Check::CapabilityUrlSyntax,
+                Source::Url,
+            ),
+            (
+                vec![issued(
+                    &format!(
+                        "http://fixture:{SENTINEL}@127.0.0.1:9/storage/{sha}?X-Amz-Signature={SENTINEL}"
+                    ),
+                    &length,
+                    octets,
+                )],
+                Stage::FileUpload,
+                Check::CapabilityUrlPolicy,
+                Source::None,
+            ),
+            (
+                vec![issued(&signed, &(bytes.len() + 1).to_string(), octets)],
+                Stage::FileUpload,
+                Check::CapabilityHeaders,
+                Source::None,
+            ),
+            (
+                vec![issued(&signed, &length, &format!("text/plain\n{SENTINEL}"))],
+                Stage::FileUpload,
+                Check::CapabilityHeaderValue,
+                Source::HeaderValue,
+            ),
+            (
+                vec![uploading(vec![]), seal(false, "sealed", Some(AT))],
+                Stage::TreeSeal,
+                Check::IdempotencyKey,
+                Source::None,
+            ),
+            (
+                vec![uploading(vec![]), seal(true, "uploading", None)],
+                Stage::TreeSeal,
+                Check::Identity,
+                Source::None,
+            ),
+        ];
+        for (responses, stage, check, source) in cases {
+            let invalid = invalid_response(upload(&[file], responses), stage, check, source);
+            assert_eq!(
+                (invalid.status(), invalid.credential_rejected()),
+                (None, false)
+            );
+        }
     }
 }
