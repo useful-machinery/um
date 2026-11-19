@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::future::Future;
@@ -637,6 +638,7 @@ impl RunningCancellationFixture {
     async fn finish(self) -> (ProcessFixture, AgentOutcome) {
         self.task.await.unwrap();
         let outcome = self.outcome.await.unwrap();
+        record_invocation_end(&outcome);
         (self.fixture, outcome)
     }
 }
@@ -660,6 +662,7 @@ async fn run_fixture_with_synthetic_model_provider(
     );
     task.await.unwrap();
     let outcome = outcome.await.unwrap();
+    record_invocation_end(&outcome);
     let started = start.receive().await.is_ok();
     if fixture.process.is_file() {
         let process = fixture_process(&fixture.process);
@@ -757,6 +760,18 @@ fn captured_requests(path: &Path) -> Vec<Value> {
 const FIXTURE_WATCHDOG_CASE: &str = "CodexAppServerV1 fixture";
 const FIXTURE_WATCHDOG_BASE: Duration = Duration::from_secs(10);
 
+thread_local! {
+    /// The last progress a case's fixture made on this test thread, which the watchdog names
+    /// when it expires. No case sets a runtime flavor, so the loopback provider, the adapter's
+    /// task and the case body share `#[tokio::test]`'s current thread, and the thread is the
+    /// case.
+    static LAST_FIXTURE_PROGRESS: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+fn record_fixture_progress(progress: String) {
+    LAST_FIXTURE_PROGRESS.with(|last| *last.borrow_mut() = Some(progress));
+}
+
 // Plain functions, not `async fn`: the body reaches `host_scaled_watchdog`'s heap pin before
 // any wrapper state holds it.
 fn with_watchdog<Output>(future: impl Future<Output = Output>) -> impl Future<Output = Output> {
@@ -767,7 +782,16 @@ fn with_watchdog_limit<Output>(
     future: impl Future<Output = Output>,
     limit: Duration,
 ) -> impl Future<Output = Output> {
-    crate::workflow::test_support::host_scaled_watchdog(FIXTURE_WATCHDOG_CASE, limit, future)
+    let bounded = crate::workflow::test_support::host_scaled_watchdog_with_diagnosis(
+        FIXTURE_WATCHDOG_CASE,
+        limit,
+        last_fixture_progress,
+        future,
+    );
+    async move {
+        LAST_FIXTURE_PROGRESS.with(|last| last.borrow_mut().take());
+        bounded.await
+    }
 }
 
 // A launch slows with the tests running beside it while the one-minute load the watchdog
@@ -781,9 +805,67 @@ fn with_scenario_watchdog<Output>(
     let case = format!("{FIXTURE_WATCHDOG_CASE} {scenario}");
     let future = Box::pin(future);
     async move {
-        crate::workflow::test_support::host_scaled_watchdog(&case, FIXTURE_WATCHDOG_BASE, future)
-            .await
+        LAST_FIXTURE_PROGRESS.with(|last| last.borrow_mut().take());
+        crate::workflow::test_support::host_scaled_watchdog_with_diagnosis(
+            case,
+            FIXTURE_WATCHDOG_BASE,
+            last_fixture_progress,
+            future,
+        )
+        .await
     }
+}
+
+/// The watchdog's diagnosis: the last progress a case's fixture recorded, or `none`.
+fn last_fixture_progress() -> Option<String> {
+    let last = LAST_FIXTURE_PROGRESS.with(|last| last.borrow().clone());
+    Some(format!(
+        "last fixture progress: {}",
+        last.as_deref().unwrap_or("none")
+    ))
+}
+
+fn record_invocation_end(outcome: &AgentOutcome) {
+    record_fixture_progress(match outcome {
+        AgentOutcome::Completed(_) => "invocation ended Completed".to_owned(),
+        AgentOutcome::Failed(failure) => {
+            format!("invocation ended Failed: {:?}", failure.cause())
+        }
+        AgentOutcome::Cancelled { reason } => format!("invocation ended Cancelled: {reason:?}"),
+    });
+}
+
+// INV-TESTING-18
+#[tokio::test]
+async fn fixture_watchdog_expiry_names_the_last_fixture_progress() {
+    let expired = tokio::spawn(with_watchdog_limit(
+        async {
+            record_fixture_progress("probe progress".to_owned());
+            std::future::pending::<()>().await;
+        },
+        Duration::from_millis(1),
+    ))
+    .await
+    .unwrap_err();
+    let message = expired.into_panic().downcast::<String>().unwrap();
+    assert!(
+        message.starts_with("CodexAppServerV1 fixture watchdog expired after")
+            && message.ends_with("; last fixture progress: probe progress"),
+        "{message:?}"
+    );
+
+    let unrecorded = tokio::spawn(with_watchdog_limit(
+        std::future::pending::<()>(),
+        Duration::from_millis(1),
+    ))
+    .await
+    .unwrap_err();
+    let message = unrecorded.into_panic().downcast::<String>().unwrap();
+    assert!(
+        message.starts_with("CodexAppServerV1 fixture watchdog expired after")
+            && message.ends_with("; last fixture progress: none"),
+        "{message:?}"
+    );
 }
 
 // The child-guard process has no in-process readiness channel. This bounded OS-boundary
@@ -1188,7 +1270,9 @@ fn codex_process_fixture() {
             json!({"method": "thread/started", "params": {"thread": thread_document(cwd, &version)}}),
         );
     }
-    let turn_started_before_response = scenario == "turn-started-before-response";
+    let turn_activity_before_response = scenario == "turn-activity-before-response";
+    let turn_started_before_response =
+        scenario == "turn-started-before-response" || turn_activity_before_response;
     if scenario == "premature-turn-started" || turn_started_before_response {
         write_server_frame(
             &mut output,
@@ -1200,6 +1284,19 @@ fn codex_process_fixture() {
         if scenario == "premature-turn-started" {
             return;
         }
+    }
+    if turn_activity_before_response {
+        let content = json!([{"type": "text", "text": "user request"}]);
+        send_item_started(
+            &mut output,
+            "user-1",
+            "userMessage",
+            json!({"content": content}),
+        );
+        send_item_completed(
+            &mut output,
+            json!({"id": "user-1", "type": "userMessage", "content": content}),
+        );
     }
     write_server_frame(
         &mut output,
@@ -2047,6 +2144,7 @@ impl LoopbackResponsesProvider {
         let task = tokio::spawn(async move {
             let mut response = response;
             let mut response_release = response_release;
+            let framed = Arc::new(AtomicUsize::new(0));
             let mut connections = tokio::task::JoinSet::new();
             loop {
                 let accepted = tokio::select! {
@@ -2061,16 +2159,25 @@ impl LoopbackResponsesProvider {
                 } = &response
                 {
                     let requests = requests.clone();
+                    let framed = Arc::clone(&framed);
                     let mut response = LoopbackProviderResponse::Guardian {
                         parent_calls: Arc::clone(parent_calls),
                         classified: Arc::clone(classified),
                     };
                     connections.spawn(async move {
-                        serve_provider_request(stream, &requests, &mut response, &mut None).await;
+                        serve_provider_request(
+                            stream,
+                            &requests,
+                            &framed,
+                            &mut response,
+                            &mut None,
+                        )
+                        .await;
                     });
                 } else if serve_provider_request(
                     stream,
                     &requests,
+                    &framed,
                     &mut response,
                     &mut response_release,
                 )
@@ -2101,6 +2208,7 @@ impl LoopbackResponsesProvider {
 async fn serve_provider_request(
     mut stream: TcpStream,
     requests: &mpsc::UnboundedSender<ProviderRequest>,
+    framed: &AtomicUsize,
     response: &mut LoopbackProviderResponse,
     response_release: &mut Option<oneshot::Receiver<()>>,
 ) -> bool {
@@ -2123,6 +2231,8 @@ async fn serve_provider_request(
     let header = std::str::from_utf8(&bytes[..header_end]).unwrap();
     let mut lines = header.split("\r\n");
     let request_line = lines.next().unwrap();
+    let ordinal = framed.fetch_add(1, Ordering::Relaxed) + 1;
+    record_fixture_progress(format!("provider request {ordinal}: {request_line}"));
     let path = request_line
         .split_ascii_whitespace()
         .nth(1)
@@ -2619,6 +2729,7 @@ pub(super) mod normal {
             "thread-warning-before-response",
             "thread-started-before-response",
             "turn-started-before-response",
+            "turn-activity-before-response",
         ] {
             let fixture = ProcessFixture::new(scenario, AgentValueMode::None, 1024);
             assert_fixture_completed_without_value(scenario, fixture).await;
@@ -2765,6 +2876,10 @@ pub(super) mod exact_binary {
                     );
                 };
                 let frame = serde_json::from_str::<Value>(&line).unwrap();
+                record_fixture_progress(match frame.get("method").and_then(Value::as_str) {
+                    Some(method) => format!("direct Codex frame {method}"),
+                    None => format!("direct Codex response {}", frame["id"]),
+                });
                 self.transcript.push(frame.clone());
                 if predicate(&frame) {
                     return frame;
@@ -3164,12 +3279,119 @@ pub(super) mod exact_binary {
         .unwrap();
     }
 
+    /// The next request at `provider`, raced against the production adapter's invocation, or
+    /// what the invocation ended with when it ends first. Every provider wait of a case whose
+    /// invocation runs in a task of its own goes through this race, so a stopped Codex fails
+    /// the case at once rather than as the watchdog expiry of a request it cannot make
+    /// (INV-TESTING-28). The provider is polled first: a request it already holds is the
+    /// answer even when the invocation that made it has ended since.
+    async fn next_request_unless_ended<Ended: Future>(
+        provider: &mut LoopbackResponsesProvider,
+        invocation: Ended,
+    ) -> Result<ProviderRequest, Ended::Output> {
+        tokio::select! {
+            biased;
+            request = provider.next_request() => Ok(request),
+            ended = invocation => Err(ended),
+        }
+    }
+
+    async fn next_request_while_running(
+        provider: &mut LoopbackResponsesProvider,
+        run: &mut tokio::task::JoinHandle<(ProcessFixture, AgentOutcome, bool)>,
+    ) -> ProviderRequest {
+        match next_request_unless_ended(provider, run).await {
+            Ok(request) => request,
+            Err(ended) => {
+                let (fixture, outcome, started) = ended.unwrap();
+                invocation_ended_before_provider_request(&fixture, started, &outcome)
+            }
+        }
+    }
+
+    async fn next_request_while_cancellable(
+        provider: &mut LoopbackResponsesProvider,
+        running: &mut RunningCancellationFixture,
+    ) -> ProviderRequest {
+        match next_request_unless_ended(provider, &mut running.task).await {
+            Ok(request) => request,
+            Err(ended) => {
+                ended.unwrap();
+                let outcome = (&mut running.outcome).await.unwrap();
+                let started = match running.start.take() {
+                    Some(start) => start.receive().await.is_ok(),
+                    None => true,
+                };
+                invocation_ended_before_provider_request(&running.fixture, started, &outcome)
+            }
+        }
+    }
+
+    fn invocation_ended_before_provider_request(
+        fixture: &ProcessFixture,
+        started: bool,
+        outcome: &AgentOutcome,
+    ) -> ! {
+        panic!(
+            "exact Codex ended before provider request: started={started} outcome={outcome:?} stderr={:?}",
+            fixture.diagnostics.get("agent-step").map(|diagnostic| {
+                String::from_utf8_lossy(diagnostic.standard_error().bytes()).into_owned()
+            })
+        );
+    }
+
+    // INV-TESTING-28
+    #[tokio::test]
+    async fn an_invocation_that_ends_before_a_provider_request_fails_the_wait_at_once() {
+        let failed = tokio::spawn(with_watchdog(async {
+            let (mut provider, _release_response) =
+                LoopbackResponsesProvider::start_blocked(RESPONSE).await;
+            let mut run = tokio::spawn(run_fixture(ProcessFixture::new(
+                "premature-turn-started",
+                AgentValueMode::None,
+                1024,
+            )));
+            next_request_while_running(&mut provider, &mut run).await;
+        }))
+        .await
+        .unwrap_err();
+        let message = failed.into_panic().downcast::<String>().unwrap();
+        assert!(
+            message.contains("HarnessSetupFailed") && !message.contains("watchdog expired"),
+            "{message:?}"
+        );
+
+        // A request already at the provider is the wait's answer even when the invocation
+        // that made it has ended since.
+        let (queued, request) = mpsc::unbounded_channel();
+        let mut provider = LoopbackResponsesProvider {
+            address: ([127, 0, 0, 1], 0).into(),
+            request,
+            shutdown: None,
+            task: tokio::spawn(async {}),
+        };
+        for _ in 0..32 {
+            queued
+                .send(ProviderRequest {
+                    path: "/responses".to_owned(),
+                    authorization: String::new(),
+                    body: Value::Null,
+                })
+                .unwrap();
+            assert!(
+                next_request_unless_ended(&mut provider, std::future::ready(()))
+                    .await
+                    .is_ok()
+            );
+        }
+    }
+
     async fn release_provider_and_settle(
         provider: &mut LoopbackResponsesProvider,
         release_response: oneshot::Sender<()>,
-        run: tokio::task::JoinHandle<(ProcessFixture, AgentOutcome, bool)>,
+        mut run: tokio::task::JoinHandle<(ProcessFixture, AgentOutcome, bool)>,
     ) -> (ProcessFixture, AgentOutcome, bool) {
-        let request = provider.next_request().await;
+        let request = next_request_while_running(provider, &mut run).await;
         assert_eq!(request.path, "/responses");
         release_response.send(()).unwrap();
         run.await.unwrap()
@@ -3311,9 +3533,9 @@ for line in sys.stdin:
                 .iter()
                 .map(|path| std::fs::read(path).unwrap())
                 .collect::<Vec<_>>();
-            let run = tokio::spawn(run_fixture(fixture));
+            let mut run = tokio::spawn(run_fixture(fixture));
 
-            let request = provider.next_request().await;
+            let request = next_request_while_running(&mut provider, &mut run).await;
             let user_content = request.body["input"]
                 .as_array()
                 .unwrap()
@@ -3408,10 +3630,8 @@ for line in sys.stdin:
         with_watchdog(async {
             let (mut provider, release_response) =
                 LoopbackResponsesProvider::start_blocked(RESPONSE).await;
-            let (fixture, stdin_capture) = ProcessFixture::with_exact_binary_stdin_capture(
-                provider.address,
-                response_mode(),
-            );
+            let (fixture, stdin_capture) =
+                ProcessFixture::with_exact_binary_stdin_capture(provider.address, response_mode());
             let codex_home = fixture.codex_home.clone();
             let sqlite_staging = fixture.sqlite_staging.clone();
             let expected_cwd = fixture.expected_cwd.clone();
@@ -3423,18 +3643,7 @@ for line in sys.stdin:
             );
             std::fs::write(codex_home.join("config.toml"), &config).unwrap();
             let mut run = tokio::spawn(run_fixture_with_synthetic_model_provider(fixture, None));
-            let request = tokio::select! {
-                request = provider.next_request() => request,
-                finished = &mut run => {
-                    let (fixture, outcome, started) = finished.unwrap();
-                    panic!(
-                        "exact Codex ended before provider request: started={started} outcome={outcome:?} stderr={:?}",
-                        fixture.diagnostics.get("agent-step").map(|diagnostic| {
-                            String::from_utf8_lossy(diagnostic.standard_error().bytes()).into_owned()
-                        })
-                    );
-                }
-            };
+            let request = next_request_while_running(&mut provider, &mut run).await;
             assert_eq!(request.path, "/responses");
             assert_eq!(request.authorization, format!("Bearer {PLACEHOLDER_KEY}"));
             assert_eq!(request.body["model"], MODEL);
@@ -3468,7 +3677,10 @@ for line in sys.stdin:
                 .find(|request| request["method"] == "thread/start")
                 .unwrap();
             assert_eq!(thread_start["params"]["model"], MODEL);
-            assert_eq!(thread_start["params"]["cwd"], expected_cwd.to_str().unwrap());
+            assert_eq!(
+                thread_start["params"]["cwd"],
+                expected_cwd.to_str().unwrap()
+            );
             assert_eq!(thread_start["params"]["approvalPolicy"], "never");
             assert_eq!(thread_start["params"]["sandbox"], "danger-full-access");
             assert_eq!(thread_start["params"]["ephemeral"], true);
@@ -3513,15 +3725,15 @@ for line in sys.stdin:
                 "[features]\n\
                  request_permissions_tool = true\n",
             );
-            let run = tokio::spawn(run_fixture(fixture));
+            let mut run = tokio::spawn(run_fixture(fixture));
 
-            let initial = provider.next_request().await;
+            let initial = next_request_while_running(&mut provider, &mut run).await;
             assert!(initial.body["tools"].as_array().is_some_and(|tools| {
                 tools
                     .iter()
                     .any(|tool| tool["name"] == "request_permissions")
             }));
-            let after_permission = provider.next_request().await;
+            let after_permission = next_request_while_running(&mut provider, &mut run).await;
             let output = after_permission.body["input"]
                 .as_array()
                 .unwrap()
@@ -3575,16 +3787,16 @@ for line in sys.stdin:
                  default_mode_request_user_input = true\n",
             );
             let (fixture, stdin_capture) = ProcessFixture::capture_exact_binary_stdin(fixture);
-            let run = tokio::spawn(run_fixture(fixture));
+            let mut run = tokio::spawn(run_fixture(fixture));
 
-            let initial = provider.next_request().await;
+            let initial = next_request_while_running(&mut provider, &mut run).await;
             assert!(initial.body["tools"].as_array().is_some_and(|tools| {
                 tools
                     .iter()
                     .any(|tool| tool["name"] == "request_user_input")
             }));
             wait_for_fixture_bytes(&stdin_capture, br#""answers":{}"#).await;
-            let after_user_input = provider.next_request().await;
+            let after_user_input = next_request_while_running(&mut provider, &mut run).await;
             let serialized = serde_json::to_string(&after_user_input.body["input"]).unwrap();
             assert!(serialized.contains("user-input-call"));
             assert!(serialized.contains(r#"\"answers\":{}"#));
@@ -3623,15 +3835,15 @@ for line in sys.stdin:
             let fixture = ProcessFixture::with_exact_binary(provider.address, response_mode());
             let elicitation_capture = configure_mcp_elicitation_fixture(&fixture);
             let observations = fixture.observations.clone();
-            let run = tokio::spawn(run_fixture(fixture));
+            let mut run = tokio::spawn(run_fixture(fixture));
 
-            let initial = provider.next_request().await;
+            let initial = next_request_while_running(&mut provider, &mut run).await;
             assert!(
                 initial.body["tools"].as_array().is_some_and(|tools| {
                     tools.iter().any(|tool| tool["type"] == "tool_search")
                 })
             );
-            let after_search = provider.next_request().await;
+            let after_search = next_request_while_running(&mut provider, &mut run).await;
             assert!(
                 after_search.body["input"].as_array().is_some_and(|input| {
                     input.iter().any(|item| {
@@ -3645,7 +3857,7 @@ for line in sys.stdin:
                 "exact Codex tool-search output: {}",
                 after_search.body["input"],
             );
-            let continuation = provider.next_request().await;
+            let continuation = next_request_while_running(&mut provider, &mut run).await;
             assert!(continuation.body["input"].as_array().is_some_and(|input| {
                 input.iter().any(|item| {
                     item["type"] == "function_call_output" && item["call_id"] == "mcp-call"
@@ -3716,18 +3928,9 @@ for line in sys.stdin:
             let observations = fixture.observations.clone();
             let (fixture, stdin_capture) = ProcessFixture::capture_exact_binary_stdin(fixture);
             let mut run = tokio::spawn(run_fixture(fixture));
-            let initial = tokio::select! {
-                request = provider.next_request() => request,
-                result = &mut run => {
-                    let (fixture, outcome, started) = result.unwrap();
-                    panic!(
-                        "Codex ended before first provider request: {outcome:?}, started={started}, stderr={:?}",
-                        fixture.diagnostics.get("agent-step").map(|d| String::from_utf8_lossy(d.standard_error().bytes()).into_owned())
-                    );
-                },
-            };
+            let initial = next_request_while_running(&mut provider, &mut run).await;
             assert_eq!(initial.path, "/responses");
-            let continuation = provider.next_request().await;
+            let continuation = next_request_while_running(&mut provider, &mut run).await;
             assert!(
                 continuation.body["input"].as_array().is_some_and(|input| {
                     input.iter().any(|item| {
@@ -4166,8 +4369,13 @@ for line in sys.stdin:
             ] {
                 let mut provider = LoopbackResponsesProvider::start_incomplete().await;
                 let fixture = ProcessFixture::with_exact_binary(provider.address, mode);
-                let run = tokio::spawn(run_fixture(fixture));
-                assert_eq!(provider.next_request().await.path, "/responses");
+                let mut run = tokio::spawn(run_fixture(fixture));
+                assert_eq!(
+                    next_request_while_running(&mut provider, &mut run)
+                        .await
+                        .path,
+                    "/responses"
+                );
                 let (fixture, outcome, started) = run.await.unwrap();
                 assert_started_failure(
                     "incomplete-response",
@@ -4228,10 +4436,15 @@ for line in sys.stdin:
                         "minimum": 1,
                     })),
                 );
-                let run = tokio::spawn(run_fixture(fixture));
+                let mut run = tokio::spawn(run_fixture(fixture));
 
                 for _ in 0..2 {
-                    assert_eq!(provider.next_request().await.path, "/responses");
+                    assert_eq!(
+                        next_request_while_running(&mut provider, &mut run)
+                            .await
+                            .path,
+                        "/responses"
+                    );
                 }
                 let (_, outcome, started) = run.await.unwrap();
 
@@ -4258,7 +4471,7 @@ for line in sys.stdin:
                 ProcessFixture::with_exact_binary_stdin_capture(provider.address, response_mode());
             let mut running = RunningCancellationFixture::start(fixture);
 
-            let request = provider.next_request().await;
+            let request = next_request_while_cancellable(&mut provider, &mut running).await;
             assert_eq!(request.path, "/responses");
             running.await_started().await;
             running.cancel();

@@ -709,6 +709,179 @@ fn matching_turn_notification_acknowledges_start_after_the_response_in_either_or
     )));
 }
 
+fn first_turn_start_response() -> Value {
+    json!({
+        "id": 4,
+        "result": {"turn": {"id": "turn-1", "items": [], "status": "inProgress"}}
+    })
+}
+
+fn user_message_item(method: &str, turn_id: &str) -> Value {
+    json!({
+        "method": method,
+        "params": {
+            "threadId": "thread-1",
+            "turnId": turn_id,
+            "item": {
+                "id": "user-1",
+                "type": "userMessage",
+                "content": [{"type": "text", "text": "user request"}],
+            },
+        }
+    })
+}
+
+fn turn_started_ahead_of_its_response(parser: &mut CodexAppServerV1Parser) {
+    initialize(parser);
+    effective_config(parser, "native-provider");
+    thread_response(parser, "native-provider");
+    for frame in [
+        thread_started_notification(),
+        json!({
+            "method": "turn/started",
+            "params": {"threadId": "thread-1", "turn": {
+                "id": "turn-1", "items": [], "status": "inProgress"
+            }}
+        }),
+    ] {
+        assert_eq!(
+            feed(parser, frame).unwrap(),
+            (ParserProgress::default(), Vec::new())
+        );
+    }
+}
+
+fn held_feed(parser: &mut CodexAppServerV1Parser, frame: Value) {
+    assert_eq!(
+        feed(parser, frame).unwrap(),
+        (ParserProgress::default(), Vec::new())
+    );
+    assert!(!parser.start_acknowledged());
+}
+
+// INV-HARNESS-20
+#[test]
+fn turn_frames_that_overtake_the_turn_start_response_are_parsed_after_it() {
+    let mut overtaken = parser(AgentValueKind::None, 1024, None);
+    turn_started_ahead_of_its_response(&mut overtaken);
+    held_feed(&mut overtaken, user_message_item("item/started", "turn-1"));
+    held_feed(
+        &mut overtaken,
+        user_message_item("item/completed", "turn-1"),
+    );
+    held_feed(&mut overtaken, item_started("commentary", "agentMessage"));
+    held_feed(
+        &mut overtaken,
+        item_completed("commentary", "looking", json!("commentary")),
+    );
+    let (progress, observations) = feed(&mut overtaken, first_turn_start_response()).unwrap();
+    assert!(progress.start_acknowledged);
+    assert_eq!(
+        observations,
+        [
+            AgentLifecycleMilestone::HarnessStarted,
+            AgentLifecycleMilestone::TurnStarted,
+            AgentLifecycleMilestone::MessageStarted,
+            AgentLifecycleMilestone::MessageCompleted,
+        ]
+        .map(lifecycle)
+    );
+    let (progress, _) = feed(
+        &mut overtaken,
+        turn_completed(
+            vec![
+                user_message_item("item/completed", "turn-1")["params"]["item"].clone(),
+                json!({
+                    "id": "commentary",
+                    "type": "agentMessage",
+                    "text": "looking",
+                    "phase": "commentary",
+                }),
+            ],
+            "completed",
+        ),
+    )
+    .unwrap();
+    assert!(progress.close_standard_input);
+    assert_eq!(
+        overtaken.finish(true),
+        AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+    );
+
+    let mut unanswered = parser(AgentValueKind::None, 1024, None);
+    turn_started_ahead_of_its_response(&mut unanswered);
+    held_feed(&mut unanswered, user_message_item("item/started", "turn-1"));
+    assert_eq!(
+        unanswered.finish(true),
+        AgentOutcome::Failed(
+            AgentFailureCause::HarnessSetupFailed {
+                stage: AgentHarnessSetupStage::TurnStart,
+            }
+            .into()
+        )
+    );
+    assert!(!unanswered.start_acknowledged());
+
+    let mut running = running_parser(AgentValueKind::None, 1024);
+    let running_failure = feed(
+        &mut running,
+        user_message_item("item/started", "other-turn"),
+    )
+    .unwrap_err();
+    let mut cross_turn = parser(AgentValueKind::None, 1024, None);
+    turn_started_ahead_of_its_response(&mut cross_turn);
+    held_feed(
+        &mut cross_turn,
+        user_message_item("item/started", "other-turn"),
+    );
+    assert_eq!(
+        feed(&mut cross_turn, first_turn_start_response()).unwrap_err(),
+        running_failure
+    );
+    assert_eq!(
+        cross_turn.rejection_reason.get(),
+        running.rejection_reason.get()
+    );
+    assert!(cross_turn.start_acknowledged());
+
+    let held = [
+        user_message_item("item/started", "turn-1"),
+        user_message_item("item/completed", "turn-1"),
+    ];
+    let held_bytes = held
+        .iter()
+        .map(|frame| {
+            let mut frame = frame.clone();
+            replace_fixture_thread_id(&mut frame);
+            u64::try_from(serde_json::to_vec(&frame).unwrap().len()).unwrap()
+        })
+        .sum::<u64>();
+    for (maximum_frame_bytes, within) in [(held_bytes, true), (held_bytes - 1, false)] {
+        let mut bounded = parser(AgentValueKind::None, 1024, None);
+        turn_started_ahead_of_its_response(&mut bounded);
+        bounded.limits = CodexAppServerV1ProtocolLimits::with_limits(
+            NonZeroU64::new(maximum_frame_bytes).unwrap(),
+            CodexAppServerV1ProtocolLimits::profile().maximum_correlation_bytes,
+        );
+        held_feed(&mut bounded, held[0].clone());
+        if within {
+            held_feed(&mut bounded, held[1].clone());
+            continue;
+        }
+        assert_eq!(
+            feed(&mut bounded, held[1].clone()).unwrap_err(),
+            AgentFailureCause::HarnessSetupFailed {
+                stage: AgentHarnessSetupStage::TurnStart,
+            }
+        );
+        assert_eq!(
+            bounded.rejection_reason.get(),
+            Some(CodexAppServerV1RejectionReason::NotificationTransitionInvalid)
+        );
+        assert!(!bounded.start_acknowledged());
+    }
+}
+
 #[test]
 fn stale_duplicate_cross_thread_cross_turn_and_cross_item_identities_fail_closed() {
     let mut stale = parser(AgentValueKind::None, 1024, None);

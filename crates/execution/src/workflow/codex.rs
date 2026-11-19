@@ -475,6 +475,8 @@ pub(super) struct CodexAppServerV1Parser {
     effective_model_provider: Option<Arc<str>>,
     thread_started_seen: bool,
     turn_started_seen: bool,
+    held_turn_frames: VecDeque<Vec<u8>>,
+    held_turn_frame_bytes: u64,
     active_items: BTreeMap<ItemId, ActiveItem>,
     completed_items: BTreeMap<ItemId, CompletedItem>,
     active_realtime_items: BTreeMap<Arc<str>, ActiveRealtimeItem>,
@@ -549,6 +551,8 @@ impl CodexAppServerV1Parser {
             effective_model_provider: None,
             thread_started_seen: false,
             turn_started_seen: false,
+            held_turn_frames: VecDeque::new(),
+            held_turn_frame_bytes: 0,
             active_items: BTreeMap::new(),
             completed_items: BTreeMap::new(),
             active_realtime_items: BTreeMap::new(),
@@ -775,20 +779,14 @@ impl CodexAppServerV1Parser {
         for &byte in bytes {
             if byte == b'\n' {
                 let frame = std::mem::take(&mut self.frame);
-                match self.parse_frame(&frame) {
-                    Ok(frame_progress) => {
-                        progress.start_acknowledged |= frame_progress.start_acknowledged;
-                        progress.close_standard_input |= frame_progress.close_standard_input;
+                self.apply_frame(&frame, &mut progress, &mut observe)?;
+                if self.state != SetupState::TurnStart {
+                    // Frames held while the `turn/start` response was outstanding are
+                    // parsed directly after it, in arrival order (INV-HARNESS-20).
+                    while let Some(held) = self.held_turn_frames.pop_front() {
+                        self.apply_frame(&held, &mut progress, &mut observe)?;
                     }
-                    Err(failure) => {
-                        self.invalidate_value();
-                        self.observations.clear();
-                        self.failure = Some(failure.clone());
-                        return Err(failure);
-                    }
-                }
-                for observation in self.observations.drain(..) {
-                    observe(observation);
+                    self.held_turn_frame_bytes = 0;
                 }
                 continue;
             }
@@ -799,6 +797,30 @@ impl CodexAppServerV1Parser {
             self.frame.push(byte);
         }
         Ok(progress)
+    }
+
+    fn apply_frame(
+        &mut self,
+        frame: &[u8],
+        progress: &mut ParserProgress,
+        observe: &mut impl FnMut(AgentObservation),
+    ) -> Result<(), AgentFailureCause> {
+        match self.parse_frame(frame) {
+            Ok(frame_progress) => {
+                progress.start_acknowledged |= frame_progress.start_acknowledged;
+                progress.close_standard_input |= frame_progress.close_standard_input;
+            }
+            Err(failure) => {
+                self.invalidate_value();
+                self.observations.clear();
+                self.failure = Some(failure.clone());
+                return Err(failure);
+            }
+        }
+        for observation in self.observations.drain(..) {
+            observe(observation);
+        }
+        Ok(())
     }
 
     pub(super) fn finish(&mut self, exit_success: bool) -> AgentOutcome {
@@ -860,6 +882,10 @@ impl CodexAppServerV1Parser {
         let object = value
             .as_object()
             .ok_or_else(|| self.failure_for(CodexAppServerV1RejectionReason::FrameNotObject))?;
+        let response = object.contains_key("id") && !object.contains_key("method");
+        if !response && self.state == SetupState::TurnStart && self.turn_started_seen {
+            return self.hold_turn_frame(frame);
+        }
         if object.contains_key("jsonrpc") {
             return Err(
                 self.failure_for(CodexAppServerV1RejectionReason::JsonRpcEnvelopeUnsupported)
@@ -871,6 +897,23 @@ impl CodexAppServerV1Parser {
             (None, Some(_)) => self.parse_notification(object, &value),
             _ => Err(self.failure_for(CodexAppServerV1RejectionReason::FrameEnvelopeInvalid)),
         }
+    }
+
+    /// Holds a frame of the started turn that overtook the `turn/start` response; the
+    /// held frames together stay within the frame limit (INV-HARNESS-20).
+    fn hold_turn_frame(&mut self, frame: &[u8]) -> Result<ParserProgress, AgentFailureCause> {
+        let Some(held_bytes) = u64::try_from(frame.len())
+            .ok()
+            .and_then(|bytes| self.held_turn_frame_bytes.checked_add(bytes))
+            .filter(|&bytes| bytes <= self.limits.maximum_frame_bytes().get())
+        else {
+            return self.fail_current_phase(
+                CodexAppServerV1RejectionReason::NotificationTransitionInvalid,
+            );
+        };
+        self.held_turn_frame_bytes = held_bytes;
+        self.held_turn_frames.push_back(frame.to_vec());
+        Ok(ParserProgress::default())
     }
 
     fn parse_response(
