@@ -1480,7 +1480,7 @@ fn list_runs_filters_and_renders_text_and_json() {
     }
 }
 
-// REQ-RUN-66
+// REQ-RUN-66, REQ-RUN-117
 #[test]
 fn list_runs_accepts_full_pages_with_large_valid_contexts() {
     let context = (0..15)
@@ -1497,28 +1497,56 @@ fn list_runs_accepts_full_pages_with_large_valid_contexts() {
         "createdAt": "2025-01-03T00:00:00Z", "updatedAt": "2025-01-03T01:00:00Z",
         "integrationContext": context, "placement": null
     });
-    let items = (0..100)
-        .rev()
+    // A stage path at its 64-element bound, alternating steps and items.
+    let stage_path = (0..64)
         .map(|index| {
-            let mut row = item.clone();
-            row["id"] = serde_json::json!(format!("run_01k0z6r1w8f4jy2m7q9v3x5{index:03}"));
-            row
+            if index % 2 == 0 {
+                serde_json::json!(format!("stage{index}"))
+            } else {
+                serde_json::json!({"item": index})
+            }
         })
         .collect::<Vec<_>>();
-    let body = serde_json::json!({"items": items, "nextCursor": "next-page"});
-    // Gateway's Go JSON encoder escapes HTML-sensitive context bytes as \u003c.
-    let encoded = serde_json::to_string(&body)
-        .unwrap()
-        .replace('<', "\\u003c")
-        .into_bytes();
-    assert!(encoded.len() > 8 * 1024 * 1024);
-    let reply = http_response_with_headers(
-        "200 OK",
-        Some("application/json"),
-        &[("Cache-Control", "private, no-store")],
-        &encoded,
-    );
-    let (server, _directory, credential_path) = prepared_run(vec![reply.clone(), reply]);
+    let page = |workflow: bool| {
+        let items = (0..100)
+            .rev()
+            .map(|index| {
+                let mut row = item.clone();
+                row["id"] = serde_json::json!(format!("run_01k0z6r1w8f4jy2m7q9v3x5{index:03}"));
+                if workflow {
+                    row["workflowState"] = serde_json::json!("waiting");
+                    row["workflowOutcome"] = serde_json::Value::Null;
+                    row["workflowProgress"] = serde_json::json!({
+                        "attempt": 1, "position": stage_path, "reportedAt": "2025-01-03T01:00:00Z",
+                        "wait": {
+                            "kind": "answer", "since": "2025-01-03T00:59:00Z",
+                            "step": stage_path, "questionCount": 2
+                        }
+                    });
+                }
+                row
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({"items": items, "nextCursor": "next-page"})
+    };
+    let reply = |body: &serde_json::Value| {
+        // Gateway's Go JSON encoder escapes HTML-sensitive context bytes as \u003c.
+        let encoded = serde_json::to_string(body)
+            .unwrap()
+            .replace('<', "\\u003c")
+            .into_bytes();
+        assert!(encoded.len() > 8 * 1024 * 1024);
+        http_response_with_headers(
+            "200 OK",
+            Some("application/json"),
+            &[("Cache-Control", "private, no-store")],
+            &encoded,
+        )
+    };
+    let earlier = page(false);
+    let body = page(true);
+    let (server, _directory, credential_path) =
+        prepared_run(vec![reply(&earlier), reply(&body), reply(&body)]);
     let environment = deployment_environment(&server.api_url, &credential_path);
     let arguments = [
         "run",
@@ -1528,6 +1556,7 @@ fn list_runs_accepts_full_pages_with_large_valid_contexts() {
         "100",
         "--allow-insecure-http",
     ];
+    let earlier_text = run_with_env(&arguments, &environment);
     let text = run_with_env(&arguments, &environment);
     assert_eq!(
         text.status.code(),
@@ -1544,6 +1573,7 @@ fn list_runs_accepts_full_pages_with_large_valid_contexts() {
         100
     );
     assert!(report.contains("next cursor: next-page"));
+    assert_eq!(report, String::from_utf8(earlier_text.stdout).unwrap());
     let json_args = [arguments.as_slice(), &["--json"]].concat();
     let structured = run_with_env(&json_args, &environment);
     assert_eq!(
@@ -1556,7 +1586,7 @@ fn list_runs_accepts_full_pages_with_large_valid_contexts() {
         serde_json::from_slice::<serde_json::Value>(&structured.stdout).unwrap(),
         body
     );
-    assert_eq!(server.finish().len(), 2);
+    assert_eq!(server.finish().len(), 3);
 }
 
 fn acceptance_body(run_id: &str, replayed: bool) -> Vec<u8> {

@@ -75,6 +75,22 @@ pub struct RunListItem {
         skip_serializing_if = "Option::is_none"
     )]
     pub workflow_wait: Option<Option<Box<models::RunListItemWorkflowWait>>>,
+    /// The run read's `workflowOutcome`: the outcome the runner reported the current attempt's workflow chose when it exited; null until one is recorded, when the runner reported none, and for a run by `workflowPath`.
+    #[serde(
+        rename = "workflowOutcome",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workflow_outcome: Option<Option<String>>,
+    /// The run read's `workflowProgress` for the current attempt, its wait giving the number of questions in place of their text; null before a report is recorded and for a run by `workflowPath`.
+    #[serde(
+        rename = "workflowProgress",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workflow_progress: Option<Option<Box<models::RunListItemWorkflowProgress>>>,
 }
 
 impl RunListItem {
@@ -104,6 +120,8 @@ impl RunListItem {
             owner: None,
             workflow_state: None,
             workflow_wait: None,
+            workflow_outcome: None,
+            workflow_progress: None,
         }
     }
 }

@@ -130,6 +130,18 @@ pub enum GetWorkflowDefinitionRevisionError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`get_workflow_definition_revision_outline`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GetWorkflowDefinitionRevisionOutlineError {
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`list_workflow_definition_evaluations`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -797,6 +809,78 @@ pub fn get_workflow_definition_revision(
     } else {
         let content = resp.text()?;
         let entity: Option<GetWorkflowDefinitionRevisionError> =
+            serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Any active member. `workflows` lists each workflow file the root (`workflow.yaml`) reaches through `workflow` steps: the root first and each other file once, in the order first reached when the listed files are walked in order and each file's steps in declaration order. Each file has its tree `path` and its `steps` in declaration order. The outline is read from the revision's sealed tree, never from a run, and a revision's outline never changes. A tree file that cannot be read is 503 `service-unavailable`. The revision read answers as before: the outline is an operation of its own.
+pub fn get_workflow_definition_revision_outline(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    project_id: &str,
+    definition_id: &str,
+    revision: i32,
+) -> Result<
+    models::WorkflowDefinitionRevisionOutline,
+    Error<GetWorkflowDefinitionRevisionOutlineError>,
+> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_project_id = project_id;
+    let p_path_definition_id = definition_id;
+    let p_path_revision = revision;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/projects/{projectId}/workflow-definitions/{definitionId}/revisions/{revision}/outline",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        projectId = crate::generated::apis::urlencode(p_path_project_id),
+        definitionId = crate::generated::apis::urlencode(p_path_definition_id),
+        revision = p_path_revision
+    );
+    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::WorkflowDefinitionRevisionOutline`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::WorkflowDefinitionRevisionOutline`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<GetWorkflowDefinitionRevisionOutlineError> =
             serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,

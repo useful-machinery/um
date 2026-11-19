@@ -930,13 +930,14 @@ pub fn list_run_workflow_steps(
     }
 }
 
-/// Requires the same active organization membership as getRun. Results are ordered by createdAt descending, then run ID descending. All filters are conjunctive. Repeat integrationContext for multiple exact key=value matches; split at the first equals sign. Context keys and values are private and must not be logged. A cursor is opaque and bound to the organization and exact filters. Run creation requests still pending materialization are not listed.
+/// Requires the same active organization membership as getRun. Results are ordered by createdAt descending, then run ID descending. All filters are conjunctive. Repeat integrationContext for multiple exact key=value matches; split at the first equals sign. Context keys and values are private and must not be logged. definitionId keeps the runs created from that workflow definition, of every revision, and no run created by workflow path; a value that is not a workflow definition ID is a bad request, and an ID that names no definition of the organization lists nothing. A cursor is opaque and bound to the organization and exact filters. Run creation requests still pending materialization are not listed.
 pub fn list_runs(
     configuration: &configuration::Configuration,
     organization_ref: &str,
     limit: Option<i32>,
     cursor: Option<&str>,
     project_id: Option<&str>,
+    definition_id: Option<&str>,
     state_group: Option<&str>,
     created_after: Option<String>,
     integration_context: Option<Vec<String>>,
@@ -946,6 +947,7 @@ pub fn list_runs(
     let p_query_limit = limit;
     let p_query_cursor = cursor;
     let p_query_project_id = project_id;
+    let p_query_definition_id = definition_id;
     let p_query_state_group = state_group;
     let p_query_created_after = created_after;
     let p_query_integration_context = integration_context;
@@ -965,6 +967,9 @@ pub fn list_runs(
     }
     if let Some(ref param_value) = p_query_project_id {
         req_builder = req_builder.query(&[("projectId", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_definition_id {
+        req_builder = req_builder.query(&[("definitionId", &param_value.to_string())]);
     }
     if let Some(ref param_value) = p_query_state_group {
         req_builder = req_builder.query(&[("stateGroup", &param_value.to_string())]);
