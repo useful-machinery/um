@@ -38,7 +38,7 @@ pub struct WorkflowDefinitionEvaluation {
     pub event: Box<models::WorkflowDefinitionStartEvent>,
     #[serde(rename = "state")]
     pub state: State,
-    /// The closed reason code of the state, such as `rule_not_matched`, `owner_unresolved` or `input_type_invalid`; null when the state needs none. A `retry_waiting` evaluation retained for its subject by a `queueLatest` trigger carries the reason of the refusal it waits on, `subject_busy`, `subject_settled` or `active_run`, and `superseded` with `skipped` is an evaluation a newer one replaced.
+    /// The closed reason code of the state, such as `rule_not_matched`, `owner_unresolved` or `input_type_invalid`; null when the state needs none. A `retry_waiting` evaluation retained for its subject by a `queueLatest` trigger carries the reason of the refusal it waits on, `subject_busy`, `subject_settled` or `active_run`, and `superseded` with `skipped` is an evaluation a newer one replaced. A `retry_waiting` evaluation waiting for its issue's blockers carries `issue_blocked`, as does one `skipped` because it was still waiting at its expiry.
     #[serde(rename = "reason", deserialize_with = "Option::deserialize")]
     pub reason: Option<String>,
     /// What the latest attempt read and resolved; null before an attempt records any.
@@ -57,7 +57,7 @@ pub struct WorkflowDefinitionEvaluation {
     pub cycle_started_at: String,
     #[serde(rename = "cycleDeadline")]
     pub cycle_deadline: String,
-    /// When the next attempt is scheduled; null when no attempt is scheduled, which for a `retry_waiting` evaluation means it is retained until its subject is free.
+    /// When the next attempt is scheduled; null when no attempt is scheduled, which for a `retry_waiting` evaluation means it is retained until its subject is free. For one waiting for its issue's blockers (`issue_blocked`) it is the next read of the issue.
     #[serde(rename = "nextAttemptAt", deserialize_with = "Option::deserialize")]
     pub next_attempt_at: Option<String>,
     #[serde(rename = "acceptedAt")]
@@ -128,6 +128,8 @@ pub enum EventName {
     ScheduleDue,
     #[serde(rename = "push")]
     Push,
+    #[serde(rename = "issue.unblocked_in_state")]
+    IssueUnblockedInState,
 }
 
 impl Default for EventName {

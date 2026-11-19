@@ -15,8 +15,8 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// WorkflowDefinitionStartEvent : The event an evaluation pinned at acceptance: a Linear issue event for `issue.state_entered` and `issue.state_left`, Cloud's due time for `schedule.due`, the GitHub push for `push`.
-/// The event an evaluation pinned at acceptance: a Linear issue event for `issue.state_entered` and `issue.state_left`, Cloud's due time for `schedule.due`, the GitHub push for `push`.
+/// WorkflowDefinitionStartEvent : The event an evaluation pinned at acceptance: a Linear issue event for `issue.state_entered`, `issue.unblocked_in_state` and `issue.state_left`, Cloud's due time for `schedule.due`, the GitHub push for `push`.
+/// The event an evaluation pinned at acceptance: a Linear issue event for `issue.state_entered`, `issue.unblocked_in_state` and `issue.state_left`, Cloud's due time for `schedule.due`, the GitHub push for `push`.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum WorkflowDefinitionStartEvent {

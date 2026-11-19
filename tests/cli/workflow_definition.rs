@@ -2231,26 +2231,44 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
         .strip_prefix(&format!("GET {definitions}/"))
         .and_then(|rest| rest.split_once("/evaluations"))
     {
-        // As Cloud does (REQ-TRIGGER-166), the push evaluation is listed and read only under
-        // evaluation vocabulary 2.
-        let latest = request
+        // As Cloud does (REQ-TRIGGER-166), an evaluation is listed and read only under a
+        // vocabulary that holds its event: the push evaluation from 2, the
+        // `issue.unblocked_in_state` ones from 3; a request naming none is vocabulary 1.
+        let vocabulary = request
             .path
             .split_once('?')
-            .is_some_and(|(_, query)| query.split('&').any(|pair| pair == "vocabulary=2"));
+            .and_then(|(_, query)| {
+                query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("vocabulary="))
+            })
+            .map_or(1, |number| number.parse::<u32>().expect("a vocabulary"));
         let answer = match evaluation.strip_prefix('/') {
-            Some(CLOUD_PUSH_EVALUATION) if !latest => return gateway_not_found(),
+            Some(CLOUD_PUSH_EVALUATION) if vocabulary < 2 => return gateway_not_found(),
+            Some(CLOUD_WAITING_EVALUATION | CLOUD_UNBLOCKED_EVALUATION) if vocabulary < 3 => {
+                return gateway_not_found();
+            }
             Some(CLOUD_PUSH_EVALUATION) => gateway_push_evaluation(id),
+            Some(CLOUD_WAITING_EVALUATION) => gateway_waiting_evaluation(id),
+            Some(CLOUD_UNBLOCKED_EVALUATION) => gateway_unblocked_evaluation(id),
             Some(CLOUD_NOT_READY_EVALUATION) => gateway_not_ready_evaluation(id),
             Some(evaluation) => gateway_evaluation(id, evaluation),
             None => {
-                let mut items = vec![
+                let mut items = Vec::new();
+                if vocabulary >= 3 {
+                    items.extend([
+                        gateway_unblocked_evaluation(id),
+                        gateway_waiting_evaluation(id),
+                    ]);
+                }
+                if vocabulary >= 2 {
+                    items.push(gateway_push_evaluation(id));
+                }
+                items.extend([
                     gateway_evaluation(id, CLOUD_EVALUATION),
                     gateway_blocked_evaluation(id),
                     gateway_not_ready_evaluation(id),
-                ];
-                if latest {
-                    items.insert(0, gateway_push_evaluation(id));
-                }
+                ]);
                 json!({"items": items, "nextCursor": "older-evaluations"})
             }
         };
@@ -2399,7 +2417,7 @@ const CLOUD_PUSH_EVALUATION: &str = "wev_01k0z6r1w8f4jy2m7q9v3x5abf";
 const CLOUD_PUSH_COMMIT: &str = "9fceb02d0ae598e95dc970b74767f19372d61af8";
 
 /// The start evaluation of a push to `main` of definition `id`, newer than
-/// [`CLOUD_EVALUATION`], which Cloud shows only under evaluation vocabulary 2.
+/// [`CLOUD_EVALUATION`], which Cloud shows from evaluation vocabulary 2.
 fn gateway_push_evaluation(id: &str) -> Value {
     let mut evaluation = gateway_evaluation(id, CLOUD_PUSH_EVALUATION);
     evaluation["triggerName"] = json!("pushed");
@@ -2416,6 +2434,61 @@ fn gateway_push_evaluation(id: &str) -> Value {
         "projectBranch": true,
         "at": CLOUD_TIME,
     });
+    evaluation
+}
+
+const CLOUD_WAITING_EVALUATION: &str = "wev_01k0z6r1w8f4jy2m7q9v3x5abg";
+const CLOUD_UNBLOCKED_EVALUATION: &str = "wev_01k0z6r1w8f4jy2m7q9v3x5abh";
+const CLOUD_UNBLOCKED_RUN: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abh";
+const CLOUD_WAIT_SINCE: &str = "2026-11-10T09:30:00Z";
+const CLOUD_NEXT_READ: &str = "2026-11-10T12:05:00Z";
+
+/// An `issue.unblocked_in_state` evaluation `evaluation` of definition `id`, which Cloud
+/// shows from evaluation vocabulary 3, observed with `blocker_wait` (REQ-TRIGGER-181).
+fn gateway_blocker_wait_evaluation(id: &str, evaluation: &str, blocker_wait: Value) -> Value {
+    let mut evaluation = gateway_evaluation(id, evaluation);
+    evaluation["eventName"] = json!("issue.unblocked_in_state");
+    evaluation["event"]["from"] = json!("state-backlog");
+    evaluation["observations"] = json!({
+        "observedAt": CLOUD_TIME,
+        "rule": {"matched": true},
+        "blockerWait": blocker_wait,
+    });
+    evaluation
+}
+
+/// An unsettled evaluation of definition `id` waiting since [`CLOUD_WAIT_SINCE`] for two
+/// open blockers, one of which Cloud returned without an identifier.
+fn gateway_waiting_evaluation(id: &str) -> Value {
+    let mut evaluation = gateway_blocker_wait_evaluation(
+        id,
+        CLOUD_WAITING_EVALUATION,
+        json!({
+            "since": CLOUD_WAIT_SINCE,
+            "blockers": [
+                {"id": "issue-a", "identifier": "AUTO-2"},
+                {"id": "issue-c", "identifier": null},
+            ],
+        }),
+    );
+    evaluation["state"] = json!("retry_waiting");
+    evaluation["reason"] = json!("issue_blocked");
+    evaluation["nextAttemptAt"] = json!(CLOUD_NEXT_READ);
+    evaluation["settledAt"] = Value::Null;
+    evaluation
+}
+
+/// An evaluation of definition `id` that waited for its issue's blockers and created a run
+/// once none was open.
+fn gateway_unblocked_evaluation(id: &str) -> Value {
+    let mut evaluation = gateway_blocker_wait_evaluation(
+        id,
+        CLOUD_UNBLOCKED_EVALUATION,
+        json!({"since": CLOUD_WAIT_SINCE, "blockers": []}),
+    );
+    evaluation["state"] = json!("run_created");
+    evaluation["reason"] = Value::Null;
+    evaluation["runId"] = json!(CLOUD_UNBLOCKED_RUN);
     evaluation
 }
 
@@ -3883,7 +3956,7 @@ fn cloud_group_reports_the_stage_and_check_of_an_invalid_response() {
 }
 
 // REQ-CLOUDDEF-15: `evaluation list` sends its filters and page as typed and `evaluation
-// show` reads one evaluation, both asking for representation 2; both report each
+// show` reads one evaluation, both asking for representation 3; both report each
 // evaluation's state, stored reason and blocking run, `-` when it has none, and the
 // readiness blockers of an evaluation whose project was not ready.
 #[test]
@@ -3930,10 +4003,10 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
         [
             "cursor=page-2",
             "limit=5",
-            "representation=2",
+            "representation=3",
             &format!("runId={run_id}"),
             "state=failed",
-            "vocabulary=2"
+            "vocabulary=3"
         ]
     );
     let listed = report(&output);
@@ -3947,25 +4020,27 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
     assert_eq!(listed["definitionId"], definition.as_str());
     assert_eq!(listed["nextCursor"], "older-evaluations");
     let items = listed["evaluations"].as_array().expect("evaluations");
-    assert_eq!(items.len(), 4);
-    assert_eq!(
-        &items[1..],
-        &[
-            gateway_evaluation(&definition, CLOUD_EVALUATION),
-            gateway_blocked_evaluation(&definition),
-            gateway_not_ready_evaluation(&definition),
-        ]
+    let named = [
+        gateway_evaluation(&definition, CLOUD_EVALUATION),
+        gateway_blocked_evaluation(&definition),
+        gateway_not_ready_evaluation(&definition),
+    ];
+    assert!(
+        items.ends_with(&named),
+        "the oldest evaluations, in order: {listed}"
     );
     assert_eq!(
-        items[3]["observations"]["project"]["blockers"],
-        json!(["runner_pool_unassigned", "repository_detached"])
+        items
+            .last()
+            .map(|item| &item["observations"]["project"]["blockers"]),
+        Some(&json!(["runner_pool_unassigned", "repository_detached"]))
     );
 
     let (output, requests) = list(&[]);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(
         requests[0].path,
-        format!("{evaluations}?representation=2&vocabulary=2")
+        format!("{evaluations}?representation=3&vocabulary=3")
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_contains_all(
@@ -4026,7 +4101,7 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
             .map(|request| &request.path)
             .collect::<Vec<_>>(),
         [&format!(
-            "{evaluations}/{CLOUD_EVALUATION}?representation=2&vocabulary=2"
+            "{evaluations}/{CLOUD_EVALUATION}?representation=3&vocabulary=3"
         )]
     );
     let shown = report(&output);
@@ -4076,11 +4151,11 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
     assert!(home.workflow_entries().is_empty());
 }
 
-// REQ-CLOUDDEF-15, REQ-TRIGGER-166: `evaluation list` and `evaluation show` ask for evaluation
-// vocabulary 2, so a push evaluation is listed and read, printed as Cloud sent it under
-// `--json` and with its branch and commit in human output.
+// REQ-CLOUDDEF-15, REQ-TRIGGER-166: `evaluation list` and `evaluation show` ask for an
+// evaluation vocabulary that holds the push event, so a push evaluation is listed and read,
+// printed as Cloud sent it under `--json` and with its branch and commit in human output.
 #[test]
-fn cloud_evaluations_ask_for_vocabulary_2_and_show_a_push_with_its_branch_and_commit() {
+fn cloud_evaluations_list_and_show_a_push_with_its_branch_and_commit() {
     let home = Home::new();
     let gateway = FakeGateway::new();
     let definition = format!("{CLOUD_ID_STEM}c");
@@ -4112,7 +4187,7 @@ fn cloud_evaluations_ask_for_vocabulary_2_and_show_a_push_with_its_branch_and_co
     let (path, query) = requests[0].path.split_once('?').expect("a query");
     assert_eq!(path, evaluations);
     assert!(
-        query.split('&').any(|pair| pair == "vocabulary=2"),
+        query.split('&').any(|pair| pair == "vocabulary=3"),
         "{query}"
     );
     let listed = report(&output);
@@ -4125,7 +4200,7 @@ fn cloud_evaluations_ask_for_vocabulary_2_and_show_a_push_with_its_branch_and_co
     assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].path,
-        format!("{evaluations}/{CLOUD_PUSH_EVALUATION}?representation=2&vocabulary=2")
+        format!("{evaluations}/{CLOUD_PUSH_EVALUATION}?representation=3&vocabulary=3")
     );
     let shown = report(&output);
     assert_eq!(shown["outcome"], "shown", "{shown}");
@@ -4139,5 +4214,145 @@ fn cloud_evaluations_ask_for_vocabulary_2_and_show_a_push_with_its_branch_and_co
             &[CLOUD_PUSH_EVALUATION, "push", "main", CLOUD_PUSH_COMMIT],
         );
     }
+    assert!(home.workflow_entries().is_empty());
+}
+
+// REQ-CLOUDDEF-15, REQ-TRIGGER-165, REQ-TRIGGER-166, REQ-TRIGGER-181: `evaluation list` and
+// `evaluation show` ask for representation 3 and evaluation vocabulary 3, so an
+// `issue.unblocked_in_state` evaluation is listed and read, printed as Cloud sent it under
+// `--json` and in human output with its issue and its blocker wait: when the wait began and
+// the blockers still open, each by its identifier or else its Linear id.
+#[test]
+fn cloud_evaluations_ask_for_vocabulary_3_and_show_an_evaluation_with_its_blocker_wait() {
+    let home = Home::new();
+    let gateway = FakeGateway::new();
+    let definition = format!("{CLOUD_ID_STEM}c");
+    gateway.define(&definition, 2);
+    let evaluations = format!(
+        "/api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions/{definition}/evaluations"
+    );
+    let waiting = gateway_waiting_evaluation(&definition);
+    let unblocked = gateway_unblocked_evaluation(&definition);
+    let evaluation = |leaf: &str, extra: &[&str]| {
+        let mut all = vec![
+            "workflow",
+            "definition",
+            "cloud",
+            "evaluation",
+            leaf,
+            CLOUD_ORGANIZATION,
+            definition.as_str(),
+        ];
+        all.extend_from_slice(extra);
+        all.extend_from_slice(&["--project-id", CLOUD_PROJECT, "--allow-insecure-http"]);
+        let (output, requests) = gateway.run(&home, &all);
+        super::assert_no_secret_output(&output, &[CLOUD_TOKEN]);
+        (output, requests)
+    };
+
+    let (output, requests) = evaluation("list", &["--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(requests.len(), 1);
+    let (path, query) = requests[0].path.split_once('?').expect("a query");
+    assert_eq!(path, evaluations);
+    let mut pairs = query.split('&').collect::<Vec<_>>();
+    pairs.sort_unstable();
+    assert_eq!(pairs, ["representation=3", "vocabulary=3"]);
+    let listed = report(&output);
+    assert_eq!(listed["outcome"], "listed", "{listed}");
+    let items = listed["evaluations"].as_array().expect("evaluations");
+    assert!(items.contains(&waiting), "{listed}");
+    assert!(items.contains(&unblocked), "{listed}");
+    let listed_wait = |id: &str| {
+        items
+            .iter()
+            .find(|item| item["id"] == id)
+            .map(|item| item["observations"]["blockerWait"].clone())
+    };
+    assert_eq!(
+        listed_wait(CLOUD_WAITING_EVALUATION).map(|wait| wait["blockers"][1].clone()),
+        Some(json!({"id": "issue-c", "identifier": null}))
+    );
+    assert_eq!(
+        listed_wait(CLOUD_UNBLOCKED_EVALUATION).map(|wait| wait["blockers"].clone()),
+        Some(json!([]))
+    );
+
+    let (output, requests) = evaluation("show", &[CLOUD_WAITING_EVALUATION, "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].path,
+        format!("{evaluations}/{CLOUD_WAITING_EVALUATION}?representation=3&vocabulary=3")
+    );
+    let shown = report(&output);
+    assert_eq!(shown["outcome"], "shown", "{shown}");
+    assert_eq!(shown["evaluation"], waiting);
+
+    // The wait names when it began, then the open blockers, or `-` when none is open.
+    let assert_wait = |wait: &str, blockers: &str| {
+        let since = wait.find(CLOUD_WAIT_SINCE);
+        assert!(since.is_some(), "{wait}");
+        assert!(wait.ends_with(blockers), "{wait}");
+        assert!(since < Some(wait.len() - blockers.len()), "{wait}");
+    };
+
+    let (output, _) = evaluation("list", &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = |id: &str| {
+        stdout
+            .lines()
+            .find(|line| line.contains(id))
+            .unwrap_or_else(|| panic!("a line for {id}: {stdout}"))
+    };
+    let fields = |id: &str| line(id).split(" · ").collect::<Vec<_>>();
+    let event = fields(CLOUD_EVALUATION)
+        .iter()
+        .position(|field| *field == "issue.state_entered AUTO-7")
+        .unwrap_or_else(|| panic!("an event field: {stdout}"));
+    assert_eq!(
+        fields(CLOUD_WAITING_EVALUATION)[event],
+        "issue.unblocked_in_state AUTO-7"
+    );
+    assert_contains_all(
+        line(CLOUD_WAITING_EVALUATION),
+        &["retry_waiting", "issue_blocked"],
+    );
+    let listed_wait = |id: &str| {
+        line(id)
+            .split_once(" · blocker wait ")
+            .map(|(_, wait)| wait.to_owned())
+            .unwrap_or_else(|| panic!("a blocker wait for {id}: {stdout}"))
+    };
+    assert_wait(&listed_wait(CLOUD_WAITING_EVALUATION), "AUTO-2, issue-c");
+    assert_wait(&listed_wait(CLOUD_UNBLOCKED_EVALUATION), " -");
+    assert_eq!(
+        line(CLOUD_EVALUATION).rsplit(" · ").next(),
+        Some("blocking run -"),
+        "{stdout}"
+    );
+
+    let show = |id: &str| {
+        let (output, _) = evaluation("show", &[id]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let field = |stdout: &str, label: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix(label))
+            .map(str::to_owned)
+            .unwrap_or_else(|| panic!("a {label:?} line: {stdout}"))
+    };
+    let stdout = show(CLOUD_WAITING_EVALUATION);
+    assert_eq!(field(&stdout, "event: "), "issue.unblocked_in_state AUTO-7");
+    assert_wait(&field(&stdout, "blocker wait: "), "AUTO-2, issue-c");
+    assert_eq!(field(&stdout, "next attempt: "), CLOUD_NEXT_READ);
+    assert_wait(
+        &field(&show(CLOUD_UNBLOCKED_EVALUATION), "blocker wait: "),
+        " -",
+    );
+    assert_eq!(field(&show(CLOUD_EVALUATION), "blocker wait: "), "-");
     assert!(home.workflow_entries().is_empty());
 }

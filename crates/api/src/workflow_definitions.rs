@@ -45,12 +45,13 @@ const PROBLEM_TYPE_PREFIX: &str = "https://api.usefulmachinery.com/problems/";
 const DEFINITION_ID_PREFIX: &str = "def_";
 const EVALUATION_ID_PREFIX: &str = "wev_";
 /// The evaluation vocabulary this release decodes (REQ-TRIGGER-166): its evaluation models
-/// hold the push event beside the Linear issue events and the schedule's due time. A request
-/// that named none would be answered in the vocabulary of releases before the parameter.
-const EVALUATION_VOCABULARY: &str = "2";
+/// hold the push event and, from 3, `issue.unblocked_in_state` beside the other Linear issue
+/// events and the schedule's due time. A request that named none would be answered in the
+/// vocabulary of releases before the parameter.
+const EVALUATION_VOCABULARY: &str = "3";
 /// The evaluation representation whose members this release's generated model knows: 2
-/// adds `observations.project` (REQ-TRIGGER-165).
-const EVALUATION_REPRESENTATION: (&str, &str) = ("representation", "2");
+/// adds `observations.project` and 3 `observations.blockerWait` (REQ-TRIGGER-165).
+const EVALUATION_REPRESENTATION: (&str, &str) = ("representation", "3");
 
 /// One file of a tree to upload: its tree-relative path, bytes and owner-execute bit.
 #[derive(Clone, Copy)]
@@ -556,7 +557,7 @@ impl<'a> WorkflowDefinitionApi<'a> {
     }
 
     /// One page of definition `id`'s retained start evaluations, newest first, with the next
-    /// page's cursor (REQ-TRIGGER-132), in representation 2 (REQ-TRIGGER-165); `filter`,
+    /// page's cursor (REQ-TRIGGER-132), in representation 3 (REQ-TRIGGER-165); `filter`,
     /// `limit` and `cursor` select the page, and the request asks for `EVALUATION_VOCABULARY`.
     pub fn evaluations(
         &self,
@@ -589,7 +590,7 @@ impl<'a> WorkflowDefinitionApi<'a> {
     }
 
     /// The start evaluation `evaluation` of definition `id` (REQ-TRIGGER-132), in
-    /// representation 2 (REQ-TRIGGER-165) and asked for in `EVALUATION_VOCABULARY`.
+    /// representation 3 (REQ-TRIGGER-165) and asked for in `EVALUATION_VOCABULARY`.
     pub fn evaluation(
         &self,
         organization: &str,

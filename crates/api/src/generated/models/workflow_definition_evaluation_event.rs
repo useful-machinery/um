@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// WorkflowDefinitionEvaluationEvent : The derived event as pinned at acceptance, with Linear ids: `from` (null on a create) for `issue.state_entered`, `to` for `issue.state_left`.
+/// WorkflowDefinitionEvaluationEvent : The derived event as pinned at acceptance, with Linear ids: `from` (null on a create) for `issue.state_entered` and `issue.unblocked_in_state`, `to` for `issue.state_left`.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowDefinitionEvaluationEvent {
     #[serde(rename = "issue")]
@@ -47,7 +47,7 @@ pub struct WorkflowDefinitionEvaluationEvent {
 }
 
 impl WorkflowDefinitionEvaluationEvent {
-    /// The derived event as pinned at acceptance, with Linear ids: `from` (null on a create) for `issue.state_entered`, `to` for `issue.state_left`.
+    /// The derived event as pinned at acceptance, with Linear ids: `from` (null on a create) for `issue.state_entered` and `issue.unblocked_in_state`, `to` for `issue.state_left`.
     pub fn new(
         issue: models::WorkflowDefinitionEvaluationEventIssue,
         issue_updated_at: String,

@@ -1,8 +1,9 @@
 //! `useful workflow definition cloud evaluation list` and `show` (REQ-CLOUDDEF-15): a Cloud
-//! definition's retained start evaluations (REQ-TRIGGER-132) in evaluation vocabulary 2
+//! definition's retained start evaluations (REQ-TRIGGER-132) in evaluation vocabulary 3
 //! (REQ-TRIGGER-166), listed with the exact `state` and `runId` filters and read one at a
-//! time, each with its stored reason and what its event names: a Linear issue, or a push's
-//! branch and commit.
+//! time, each with its stored reason, what its event names (a Linear issue, or a push's
+//! branch and commit) and, when it waited for its issue's blockers, that blocker wait
+//! (REQ-TRIGGER-181).
 
 use std::io::{self, Write};
 
@@ -178,8 +179,9 @@ impl Show {
     }
 }
 
-/// One evaluation on a line: id, state with its reason, trigger, revision, event, run, the
-/// run blocking it and, when Cloud observed any, its project's readiness blockers.
+/// One evaluation on a line in vocabulary 3: id, state with its reason, trigger, revision,
+/// event, run, the run blocking it and, when Cloud observed them, its project's readiness
+/// blockers and its blocker wait.
 fn summary(evaluation: &WorkflowDefinitionEvaluation) -> String {
     let line = format!(
         "{} · {} · reason {} · trigger {} · revision {} · {} {} · accepted {} · run {} · blocking run {}",
@@ -194,8 +196,12 @@ fn summary(evaluation: &WorkflowDefinitionEvaluation) -> String {
         or_dash(evaluation.run_id.as_deref()),
         or_dash(evaluation.blocking_run_id.as_deref()),
     );
-    match project_blockers(evaluation) {
+    let line = match project_blockers(evaluation) {
         Some(blockers) => format!("{line} · project blockers {blockers}"),
+        None => line,
+    };
+    match blocker_wait(evaluation) {
+        Some(wait) => format!("{line} · blocker wait {wait}"),
         None => line,
     }
 }
@@ -236,6 +242,11 @@ fn write_evaluation(
         out,
         "project blockers: {}",
         project_blockers(evaluation).unwrap_or_else(|| "-".to_owned())
+    )?;
+    writeln!(
+        out,
+        "blocker wait: {}",
+        blocker_wait(evaluation).unwrap_or_else(|| "-".to_owned())
     )?;
     writeln!(
         out,
@@ -280,6 +291,26 @@ fn project_blockers(evaluation: &WorkflowDefinitionEvaluation) -> Option<String>
             .collect::<Vec<_>>()
             .join(", ")
     })
+}
+
+/// The wait Cloud observed for the evaluation's issue's blockers, as `since <since> · blocked
+/// by <blockers>`, each open blocker by its identifier or else its Linear id, `-` when none is
+/// open; `None` when the evaluation never waited (REQ-TRIGGER-181).
+fn blocker_wait(evaluation: &WorkflowDefinitionEvaluation) -> Option<String> {
+    let wait = evaluation.observations.as_ref()?.blocker_wait.as_ref()?;
+    let blockers = if wait.blockers.is_empty() {
+        "-".to_owned()
+    } else {
+        wait.blockers
+            .iter()
+            .map(|blocker| display(blocker.identifier.as_deref().unwrap_or(&blocker.id)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    Some(format!(
+        "since {} · blocked by {blockers}",
+        display(&wait.since)
+    ))
 }
 
 fn or_dash(value: Option<&str>) -> String {
