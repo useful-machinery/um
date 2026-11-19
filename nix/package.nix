@@ -46,16 +46,33 @@ let
   # build identity changes with every CLI source change and must not reach this
   # derivation, or the cached dependency artifacts would be invalidated by
   # every source change.
-  cargoArtifacts = craneLib.buildDepsOnly (
-    commonArgs
+  dependencyArgs = commonArgs // {
+    version = "0.0.0-deps";
+    # Keep the workspace's registry patch real when Crane stubs local crates.
+    extraDummyScript = ''
+      rm -rf "$out/vendor/rustls-platform-verifier"
+      cp -R ${../vendor/rustls-platform-verifier} "$out/vendor/rustls-platform-verifier"
+    '';
+  };
+
+  cargoArtifacts = craneLib.buildDepsOnly dependencyArgs;
+
+  testProfileEnv = {
+    CARGO_PROFILE_DEV_DEBUG = "0";
+    CARGO_PROFILE_TEST_DEBUG = "0";
+  };
+
+  # Test and release dependency artifacts use different compiler profiles.
+  # This input contains manifests and the patched vendor source. A workspace
+  # source change always rebuilds the real test binaries and runs nextest.
+  testCargoArtifacts = craneLib.buildDepsOnly (
+    dependencyArgs
     // {
-      version = "0.0.0-deps";
-      # Registry dependencies compile against this local patch, so its API must
-      # remain available while Crane replaces the application crates with stubs.
-      extraDummyScript = ''
-        rm -rf "$out/vendor/rustls-platform-verifier"
-        cp -R ${../vendor/rustls-platform-verifier} "$out/vendor/rustls-platform-verifier"
-      '';
+      pname = "useful-test";
+      CARGO_PROFILE = "";
+      env = testProfileEnv;
+      buildPhaseCargoCommand = "cargo build --locked --workspace --all-targets --all-features";
+      doCheck = false;
     }
   );
 
@@ -92,22 +109,12 @@ let
       # with debug assertions and overflow checks, as check-suite does
       # (INV-TESTING-23).
       CARGO_PROFILE = "";
-      # The package's dependency archive is a release build, which this
-      # build cannot use, so it is not taken.
-      cargoArtifacts = null;
+      cargoArtifacts = testCargoArtifacts;
       doInstallCargoArtifacts = false;
-      # preBuild's dev build and the test build share target/debug and its
-      # dependency artifacts because their debuginfo settings are equal.
-      # Debuginfo is off in both to keep the build directory small, which full
-      # debug symbols can exhaust on the validation host before the suite runs.
-      env = testArgs.env // {
-        CARGO_PROFILE_DEV_DEBUG = "0";
-        CARGO_PROFILE_TEST_DEBUG = "0";
-      };
-      # --all-targets builds the example as a test harness. Tests that spawn
-      # internal workers need the ordinary executable supplied explicitly.
+      env = testArgs.env // testProfileEnv;
+      # Tests that spawn internal workers need the ordinary example executable.
       preBuild = ''
-        cargo build --locked --workspace --all-features --bins --example internal-worker
+        cargo build --locked --workspace --all-targets --all-features
         export USEFUL_TEST_INTERNAL_WORKER_EXECUTABLE="$(realpath "''${CARGO_TARGET_DIR:-target}/debug/examples/internal-worker")"
       '';
     }
@@ -127,7 +134,7 @@ craneLib.buildPackage (
     };
 
     passthru = {
-      inherit cargoArtifacts nextestTests;
+      inherit cargoArtifacts nextestTests testCargoArtifacts;
     };
 
     postInstall = ''
