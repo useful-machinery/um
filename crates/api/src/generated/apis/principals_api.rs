@@ -2726,7 +2726,7 @@ pub fn revoke_grant_authorization(
     }
 }
 
-/// Explicitly provisions a human principal for the authenticated identity when the deployment's platform signup policy permits open signup. The request has no body; identity and optional profile attributes come only from verified access-token claims.  Idempotency-Key is required. Keys are scoped to the authenticated identity and this operation and are retained for seven days. Retrying with the same key returns the original 201 response without repeating the principal or audit-record mutation. After signup, a new key for the same identity receives a conflict response.  Problem types: 403 `signup-not-permitted`; 409 `principal-already-provisioned`.
+/// Explicitly provisions a human principal for the authenticated identity when the deployment's signup policy admits that identity: any authenticated human identity under `open`; under `invitation`, only an identity whose access token asserts a verified email that an outstanding, unexpired email invitation of an active organization is addressed to, the request naming no invitation; and none under `disabled`. The request has no body; identity and optional profile attributes come only from verified access-token claims.  Idempotency-Key is required. Keys are scoped to the authenticated identity and this operation and are retained for seven days. Retrying with the same key returns the original 201 response without repeating the principal or audit-record mutation. After signup, a new key for the same identity receives a conflict response.  Problem types: 403 `signup-not-permitted`; 409 `principal-already-provisioned`.
 pub fn signup_human(
     configuration: &configuration::Configuration,
     idempotency_key: &str,
