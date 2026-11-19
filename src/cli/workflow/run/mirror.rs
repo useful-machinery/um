@@ -1,7 +1,8 @@
 //! The run mirror (REQ-LOCALRUN-191, INV-ENGINE-25): which runs write to Linear and through
-//! what. A definition run of a root workflow that carries `mirror` gets a `Mirror` over its
-//! issue input, its revision's bindings snapshot and resolution record (REQ-WFDEF-32), its
-//! owner and id, its `external.url` or run directory and its run directory; the hook
+//! what. A definition run of a root workflow that carries `mirror`, its issue input not the
+//! empty text, gets a `Mirror` over its issue input, its revision's bindings snapshot and
+//! resolution record (REQ-WFDEF-32), its owner and id, its `external.url` or run directory
+//! and its run directory; a run whose issue input is the empty text has none. The hook
 //! sites in `create.rs`, `end.rs` and `resume.rs` drive it against the Linear target, and a
 //! write's result never changes the command's. A command that ends a run itself checks for a
 //! Linear credential first (`outcome_credentials`, REQ-LOCALRUN-204).
@@ -26,8 +27,9 @@ pub(super) type Hook =
     dyn FnOnce(&Mirror, &dyn MirrorTarget) -> Result<(), LocalRunDirectoryError> + Send;
 
 /// The run's mirror, or `None` when it writes nothing: its root has no `mirror` block, it was
-/// started by path (no definition or revision), or it is a child run, a nested run included,
-/// whose stages' `onStage` its root's mirror writes. A missing or non-text
+/// started by path (no definition or revision), it is a child run, a nested run included,
+/// whose stages' `onStage` its root's mirror writes, or its issue input is the empty text, as
+/// an optional input the run was not given resolves to (REQ-WFFORMAT-84). A missing or non-text
 /// issue input, or a snapshot or resolution record that cannot be read, still makes a
 /// `Mirror`, whose every hook records the failure. A revision with a resolution record
 /// makes a mirror that matches and writes states by id (REQ-LOCALRUN-192).
@@ -45,6 +47,7 @@ pub(super) fn mirror_for_run(
         return None;
     };
     let issue = match inputs.get(&block.issue) {
+        Some(ResolvedInput::Text(issue)) if issue.is_empty() => return None,
         Some(ResolvedInput::Text(issue)) => Ok(issue.to_string()),
         _ => Err(MirrorFailure::issue_unavailable(format!(
             "The run has no text input `{}` naming the issue.",

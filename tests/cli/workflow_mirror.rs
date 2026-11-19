@@ -1144,21 +1144,30 @@ impl MirroredWaitTree {
 
     /// A run for `ticket` whose `design` decided `verdict` and waits on `kind`.
     fn waiting_after(&self, stub: &LinearStub, ticket: &str, verdict: &str, kind: &str) -> PathBuf {
+        self.waiting_with(stub, &[("ticket", ticket)], verdict, kind)
+    }
+
+    /// A run given the text `inputs` whose `design` decided `verdict` and waits on `kind`.
+    fn waiting_with(
+        &self,
+        stub: &LinearStub,
+        inputs: &[(&str, &str)],
+        verdict: &str,
+        kind: &str,
+    ) -> PathBuf {
         decide(&self.bundle, "design", verdict);
         let execution_root = self.bundle.execution_root().to_str().unwrap().to_owned();
-        let terminal = completed(&self.run(
-            stub,
-            &[
-                "create",
-                &self.definition,
-                "--execution-root",
-                &execution_root,
-                "--input-text",
-                "ticket",
-                ticket,
-                "--json",
-            ],
-        ));
+        let mut args = vec![
+            "create",
+            &self.definition,
+            "--execution-root",
+            &execution_root,
+        ];
+        for (name, value) in inputs {
+            args.extend(["--input-text", name, value]);
+        }
+        args.push("--json");
+        let terminal = completed(&self.run(stub, &args));
         assert_eq!(terminal["wait"]["kind"], kind, "{terminal}");
         PathBuf::from(terminal["runDirectory"].as_str().unwrap())
     }
@@ -1829,6 +1838,58 @@ fn a_mirror_that_does_not_map_the_outcome_needs_no_key() {
     assert_eq!(document["outcome"], "withdrawn", "{document}");
     assert_eq!(run_record(&run)["outcome"], "withdrawn");
     assert_eq!(mirror_names(&run), writes);
+}
+
+// REQ-LOCALRUN-191, REQ-LOCALRUN-204: a run whose mirror `issue` input is the empty text, as
+// an optional input the run was not given resolves to, has no mirror: it passes `onStart`,
+// `onStage` and `onWait` sending Linear nothing and recording nothing, `show` lists no write,
+// and `withdraw` without the key ends it although `onOutcome` maps `withdrawn`. A run of the
+// same definition that gives the input mirrors as before.
+#[test]
+fn a_run_whose_issue_input_is_empty_has_no_mirror() {
+    let mut header = MIRRORED_WAIT_HEADER.to_owned();
+    for (from, to) in [
+        ("subject: ticket\n", "subject: topic\n"),
+        (
+            "inputs:\n  ticket:\n    kind: text\n",
+            "inputs:\n  topic:\n    kind: text\n  ticket:\n    kind: text\n    optional: true\n",
+        ),
+    ] {
+        assert!(header.contains(from), "{from}");
+        header = header.replacen(from, to, 1);
+    }
+    let tree = MirroredWaitTree::publish(&header);
+    let stub = LinearStub::start();
+
+    let run = tree.waiting_with(&stub, &[("topic", "first")], "blocked", "answer");
+    assert_eq!(stub.bodies(), Vec::<Value>::new());
+    assert!(!run.join("mirror").exists());
+    let path = run.to_str().unwrap();
+    assert_eq!(
+        shown_mirror(&tree.run(&stub, &["show", path])),
+        ["mirror: none"]
+    );
+    let document = shown_document(&tree.run(&stub, &["show", path, "--json"]));
+    assert_eq!(document["mirror"], json!([]), "{document}");
+
+    let output = tree.run_adjusted(&stub, &["withdraw", path, "--json"], without_key);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "withdrawn", "{record}");
+    assert!(!run.join("mirror").exists());
+    assert_eq!(stub.bodies(), Vec::<Value>::new());
+
+    let run = tree.waiting_with(
+        &stub,
+        &[("topic", "second"), ("ticket", "AUTO-7")],
+        "blocked",
+        "answer",
+    );
+    let writes = mirror_writes(&run);
+    let (name, write) = writes.first().unwrap();
+    assert_eq!(name, "0001-start.json", "{writes:?}");
+    assert_eq!(write["outcome"], "written", "{write}");
 }
 
 // REQ-LOCALRUN-204, REQ-CONTINUE-75: `resume` of a mirrored run whose repair wait a recorded
