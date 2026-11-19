@@ -381,6 +381,59 @@ fn validate_reports_the_roots_own_as_for_each_integration() {
     );
 }
 
+// REQ-WFDEF-14, REQ-WFDEF-34: a root that declares the token services `mergify` and
+// `buildkite` reports each with the `as` that applies to it, and otherwise validates and
+// publishes as the plain tree does, the digest apart.
+#[test]
+fn a_root_declaring_token_services_reports_them_and_publishes() {
+    let declared = Tree::with(
+        &declaring_integrations(
+            "  as: member\n  integrations: {mergify: {as: org}, buildkite: {}}\n",
+        ),
+        DESIGN_WORKFLOW,
+    );
+    let mut declared_report = valid_report(declared.path());
+    let mut plain_report = valid_report(Tree::engineering().path());
+    assert_eq!(
+        declared_report["requiresIntegrations"],
+        json!({"buildkite": {"as": "member"}, "mergify": {"as": "org"}})
+    );
+    for report in [&mut declared_report, &mut plain_report] {
+        let object = report.as_object_mut().unwrap();
+        object.remove("digest");
+        object.remove("tree");
+        object.remove("requiresIntegrations");
+    }
+    assert_eq!(declared_report, plain_report);
+
+    let home = Home::new();
+    let published = home.publish(&declared, &["--bindings", &declared.engineering_bindings()]);
+    assert_eq!(published["revision"]["n"], 1);
+    assert_eq!(published["definition"]["current"], 1);
+}
+
+// REQ-WFDEF-35: a stage file may override a token service the root declares, and
+// overriding one the root does not declare is `integration_undeclared`.
+#[test]
+fn a_stage_file_overrides_a_token_service_only_when_the_root_declares_it() {
+    let overriding =
+        format!("{DESIGN_WORKFLOW}requires:\n  integrations:\n    mergify: {{as: org}}\n");
+    let tree = Tree::with(
+        &declaring_integrations("  integrations: {mergify: {}}\n"),
+        &overriding,
+    );
+    let output = validate(tree.path(), true);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let (code, location) = single_rejection(
+        &declaring_integrations("  integrations: {buildkite: {}}\n"),
+        &overriding,
+    );
+    assert_eq!(code, "integration_undeclared");
+    assert_eq!(location["path"], "design.yaml");
+    assert_eq!(location["integration"], "mergify");
+}
+
 fn report_digest(output: &std::process::Output) -> String {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     report(output)["digest"]["value"]

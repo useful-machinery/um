@@ -76,7 +76,7 @@ impl DoctorCheck for AgentLoginsCheck {
             Ok(None) => {
                 return Outcome::fail(
                     "readiness_unknown",
-                    "The runner has recorded no agent-login readiness; start `useful runner serve` or run `useful runner grant sync`.",
+                    "The runner has recorded no agent-login readiness; start `useful runner serve` or run `useful runner integration sync`.",
                     BTreeMap::new(),
                 );
             }

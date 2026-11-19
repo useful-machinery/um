@@ -31,6 +31,22 @@ pub enum AcceptInvitationError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`authorize_organization_integration_token_runner`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AuthorizeOrganizationIntegrationTokenRunnerError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`cancel_organization_deletion`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -140,6 +156,19 @@ pub enum ListOrganizationAuditRecordsError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`list_organization_integration_tokens`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ListOrganizationIntegrationTokensError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`list_organization_invitations`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -213,6 +242,50 @@ pub enum RevokeInvitationError {
     Status404(models::Problem),
     Status409(models::Problem),
     Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`revoke_organization_integration_token`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RevokeOrganizationIntegrationTokenError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`revoke_organization_integration_token_authorization`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RevokeOrganizationIntegrationTokenAuthorizationError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`store_organization_integration_token`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StoreOrganizationIntegrationTokenError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
     UnknownValue(serde_json::Value),
 }
 
@@ -305,6 +378,81 @@ pub fn accept_invitation(
     } else {
         let content = resp.text()?;
         let entity: Option<AcceptInvitationError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Authorizes one runner registration of the organization to use one of the organization's integration tokens, and answers 201 with the authorization (REQ-INTEGRATION-5). A token is used on no runner until an owner authorizes that runner. Only an owner may authorize (REQ-INTEGRATION-3): another active member is answered 403 and a caller who is not an active member as any other read of the organization answers them. A token that is unknown, revoked, a member's or another organization's is `integration-token-not-found`; a runner that is unknown, deleted or of another organization is `integration-token-runner-not-found`; a token already authorized for the runner is `integration-token-already-authorized`. A token whose provider the deployment no longer serves as a token service is refused `provider-unavailable`.  Idempotency-Key is scoped to the exact acting OIDC identity, the organization and a semantic fingerprint containing integrationTokenId and runnerId. Exact replay returns the original created response. Reusing the key for another request conflicts.  Problem types: 404 `integration-token-not-found`, `integration-token-runner-not-found`; 409 `integration-token-already-authorized`; 503 `provider-unavailable`.
+pub fn authorize_organization_integration_token_runner(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    integration_token_id: &str,
+    idempotency_key: &str,
+    authorize_integration_token_runner_request: models::AuthorizeIntegrationTokenRunnerRequest,
+) -> Result<
+    models::IntegrationTokenAuthorization,
+    Error<AuthorizeOrganizationIntegrationTokenRunnerError>,
+> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_integration_token_id = integration_token_id;
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_authorize_integration_token_runner_request =
+        authorize_integration_token_runner_request;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/integration-tokens/{integrationTokenId}/authorizations",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        integrationTokenId = crate::generated::apis::urlencode(p_path_integration_token_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_authorize_integration_token_runner_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::IntegrationTokenAuthorization`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::IntegrationTokenAuthorization`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<AuthorizeOrganizationIntegrationTokenRunnerError> =
+            serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,
@@ -779,6 +927,76 @@ pub fn list_organization_audit_records(
     }
 }
 
+/// Returns one page of the organization's unrevoked integration tokens to any active member of it, oldest first by creation time and opaque token ID, each with its ID, provider, side `org`, the organization's ID, version, the member who stored the current version and when, its creation time and its authorizations in force, each with its runner's ID and name and that runner's organization (REQ-INTEGRATION-4). No answer carries a token, and no member's own token is listed. A caller who is not an active member is answered as any other read of the organization answers them. The cursor is opaque and may be used only with this operation. A deployment configured without the integration credential key answers `provider-unavailable` (REQ-INTEGRATION-1).  Problem types: 503 `provider-unavailable`.
+pub fn list_organization_integration_tokens(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    limit: Option<i32>,
+    cursor: Option<&str>,
+) -> Result<models::IntegrationTokenList, Error<ListOrganizationIntegrationTokensError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_query_limit = limit;
+    let p_query_cursor = cursor;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/integration-tokens",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref)
+    );
+    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
+
+    if let Some(ref param_value) = p_query_limit {
+        req_builder = req_builder.query(&[("limit", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_cursor {
+        req_builder = req_builder.query(&[("cursor", &param_value.to_string())]);
+    }
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::IntegrationTokenList`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::IntegrationTokenList`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<ListOrganizationIntegrationTokensError> =
+            serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
 /// Returns the active organization's invitation history oldest first. Only active owners may view target metadata and delivery state. The cursor is scoped to this operation and organization.
 pub fn list_organization_invitations(
     configuration: &configuration::Configuration,
@@ -1156,6 +1374,175 @@ pub fn revoke_invitation(
     } else {
         let content = resp.text()?;
         let entity: Option<RevokeInvitationError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Revokes one of the organization's integration tokens and answers 204; a token already revoked answers 204 too (REQ-INTEGRATION-6). The request accepts no body. The token is erased, every authorization of it ends and it is no longer listed; a token stored for the same provider afterwards is a new record at version 1. Revoking serves every provider, whether or not the deployment's table still holds it, and does not end the token at its service. Only an owner may revoke (REQ-INTEGRATION-3): another active member is answered 403 and a caller who is not an active member as any other read of the organization answers them. A token that is unknown, a member's or another organization's is `integration-token-not-found`.  Idempotency-Key is scoped to the exact acting OIDC identity, the organization and a semantic fingerprint containing integrationTokenId. Exact replay returns the original 204 response. Reusing the key for another token conflicts.  Problem types: 404 `integration-token-not-found`; 503 `provider-unavailable`.
+pub fn revoke_organization_integration_token(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    integration_token_id: &str,
+    idempotency_key: &str,
+) -> Result<(), Error<RevokeOrganizationIntegrationTokenError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_integration_token_id = integration_token_id;
+    let p_header_idempotency_key = idempotency_key;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/integration-tokens/{integrationTokenId}",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        integrationTokenId = crate::generated::apis::urlencode(p_path_integration_token_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::DELETE, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+
+    if !status.is_client_error() && !status.is_server_error() {
+        Ok(())
+    } else {
+        let content = resp.text()?;
+        let entity: Option<RevokeOrganizationIntegrationTokenError> =
+            serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Ends one authorization in force of one of the organization's integration tokens and answers 204; an authorization already ended answers 204 too (REQ-INTEGRATION-5). The request accepts no body. Ending one serves every provider, whether or not the deployment's table still holds it, and asks no run to stop. Only an owner may end one (REQ-INTEGRATION-3): another active member is answered 403 and a caller who is not an active member as any other read of the organization answers them. An authorization that is unknown or not on one of the organization's tokens is `integration-token-authorization-not-found`.  Idempotency-Key is scoped to the exact acting OIDC identity, the organization and a semantic fingerprint containing integrationTokenId and authorizationId. Exact replay returns the original 204 response. Reusing the key for another authorization conflicts.  Problem types: 404 `integration-token-authorization-not-found`; 503 `provider-unavailable`.
+pub fn revoke_organization_integration_token_authorization(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    integration_token_id: &str,
+    authorization_id: &str,
+    idempotency_key: &str,
+) -> Result<(), Error<RevokeOrganizationIntegrationTokenAuthorizationError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_integration_token_id = integration_token_id;
+    let p_path_authorization_id = authorization_id;
+    let p_header_idempotency_key = idempotency_key;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/integration-tokens/{integrationTokenId}/authorizations/{authorizationId}",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        integrationTokenId = crate::generated::apis::urlencode(p_path_integration_token_id),
+        authorizationId = crate::generated::apis::urlencode(p_path_authorization_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::DELETE, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+
+    if !status.is_client_error() && !status.is_server_error() {
+        Ok(())
+    } else {
+        let content = resp.text()?;
+        let entity: Option<RevokeOrganizationIntegrationTokenAuthorizationError> =
+            serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Stores the organization's token for one token service of the deployment's provider table, held sealed in Cloud custody, and answers 201 with the token's record at version 1, on side `org` with the organization's ID (REQ-INTEGRATION-3). The body and its rules are storeIntegrationToken's: a token outside the form is refused `integration-token-invalid` and no answer repeats it; where the organization already holds an unrevoked token of the provider, a request without `replace` true is refused `integration-token-exists` with nothing changed, and one with it stores the next version and answers 200. A provider that is not a token service of the deployment's table, and every request to a deployment without the integration credential key, is refused `provider-unavailable` (REQ-INTEGRATION-1).  Only an active human who is an owner of the organization may store or replace its token: another active member is answered 403 with nothing changed, and a caller who is not an active member is answered as any other read of the organization answers them. The token is the organization's, never the member's who stored it; `connectedBy` records who stored the current version and confers nothing.  Idempotency-Key is scoped to the exact acting OIDC identity, the organization and a semantic fingerprint containing provider, replace and a keyed digest of the token. Exact replay returns the original status with the token's record as it now is. Reusing the key for another request conflicts.  Problem types: 400 `integration-token-invalid`; 409 `integration-token-exists`; 503 `provider-unavailable`.
+pub fn store_organization_integration_token(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    idempotency_key: &str,
+    store_integration_token_request: models::StoreIntegrationTokenRequest,
+) -> Result<models::IntegrationToken, Error<StoreOrganizationIntegrationTokenError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_store_integration_token_request = store_integration_token_request;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/integration-tokens",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_store_integration_token_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::IntegrationToken`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::IntegrationToken`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<StoreOrganizationIntegrationTokenError> =
+            serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,

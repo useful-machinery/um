@@ -25,7 +25,7 @@ pub(super) struct Command {
 
 /// Who can use the agent login once a runner holds it (REQ-GRANT-35).
 impl Stated for Command {
-    const COMMAND: &'static str = "useful grant authorize";
+    const COMMAND: &'static str = "useful integration authorize";
     type Usage = crate::cli::grant::authorize::Command;
     const STATEMENT: Statement = Statement::Fixed(NATIVE_AUTHORIZE);
     const ACTION: &'static str = "to authorize the runner";

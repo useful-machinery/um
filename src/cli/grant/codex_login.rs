@@ -1,5 +1,5 @@
-//! A fresh Codex sign-in in a private temporary Codex home, which `useful grant create codex` and
-//! the earlier `import` and `reconnect` with `--login` run (REQ-GRANT-34, REQ-GRANT-70,
+//! A fresh Codex sign-in in a private temporary Codex home, which `useful integration connect
+//! codex` and the earlier `import` and `reconnect` with `--login` run (REQ-GRANT-34, REQ-GRANT-70,
 //! REQ-GRANT-74, INV-CLI-13).
 //!
 //! Only the provider's documented names are used: `codex login`, its device-code form
@@ -46,10 +46,10 @@ impl Failure {
     pub(in crate::cli) const fn remedy(&self) -> &'static str {
         match self {
             Self::NotFound => {
-                "Install Codex so that codex is on your PATH, or import an auth.json:\n  useful grant create codex --from-file PATH"
+                "Install Codex so that codex is on your PATH, or import an auth.json:\n  useful integration connect codex --from-file PATH"
             }
             _ => {
-                "Run the command again and complete the Codex sign-in, or import an auth.json:\n  useful grant create codex --from-file PATH"
+                "Run the command again and complete the Codex sign-in, or import an auth.json:\n  useful integration connect codex --from-file PATH"
             }
         }
     }

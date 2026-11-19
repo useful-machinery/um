@@ -1,23 +1,21 @@
-//! What `useful grant authorize` and `useful grant deauthorize` offer when given no `RUNNER`
-//! (REQ-GRANT-81): the runners they read, in the order they offer them, and the outcome when
-//! there is none to offer; and the runner they act on, named by `RUNNER` or chosen from the
-//! list where the command can prompt (REQ-GRANT-82, INV-CLI-16), or all of them chosen as
-//! one (REQ-GRANT-83).
+//! What `useful integration authorize` and `useful integration deauthorize` offer when given no
+//! `RUNNER` (REQ-GRANT-81), for a grant or a token (REQ-INTEGRATION-20): the runners they read,
+//! in the order they offer them, and the outcome when there is none to offer; and the runner they act on, named by `RUNNER` or chosen from the
+//! list where the command can prompt (REQ-GRANT-82, INV-CLI-16), or all of them chosen as one
+//! (REQ-GRANT-83).
 
 use std::collections::BTreeSet;
 
 use anyhow::Context;
 
 use crate::exit_code::ExitCode;
-use useful_api::{
-    MemberGrant, MemberGrantFailure, MemberGrantKind, MemberGrantProvider, RunnerFailure,
-    RunnerRegistration,
-};
+use useful_api::{MemberGrantFailure, MemberGrantProvider, RunnerFailure, RunnerRegistration};
 use useful_human_auth::Deployment;
 
 use super::super::PrincipalAuthenticationArgs;
+use super::authorization::Holder;
 use super::runner_picker::{self, Picked};
-use super::{Options, confirmation, every_page, organization, output, with_api};
+use super::{Options, Subject, confirmation, every_page, organization, output, with_api};
 
 // The largest page the runner registration list serves.
 const PAGE: u16 = 200;
@@ -100,12 +98,12 @@ impl Runner {
 pub(super) enum Nothing {
     /// The organizations it reads hold no runner.
     RunnerNotFound,
-    /// The grant is authorized for every runner of those organizations.
+    /// The grant or token is authorized for every runner of those organizations.
     AlreadyAuthorized,
     /// A Codex grant, which serves one runner at a time (REQ-GRANT-59), has an authorization in
     /// force.
     AuthorizedElsewhere,
-    /// The grant is authorized for no runner.
+    /// The grant or token is authorized for no runner.
     AuthorizationNotFound,
 }
 
@@ -117,23 +115,25 @@ pub(super) enum Offer {
     RunnerFailure(RunnerFailure),
 }
 
-/// The runners `authorize GRANT` offers: those of the grant's organization for a native grant,
-/// of every organization the member is an active member of for an OAuth grant, less those the
-/// grant is authorized for already. A Codex grant with an authorization in force is offered
+/// The runners `authorize INTEGRATION` offers: those of the grant's organization for a native
+/// grant and of the token's for an organization's token, of every organization the member is an
+/// active member of for an OAuth grant and for the member's token (REQ-INTEGRATION-20), less
+/// those it is authorized for already. A Codex grant with an authorization in force is offered
 /// none, and nothing is read.
 pub(super) fn to_authorize(
     deployment: &Deployment,
     options: &Options,
-    grant: &MemberGrant,
+    subject: &Subject,
 ) -> anyhow::Result<Offer> {
-    if grant.provider == MemberGrantProvider::GrantProviderCodex.as_str()
-        && !grant.authorizations.is_empty()
+    let in_force = subject.in_force();
+    if subject.provider() == MemberGrantProvider::GrantProviderCodex.as_str()
+        && !in_force.is_empty()
     {
         return Ok(Offer::Nothing(Nothing::AuthorizedElsewhere));
     }
-    let organizations = match grant.kind {
-        MemberGrantKind::GrantKindNative => grant.organization_id.iter().cloned().collect(),
-        MemberGrantKind::GrantKindOAuth => match active_organizations(deployment, options)? {
+    let organizations = match subject.serving() {
+        Some(organizations) => organizations,
+        None => match active_organizations(deployment, options)? {
             Ok(organizations) => organizations,
             Err(failure) => return Ok(Offer::GrantFailure(failure)),
         },
@@ -145,8 +145,7 @@ pub(super) fn to_authorize(
             runners
                 .into_iter()
                 .filter(|runner| {
-                    !grant
-                        .authorizations
+                    !in_force
                         .iter()
                         .any(|authorization| authorization.runner_id == runner.id)
                 })
@@ -157,14 +156,19 @@ pub(super) fn to_authorize(
 }
 
 /// The runners `authorize --all` offers: those of every organization the member is an active
-/// member of.
+/// member of, or with `--org` those of the organization `org` names alone, whose tokens it
+/// authorizes the runner for (REQ-INTEGRATION-20).
 pub(super) fn to_authorize_all(
     deployment: &Deployment,
     options: &Options,
+    org: Option<&str>,
 ) -> anyhow::Result<Offer> {
-    let organizations = match active_organizations(deployment, options)? {
-        Ok(organizations) => organizations,
-        Err(failure) => return Ok(Offer::GrantFailure(failure)),
+    let organizations = match org {
+        Some(org) => BTreeSet::from([org.to_owned()]),
+        None => match active_organizations(deployment, options)? {
+            Ok(organizations) => organizations,
+            Err(failure) => return Ok(Offer::GrantFailure(failure)),
+        },
     };
     Ok(match registered(deployment, options, &organizations)? {
         Err(failure) => Offer::RunnerFailure(failure),
@@ -172,28 +176,27 @@ pub(super) fn to_authorize_all(
     })
 }
 
-/// The runners `deauthorize` offers: those the grant is authorized for, each with the
+/// The runners `deauthorize` offers: those the grant or token is authorized for, each with the
 /// registration read from its authorization's organization, or by its ID alone when there is
-/// none. A grant authorized for no runner is offered none, and nothing is read.
+/// none. A grant or token authorized for no runner is offered none, and nothing is read.
 pub(super) fn to_deauthorize(
     deployment: &Deployment,
     options: &Options,
-    grant: &MemberGrant,
+    subject: &Subject,
 ) -> anyhow::Result<Offer> {
-    if grant.authorizations.is_empty() {
+    let in_force = subject.in_force();
+    if in_force.is_empty() {
         return Ok(Offer::Nothing(Nothing::AuthorizationNotFound));
     }
-    let organizations = grant
-        .authorizations
+    let organizations = in_force
         .iter()
-        .map(|authorization| authorization.organization_id.clone())
+        .map(|authorization| authorization.organization_id.to_owned())
         .collect();
     let mut registered = match registered(deployment, options, &organizations)? {
         Ok(registered) => registered,
         Err(failure) => return Ok(Offer::RunnerFailure(failure)),
     };
-    let runners = grant
-        .authorizations
+    let runners = in_force
         .iter()
         .map(|authorization| {
             match registered
@@ -202,8 +205,8 @@ pub(super) fn to_deauthorize(
             {
                 Some(index) => registered.swap_remove(index),
                 None => Runner {
-                    id: authorization.runner_id.clone(),
-                    organization_id: authorization.organization_id.clone(),
+                    id: authorization.runner_id.to_owned(),
+                    organization_id: authorization.organization_id.to_owned(),
                     registration: None,
                 },
             }
@@ -270,14 +273,14 @@ pub(super) fn choose(
     json: bool,
     yes: bool,
     offer: Offer,
-    grant_id: Option<&str>,
+    holder: Option<Holder<'_>>,
     purpose: &str,
     example: impl FnOnce(&str) -> String,
 ) -> anyhow::Result<Result<Acting, ExitCode>> {
     let pick = |message: &str, runners| {
         Ok(runner_picker::pick(message, runners)?.map(|runner| Acting::chosen(runner, yes)))
     };
-    choose_with(deployment, json, offer, grant_id, purpose, example, pick)
+    choose_with(deployment, json, offer, holder, purpose, example, pick)
 }
 
 /// What a command given no `RUNNER` acts on as [`choose`] says, where the list also offers
@@ -287,7 +290,7 @@ pub(super) fn choose_one_or_all(
     json: bool,
     yes: bool,
     offer: Offer,
-    grant_id: Option<&str>,
+    holder: Option<Holder<'_>>,
     purpose: &str,
     example: impl FnOnce(&str) -> String,
 ) -> anyhow::Result<Result<Chosen, ExitCode>> {
@@ -308,7 +311,7 @@ pub(super) fn choose_one_or_all(
             }),
         )
     };
-    choose_with(deployment, json, offer, grant_id, purpose, example, pick)
+    choose_with(deployment, json, offer, holder, purpose, example, pick)
 }
 
 /// Where the command can prompt, what `pick` yields from the list of `offer`'s runners, which
@@ -317,7 +320,7 @@ fn choose_with<T>(
     deployment: &Deployment,
     json: bool,
     offer: Offer,
-    grant_id: Option<&str>,
+    holder: Option<Holder<'_>>,
     purpose: &str,
     example: impl FnOnce(&str) -> String,
     pick: impl FnOnce(&str, Vec<Runner>) -> anyhow::Result<Result<T, ExitCode>>,
@@ -326,7 +329,7 @@ fn choose_with<T>(
         Offer::Runners(runners) if !json && confirmation::can_ask() => {
             pick(&format!("Runner {purpose}:"), runners)
         }
-        offer => refuse(deployment, json, offer, grant_id, purpose, example).map(Err),
+        offer => refuse(deployment, json, offer, holder, purpose, example).map(Err),
     }
 }
 
@@ -338,7 +341,7 @@ fn refuse(
     deployment: &Deployment,
     json: bool,
     offer: Offer,
-    grant_id: Option<&str>,
+    holder: Option<Holder<'_>>,
     purpose: &str,
     example: impl FnOnce(&str) -> String,
 ) -> anyhow::Result<ExitCode> {
@@ -347,9 +350,14 @@ fn refuse(
         Offer::Runners(runners) => {
             let example = example(runners.first().map_or("RUNNER", |runner| &runner.id));
             let diagnostic = format!("name the runner {purpose}");
-            output::write_runner_required(api_url, grant_id, &runners, &diagnostic, &example, json)
+            output::write_runner_required(api_url, holder, &runners, &diagnostic, &example, json)
         }
-        Offer::Nothing(nothing) => output::write_nothing_offered(api_url, nothing, json),
+        Offer::Nothing(nothing) => output::write_nothing_offered(
+            api_url,
+            nothing,
+            holder.map_or("grant", Holder::noun),
+            json,
+        ),
         Offer::GrantFailure(failure) => output::failure(api_url, &failure, json),
         Offer::RunnerFailure(failure) => super::super::runner::write_failure(
             deployment,

@@ -1036,6 +1036,13 @@ impl AgentLoginCloud for ObservingCloud {
         self.inner.grant_providers(request)
     }
 
+    fn token_services(
+        &self,
+        request: &GrantProvidersRequest,
+    ) -> Result<Vec<ListedProvider>, GrantProvidersFailure> {
+        self.inner.token_services(request)
+    }
+
     fn credential_sources(
         &self,
         request: &CredentialSourcesRequest,
@@ -2128,7 +2135,7 @@ async fn a_use_is_stated_to_cloud_only_beside_a_ready_install() {
 }
 
 impl Fixture {
-    /// A setup `useful runner grant sync` asked for.
+    /// A setup `useful runner integration sync` asked for.
     async fn sync(&self) -> SetupAnswer {
         self.setup.set_up(SetupCaller::Sync).await
     }
@@ -2526,6 +2533,7 @@ fn a_credential_source_report_cloud_does_not_take_is_recorded_unless_cloud_lacks
             grant_id: Some(crate::service::FAKE_GRANT_ID.to_owned()),
             agent_login_id: None,
         }],
+        token_services: Vec::new(),
     };
 
     // A report Cloud records, and one a Cloud without the route answers,

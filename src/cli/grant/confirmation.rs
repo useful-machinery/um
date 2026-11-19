@@ -1,6 +1,6 @@
-//! The statement a leaf makes before it acts on a grant, and its `--yes`, which refuses a
-//! missing confirmation with that statement. `useful grant` and the earlier commands it replaces
-//! share them. The `[y/N]` question every grant command asks on a terminal is here too.
+//! The statement a leaf makes before it acts on a grant or a token, and its `--yes`, which refuses
+//! a missing confirmation with that statement. `useful integration` and the earlier commands it
+//! replaces share them. The `[y/N]` question every grant command asks on a terminal is here too.
 
 use std::fmt;
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -10,7 +10,7 @@ use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{ArgAction, ArgMatches, Args, FromArgMatches};
 
 use crate::exit_code::ExitCode;
-use useful_api::MemberGrantKind;
+use useful_api::{IntegrationTokenSide, MemberGrantKind};
 
 /// Who can use a native grant once a runner holds it (REQ-GRANT-35, REQ-GRANT-66).
 pub(in crate::cli) const NATIVE_AUTHORIZE: &[&str] = &[
@@ -29,51 +29,109 @@ pub(in crate::cli) const NATIVE_REVOKE: &[&str] = &[
      member started it",
 ];
 
-/// What acting does: the same for every subject, or, for a leaf of `useful grant`, by the kind of
-/// the grant it acts on, which the leaf knows only once it has read the grant.
+/// What a statement depends on: the kind of the grant a leaf acts on, or the side of the token,
+/// the member's or an organization's (REQ-INTEGRATION-20).
+#[derive(Clone, Copy)]
+pub(in crate::cli) enum Kind {
+    Grant(MemberGrantKind),
+    Token(IntegrationTokenSide),
+}
+
+impl Kind {
+    /// The grants of either kind, which `useful grant` reaches.
+    pub(super) const GRANTS: [Self; 2] = [
+        Self::Grant(MemberGrantKind::GrantKindOAuth),
+        Self::Grant(MemberGrantKind::GrantKindNative),
+    ];
+    /// Every kind, which a refusal made before anything is read states.
+    const ALL: [Self; 4] = [
+        Self::Grant(MemberGrantKind::GrantKindOAuth),
+        Self::Grant(MemberGrantKind::GrantKindNative),
+        Self::Token(IntegrationTokenSide::IntegrationTokenSideMember),
+        Self::Token(IntegrationTokenSide::IntegrationTokenSideOrg),
+    ];
+}
+
+/// What acting does: the same for every subject, or, for a leaf of `useful integration`, by the
+/// kind of the grant it acts on or the side of the token, which the leaf knows only once it has
+/// read what the name names.
 pub(in crate::cli) enum Statement {
     Fixed(&'static [&'static str]),
     ByKind {
         oauth: &'static [&'static str],
         native: &'static [&'static str],
+        /// The member's own token.
+        token: &'static [&'static str],
+        /// An organization's token.
+        org_token: &'static [&'static str],
     },
 }
 
 impl Statement {
-    /// The lines that state what acting on a grant of `kind` does.
-    pub(in crate::cli) const fn of(&self, kind: MemberGrantKind) -> &'static [&'static str] {
+    /// The lines that state what acting on a subject of `kind` does.
+    pub(in crate::cli) const fn of(&self, kind: Kind) -> &'static [&'static str] {
         match (self, kind) {
             (Self::Fixed(lines), _)
-            | (Self::ByKind { oauth: lines, .. }, MemberGrantKind::GrantKindOAuth)
-            | (Self::ByKind { native: lines, .. }, MemberGrantKind::GrantKindNative) => lines,
+            | (Self::ByKind { oauth: lines, .. }, Kind::Grant(MemberGrantKind::GrantKindOAuth))
+            | (Self::ByKind { native: lines, .. }, Kind::Grant(MemberGrantKind::GrantKindNative))
+            | (
+                Self::ByKind { token: lines, .. },
+                Kind::Token(IntegrationTokenSide::IntegrationTokenSideMember),
+            )
+            | (
+                Self::ByKind {
+                    org_token: lines, ..
+                },
+                Kind::Token(IntegrationTokenSide::IntegrationTokenSideOrg),
+            ) => lines,
         }
     }
 
-    /// Every line, each attributed to its kind where the statement depends on it: a refusal
-    /// made before anything is read states both.
-    pub(super) fn every_line(&self) -> Vec<String> {
-        match self {
-            Self::Fixed(lines) => lines.iter().map(|&line| line.to_owned()).collect(),
-            Self::ByKind { oauth, native } => oauth
-                .iter()
-                .map(|line| format!("for an OAuth grant, {line}"))
-                .chain(
-                    native
-                        .iter()
-                        .map(|line| format!("for a native grant, {line}")),
-                )
-                .collect(),
+    /// The lines that state what acting on a subject of any of `kinds` does, each attributed to
+    /// its kind where the statement depends on it; a token's lines that are the same for either
+    /// side are stated once, of a token.
+    pub(in crate::cli) fn lines_of(&self, kinds: &[Kind]) -> Vec<String> {
+        let (token, org_token) = match self {
+            Self::Fixed(lines) => return lines.iter().map(|&line| line.to_owned()).collect(),
+            Self::ByKind {
+                token, org_token, ..
+            } => (token, org_token),
+        };
+        let mut lines: Vec<String> = Vec::new();
+        for &kind in kinds {
+            let subject = match kind {
+                Kind::Grant(MemberGrantKind::GrantKindOAuth) => "an OAuth grant",
+                Kind::Grant(MemberGrantKind::GrantKindNative) => "a native grant",
+                Kind::Token(_) if token == org_token => "a token",
+                Kind::Token(IntegrationTokenSide::IntegrationTokenSideMember) => "your token",
+                Kind::Token(IntegrationTokenSide::IntegrationTokenSideOrg) => {
+                    "an organization's token"
+                }
+            };
+            for line in self.of(kind) {
+                let line = format!("for {subject}, {line}");
+                if !lines.contains(&line) {
+                    lines.push(line);
+                }
+            }
         }
+        lines
+    }
+
+    /// Every line, each attributed to its kind where the statement depends on it: a refusal
+    /// made before anything is read states them all.
+    pub(super) fn every_line(&self) -> Vec<String> {
+        self.lines_of(&Kind::ALL)
     }
 }
 
 /// A leaf that states what acting does before it acts, and in place of acting when `--yes` is
-/// missing: `authorize` who can use the grant (REQ-GRANT-35, REQ-GRANT-66), `revoke` and
-/// `deauthorize` the runs that will be asked to stop (REQ-GRANT-30, REQ-GRANT-35,
-/// REQ-GRANT-67, REQ-GRANT-68).
+/// missing: `authorize` who can use the grant or the token (REQ-GRANT-35, REQ-GRANT-66,
+/// REQ-INTEGRATION-20), `revoke` and `deauthorize` the runs that will be asked to stop or lose
+/// the token (REQ-GRANT-30, REQ-GRANT-35, REQ-GRANT-67, REQ-GRANT-68).
 pub(in crate::cli) trait Stated: Args {
     /// The command path the refusal's usage names: the leaf's, or for an earlier leaf the
-    /// `useful grant` leaf that replaces it (REQ-GRANT-77).
+    /// `useful integration` leaf that replaces it (REQ-GRANT-77, REQ-INTEGRATION-15).
     const COMMAND: &'static str;
     /// The arguments of the leaf at `COMMAND`, which the usage shows.
     type Usage: Args;

@@ -134,6 +134,10 @@ pub enum Field {
     Retryable,
     #[serde(rename = "no_effect_reason")]
     NoEffectReason,
+    #[serde(rename = "provider")]
+    Provider,
+    #[serde(rename = "runner_id")]
+    RunnerId,
 }
 
 impl Default for Field {

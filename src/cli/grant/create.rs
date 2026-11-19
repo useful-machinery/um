@@ -7,12 +7,13 @@ use anyhow::{Context, anyhow};
 use clap::{ArgGroup, Args};
 use zeroize::Zeroizing;
 
+use crate::cli::integration::{OrganizationSignIn, Reach};
 use crate::cli::runner::doctor::roots::Roots;
 use crate::cli::{CommandFailure, HttpOptions, NoAuthenticationArgs, OrganizationArg};
 use crate::exit_code::ExitCode;
 use useful_api::{
     MemberGrant, MemberGrantApi, MemberGrantFailure, MemberGrantKind, MemberGrantProvider,
-    ServedGrantProvider,
+    ServedGrantProvider, ServedTokenService,
 };
 use useful_human_auth::Deployment;
 use useful_runner::{CredentialKind, WorkflowCredentials};
@@ -31,11 +32,11 @@ pub(super) const ABOUT: &str = "Create a grant through the provider's own sign-i
 #[derive(Debug, Args)]
 #[command(group(ArgGroup::new("source").multiple(false)))]
 #[command(group(ArgGroup::new("replaces").args(["provider", "workflows"]).multiple(true)))]
-pub(super) struct Command {
+pub(in crate::cli) struct Command {
     #[arg(
         value_name = "PROVIDER",
         value_parser = parse_provider,
-        help = "Provider to sign in to: github, gitlab.com, linear, claude_code, codex or the id of another OAuth provider your deployment serves; without one, each provider you hold no grant of"
+        help = "Service to connect: github, gitlab.com, linear, claude_code, codex or the id of another OAuth provider or token service your deployment serves; without one, each provider you hold no grant of"
     )]
     provider: Option<ProviderName>,
 
@@ -86,7 +87,7 @@ pub(super) struct Command {
         value_name = "PATH",
         group = "source",
         requires = "provider",
-        help = "Read a Codex auth.json from an owned mode-0600 file, or - for standard input"
+        help = "Read a Codex auth.json or a token service's token from an owned mode-0600 file, or - for standard input"
     )]
     from_file: Option<PathBuf>,
 
@@ -123,9 +124,9 @@ pub(super) struct Command {
     options: Options,
 }
 
-/// What the flow of `useful grant create` reads of the command that runs it, besides the providers:
-/// `useful grant create` builds it from its options, and `useful runner doctor --workflow --connect`
-/// from its own, taking the defaults for the rest (INV-CLI-15).
+/// What the flow of `useful integration connect` reads of the command that runs it, besides the
+/// providers: `useful integration connect` builds it from its options, and `useful runner doctor
+/// --workflow --connect` from its own, taking the defaults for the rest (INV-CLI-15).
 #[derive(Default)]
 pub(in crate::cli) struct Flow<'a> {
     /// Whether each line printed is a JSON event.
@@ -160,7 +161,7 @@ impl Ending {
     }
 }
 
-/// A provider `useful grant create` has a built-in name for.
+/// A provider `useful integration connect` has a built-in name for.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderArg {
     Github,
@@ -170,9 +171,9 @@ enum ProviderArg {
     Codex,
 }
 
-/// The `PROVIDER` `useful grant create` is given (REQ-GRANT-69): one of the five it has a built-in
-/// name for, or any other provider id, taken for an OAuth provider the deployment serves, which
-/// the command reads before it begins anything.
+/// The `PROVIDER` `useful integration connect` is given (REQ-GRANT-69): one of the five it has a
+/// built-in name for, or any other provider id, taken for an OAuth provider the deployment serves,
+/// which the command reads before it begins anything.
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum ProviderName {
     BuiltIn(ProviderArg),
@@ -190,7 +191,7 @@ fn parse_provider(value: &str) -> Result<ProviderName, String> {
     }
     Err(
         "provider must be github, gitlab.com, linear, claude_code or codex, or the id of another \
-         OAuth provider your deployment serves, as useful grant list shows it"
+         OAuth provider your deployment serves, as useful integration list shows it"
             .to_owned(),
     )
 }
@@ -227,8 +228,8 @@ impl NamedProvider {
     }
 }
 
-/// A provider in the order `useful grant create` signs in to several in: one of the five it has
-/// a built-in name for, or another OAuth provider the deployment serves (REQ-GRANT-75).
+/// A provider in the order `useful integration connect` signs in to several in: one of the five it
+/// has a built-in name for, or another OAuth provider the deployment serves (REQ-GRANT-75).
 enum Ordered {
     BuiltIn(ProviderArg),
     Served(NamedProvider),
@@ -252,7 +253,7 @@ impl Ordered {
     }
 }
 
-/// The order `useful grant create` signs in to several providers in (REQ-GRANT-75), that of
+/// The order `useful integration connect` signs in to several providers in (REQ-GRANT-75), that of
 /// [`projection::providers`] for the providers `served` names: the OAuth providers first,
 /// whose consents need only a browser anywhere, the deployment's other OAuth providers after
 /// the built-in ones, then the coding agents, whose sign-ins run on this machine.
@@ -335,15 +336,16 @@ impl ProviderArg {
     }
 
     /// The provider whose grant a kind a workflow calls for names; `gitlab` is GitLab.com
-    /// (REQ-GRANT-76).
-    const fn of_kind(kind: CredentialKind) -> Self {
-        match kind {
+    /// (REQ-GRANT-76). A token service has none (REQ-CREDREADY-29).
+    const fn of_kind(kind: CredentialKind) -> Option<Self> {
+        Some(match kind {
             CredentialKind::Github => Self::Github,
             CredentialKind::Gitlab => Self::GitlabCom,
             CredentialKind::Linear => Self::Linear,
             CredentialKind::ClaudeCode => Self::ClaudeCode,
             CredentialKind::Codex => Self::Codex,
-        }
+            CredentialKind::Mergify | CredentialKind::Buildkite => return None,
+        })
     }
 }
 
@@ -616,6 +618,57 @@ fn first_given<const N: usize>(options: [(bool, &'static str); N]) -> Option<&'s
         .find_map(|(given, option)| given.then_some(option))
 }
 
+/// A usage error, exit 2, saying `message`.
+fn usage(message: String) -> CommandFailure {
+    CommandFailure::with_exit_code(anyhow!(message), ExitCode::UsageError)
+}
+
+/// The usage error of `option` given for the service `name`, which does not take it, with
+/// `remedy`.
+fn unsuited(option: &str, name: &str, remedy: &str) -> CommandFailure {
+    usage(format!("{option} does not apply to {name}\n\n{remedy}"))
+}
+
+/// The OAuth provider with no built-in name `name` names among those `served` lists
+/// (REQ-GRANT-69), or the refusal of a name it does not list as one, exit 2, which names the
+/// providers that can be given and, where `token_services` holds the token services served
+/// because they are in reach, after them those (REQ-INTEGRATION-16).
+fn served_oauth(
+    name: &str,
+    served: &[ServedGrantProvider],
+    token_services: Option<&[ServedTokenService]>,
+) -> Result<NamedProvider, CommandFailure> {
+    if let Some(provider) = served
+        .iter()
+        .filter_map(NamedProvider::of)
+        .find(|provider| provider.name == name)
+    {
+        return Ok(provider);
+    }
+    // The built-in OAuth providers, the served ones, the coding agents, then the token
+    // services.
+    let mut given: Vec<_> = projection::providers(served)
+        .into_iter()
+        .map(Provider::name)
+        .chain(
+            token_services
+                .unwrap_or_default()
+                .iter()
+                .map(|service| service.name.as_str()),
+        )
+        .collect();
+    let last = given.pop().unwrap_or_default();
+    let served_as = match token_services {
+        Some(_) => "an OAuth provider or a token service",
+        None => "an OAuth provider",
+    };
+    Err(usage(format!(
+        "this deployment does not serve {name} as {served_as}\n\n\
+         Name {} or {last} instead:\n  useful integration connect PROVIDER",
+        given.join(", ")
+    )))
+}
+
 /// The exit status of several sign-ins (REQ-GRANT-75): a signal's when one stopped them, 1 when
 /// any failed or when every one was passed over, as unavailable, for want of an organization or
 /// as needing reconnecting (REQ-GRANT-79), and otherwise 0, as when there were none.
@@ -650,8 +703,12 @@ impl Command {
     /// provider outside the five once the deployment is found to serve it (REQ-GRANT-69), or by
     /// importing a coding agent's login (REQ-GRANT-70, REQ-GRANT-71).
     /// Without it, makes a grant of each provider the member lacks (REQ-GRANT-75), or with
-    /// `--workflow` of each the workflows call for (REQ-GRANT-76).
-    pub(super) fn run(self, deployment: &Deployment) -> super::super::CommandResult {
+    /// `--workflow` of each the workflows call for (REQ-GRANT-76). Where `reach` puts token
+    /// services in reach, under `useful integration`, a name outside the five is read for first,
+    /// and may be a token service's (REQ-INTEGRATION-16); with `--org`, `github` and `linear`
+    /// connect the organization (REQ-INTEGRATION-21) and the other three of the five refuse it,
+    /// before anything is read or sent (REQ-INTEGRATION-17).
+    pub(super) fn run(self, deployment: &Deployment, reach: &Reach) -> super::super::CommandResult {
         let flow = self.flow();
         let Some(provider) = &self.provider else {
             if !self.workflows.is_empty() {
@@ -663,6 +720,15 @@ impl Command {
                 Err(refused) => Ok(refused),
             };
         };
+        match provider {
+            ProviderName::BuiltIn(built_in) if reach.org().is_some() => {
+                return self.connect_organization(deployment, *built_in, reach);
+            }
+            ProviderName::Other(name) if reach.tokens() => {
+                return self.connect_served(deployment, provider, name, reach);
+            }
+            _ => {}
+        }
         match self.sign_in(provider)? {
             SignIn::Consent(consent) => flow.replace_by_consent(deployment, consent),
             SignIn::Served(name) => flow.consent_served(deployment, name),
@@ -712,12 +778,7 @@ impl Command {
             ProviderName::BuiltIn(provider) => (provider.grant().as_str(), Some(*provider)),
             ProviderName::Other(name) => (name.as_str(), None),
         };
-        let usage = |message: String| {
-            CommandFailure::with_exit_code(anyhow!(message), ExitCode::UsageError)
-        };
-        let unsuited = |option: &str, remedy: &str| {
-            usage(format!("{option} does not apply to {name}\n\n{remedy}"))
-        };
+        let unsuited = |option: &str, remedy: &str| unsuited(option, name, remedy);
         if provider.is_some_and(ProviderArg::native)
             && let Some(option) = first_given([
                 (self.no_wait, "--no-wait"),
@@ -728,7 +789,7 @@ impl Command {
                 option,
                 &format!(
                     "A {name} grant is made by the coding agent's own sign-in, which has no \
-                     consent to wait for:\n  useful grant create {name}"
+                     consent to wait for:\n  useful integration connect {name}"
                 ),
             ));
         }
@@ -765,7 +826,7 @@ impl Command {
                     return Err(unsuited(
                         option,
                         "Run Claude Code's sign-in, or import the token claude setup-token \
-                         printed with --token-file PATH:\n  useful grant create claude_code",
+                         printed with --token-file PATH:\n  useful integration connect claude_code",
                     ));
                 }
                 return Ok(SignIn::Native(
@@ -790,11 +851,132 @@ impl Command {
                 option,
                 &format!(
                     "A {name} grant is made by the provider's consent and is yours alone:\n  \
-                     useful grant create {name}"
+                     useful integration connect {name}"
                 ),
             ));
         }
         Ok(consent)
+    }
+
+    /// Under `useful integration`, connects `provider`, the provider id `name` outside the five,
+    /// once one read of what the deployment serves says what it is (REQ-INTEGRATION-16): a token
+    /// service's token, once the options of a sign-in are refused, for the member or for the
+    /// organization `reach` names; or an OAuth provider's consent, as under `useful grant`, but
+    /// for `--org`, which it does not take (REQ-INTEGRATION-17). Any other name is refused as
+    /// [`Flow::consent_served`] refuses it, naming the token services too, and before anything is
+    /// read from a file, standard input or the terminal.
+    fn connect_served(
+        &self,
+        deployment: &Deployment,
+        provider: &ProviderName,
+        name: &str,
+        reach: &Reach,
+    ) -> super::super::CommandResult {
+        let flow = self.flow();
+        let (served, token_services) =
+            match flow.with_api(deployment, MemberGrantApi::served_integrations)? {
+                Ok(served) => served
+                    .map(|served| (served.providers, served.token_services))
+                    .unwrap_or_default(),
+                Err(failure) => return flow.write_read_refusal(deployment, &failure),
+            };
+        if let Some(service) = token_services.iter().find(|service| service.name == name) {
+            if let Some(option) = first_given([
+                (self.login, "--login"),
+                (self.device, "--device"),
+                (self.token_file.is_some(), "--token-file"),
+                (self.no_wait, "--no-wait"),
+                (self.wait.timeout.is_some(), "--timeout"),
+                (self.organization.is_some(), "--organization"),
+            ]) {
+                return Err(unsuited(
+                    option,
+                    name,
+                    &format!(
+                        "A {name} token is read from --from-file PATH, from standard input or at \
+                         a prompt, and is yours, or with --org an organization's:\n  \
+                         useful integration connect {name}"
+                    ),
+                ));
+            }
+            return reach.connect_token(&flow, deployment, service, self.from_file.as_deref());
+        }
+        let oauth = served_oauth(name, &served, Some(&token_services))?;
+        if reach.org().is_some() {
+            return Err(reach.org_refused(
+                name,
+                false,
+                &format!("useful integration connect {name}"),
+            ));
+        }
+        self.sign_in(provider)?;
+        flow.replace_by_consent(deployment, oauth.consent())
+    }
+
+    /// Under `useful integration` with `--org`, connects the organization `reach` names at
+    /// `provider`, `github` or `linear`, through the `useful connection` leaf that does it
+    /// (REQ-INTEGRATION-21), once the options of the member's sign-in are refused, before any
+    /// file is read or anything is sent: each source, `--organization` and `--replace`, and with
+    /// `github`, whose setup waits for nothing, `--no-wait` and `--timeout`. The other three of
+    /// the five take no `--org` (REQ-INTEGRATION-17).
+    fn connect_organization(
+        &self,
+        deployment: &Deployment,
+        provider: ProviderArg,
+        reach: &Reach,
+    ) -> super::super::CommandResult {
+        let name = provider.grant().as_str();
+        let sign_in = match provider {
+            ProviderArg::Github => OrganizationSignIn::GitHub,
+            ProviderArg::Linear => OrganizationSignIn::Linear,
+            ProviderArg::GitlabCom | ProviderArg::ClaudeCode | ProviderArg::Codex => {
+                let example = if provider.native() {
+                    format!("useful integration connect {name} --organization ORGANIZATION")
+                } else {
+                    format!("useful integration connect {name}")
+                };
+                return Err(reach.org_refused(name, provider.native(), &example));
+            }
+        };
+        let with_org = format!("{name} --org");
+        let connects = format!(
+            "Connect the organization at {name} with your session alone:\n  \
+             useful integration connect {name} --org ORGANIZATION"
+        );
+        if let Some(option) = first_given([
+            (self.organization.is_some(), "--organization"),
+            (self.login, "--login"),
+            (self.device, "--device"),
+            (self.from_file.is_some(), "--from-file"),
+            (self.token_file.is_some(), "--token-file"),
+            (self.replace, "--replace"),
+        ]) {
+            let remedy = match (option, sign_in) {
+                ("--replace", OrganizationSignIn::Linear) => format!(
+                    "{connects}\n\nReauthorize an existing connection with:\n  \
+                     useful connection linear authorization create ORGANIZATION --connection-id \
+                     CONNECTION"
+                ),
+                _ => connects,
+            };
+            return Err(unsuited(option, &with_org, &remedy));
+        }
+        if sign_in == OrganizationSignIn::GitHub
+            && let Some(option) = first_given([
+                (self.no_wait, "--no-wait"),
+                (self.wait.timeout.is_some(), "--timeout"),
+            ])
+        {
+            return Err(unsuited(
+                option,
+                &with_org,
+                &format!(
+                    "The GitHub setup waits for nothing; complete it with the command its report \
+                     names.\n\n{connects}"
+                ),
+            ));
+        }
+        reach.connect_organization(&self.flow(), deployment, sign_in)
     }
 
     /// Signs in to what the `--workflow` files call for (REQ-GRANT-76) through the flow over
@@ -805,7 +987,7 @@ impl Command {
         let roots = Roots::find(
             &self.workflows,
             self.source_root.as_deref(),
-            "useful grant create --workflow FILE --source-root ROOT",
+            "useful integration connect --workflow FILE --source-root ROOT",
         )?;
         let Some(derived) = roots.derive(&roots.origin_remote(), self.options.json)? else {
             return Ok(ExitCode::GeneralFailure);
@@ -828,14 +1010,14 @@ impl Flow<'_> {
         }
     }
 
-    /// The flow over a derivation of workflow files, which `useful grant create --workflow` and
-    /// `useful runner doctor --workflow --connect` both run (INV-CLI-15): signs in to the providers
-    /// the files call for that the member lacks (REQ-GRANT-76), and to those whose every held
-    /// grant needs reconnecting once their replacement is settled (REQ-GRANT-79). A tree that
-    /// calls for no provider is not taken to Cloud. Each replacement is settled once the grants
-    /// are read, and the plan is printed once the selection is settled, so no sign-in precedes
-    /// a question; then the selection runs as without `--workflow`, its summary naming the
-    /// command of `scope` to run again. Returns whether it reached its summary and its status.
+    /// The flow over a derivation of workflow files, which `useful integration connect --workflow`
+    /// and `useful runner doctor --workflow --connect` both run (INV-CLI-15): signs in to the
+    /// providers the files call for that the member lacks (REQ-GRANT-76), and to those whose every
+    /// held grant needs reconnecting once their replacement is settled (REQ-GRANT-79). A tree that
+    /// calls for no provider is not taken to Cloud. Each replacement is settled once the grants are
+    /// read, and the plan is printed once the selection is settled, so no sign-in precedes a
+    /// question; then the selection runs as without `--workflow`, its summary naming the command of
+    /// `scope` to run again. Returns whether it reached its summary and its status.
     pub(in crate::cli) fn run_workflows(
         &self,
         deployment: &Deployment,
@@ -845,7 +1027,7 @@ impl Flow<'_> {
         let wanted: Vec<_> = credentials
             .requirements
             .iter()
-            .map(|requirement| ProviderArg::of_kind(requirement.kind))
+            .filter_map(|requirement| ProviderArg::of_kind(requirement.kind))
             .collect();
         let mut selection = if wanted.is_empty() {
             Selection::NONE
@@ -869,13 +1051,13 @@ impl Flow<'_> {
         let planned: Vec<_> = credentials
             .requirements
             .iter()
-            .map(|requirement| {
-                let provider = ProviderArg::of_kind(requirement.kind);
-                workflow::Planned {
+            .filter_map(|requirement| {
+                let provider = ProviderArg::of_kind(requirement.kind)?;
+                Some(workflow::Planned {
                     provider: provider.grant().as_str(),
                     state: selection.planned(provider),
                     requirement,
-                }
+                })
             })
             .collect();
         workflow::write_plan(
@@ -1166,26 +1348,7 @@ impl Flow<'_> {
             Ok(served) => served.unwrap_or_default(),
             Err(failure) => return self.write_read_refusal(deployment, &failure),
         };
-        let Some(provider) = served
-            .iter()
-            .filter_map(NamedProvider::of)
-            .find(|provider| provider.name == name)
-        else {
-            // The built-in OAuth providers, the served ones, then the coding agents.
-            let mut given: Vec<_> = projection::providers(&served)
-                .into_iter()
-                .map(Provider::name)
-                .collect();
-            let last = given.pop().unwrap_or_default();
-            return Err(CommandFailure::with_exit_code(
-                anyhow!(
-                    "this deployment does not serve {name} as an OAuth provider\n\n\
-                     Name {} or {last} instead:\n  useful grant create PROVIDER",
-                    given.join(", ")
-                ),
-                ExitCode::UsageError,
-            ));
-        };
+        let provider = served_oauth(name, &served, None)?;
         self.replace_by_consent(deployment, provider.consent())
     }
 
@@ -1337,7 +1500,7 @@ impl Flow<'_> {
                 api,
                 self.organization,
                 name,
-                &format!("useful grant create {name} --organization ORGANIZATION"),
+                &format!("useful integration connect {name} --organization ORGANIZATION"),
             )? {
                 Ok(organization) => organization,
                 Err(refusal) => return Ok(Err(refusal)),
@@ -1365,8 +1528,8 @@ impl Flow<'_> {
     }
 
     /// Runs `f` against the grants resource with the signed-in human session, refreshing a
-    /// rejected session once.
-    fn with_api<T>(
+    /// rejected session once. A token service's token is stored through it too.
+    pub(in crate::cli) fn with_api<T>(
         &self,
         deployment: &Deployment,
         f: impl FnMut(&MemberGrantApi) -> Result<T, MemberGrantFailure>,

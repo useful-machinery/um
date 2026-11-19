@@ -129,7 +129,7 @@ impl AssignmentGate for Admitting {
 /// (REQ-GRANT-90).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SetupCaller {
-    /// `useful runner grant sync`, through the control socket: every login the
+    /// `useful runner integration sync`, through the control socket: every login the
     /// pass leaves `ready` is checked.
     Sync,
     /// The schedule, at start and every interval: a login the pass
@@ -529,10 +529,10 @@ impl AgentLoginSetup {
     /// (REQ-GRANT-89), under the pass lock, so that a refresh never
     /// interleaves with a pass's or an admission's writes to the directory
     /// or the readiness document. Answers what the refresh task does next,
-    /// the state and generation it recorded for the task to carry on, and
-    /// the readiness it recorded when it changed the entry and could read
-    /// and write the document; a provider with no entry changes none, so
-    /// nothing is written or published for it.
+    /// the state, grant and generation it recorded for the task to carry
+    /// on, and the readiness it recorded when it changed the entry and could
+    /// read and write the document; a provider with no entry changes none,
+    /// so nothing is written or published for it.
     pub(crate) fn refresh_grant_token(
         &self,
         boot_id: &str,

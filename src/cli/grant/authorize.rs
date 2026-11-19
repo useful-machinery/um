@@ -1,32 +1,35 @@
-use anyhow::Context;
+use anyhow::Context as _;
 use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{ArgMatches, Args, FromArgMatches};
 
+use crate::cli::CommandResult;
+use crate::cli::integration::Reach;
 use crate::exit_code::ExitCode;
 use useful_api::{
-    MemberGrant, MemberGrantAuthorization, MemberGrantFailure, MemberGrantKind, MemberGrantProvider,
+    IntegrationTokenAuthorization, IntegrationTokenSide, MemberGrantApi, MemberGrantAuthorization,
+    MemberGrantFailure, MemberGrantKind, MemberGrantProvider,
 };
 use useful_human_auth::Deployment;
 
-use super::authorization::{AuthorizationView, Holder, write_authorized};
-use super::confirmation::{self, Confirmation, NATIVE_AUTHORIZE, Stated, Statement};
+use super::authorization::{AuthorizationView, write_authorized};
+use super::confirmation::{self, Confirmation, Kind, NATIVE_AUTHORIZE, Stated, Statement};
 use super::runner_choice::{self, Acting, Chosen};
 use super::{
-    GRANT_HELP, GrantArg, Options, RUNNER_HELP, RunnerArgs, each_under_its_key, every_grant,
-    grant_and_runner, output, replayed, runner_outcome, state_then_act, state_then_act_on_each,
-    unrevoked,
+    GrantArg, INTEGRATION_HELP, LeafRun, Options, RUNNER_HELP, RunnerArgs, Subject,
+    each_under_its_key, every_grant, output, replayed, report_under, runner_outcome,
+    state_then_act, state_then_act_on_each, subject_and_runner, unrevoked,
 };
 
 pub(super) const ABOUT: &str = "Authorize a runner to use one of your grants, or all of them";
 
-/// The remedy for a Codex grant authorized for another runner (REQ-GRANT-66), which `useful grant
-/// authorize` and the earlier `useful auth agent-login authorize` both report: a Codex grant serves
-/// one runner, and another sign-in cannot make a second grant for another runner, since a held
-/// grant is refused or replaced in place (REQ-GRANT-73).
-pub(in crate::cli) const MOVE_CODEX_GRANT: &str = "A Codex grant serves one runner at a time. To move it to this runner, end its authorization for the other, which `useful grant list GRANT` names, then authorize this one:\n  useful grant deauthorize GRANT RUNNER --yes";
+/// The remedy for a Codex grant authorized for another runner (REQ-GRANT-66), which `useful
+/// integration authorize` and the earlier `useful auth agent-login authorize` both report: a Codex
+/// grant serves one runner, and another sign-in cannot make a second grant for another runner,
+/// since a held grant is refused or replaced in place (REQ-GRANT-73).
+pub(in crate::cli) const MOVE_CODEX_GRANT: &str = "A Codex grant serves one runner at a time. To move it to this runner, end its authorization for the other, which `useful integration list INTEGRATION` names, then authorize this one:\n  useful integration deauthorize INTEGRATION RUNNER --yes";
 
-/// The leaf's arguments as clap reads them. `--all` takes the place of `GRANT`, so after it the
-/// first positional is the runner: clap fills positionals in order, whatever they hold, so the
+/// The leaf's arguments as clap reads them. `--all` takes the place of `INTEGRATION`, so after it
+/// the first positional is the runner: clap fills positionals in order, whatever they hold, so the
 /// first takes either and `Command` sorts them out.
 #[derive(Debug, Args)]
 #[group(id = "target", args = ["grant", "all"], required = true, multiple = true)]
@@ -36,12 +39,12 @@ struct Arguments {
     #[command(flatten)]
     confirmation: Confirmation<Command>,
 
-    #[arg(value_name = "GRANT", value_parser = parse_first, help = GRANT_HELP)]
+    #[arg(value_name = "INTEGRATION", value_parser = parse_first, help = INTEGRATION_HELP)]
     grant: Option<First>,
 
     #[arg(
         long,
-        help = "Authorize the runner for every grant of yours that can serve it, in place of GRANT"
+        help = "Authorize the runner for every grant of yours that can serve it, in place of INTEGRATION"
     )]
     all: bool,
 
@@ -75,8 +78,8 @@ enum Target {
     All,
 }
 
-/// `useful grant authorize GRANT [RUNNER]` or `useful grant authorize --all [RUNNER]`; given no
-/// `RUNNER` it offers the runners instead (REQ-GRANT-81).
+/// `useful integration authorize INTEGRATION [RUNNER]` or `useful integration authorize --all
+/// [RUNNER]`; given no `RUNNER` it offers the runners instead (REQ-GRANT-81).
 #[derive(Debug)]
 pub(in crate::cli) struct Command {
     target: Target,
@@ -85,7 +88,7 @@ pub(in crate::cli) struct Command {
 }
 
 /// The target and runner `matches` name, or the usage error of a command line that names
-/// both a grant and `--all`, a runner in place of `GRANT` without `--all`, or a second runner
+/// both a grant and `--all`, a runner in place of `INTEGRATION` without `--all`, or a second runner
 /// after `--all`.
 fn target(matches: &ArgMatches) -> Result<(Target, Option<String>), clap::Error> {
     let first = matches.try_get_one::<First>("grant").ok().flatten();
@@ -113,7 +116,7 @@ fn target(matches: &ArgMatches) -> Result<(Target, Option<String>), clap::Error>
             ErrorKind::ArgumentConflict,
             &[
                 (ContextKind::InvalidArg, text("--all")),
-                (ContextKind::PriorArg, text("[GRANT]")),
+                (ContextKind::PriorArg, text("[INTEGRATION]")),
             ],
         )),
         (Some(First::Runner(_)), true, Some(runner_id)) => Err(refused(
@@ -123,7 +126,7 @@ fn target(matches: &ArgMatches) -> Result<(Target, Option<String>), clap::Error>
         (Some(First::Runner(runner_id)), false, _) => Err(refused(
             ErrorKind::ValueValidation,
             &[
-                (ContextKind::InvalidArg, text("[GRANT]")),
+                (ContextKind::InvalidArg, text("[INTEGRATION]")),
                 (ContextKind::InvalidValue, text(runner_id)),
                 (
                     ContextKind::Suggested,
@@ -133,13 +136,13 @@ fn target(matches: &ArgMatches) -> Result<(Target, Option<String>), clap::Error>
                 ),
             ],
         )),
-        // The group requires GRANT or --all, so clap refuses a command line with neither
+        // The group requires INTEGRATION or --all, so clap refuses a command line with neither
         // before this reads it.
         (None, false, _) => Err(refused(
             ErrorKind::MissingRequiredArgument,
             &[(
                 ContextKind::InvalidArg,
-                ContextValue::Strings(vec!["<GRANT|--all>".to_owned()]),
+                ContextValue::Strings(vec!["<INTEGRATION|--all>".to_owned()]),
             )],
         )),
     }
@@ -171,12 +174,14 @@ impl FromArgMatches for Command {
     }
 }
 
-/// Who can use the grant once the runner is authorized for it (REQ-GRANT-66): an OAuth
-/// grant's tokens are issued only to the runs its owner started (REQ-GRANT-10), and every step
-/// of such a run can read the token, while a native grant's login is the runner's to every run
-/// and step (REQ-GRANT-35).
+/// Who can use the grant or token once the runner is authorized for it (REQ-GRANT-66,
+/// REQ-INTEGRATION-20): an OAuth grant's tokens are issued only to the runs its owner started
+/// (REQ-GRANT-10), and every step of such a run can read the token, while a native grant's login
+/// is the runner's to every run and step (REQ-GRANT-35). A member's token is issued to the runs
+/// whose actor is the member and whose workflow declares the service as the member's, an
+/// organization's token to every run of the organization whose workflow declares it as `org`.
 impl Stated for Command {
-    const COMMAND: &'static str = "useful grant authorize";
+    const COMMAND: &'static str = "useful integration authorize";
     type Usage = Self;
     const STATEMENT: Statement = Statement::ByKind {
         oauth: &[
@@ -184,6 +189,16 @@ impl Stated for Command {
             "every step of such a run can read the token the runner is issued for it",
         ],
         native: NATIVE_AUTHORIZE,
+        token: &[
+            "every run on the runner whose actor is you and whose workflow declares the service \
+             as yours can be issued the token",
+            "every step of such a run can read your token",
+        ],
+        org_token: &[
+            "every run of the organization on the runner whose workflow declares the service as \
+             org can be issued the token, whoever caused the run",
+            "every step of such a run can read the organization's token",
+        ],
     };
     const ACTION: &'static str = "to authorize the runner";
 
@@ -192,9 +207,24 @@ impl Stated for Command {
     }
 }
 
-/// What `--all` did with one grant.
+/// An authorization `authorize` made: of a grant, or of a token (REQ-INTEGRATION-20).
+pub(super) enum Made {
+    Grant(MemberGrantAuthorization),
+    Token(IntegrationTokenAuthorization),
+}
+
+impl Made {
+    pub(super) fn view(&self) -> AuthorizationView<'_> {
+        match self {
+            Self::Grant(authorization) => AuthorizationView::made(authorization),
+            Self::Token(authorization) => AuthorizationView::of_token(authorization),
+        }
+    }
+}
+
+/// What `--all` did with one grant or token.
 pub(super) enum Outcome {
-    Authorized(MemberGrantAuthorization),
+    Authorized(Made),
     /// The runner was authorized for the grant already, and is left as it is.
     AlreadyAuthorized,
     /// A Codex grant authorized for another runner, which it serves in place of this one.
@@ -218,48 +248,64 @@ impl Outcome {
     }
 }
 
-/// A refusal of one runner that leaves `authorize GRANT` with all runners chosen to try the
-/// others (REQ-GRANT-83); any other failure ends it.
+/// A refusal of one runner that leaves `authorize INTEGRATION` with all runners chosen to try
+/// the others (REQ-GRANT-83); any other failure ends it.
 const fn refuses_one_runner(failure: &MemberGrantFailure) -> bool {
     matches!(
         failure,
         MemberGrantFailure::RunnerNotFound
             | MemberGrantFailure::RunnerHoldsLogin
             | MemberGrantFailure::AlreadyAuthorized
+            | MemberGrantFailure::IntegrationTokenRunnerNotFound
+            | MemberGrantFailure::IntegrationTokenAlreadyAuthorized
     )
 }
 
-/// A refusal of one grant that leaves `--all` to try the others; any other failure ends it.
-const fn refuses_one_grant(failure: &MemberGrantFailure) -> bool {
+/// A refusal of one grant or token that leaves `--all` to try the others; any other failure, a
+/// refusal of the member by an organization among them, ends it.
+const fn refuses_one_subject(failure: &MemberGrantFailure) -> bool {
     matches!(
         failure,
         MemberGrantFailure::ProviderUnavailable
             | MemberGrantFailure::GrantNotFound
             | MemberGrantFailure::RunnerNotFound
             | MemberGrantFailure::RunnerHoldsLogin
+            | MemberGrantFailure::IntegrationTokenNotFound
+            | MemberGrantFailure::IntegrationTokenRunnerNotFound
     )
 }
 
 impl Command {
-    pub(super) fn run(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
+    /// Authorizes the runner for what `INTEGRATION` names under `reach`, a grant or, under
+    /// `useful integration`, a token, the member's or with `--org` the organization's; or with
+    /// `--all` for every one that can serve it (REQ-GRANT-66, REQ-INTEGRATION-20).
+    pub(super) fn run(self, deployment: &Deployment, reach: &Reach) -> CommandResult {
         let options = &self.arguments.options;
+        let context = LeafRun {
+            deployment,
+            options,
+            reach,
+        };
         let yes = self.arguments.confirmation.yes;
         let grant = match (&self.target, &self.runner_id) {
             (Target::All, Some(runner_id)) => {
-                return self.run_all(deployment, &Acting::named(runner_id));
+                return Ok(self.run_all(context, &Acting::named(runner_id))?);
             }
             (Target::All, None) => {
-                let offer = runner_choice::to_authorize_all(deployment, options)?;
+                let offer = runner_choice::to_authorize_all(deployment, options, reach.org())?;
+                let org = reach
+                    .org()
+                    .map_or_else(String::new, |org| format!(" --org {org}"));
                 return match runner_choice::choose(
                     deployment,
                     options.json,
                     yes,
                     offer,
                     None,
-                    "to authorize for every grant of yours that can serve it",
-                    |runner_id| format!("{} --all {runner_id} --yes", Self::COMMAND),
+                    &format!("to authorize for {}", all_of(reach)),
+                    |runner_id| format!("{} --all {runner_id}{org} --yes", Self::COMMAND),
                 )? {
-                    Ok(runner) => self.run_all(deployment, &runner),
+                    Ok(runner) => Ok(self.run_all(context, &runner)?),
                     Err(exit) => Ok(exit),
                 };
             }
@@ -269,15 +315,14 @@ impl Command {
             id: self.runner_id.as_deref(),
             yes,
         };
-        let (grant, chosen) = match grant_and_runner::<Self>(
-            deployment,
-            options,
+        let (subject, chosen) = match subject_and_runner::<Self>(
+            context,
             grant,
             &runner,
-            |grant| runner_choice::to_authorize(deployment, options, grant),
-            |grant| format!("to authorize for grant {}", grant.id),
+            |subject| runner_choice::to_authorize(deployment, options, subject),
+            |subject| format!("to authorize for {}", subject.named()),
             // A Codex grant serves one runner at a time (REQ-GRANT-59).
-            |grant| grant.provider != MemberGrantProvider::GrantProviderCodex.as_str(),
+            |subject| subject.provider() != MemberGrantProvider::GrantProviderCodex.as_str(),
         )? {
             Ok(acting) => acting,
             Err(exit) => return Ok(exit),
@@ -285,91 +330,129 @@ impl Command {
         let runner = match chosen {
             Chosen::One(runner) => runner,
             Chosen::All(all) => {
-                return state_then_act_on_each::<Self, _>(
-                    deployment,
-                    options,
-                    &grant,
+                return Ok(state_then_act_on_each::<Self, _>(
+                    context,
+                    &subject,
                     &format!(
-                        "Authorizing each of {} runners for grant {}:",
+                        "Authorizing each of {} runners for {}:",
                         all.runners.len(),
-                        grant.id
+                        subject.named()
                     ),
                     &all,
-                    |api, grant, runner_id, key| {
-                        runner_outcome(authorize(api, grant, runner_id, key), refuses_one_runner)
+                    |api, subject, runner_id, key| {
+                        runner_outcome(
+                            authorize(api, reach, subject, runner_id, key),
+                            refuses_one_runner,
+                        )
                     },
-                    |api_url, grant, _, authorization| write(api_url, grant, &authorization, false),
-                );
+                    |api_url, subject, _, made| write(api_url, subject, &made, false),
+                )?);
             }
         };
         let key = useful_support::generate_idempotency_key()
             .context("generate grant authorization request key")?;
-        state_then_act::<Self, _>(
-            deployment,
-            options,
-            &grant,
+        Ok(state_then_act::<Self, _>(
+            context,
+            &subject,
             &format!(
-                "Authorizing runner {} for grant {}:",
-                runner.named, grant.id
+                "Authorizing runner {} for {}:",
+                runner.named,
+                subject.named()
             ),
             runner.asks,
-            |api, grant| authorize(api, grant, &runner.id, &key),
-            |api_url, grant, authorization, json| write(api_url, grant, &authorization, json),
-        )
+            |api, subject| authorize(api, reach, subject, &runner.id, &key),
+            |api_url, subject, made, json| write(api_url, subject, &made, json),
+        )?)
     }
 
-    /// Authorizes the runner for every unrevoked grant of the member that can serve it: each
-    /// tried in turn, since only Cloud knows which organization the runner is in. A runner
-    /// chosen from the list without `--yes` is asked about after the statement.
-    fn run_all(&self, deployment: &Deployment, runner: &Acting) -> anyhow::Result<ExitCode> {
-        let json = self.arguments.options.json;
+    /// Authorizes the runner for every unrevoked grant of the member and, under
+    /// `useful integration`, every token of theirs, or with `--org` for every token of that
+    /// organization and nothing of the member's (REQ-INTEGRATION-20): each tried in turn, since
+    /// only Cloud knows which organization the runner is in. A runner chosen from the list
+    /// without `--yes` is asked about after the statement.
+    fn run_all(&self, context: LeafRun<'_>, runner: &Acting) -> anyhow::Result<ExitCode> {
+        let LeafRun {
+            deployment,
+            options,
+            reach,
+        } = context;
+        let json = options.json;
         let api_url = deployment.fingerprint().api_url();
         let runner_id = runner.id.as_str();
+        let kinds: &[Kind] = match (reach.org(), reach.tokens()) {
+            (Some(_), _) => &[Kind::Token(IntegrationTokenSide::IntegrationTokenSideOrg)],
+            (None, true) => &[
+                Kind::GRANTS[0],
+                Kind::GRANTS[1],
+                Kind::Token(IntegrationTokenSide::IntegrationTokenSideMember),
+            ],
+            (None, false) => &Kind::GRANTS,
+        };
         confirmation::state(
-            format_args!(
-                "Authorizing runner {} for every grant of yours that can serve it:",
-                runner.named
-            ),
-            &Self::STATEMENT.every_line(),
+            format_args!("Authorizing runner {} for {}:", runner.named, all_of(reach)),
+            &Self::STATEMENT.lines_of(kinds),
         )?;
         if let Err(exit) = confirmation::go_on(runner.asks)? {
             return Ok(exit);
         }
-        let grants = match super::with_api(deployment, &self.arguments.options, |api| {
-            Ok(every_grant(api)?
-                .into_iter()
-                .filter(unrevoked)
-                .collect::<Vec<_>>())
-        })? {
-            Ok(grants) if grants.is_empty() => {
-                return output::failure(api_url, &MemberGrantFailure::GrantNotFound, json);
+        let read = super::with_api(deployment, options, |api| {
+            let mut subjects = Vec::new();
+            if reach.org().is_none() {
+                subjects.extend(
+                    every_grant(api)?
+                        .into_iter()
+                        .filter(unrevoked)
+                        .map(|grant| Subject::Grant(Box::new(grant))),
+                );
             }
-            Ok(grants) => grants,
-            Err(failure) => return output::failure(api_url, &failure, json),
+            subjects.extend(
+                reach
+                    .every_token(api)?
+                    .into_iter()
+                    .map(|token| Subject::Token(Box::new(token))),
+            );
+            Ok(subjects)
+        })?;
+        let report = |subject: Option<&Subject>, failure: &MemberGrantFailure| {
+            let service = subject.map_or("SERVICE", Subject::provider);
+            report_under(api_url, reach, service, failure)
         };
-        // A failure other than a refusal of one grant ends the command at that grant, keeping
-        // the outcomes of the grants before it to report.
-        let (mut outcomes, ended) = each_under_its_key(
-            deployment,
-            &self.arguments.options,
-            &grants,
-            |api, grant, key| authorize_one(api, grant, runner_id, key),
-        )?;
+        let subjects = match read {
+            Ok(subjects) if subjects.is_empty() => {
+                return reach.report_nothing_held(api_url).write(api_url, json);
+            }
+            Ok(subjects) => subjects,
+            Err(failure) => return report(None, &failure).write(api_url, json),
+        };
+        // A failure other than a refusal of one subject ends the command at that subject,
+        // keeping the outcomes of those before it to report.
+        let (mut outcomes, ended) =
+            each_under_its_key(deployment, options, &subjects, |api, subject, key| {
+                authorize_one(api, reach, subject, runner_id, key)
+            })?;
         let found_runner = outcomes.iter().any(Outcome::found_runner);
         match &ended {
             Some(failure) if outcomes.is_empty() => {
-                return output::failure(api_url, failure, json);
+                return report(subjects.first(), failure).write(api_url, json);
             }
-            // No grant found the runner: it is in none of the member's organizations, or none
-            // of the member's grants can serve it.
+            // Nothing found the runner: it is in none of the organizations the subjects serve.
             None if !found_runner => {
-                return output::failure(api_url, &MemberGrantFailure::RunnerNotFound, json);
+                let failure = if subjects
+                    .iter()
+                    .all(|subject| matches!(subject, Subject::Token(_)))
+                {
+                    MemberGrantFailure::IntegrationTokenRunnerNotFound
+                } else {
+                    MemberGrantFailure::RunnerNotFound
+                };
+                return report(None, &failure).write(api_url, json);
             }
             _ => {}
         }
         if found_runner {
-            for (grant, outcome) in grants.iter().zip(&mut outcomes) {
-                if grant.kind == MemberGrantKind::GrantKindNative
+            for (subject, outcome) in subjects.iter().zip(&mut outcomes) {
+                if let Subject::Grant(grant) = subject
+                    && grant.kind == MemberGrantKind::GrantKindNative
                     && matches!(
                         outcome,
                         Outcome::Refused(MemberGrantFailure::RunnerNotFound)
@@ -379,59 +462,85 @@ impl Command {
                 }
             }
         }
-        output::write_authorize_all(api_url, runner_id, &grants, &outcomes, ended.as_ref(), json)
+        let ended = ended.map(|failure| report(subjects.get(outcomes.len()), &failure));
+        output::write_authorize_all(
+            api_url,
+            runner_id,
+            &subjects,
+            &outcomes,
+            ended,
+            reach.tokens(),
+            json,
+        )
     }
 }
 
-/// Authorizes `runner_id` for `grant` under `key`, once more when the answer was lost.
+/// What `authorize --all` authorizes the runner for under `reach`, as its statement and its list
+/// of runners name it.
+fn all_of(reach: &Reach) -> String {
+    match (reach.org(), reach.tokens()) {
+        (Some(org), _) => format!("every token of the organization {org}"),
+        (None, true) => "every grant and token of yours that can serve it".to_owned(),
+        (None, false) => "every grant of yours that can serve it".to_owned(),
+    }
+}
+
+/// Authorizes `runner_id` for `subject` under `key`, once more when the answer was lost: a token
+/// through the routes of the owner `reach` names.
 fn authorize(
-    api: &useful_api::MemberGrantApi,
-    grant: &MemberGrant,
+    api: &MemberGrantApi,
+    reach: &Reach,
+    subject: &Subject,
     runner_id: &str,
     key: &str,
-) -> Result<MemberGrantAuthorization, MemberGrantFailure> {
-    replayed(|| api.authorize(&grant.id, runner_id, key))
+) -> Result<Made, MemberGrantFailure> {
+    match subject {
+        Subject::Grant(grant) => {
+            replayed(|| api.authorize(&grant.id, runner_id, key)).map(Made::Grant)
+        }
+        Subject::Token(token) => {
+            replayed(|| api.authorize_integration_token(reach.owner(), &token.id, runner_id, key))
+                .map(Made::Token)
+        }
+    }
 }
 
-/// Reports the authorization of a runner for `grant`.
-fn write(
-    api_url: &str,
-    grant: &MemberGrant,
-    authorization: &MemberGrantAuthorization,
-    json: bool,
-) -> anyhow::Result<ExitCode> {
-    write_authorized(
-        api_url,
-        Holder::Grant(&grant.id),
-        AuthorizationView::made(authorization),
-        json,
-    )
+/// Reports the authorization of a runner for `subject`.
+fn write(api_url: &str, subject: &Subject, made: &Made, json: bool) -> anyhow::Result<ExitCode> {
+    write_authorized(api_url, subject.holder(), made.view(), json)
 }
 
-/// Authorizes `runner_id` for `grant` unless it already is, reporting a refusal of this one
-/// grant as its outcome.
+/// Authorizes `runner_id` for `subject` unless it already is, reporting a refusal of this one
+/// grant or token as its outcome.
 fn authorize_one(
-    api: &useful_api::MemberGrantApi,
-    grant: &MemberGrant,
+    api: &MemberGrantApi,
+    reach: &Reach,
+    subject: &Subject,
     runner_id: &str,
     key: &str,
 ) -> Result<Outcome, MemberGrantFailure> {
-    if grant
-        .authorizations
+    if subject
+        .in_force()
         .iter()
         .any(|authorization| authorization.runner_id == runner_id)
     {
         return Ok(Outcome::AlreadyAuthorized);
     }
-    match authorize(api, grant, runner_id, key) {
-        Ok(authorization) => Ok(Outcome::Authorized(authorization)),
+    match (authorize(api, reach, subject, runner_id, key), subject) {
+        (Ok(made), _) => Ok(Outcome::Authorized(made)),
         // The grant does not list the runner, so for a native grant the authorization Cloud
         // holds is another runner's; an OAuth grant's is this runner's, made since the list.
-        Err(MemberGrantFailure::AlreadyAuthorized) => Ok(match grant.kind {
-            MemberGrantKind::GrantKindNative => Outcome::AuthorizedElsewhere,
-            MemberGrantKind::GrantKindOAuth => Outcome::AlreadyAuthorized,
-        }),
-        Err(failure) if refuses_one_grant(&failure) => Ok(Outcome::Refused(failure)),
-        Err(failure) => Err(failure),
+        (Err(MemberGrantFailure::AlreadyAuthorized), Subject::Grant(grant)) => {
+            Ok(match grant.kind {
+                MemberGrantKind::GrantKindNative => Outcome::AuthorizedElsewhere,
+                MemberGrantKind::GrantKindOAuth => Outcome::AlreadyAuthorized,
+            })
+        }
+        // A token is authorized for any number of runners: this one, since the list.
+        (Err(MemberGrantFailure::IntegrationTokenAlreadyAuthorized), _) => {
+            Ok(Outcome::AlreadyAuthorized)
+        }
+        (Err(failure), _) if refuses_one_subject(&failure) => Ok(Outcome::Refused(failure)),
+        (Err(failure), _) => Err(failure),
     }
 }

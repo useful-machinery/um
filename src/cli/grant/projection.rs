@@ -1,7 +1,7 @@
 //! The member's view of a credential (REQ-GRANT-53): what Cloud's API returns for a grant's
-//! authorization, for an agent login's and for a provider grant, mapped to one availability
-//! and one next action, with the command or step that next action names. `useful grant list` and
-//! the earlier commands it replaces print it; Cloud's API carries the facts only.
+//! authorization, for an agent login's and for a provider grant, mapped to one availability and one
+//! next action, with the command or step that next action names. `useful integration list` and the
+//! earlier commands it replaces print it; Cloud's API carries the facts only.
 
 use std::io::{self, Write};
 
@@ -191,15 +191,16 @@ pub(in crate::cli) enum Provider<'a> {
 
 impl<'a> Provider<'a> {
     /// The provider whose grant a kind a workflow calls for names; `gitlab` is GitLab.com
-    /// (REQ-GRANT-76, REQ-CREDREADY-22).
-    pub(in crate::cli) const fn of_kind(kind: CredentialKind) -> Self {
-        match kind {
+    /// (REQ-GRANT-76, REQ-CREDREADY-22). A token service has none (REQ-CREDREADY-29).
+    pub(in crate::cli) const fn of_kind(kind: CredentialKind) -> Option<Self> {
+        Some(match kind {
             CredentialKind::Github => Self::Grant("github"),
             CredentialKind::Gitlab => Self::Grant("gitlab.com"),
             CredentialKind::Linear => Self::Grant("linear"),
             CredentialKind::ClaudeCode => Self::CodingAgent("claude_code"),
             CredentialKind::Codex => Self::CodingAgent("codex"),
-        }
+            CredentialKind::Mergify | CredentialKind::Buildkite => return None,
+        })
     }
 
     pub(in crate::cli) const fn name(self) -> &'a str {
@@ -288,33 +289,34 @@ impl MemberStatus {
     }
 }
 
-/// The command or step a member's next action names, each a `useful grant` or `useful runner grant`
-/// command (REQ-GRANT-77). Waiting for a runner names none.
+/// The command or step a member's next action names, each a `useful integration` or
+/// `useful runner integration` command whatever spelling ran (REQ-GRANT-77, REQ-INTEGRATION-15).
+/// Waiting for a runner names none.
 fn member_step(next_action: NextAction, subject: Subject<'_>) -> Option<String> {
     match (next_action, subject) {
         (NextAction::Reconnect, Subject::AgentLogin { provider, .. }) => Some(format!(
-            "store a new sign-in with `useful grant create {provider} --replace`"
+            "store a new sign-in with `useful integration connect {provider} --replace`"
         )),
         (
             NextAction::Reconnect,
             Subject::Grant { provider } | Subject::OAuthGrant { provider, .. },
         ) => Some(format!(
-            "consent again with `useful grant create {provider} --replace`"
+            "consent again with `useful integration connect {provider} --replace`"
         )),
         (NextAction::Connect, Subject::Grant { provider }) => {
-            Some(format!("consent with `useful grant create {provider}`"))
+            Some(format!("consent with `useful integration connect {provider}`"))
         }
         (NextAction::Connect, Subject::CodingAgent { provider }) => {
-            Some(format!("sign in with `useful grant create {provider}`"))
+            Some(format!("sign in with `useful integration connect {provider}`"))
         }
         (
             NextAction::AuthorizeRunner,
             Subject::AgentLogin { id, .. } | Subject::OAuthGrant { id, .. },
         ) => Some(format!(
-            "authorize a runner with `useful grant authorize {id} RUNNER --yes`"
+            "authorize a runner with `useful integration authorize {id} RUNNER --yes`"
         )),
         (NextAction::SyncRunner, _) => Some(
-            "on the runner's host, set grants up again with `useful runner grant sync`"
+            "on the runner's host, set grants up again with `useful runner integration sync`"
                 .to_owned(),
         ),
         (NextAction::CheckTarget, _) => Some(

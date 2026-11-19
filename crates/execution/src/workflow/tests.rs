@@ -887,6 +887,60 @@ fn root_integration_bindings_decode_with_kinds_defaults_and_integration_referenc
 
 // REQ-WFDEF-34
 #[test]
+fn root_requires_decodes_a_declared_token_service() {
+    let workflow = decode(
+        &fs::read(fixture_root().join("valid/root-integrations-token-services.yaml")).unwrap(),
+    )
+    .unwrap();
+    let requires = workflow.root.unwrap().requires.unwrap();
+    assert_eq!(requires.acting_as, Some(IntegrationAs::Member));
+    assert_eq!(
+        requires.integrations,
+        BTreeMap::from([
+            (
+                IntegrationProvider::Mergify,
+                Integration {
+                    acting_as: Some(IntegrationAs::Org),
+                    bindings: BTreeMap::new(),
+                }
+            ),
+            (IntegrationProvider::Buildkite, Integration::default()),
+        ])
+    );
+}
+
+// REQ-WFDEF-34
+#[test]
+fn declared_integrations_iterate_in_the_bytewise_order_of_their_ids() {
+    let source = "schemaVersion: 1\nrequires:\n  integrations:\n    mergify: {}\n    linear: {}\n    gitlab.com: {}\n    github: {}\n    codex: {}\n    claude_code: {}\n    buildkite: {}\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+    let integrations = decode(source.as_bytes())
+        .unwrap()
+        .root
+        .unwrap()
+        .requires
+        .unwrap()
+        .integrations;
+    let keys: Vec<&str> = integrations
+        .keys()
+        .copied()
+        .map(IntegrationProvider::as_str)
+        .collect();
+    assert_eq!(
+        keys,
+        [
+            "buildkite",
+            "claude_code",
+            "codex",
+            "github",
+            "gitlab.com",
+            "linear",
+            "mergify"
+        ]
+    );
+}
+
+// REQ-WFDEF-34
+#[test]
 fn every_schema_integration_provider_decodes_to_its_closed_id() {
     let schema: Value = serde_json::from_str(STRUCTURAL_SCHEMA).unwrap();
     let ids = schema["$defs"]["IntegrationProvider"]["enum"]
@@ -1245,7 +1299,9 @@ fn a_structural_failure_names_the_field_and_the_rule() {
                 "gitlab.com",
                 "linear",
                 "claude_code",
-                "codex"
+                "codex",
+                "mergify",
+                "buildkite"
             ])),
         ),
         (

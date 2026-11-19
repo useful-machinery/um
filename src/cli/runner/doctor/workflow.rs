@@ -1,9 +1,9 @@
-//! The workflow mode of `useful runner doctor` (REQ-CREDREADY-1 to REQ-CREDREADY-28): the
+//! The workflow mode of `useful runner doctor` (REQ-CREDREADY-1 to REQ-CREDREADY-29): the
 //! credentials a workflow tree declares, with what Cloud holds for the organization and a named
 //! project when `--readiness` asks and what the member holds of each provider when `--grants`
 //! asks, and where a declaring file's integrations and the inference differ, printed as a
 //! checklist or a JSON document. `--connect` first runs the grant flow of
-//! `useful grant create --workflow` over the same derivation (INV-CLI-15).
+//! `useful integration connect --workflow` over the same derivation (INV-CLI-15).
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -20,6 +20,7 @@ use useful_runner::{
     UnknownDeclaration, WorkflowCredentials, read_workflow_credentials,
 };
 
+use super::super::super::grant::projection::Provider;
 use super::super::super::grant::{Flow, output};
 use super::grants::{self, Failing, Held, Shortfall};
 use super::readiness::{self, Readiness, Repository};
@@ -86,16 +87,17 @@ pub(super) fn execute(
         return Ok(ExitCode::GeneralFailure);
     };
     // Nothing is loaded and Cloud is not contacted unless a requirement has a read: a
-    // connection read, or the grants read, which any requirement has, or `--connect` asks for
-    // the grant flow, which takes a tree that calls for no kind to Cloud for nothing
-    // (REQ-RUNNERENROLL-45, REQ-CREDREADY-13, REQ-CREDREADY-22, REQ-CREDREADY-24).
+    // connection read, or the grants read, which any requirement with a grant provider has and
+    // a token service's has not, or `--connect` asks for the grant flow, which takes a tree that
+    // calls for no kind to Cloud for nothing (REQ-RUNNERENROLL-45, REQ-CREDREADY-13,
+    // REQ-CREDREADY-22, REQ-CREDREADY-24, REQ-CREDREADY-29).
     let connections = readiness.is_some()
         && derived
             .reported
             .requirements
             .iter()
             .any(|requirement| readiness::read_for(requirement.kind).is_some());
-    let reads = connections || (grants.is_some() && !derived.reported.requirements.is_empty());
+    let reads = connections || (grants.is_some() && has_grant_read(&derived.reported));
     if connect.is_none() && !reads {
         return write_report(
             &unread(derived.reported, derived.differences, readiness),
@@ -153,12 +155,12 @@ fn unread<'a>(
     }
 }
 
-/// Runs the grant flow over `credentials`, the inference, which selects as
-/// `useful grant create --workflow` does whether or not a file declares its integrations, when
-/// `--connect` asks for it (REQ-CREDREADY-24, REQ-GRANT-76): its
-/// status once it reached its summary and no signal stopped it, for the report that follows,
-/// and otherwise, as the error, the status the command ends with at once, with no report
-/// (REQ-CREDREADY-25). Without `--connect` nothing is run and nothing failed.
+/// Runs the grant flow over `credentials`, the inference, which selects as `useful integration
+/// connect --workflow` does whether or not a file declares its integrations, when `--connect` asks
+/// for it (REQ-CREDREADY-24, REQ-GRANT-76): its status once it reached its summary and no signal
+/// stopped it, for the report that follows, and otherwise, as the error, the status the command
+/// ends with at once, with no report (REQ-CREDREADY-25). Without `--connect` nothing is run and
+/// nothing failed.
 fn connected(
     connect: Option<&Flow<'_>>,
     deployment: &Deployment,
@@ -238,9 +240,18 @@ pub(super) fn derive(
     }
 }
 
+/// Whether `--grants` has a read to make for `credentials`: a requirement whose kind has a grant
+/// provider, which a token service has not (REQ-CREDREADY-22, REQ-CREDREADY-29).
+fn has_grant_read(credentials: &WorkflowCredentials) -> bool {
+    credentials
+        .requirements
+        .iter()
+        .any(|requirement| Provider::of_kind(requirement.kind).is_some())
+}
+
 /// With `readiness`, makes the connection read of each requirement that has one, in kind
 /// order, and combines a named project's repository with its kind's code; with `grants`, then
-/// reads the member's grants when a requirement exists; and writes the report, with the
+/// reads the member's grants when a requirement has a grant provider; and writes the report, with the
 /// differences, of which nothing is asked (REQ-CREDREADY-28). A failure that ends the command is
 /// written instead (REQ-CREDREADY-14, REQ-CREDREADY-22).
 fn check(
@@ -271,7 +282,7 @@ fn check(
             }
         }
     }
-    let held = match grants.filter(|_| !credentials.requirements.is_empty()) {
+    let held = match grants.filter(|_| has_grant_read(&credentials)) {
         Some(request) => match request.read(deployment)? {
             Ok(held) => Some(held),
             Err(failure) => return output::failure(api_url, &failure, json),
@@ -497,9 +508,13 @@ fn write_requirement(
     }
     writeln!(output)?;
     writeln!(output, "  {}", next_action(requirement, shortfall, report))?;
-    if let Some(held) = &report.grants {
+    if let Some(view) = report
+        .grants
+        .as_ref()
+        .and_then(|held| held.of(requirement.kind))
+    {
         writeln!(output)?;
-        held.of(requirement.kind).write_human(output)?;
+        view.write_human(output)?;
     }
     writeln!(output)
 }
@@ -671,7 +686,10 @@ impl<'a> JsonRequirement<'a> {
                 .iter()
                 .map(JsonDeclaration::from_declaration)
                 .collect(),
-            grant: report.grants.as_ref().map(|held| held.of(requirement.kind)),
+            grant: report
+                .grants
+                .as_ref()
+                .and_then(|held| held.of(requirement.kind)),
         }
     }
 }

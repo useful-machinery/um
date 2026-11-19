@@ -1,6 +1,6 @@
 use super::*;
 
-use super::grant::{after_notice, assert_next_actions_name_the_grant_commands};
+use super::grant::{after_notice, assert_next_actions_name_the_integration_commands};
 
 const TOKEN: &str = "unique-credential-status-session-token";
 const GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -218,6 +218,7 @@ fn assert_reads_both_lists_to_their_last_page(requests: &[String]) {
 
 // REQ-GRANT-55
 // REQ-GRANT-77
+// REQ-INTEGRATION-15
 #[test]
 fn status_reports_every_grant_and_authorization_and_each_provider_not_connected() {
     let mut responses = two_page_lists();
@@ -261,11 +262,11 @@ fn status_reports_every_grant_and_authorization_and_each_provider_not_connected(
     );
     // The earlier command names its replacement on standard error, and only that
     // (REQ-GRANT-77).
-    assert_eq!(after_notice(&output, "useful grant list"), "");
+    assert_eq!(after_notice(&output, "useful integration list"), "");
     assert_no_secret_output(&output, &[SENTINEL, TOKEN]);
 
     assert_eq!(human.status.code(), Some(0));
-    assert_eq!(after_notice(&human, "useful grant list"), "");
+    assert_eq!(after_notice(&human, "useful integration list"), "");
     assert_no_secret_output(&human, &[SENTINEL, TOKEN]);
     let text = String::from_utf8(human.stdout).unwrap();
     let (rows, ended) = text.split_once("ended authorizations: 1").unwrap();
@@ -277,11 +278,11 @@ fn status_reports_every_grant_and_authorization_and_each_provider_not_connected(
         "reconnect_required",
         "wait_for_runner",
         "not_connected",
-        "useful grant create github",
+        "useful integration connect github",
     ] {
         assert!(rows.contains(name), "missing {name:?} in\n{text}");
     }
-    assert_next_actions_name_the_grant_commands(&text);
+    assert_next_actions_name_the_integration_commands(&text);
     assert!(!rows.contains(REVOKED_GRANT_ID), "{text}");
     assert!(!rows.contains(REVOKED_AGENT_LOGIN_ID), "{text}");
     for name in [REVOKED_AGENT_LOGIN_ID, ENDED_RUNNER_ID, RUN_ID, "pending"] {

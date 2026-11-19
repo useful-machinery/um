@@ -565,7 +565,15 @@ fn a_requires_integrations_declaration_validates_and_reports_nothing_more() {
             "kind": "workflow",
             "field": "requires.integrations.jira",
             "rule": "enum",
-            "expected": ["github", "gitlab.com", "linear", "claude_code", "codex"],
+            "expected": [
+                "github",
+                "gitlab.com",
+                "linear",
+                "claude_code",
+                "codex",
+                "mergify",
+                "buildkite"
+            ],
         })
     );
 

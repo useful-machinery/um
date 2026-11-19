@@ -13,7 +13,7 @@ use crate::exit_code::ExitCode;
 use useful_api::{AgentLoginApi, AgentLoginFailure};
 use useful_human_auth::Deployment;
 
-// The Codex sign-in `import --login` and `reconnect --login` run is `useful grant create`'s.
+// The Codex sign-in `import --login` and `reconnect --login` run is `useful integration connect`'s.
 use crate::cli::grant::codex_login;
 use crate::cli::grant::confirmation::{Confirmation, Stated, Statement, state};
 use crate::cli::grant::parse_runner_id;

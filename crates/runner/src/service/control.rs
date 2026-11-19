@@ -17,7 +17,8 @@ use useful_execution::HarnessLoginObserver;
 
 use super::assignment::AssignmentManager;
 use crate::agent_login::OfferedLogin;
-use crate::agent_login::cloud::{CredentialSourcesRequest, ReportedSource};
+use crate::agent_login::ReportedSources;
+use crate::agent_login::cloud::CredentialSourcesRequest;
 use crate::agent_login::grant_token::AssignmentGrantTokens;
 use crate::agent_login::readiness::ReadinessDocument;
 use crate::agent_login::setup::{
@@ -163,17 +164,22 @@ impl AdmissionAgentLogins {
     }
 
     /// Reports to Cloud where the credentials of the assignment
-    /// `assignment_id` of this boot come from, `sources` (REQ-GRANT-93),
-    /// through the setup, on the admission's preparation task once it has
-    /// settled them; the setup records a report Cloud does not take, and
-    /// nothing here fails the admission. Nothing is reported when the setup
-    /// is gone.
-    pub(super) fn report_sources(&self, assignment_id: &str, sources: Vec<ReportedSource>) {
+    /// `assignment_id` of this boot come from, `reported` (REQ-GRANT-93,
+    /// REQ-INTEGRATION-12), through the setup, on the admission's
+    /// preparation task once it has settled them; the setup records a
+    /// report Cloud does not take, and nothing here fails the admission.
+    /// Nothing is reported when the setup is gone.
+    pub(super) fn report_sources(&self, assignment_id: &str, reported: ReportedSources) {
+        let ReportedSources {
+            sources,
+            token_services,
+        } = reported;
         if let Some(setup) = self.setup.upgrade() {
             setup.report_credential_sources(&CredentialSourcesRequest {
                 boot_id: self.status.boot_id().to_owned(),
                 assignment_id: assignment_id.to_owned(),
                 sources,
+                token_services,
             });
         }
     }

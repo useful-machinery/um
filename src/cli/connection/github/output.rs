@@ -386,7 +386,9 @@ const fn account_type(account_type: GitHubAccountType) -> &'static str {
     }
 }
 
-const fn installation_state(state: GitHubInstallationState) -> &'static str {
+pub(in crate::cli::connection) const fn installation_state(
+    state: GitHubInstallationState,
+) -> &'static str {
     match state {
         GitHubInstallationState::Active => "active",
         GitHubInstallationState::Disconnected => "disconnected",

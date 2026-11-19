@@ -5,7 +5,8 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 
 use super::runner_agent_login::{
-    EARLIER_SYNC, READY_CODEX, SYNC, SYNC_REQUEST, ScriptedControlSocket, synced_response,
+    EARLIER_SYNC, INTEGRATION_SYNC, READY_CODEX, SYNC, SYNC_REQUEST, ScriptedControlSocket,
+    synced_response,
 };
 use super::runner_enrollment::{
     ACTIVATION_ID, ConnectionWitness, JOIN_KEY_ID, ServeProcess, StandardInput,
@@ -608,21 +609,26 @@ fn enroll_replace_credential_without_a_configuration_asks_the_homes_control_sock
     assert_eq!(state["pendingCredential"]["id"], replacement);
 }
 
-/// `useful runner status` and both spellings of `useful runner grant sync`, each with
-/// the request it sends and a live runner's answer to it.
-fn reading_commands() -> [(&'static [&'static str], &'static [u8], Vec<u8>); 3] {
+/// `useful runner status` and the three spellings of `useful runner integration sync`, each
+/// with the request it sends and a live runner's answer to it.
+fn reading_commands() -> [(&'static [&'static str], &'static [u8], Vec<u8>); 4] {
     [
         (
             &["runner", "status"],
             STATUS_REQUEST,
             CONNECTED_STATUS.to_vec(),
         ),
+        (
+            &INTEGRATION_SYNC,
+            SYNC_REQUEST,
+            synced_response(READY_CODEX),
+        ),
         (&SYNC, SYNC_REQUEST, synced_response(READY_CODEX)),
         (&EARLIER_SYNC, SYNC_REQUEST, synced_response(READY_CODEX)),
     ]
 }
 
-// REQ-RUNNERENROLL-112, REQ-RUNNERENROLL-44, REQ-GRANT-41
+// REQ-RUNNERENROLL-112, REQ-RUNNERENROLL-44, REQ-GRANT-41, REQ-INTEGRATION-14
 #[test]
 fn reading_commands_on_an_absent_or_empty_home_find_no_runner_and_create_nothing() {
     for (command, _, _) in reading_commands() {
@@ -643,7 +649,7 @@ fn reading_commands_on_an_absent_or_empty_home_find_no_runner_and_create_nothing
     }
 }
 
-// REQ-RUNNERENROLL-112, REQ-GRANT-41
+// REQ-RUNNERENROLL-112, REQ-GRANT-41, REQ-INTEGRATION-14
 #[test]
 fn reading_commands_ask_the_homes_default_socket_when_it_holds_no_configuration() {
     for (command, request, response) in reading_commands() {

@@ -19,7 +19,23 @@ fn prepared_github(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDi
     (server, credential_directory, credential_path)
 }
 
-fn installation_body(state: &str) -> serde_json::Value {
+/// The GitHub App installation page a setup session hands the browser to.
+fn setup_url() -> String {
+    format!("https://github.example/apps/scherzo/installations/new?state={SETUP_SESSION}")
+}
+
+/// A setup session as `setup begin` is answered it, with a member the contract does not name.
+pub(super) fn setup_session() -> serde_json::Value {
+    serde_json::json!({
+        "id": SETUP_SESSION,
+        "state": "pending",
+        "expiresAt": "2026-09-05T12:10:00Z",
+        "setupUrl": setup_url(),
+        "future": "setup-response-sentinel"
+    })
+}
+
+pub(super) fn installation_body(state: &str) -> serde_json::Value {
     serde_json::json!({
         "id": INSTALLATION,
         "providerInstallationId": "713",
@@ -81,19 +97,9 @@ fn removed_top_level_github_family_is_a_usage_error_without_contacting_the_deplo
 // REQ-CONNECTION-16, REQ-CONNECTION-17
 #[test]
 fn setup_begin_and_complete_preserve_the_browser_handoff() {
-    let setup_url =
-        format!("https://github.example/apps/scherzo/installations/new?state={SETUP_SESSION}");
+    let setup_url = setup_url();
     let (server, _directory, credential_path) = prepared_github(vec![
-        json_http_response(
-            "201 Created",
-            serde_json::json!({
-                "id": SETUP_SESSION,
-                "state": "pending",
-                "expiresAt": "2026-09-05T12:10:00Z",
-                "setupUrl": setup_url.clone(),
-                "future": "setup-response-sentinel"
-            }),
-        ),
+        json_http_response("201 Created", setup_session()),
         json_http_response("200 OK", installation_body("active")),
     ]);
     let environment = deployment_environment(&server.api_url, &credential_path);

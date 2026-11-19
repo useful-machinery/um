@@ -1027,8 +1027,8 @@
       }
     },
     "IntegrationProvider": {
-      "description": "A provider id: the provider table's rows followed by the coding agents a member signs in.",
-      "enum": ["github", "gitlab.com", "linear", "claude_code", "codex"]
+      "description": "A provider id: the reviewed provider table's OAuth rows, then the coding agents a member signs in, then the reviewed token services.",
+      "enum": ["github", "gitlab.com", "linear", "claude_code", "codex", "mergify", "buildkite"]
     },
     "IntegrationAs": {
       "description": "Whose credentials act for an integration: a member's or the organization's.",

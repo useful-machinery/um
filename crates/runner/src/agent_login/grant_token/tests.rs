@@ -11,7 +11,7 @@ use super::*;
 use crate::agent_login::check::LoginCheck;
 use crate::agent_login::cloud::{
     AgentLoginCloud, CloudFailure, GrantProvidersFailure, GrantProvidersRequest, GrantTokenFailure,
-    GrantTokenRefusal, ListedProvider,
+    GrantTokenRefusal, ListedProvider, ReportedTokenService, TokenServiceSource,
 };
 use crate::agent_login::readiness::{ReadinessDocument, readiness_path};
 use crate::agent_login::setup::{
@@ -217,14 +217,8 @@ impl Fixture {
     /// token and the path of its file are to be offered under, for each
     /// assignment.
     fn list_named(&self, entries: &[(&str, &str, &str)]) {
-        self.cloud.answer_grant_providers(Ok(entries
-            .iter()
-            .map(|(id, token, token_file)| ListedProvider {
-                provider: (*id).to_owned(),
-                token: (*token).to_owned(),
-                token_file: (*token_file).to_owned(),
-            })
-            .collect()));
+        self.cloud
+            .answer_grant_providers(Ok(listed_entries(entries)));
     }
 
     /// Where the runner keeps the token of the configured provider `id`.
@@ -255,6 +249,35 @@ impl Fixture {
             .filter(|record| record["um.grant_token.provider"] == provider)
             .collect()
     }
+
+    /// Lets Cloud list each of `entries` as a token service, with the names
+    /// its token and the path of its file are to be offered under, for each
+    /// assignment.
+    fn list_token_services(&self, entries: &[(&str, &str, &str)]) {
+        self.cloud
+            .answer_token_services(Ok(listed_entries(entries)));
+    }
+}
+
+/// Each of `entries`, a provider's id with the names its token and the path
+/// of its file are to be offered under, as Cloud lists it.
+fn listed_entries(entries: &[(&str, &str, &str)]) -> Vec<ListedProvider> {
+    entries
+        .iter()
+        .map(|(id, token, token_file)| ListedProvider {
+            provider: (*id).to_owned(),
+            token: (*token).to_owned(),
+            token_file: (*token_file).to_owned(),
+        })
+        .collect()
+}
+
+/// The token-service list entry of Mergify.
+const MERGIFY_ENTRY: (&str, &str, &str) = ("mergify", "MERGIFY_TOKEN", "MERGIFY_TOKEN_FILE");
+
+/// The token service Cloud lists as `id`.
+fn token_service(id: &str) -> GrantProvider {
+    GrantProvider::token_service(id).unwrap()
 }
 
 /// The list entry of `github`, with the names the runner offers it under.
@@ -324,6 +347,35 @@ fn a_declared_integration_names_exactly_the_variables_the_runner_offers_it_under
         IntegrationProvider::Codex.environment_names(),
         [CODEX_LOGIN_VARIABLE]
     );
+}
+
+// INV-ENGINE-43
+#[test]
+fn a_declared_token_service_names_exactly_the_variables_cloud_lists_for_it() {
+    use useful_execution::IntegrationProvider;
+
+    let path = format!(
+        "{}/../../tests/fixtures/runner-grant-providers/v1/token-services.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let fixture: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+    let mut ids = Vec::new();
+    for entry in fixture["providers"].as_array().unwrap() {
+        let id = entry["provider"].as_str().unwrap();
+        let provider: IntegrationProvider =
+            serde_json::from_value(entry["provider"].clone()).unwrap();
+        assert_eq!(
+            provider.environment_names(),
+            [
+                entry["environment"]["token"].as_str().unwrap(),
+                entry["environment"]["tokenFile"].as_str().unwrap(),
+            ],
+            "{id}"
+        );
+        ids.push(id);
+    }
+    assert_eq!(ids, ["mergify", "buildkite"]);
 }
 
 // REQ-GRANT-86, REQ-GRANT-88
@@ -827,7 +879,9 @@ fn a_file_an_earlier_assignment_left_is_gone_before_any_answer_is_used() {
         for provider in brokered_providers() {
             let file = fixture.token_file(provider);
             match answer {
-                FakeGrantToken::Issue(generation) => assert_eq!(
+                FakeGrantToken::Issue(generation)
+                | FakeGrantToken::IssueIntegrationToken(generation)
+                | FakeGrantToken::IssueFrom(_, generation) => assert_eq!(
                     fs::read_to_string(&file).unwrap(),
                     fake_grant_token(provider, generation)
                 ),
@@ -1664,6 +1718,420 @@ fn a_configured_providers_directory_that_cannot_be_removed_asks_for_none_of_them
     );
 }
 
+/// The request each admission of `ASSIGNMENT` lists its providers with.
+fn listing_request() -> GrantProvidersRequest {
+    GrantProvidersRequest {
+        boot_id: BOOT.to_owned(),
+        assignment_id: ASSIGNMENT.to_owned(),
+    }
+}
+
+/// The attributes of each record of the fixture, sorted by the provider
+/// each names.
+fn sorted_records(fixture: &Fixture) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    let mut records: Vec<_> = fixture.records().iter().map(grant_attributes).collect();
+    records.sort_by_key(|record| {
+        record
+            .get("um.grant_token.provider")
+            .map(ToString::to_string)
+    });
+    records
+}
+
+// REQ-INTEGRATION-12, REQ-GRANT-86, REQ-TELEMETRY-46
+#[test]
+fn a_listed_token_services_token_is_asked_for_beside_the_others_kept_and_offered_under_its_names() {
+    let fixture = Fixture::new();
+    fixture.answer_all(FakeGrantToken::Issue(1));
+    fixture.list_token_services(&[MERGIFY_ENTRY]);
+    fixture.cloud.answer_grant_token(
+        token_service("mergify"),
+        FakeGrantToken::IssueIntegrationToken(2),
+    );
+
+    let admitted = fixture.admit(ASSIGNMENT);
+
+    fixture.assert_listed_once_first();
+    assert_eq!(
+        fixture.cloud.token_services_requests(),
+        [(0, listing_request())]
+    );
+    assert_eq!(
+        fixture.asked_ids(),
+        ["github", "gitlab.com", "linear", "mergify"]
+    );
+    assert!(
+        fixture
+            .cloud
+            .grant_requests()
+            .iter()
+            .any(|request| request.provider == token_service("mergify"))
+    );
+    let file = fixture.configured_file("mergify");
+    let token = fake_grant_token(token_service("mergify"), 2);
+    assert_eq!(fs::read_to_string(&file).unwrap(), token);
+    assert_eq!(mode(&file), 0o600);
+    let offered = offered_alone(&admitted.tokens);
+    assert_eq!(
+        variable(&offered, "MERGIFY_TOKEN"),
+        Some(std::ffi::OsStr::new(&token))
+    );
+    assert_eq!(
+        variable(&offered, "MERGIFY_TOKEN_FILE"),
+        Some(file.as_os_str())
+    );
+    assert_eq!(
+        fixture.records_naming("mergify"),
+        [attributes(&serde_json::json!({
+            "um.grant_token.provider": "mergify",
+            "um.grant_token.phase": "admission",
+            "um.grant_token.state": "ready",
+            "um.grant_token.generation": 2,
+            "um.assignment.id": ASSIGNMENT,
+        }))]
+    );
+    // The readiness document's entries are the runner's three alone.
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(readiness_path(&fixture.state_path())).unwrap())
+            .unwrap();
+    let mut entries: Vec<&str> = document["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["provider"].as_str().unwrap())
+        .collect();
+    entries.sort_unstable();
+    assert_eq!(entries, ["github", "gitlab", "linear"], "{document}");
+}
+
+// REQ-INTEGRATION-12, INV-RUNNER-31
+#[test]
+fn a_token_services_source_is_the_token_while_its_kept_file_reads_back_and_none_after() {
+    const ISSUED_FROM: &str = "itk_01k0z6r1w8f4jy2m7q9v3x5abe";
+    let fixture = Fixture::new();
+    fixture.list_token_services(&[MERGIFY_ENTRY]);
+    fixture.cloud.answer_grant_token(
+        token_service("mergify"),
+        FakeGrantToken::IssueFrom(ISSUED_FROM, 1),
+    );
+    let admitted = fixture.admit(ASSIGNMENT);
+    let nothing = EnvironmentSnapshot::new(Vec::<(OsString, OsString)>::new());
+    assert_eq!(
+        token_service_sources(&nothing, Some(&admitted.tokens)),
+        [ReportedTokenService {
+            provider: "mergify".to_owned(),
+            source: TokenServiceSource::Token {
+                integration_token_id: ISSUED_FROM.to_owned(),
+            },
+        }]
+    );
+
+    // The file no longer holds a token of its form: `offer` offers none,
+    // and the service has no source.
+    fs::write(fixture.configured_file("mergify"), "").unwrap();
+
+    assert_eq!(
+        variable(&offered_alone(&admitted.tokens), "MERGIFY_TOKEN"),
+        None
+    );
+    assert_eq!(token_service_sources(&nothing, Some(&admitted.tokens)), []);
+}
+
+// REQ-INTEGRATION-12, REQ-GRANT-87, INV-RUNNER-17
+#[test]
+fn a_token_service_the_host_provides_is_asked_for_nothing_and_keeps_no_file() {
+    let service = [("MERGIFY_TOKEN_FILE", "/srv/mergify-token")];
+    let fixture = Fixture::serving(&service);
+    fixture.answer_all(FakeGrantToken::Issue(1));
+    fixture.list_token_services(&[MERGIFY_ENTRY]);
+    fixture.cloud.answer_grant_token(
+        token_service("mergify"),
+        FakeGrantToken::IssueIntegrationToken(1),
+    );
+
+    let admitted = fixture.admit(ASSIGNMENT);
+
+    assert_eq!(fixture.asked_ids(), ["github", "gitlab.com", "linear"]);
+    assert!(!fixture.configured_file("mergify").exists());
+    assert_eq!(fixture.records_naming("mergify"), []);
+    let offered = offer(&EnvironmentSnapshot::new(service), Some(&admitted.tokens));
+    assert_eq!(
+        variable(&offered, "MERGIFY_TOKEN_FILE"),
+        Some(std::ffi::OsStr::new("/srv/mergify-token"))
+    );
+    assert_eq!(variable(&offered, "MERGIFY_TOKEN"), None);
+}
+
+// REQ-INTEGRATION-12
+#[test]
+fn a_cloud_without_the_token_service_list_is_asked_and_recorded_exactly_as_before() {
+    let fixture = Fixture::new();
+    fixture.answer_all(FakeGrantToken::Issue(1));
+    fixture.list_named(&[GITHUB_ENTRY]);
+    fixture.cloud.answer_grant_token(
+        token_service("mergify"),
+        FakeGrantToken::IssueIntegrationToken(1),
+    );
+
+    let admitted = fixture.admit(ASSIGNMENT);
+
+    fixture.assert_listed_once_first();
+    assert_eq!(
+        fixture.cloud.token_services_requests(),
+        [(0, listing_request())]
+    );
+    assert_eq!(fixture.asked_ids(), ["github"]);
+    assert!(
+        !LoginDirectory::beside(&fixture.state_path())
+            .grant_tokens()
+            .exists()
+    );
+    assert_eq!(
+        offered_alone(&admitted.tokens)
+            .variables()
+            .keys()
+            .collect::<Vec<_>>(),
+        ["GH_TOKEN", "GH_TOKEN_FILE"]
+            .map(OsString::from)
+            .iter()
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        sorted_records(&fixture),
+        [
+            serde_json::json!({
+                "um.grant_token.provider": "github",
+                "um.grant_token.phase": "admission",
+                "um.grant_token.state": "ready",
+                "um.grant_token.generation": 1,
+                "um.assignment.id": ASSIGNMENT,
+            }),
+            serde_json::json!({
+                "um.grant_token.provider": "gitlab",
+                "um.grant_token.phase": "admission",
+                "um.grant_token.state": "not_authorized",
+                "um.assignment.id": ASSIGNMENT,
+            }),
+            serde_json::json!({
+                "um.grant_token.provider": "linear",
+                "um.grant_token.phase": "admission",
+                "um.grant_token.state": "not_authorized",
+                "um.assignment.id": ASSIGNMENT,
+            }),
+        ]
+        .map(|record| record.as_object().unwrap().clone())
+    );
+}
+
+// REQ-INTEGRATION-12, REQ-TELEMETRY-46
+#[test]
+fn a_token_service_list_cloud_did_not_answer_asks_for_none_and_is_recorded_once_with_no_provider() {
+    let admit_with = |services: Result<Vec<ListedProvider>, GrantProvidersFailure>| {
+        let fixture = Fixture::new();
+        fixture.answer_all(FakeGrantToken::Issue(1));
+        fixture.list_named(&[GITHUB_ENTRY]);
+        fixture.cloud.answer_grant_token(
+            token_service("mergify"),
+            FakeGrantToken::IssueIntegrationToken(1),
+        );
+        fixture.cloud.answer_token_services(services);
+        drop(fixture.admit(ASSIGNMENT));
+        fixture
+    };
+    // What the runner asks and records when Cloud lists no token service.
+    let empty = admit_with(Ok(Vec::new()));
+    assert_eq!(empty.asked_ids(), ["github"]);
+    let expected = sorted_records(&empty);
+    assert_eq!(expected.len(), 3);
+
+    for (failure, cause, status) in [
+        (
+            GrantProvidersFailure::Cloud(CloudFailure::Status(503)),
+            "http_status",
+            Some(503),
+        ),
+        (
+            GrantProvidersFailure::AssignmentNotCurrent,
+            "http_status",
+            Some(409),
+        ),
+        (
+            GrantProvidersFailure::Cloud(CloudFailure::InvalidResponse),
+            "invalid_response",
+            None,
+        ),
+        (
+            GrantProvidersFailure::Cloud(CloudFailure::Transport),
+            "transport",
+            None,
+        ),
+    ] {
+        let fixture = admit_with(Err(failure));
+
+        assert_eq!(fixture.asked_ids(), empty.asked_ids(), "{failure:?}");
+        assert!(!fixture.configured_file("mergify").exists(), "{failure:?}");
+        let records = sorted_records(&fixture);
+        let mut list = serde_json::json!({
+            "um.grant_token.phase": "admission",
+            "um.grant_token.failure_stage": "list",
+            "um.grant_token.failure_cause": cause,
+            "um.assignment.id": ASSIGNMENT,
+        });
+        if let Some(status) = status {
+            list["um.grant_token.http_status"] = status.into();
+        }
+        // The record with no provider sorts first.
+        assert_eq!(
+            serde_json::Value::Object(records[0].clone()),
+            list,
+            "{failure:?}"
+        );
+        assert_eq!(records[1..], expected[..], "{failure:?}");
+    }
+}
+
+// REQ-INTEGRATION-12
+#[test]
+fn a_failed_oauth_list_still_asks_for_and_keeps_a_listed_token_services_token() {
+    let fixture = Fixture::new();
+    fixture.answer_all(FakeGrantToken::Issue(1));
+    fixture
+        .cloud
+        .answer_grant_providers(Err(GrantProvidersFailure::Cloud(CloudFailure::Status(503))));
+    fixture.list_token_services(&[MERGIFY_ENTRY]);
+    fixture.cloud.answer_grant_token(
+        token_service("mergify"),
+        FakeGrantToken::IssueIntegrationToken(1),
+    );
+
+    let admitted = fixture.admit(ASSIGNMENT);
+
+    assert_eq!(fixture.asked_ids(), ["mergify"]);
+    let file = fixture.configured_file("mergify");
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        fake_grant_token(token_service("mergify"), 1)
+    );
+    assert_eq!(
+        variable(&offered_alone(&admitted.tokens), "MERGIFY_TOKEN_FILE"),
+        Some(file.as_os_str())
+    );
+    for grant in fixture.grants() {
+        assert_eq!(grant.state, AgentLoginState::CloudUnavailable, "{grant:?}");
+    }
+    assert_eq!(
+        fixture.records_naming("mergify")[0]["um.grant_token.state"],
+        "ready"
+    );
+}
+
+// REQ-INTEGRATION-12, INV-RUNNER-32, REQ-TELEMETRY-46
+#[test]
+fn a_token_service_entry_sharing_a_name_or_an_id_with_another_is_asked_for_nothing_and_recorded() {
+    for (oauth, services) in [
+        // A name of the runner's three.
+        (
+            vec![GITHUB_ENTRY],
+            vec![("mergify", "GH_TOKEN", "MERGIFY_TOKEN_FILE")],
+        ),
+        // A name of a configured entry of the OAuth list.
+        (
+            vec![GITHUB_ENTRY, EXAMPLE_ENTRY],
+            vec![("mergify", "MERGIFY_TOKEN", "EXAMPLE_ACCESS_TOKEN_FILE")],
+        ),
+        // An id the OAuth list also names.
+        (
+            vec![
+                GITHUB_ENTRY,
+                ("mergify", "OAUTH_MERGIFY_TOKEN", "OAUTH_MERGIFY_TOKEN_FILE"),
+            ],
+            vec![MERGIFY_ENTRY],
+        ),
+    ] {
+        let fixture = Fixture::new();
+        fixture.answer_all(FakeGrantToken::Issue(1));
+        fixture.list_named(&oauth);
+        fixture.list_token_services(&services);
+        fixture.cloud.answer_grant_token(
+            token_service("mergify"),
+            FakeGrantToken::IssueIntegrationToken(1),
+        );
+
+        let admitted = fixture.admit(ASSIGNMENT);
+
+        assert!(
+            fixture
+                .cloud
+                .grant_requests()
+                .iter()
+                .all(|request| request.provider != token_service("mergify")),
+            "{services:?}"
+        );
+        assert!(!fixture.configured_file("mergify").exists(), "{services:?}");
+        let offered = offered_alone(&admitted.tokens);
+        assert_eq!(variable(&offered, "MERGIFY_TOKEN"), None, "{services:?}");
+        assert!(
+            fixture
+                .records_naming("mergify")
+                .contains(&attributes(&serde_json::json!({
+                    "um.grant_token.provider": "mergify",
+                    "um.grant_token.phase": "admission",
+                    "um.grant_token.state": "cloud_unavailable",
+                    "um.grant_token.failure_stage": "list",
+                    "um.grant_token.failure_cause": "invalid_response",
+                    "um.assignment.id": ASSIGNMENT,
+                }))),
+            "{services:?}"
+        );
+        assert_eq!(
+            fixture
+                .recorded()
+                .grant(AgentLoginProvider::Github)
+                .map(|grant| grant.state),
+            Some(AgentLoginState::Ready),
+            "{services:?}"
+        );
+    }
+}
+
+// REQ-INTEGRATION-12, REQ-TELEMETRY-46
+#[test]
+fn no_token_services_token_is_in_the_readiness_document_or_any_record() {
+    let fixture = Fixture::new();
+    fixture.list_token_services(&[MERGIFY_ENTRY]);
+    fixture.cloud.answer_grant_token(
+        token_service("mergify"),
+        FakeGrantToken::IssueIntegrationToken(3),
+    );
+    // Beside it, a failed token-service list's record.
+    let failed = Fixture::new();
+    failed
+        .cloud
+        .answer_token_services(Err(GrantProvidersFailure::Cloud(CloudFailure::Transport)));
+
+    let admitted = fixture.admit(ASSIGNMENT);
+    drop(failed.admit(ASSIGNMENT));
+
+    assert!(fixture.configured_file("mergify").exists());
+    for checked in [&fixture, &failed] {
+        let document = fs::read_to_string(readiness_path(&checked.state_path())).unwrap();
+        let records = serde_json::to_string(&checked.capture.events()).unwrap();
+        for (name, text) in [("readiness document", document), ("telemetry", records)] {
+            assert!(!text.contains(FAKE_GRANT_TOKEN_SENTINEL), "{name}: {text}");
+            assert!(
+                !text.contains(".token"),
+                "{name} names a token file: {text}"
+            );
+            assert!(
+                !text.contains("MERGIFY_TOKEN"),
+                "{name} names an offered variable: {text}"
+            );
+        }
+    }
+    let hold = format!("{:?}", admitted.tokens);
+    assert!(!hold.contains(FAKE_GRANT_TOKEN_SENTINEL), "{hold}");
+}
+
 /// The wait the fake Cloud names with each token in the refresh tests.
 const WAIT: Duration = Duration::from_secs(60);
 
@@ -1685,6 +2153,8 @@ struct Refreshing {
     /// The sleep the task waits in, once the test has seen it.
     pending: Option<(Duration, SleepRelease)>,
     published: Arc<Mutex<Vec<ReadinessDocument>>>,
+    /// The time on the sleeper's clock when the assignment was admitted.
+    started: OffsetDateTime,
 }
 
 impl Refreshing {
@@ -1705,22 +2175,46 @@ impl Refreshing {
         provider: GrantProvider,
         entries: &[(&str, &str, &str)],
     ) -> Self {
+        Self::admitted(lifetime, provider, FakeGrantToken::Issue(1), |fixture| {
+            if !entries.is_empty() {
+                fixture.list_named(entries);
+            }
+            for (id, _, _) in entries {
+                fixture.cloud.answer_grant_token(
+                    GrantProvider::listed(id).unwrap(),
+                    FakeGrantToken::Issue(1),
+                );
+            }
+        })
+    }
+
+    /// `start` for `mergify`, the one token service Cloud lists, whose
+    /// token Cloud issues from an integration token at version 1.
+    fn mergify(lifetime: time::Duration) -> Self {
+        Self::admitted(
+            lifetime,
+            token_service("mergify"),
+            FakeGrantToken::IssueIntegrationToken(1),
+            |fixture| fixture.list_token_services(&[MERGIFY_ENTRY]),
+        )
+    }
+
+    /// `start` for `provider`, issued `issued`, once `prepare` has set what
+    /// else Cloud answers.
+    fn admitted(
+        lifetime: time::Duration,
+        provider: GrantProvider,
+        issued: FakeGrantToken,
+        prepare: impl FnOnce(&Fixture),
+    ) -> Self {
         let fixture = Fixture::new();
         let (sleeper, sleeps) = controlled_sleeper();
+        let started = sleeper.utc_now();
         fixture
             .cloud
-            .issue_grant_tokens_with(WAIT, sleeper.utc_now() + lifetime);
-        if !entries.is_empty() {
-            fixture.list_named(entries);
-        }
-        for (id, _, _) in entries {
-            fixture
-                .cloud
-                .answer_grant_token(GrantProvider::listed(id).unwrap(), FakeGrantToken::Issue(1));
-        }
-        fixture
-            .cloud
-            .answer_grant_token(provider.clone(), FakeGrantToken::Issue(1));
+            .issue_grant_tokens_with(WAIT, started + lifetime);
+        prepare(&fixture);
+        fixture.cloud.answer_grant_token(provider.clone(), issued);
         let mut admitted = fixture.admit(ASSIGNMENT);
         let requests = fixture.cloud.grant_requests().len();
         let offered = offer(
@@ -1742,6 +2236,7 @@ impl Refreshing {
             sleeps,
             pending: None,
             published,
+            started,
         }
     }
 
@@ -2381,4 +2876,209 @@ async fn when_the_assignment_ends_a_configured_provider_is_asked_no_more() {
     release.release();
     assert!(run.wait().await.is_none());
     assert_eq!(run.refresh_requests(), []);
+}
+
+// REQ-INTEGRATION-12, REQ-GRANT-89, REQ-TELEMETRY-46
+#[tokio::test]
+async fn a_token_services_file_is_replaced_by_a_newer_version_and_removed_at_a_refusal() {
+    let mut run = Refreshing::mergify(time::Duration::days(1));
+    let file = run.fixture.configured_file("mergify");
+    assert_eq!(run.file(), file);
+    assert_eq!(run.token(), fake_grant_token(token_service("mergify"), 1));
+
+    assert_eq!(
+        run.pass(FakeGrantToken::IssueIntegrationToken(2)).await,
+        Some(WAIT)
+    );
+
+    assert_eq!(
+        run.refresh_requests(),
+        [GrantTokenRequest {
+            boot_id: BOOT.to_owned(),
+            assignment_id: ASSIGNMENT.to_owned(),
+            provider: token_service("mergify"),
+        }]
+    );
+    assert_eq!(
+        fs::read_to_string(&file).unwrap(),
+        fake_grant_token(token_service("mergify"), 2)
+    );
+    assert_eq!(mode(&file), 0o600);
+    assert_eq!(
+        run.refresh_records(),
+        [attributes(&serde_json::json!({
+            "um.grant_token.provider": "mergify",
+            "um.grant_token.phase": "refresh",
+            "um.grant_token.state": "ready",
+            "um.grant_token.generation": 2,
+            "um.assignment.id": ASSIGNMENT,
+        }))]
+    );
+
+    for (refusal, state) in [
+        (GrantTokenRefusal::Revoked, "revoked"),
+        (GrantTokenRefusal::Unauthorized, "not_authorized"),
+    ] {
+        let mut run = Refreshing::mergify(time::Duration::days(1));
+
+        // Its asking ends with the one token it held.
+        assert_eq!(
+            run.pass(FakeGrantToken::Fail(GrantTokenFailure::Refused(refusal)))
+                .await,
+            None,
+            "{refusal:?}"
+        );
+
+        assert!(!run.file().exists(), "{refusal:?}");
+        assert_eq!(
+            run.refresh_records(),
+            [attributes(&serde_json::json!({
+                "um.grant_token.provider": "mergify",
+                "um.grant_token.phase": "refresh",
+                "um.grant_token.state": state,
+                "um.assignment.id": ASSIGNMENT,
+            }))],
+            "{refusal:?}"
+        );
+    }
+}
+
+/// Another integration token Cloud issues a token service's tokens from: one
+/// revoked and stored again, say.
+const OTHER_INTEGRATION_TOKEN_ID: &str = "itk_01k0z6r1w8f4jy2m7q9v3x5abd";
+/// Another grant Cloud issues `github`'s tokens from: one revoked and
+/// created again, say.
+const OTHER_GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abd";
+
+// REQ-GRANT-89, REQ-INTEGRATION-12
+#[tokio::test]
+async fn each_answer_for_the_held_token_renews_the_expiry_its_file_stands_until() {
+    // Admitted at version 1 with a token that expires an hour ahead.
+    let mut run = Refreshing::mergify(time::Duration::hours(1));
+    let held = fake_grant_token(token_service("mergify"), 1);
+    let unavailable = FakeGrantToken::Fail(GrantTokenFailure::Cloud(CloudFailure::Status(503)));
+    // The refresh after the wait is answered version 1 again, which expires
+    // an hour after that answer and names a wait that ends 10 seconds after
+    // the first expiry.
+    let answered = run.started + WAIT;
+    run.fixture.cloud.issue_grant_tokens_with(
+        Duration::from_secs(3550),
+        answered + time::Duration::hours(1),
+    );
+
+    assert_eq!(
+        run.pass(FakeGrantToken::IssueIntegrationToken(1)).await,
+        Some(Duration::from_secs(3550))
+    );
+    assert_eq!(run.refresh_records(), []);
+
+    // The first expiry has passed when the next refresh is not answered,
+    // and the file still holds the token.
+    assert_eq!(run.pass(unavailable).await, Some(Duration::from_secs(5)));
+    assert_eq!(run.token(), held);
+    // So it does until the hour from the last answer has passed unanswered:
+    // the retries 5, 15 and 35 seconds later keep it, the one 75 seconds
+    // later removes it.
+    assert_eq!(run.pass(unavailable).await, Some(Duration::from_secs(10)));
+    assert_eq!(run.pass(unavailable).await, Some(Duration::from_secs(20)));
+    assert_eq!(run.pass(unavailable).await, Some(Duration::from_secs(40)));
+    assert_eq!(run.token(), held);
+
+    assert_eq!(run.pass(unavailable).await, Some(Duration::from_secs(80)));
+
+    assert!(!run.file().exists());
+}
+
+/// The inode of `path`, which a file written again in one step changes.
+fn inode(path: &Path) -> u64 {
+    std::os::unix::fs::MetadataExt::ino(&fs::metadata(path).unwrap())
+}
+
+// REQ-GRANT-89
+#[tokio::test]
+async fn an_answer_from_another_grant_or_token_replaces_the_file_whatever_its_generation() {
+    let github = GrantProvider::try_from(AgentLoginProvider::Github).unwrap();
+    // The generation held is a later one, or the one the other grant or
+    // token answers at: a token stored again starts at version 1.
+    for (provider, held, other) in [
+        (github.clone(), 3, OTHER_GRANT_ID),
+        (github, 1, OTHER_GRANT_ID),
+        (token_service("mergify"), 3, OTHER_INTEGRATION_TOKEN_ID),
+        (token_service("mergify"), 1, OTHER_INTEGRATION_TOKEN_ID),
+    ] {
+        let issued = if provider.agent_login_provider().is_some() {
+            FakeGrantToken::Issue(held)
+        } else {
+            FakeGrantToken::IssueIntegrationToken(held)
+        };
+        let mut run = Refreshing::admitted(
+            time::Duration::days(1),
+            provider.clone(),
+            issued,
+            |fixture| {
+                if provider.agent_login_provider().is_none() {
+                    fixture.list_token_services(&[MERGIFY_ENTRY]);
+                }
+            },
+        );
+        let file = run.file();
+        assert_eq!(run.token(), fake_grant_token(provider.clone(), held));
+        let kept = inode(&file);
+        let expires_at = run.started + time::Duration::days(2);
+        run.fixture.cloud.issue_grant_tokens_with(WAIT, expires_at);
+
+        // Generation 1 of another grant or token than the one held.
+        assert_eq!(
+            run.pass(FakeGrantToken::IssueFrom(other, 1)).await,
+            Some(WAIT),
+            "{provider:?} {held}"
+        );
+
+        assert_eq!(run.file(), file, "{provider:?} {held}");
+        assert_ne!(inode(&file), kept, "{provider:?} {held}");
+        assert_eq!(
+            run.token(),
+            fake_grant_token(provider.clone(), 1),
+            "{provider:?} {held}"
+        );
+        assert_eq!(mode(&file), 0o600, "{provider:?} {held}");
+        assert_eq!(
+            run.refresh_records(),
+            [attributes(&serde_json::json!({
+                "um.grant_token.provider": provider.cloud_id(),
+                "um.grant_token.phase": "refresh",
+                "um.grant_token.state": "ready",
+                "um.grant_token.generation": 1,
+                "um.assignment.id": ASSIGNMENT,
+            }))],
+            "{provider:?} {held}"
+        );
+        if provider.agent_login_provider().is_some() {
+            assert_eq!(
+                run.github(),
+                GrantReadiness {
+                    issued: Some(IssuedGrant {
+                        grant_id: OTHER_GRANT_ID.to_owned(),
+                        generation: 1,
+                        expires_at,
+                    }),
+                    ..ready(1, expires_at)
+                },
+                "{held}"
+            );
+        }
+
+        // An answer of the grant or token now held, at the generation held,
+        // still writes no file and no record.
+        let written = inode(&file);
+        let recorded = run.fixture.recorded();
+        assert_eq!(
+            run.pass(FakeGrantToken::IssueFrom(other, 1)).await,
+            Some(WAIT),
+            "{provider:?}"
+        );
+        assert_eq!(inode(&file), written, "{provider:?}");
+        assert_eq!(run.refresh_records().len(), 1, "{provider:?}");
+        assert_eq!(run.fixture.recorded(), recorded, "{provider:?}");
+    }
 }

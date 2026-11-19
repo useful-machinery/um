@@ -8,7 +8,7 @@ use base64::Engine as _;
 use futures_util::{SinkExt as _, StreamExt as _};
 use tokio_tungstenite::tungstenite::Message;
 
-use super::grant::after_notice;
+use super::grant::{after_notice, without_notice};
 use super::runner_status::{
     ServeStatusFixture, accept_runner_connection_answering, accept_runner_socket,
     cloud_observation_ack, cloud_welcome, write_status_config,
@@ -39,20 +39,32 @@ pub(super) fn synced_response(codex: &str) -> Vec<u8> {
 
 pub(super) const READY_CODEX: &str = r#"{"provider":"codex","state":"ready","agentLoginId":"agl_01k0z6r1w8f4jy2m7q9v3x5abc","generation":3,"checkedAt":"2026-11-12T01:00:00Z","installedAt":"2026-11-12T00:55:00Z"}"#;
 
-/// The sync command (REQ-GRANT-41).
+/// The sync command (REQ-GRANT-41, REQ-INTEGRATION-14).
+pub(super) const INTEGRATION_SYNC: [&str; 3] = ["runner", "integration", "sync"];
+/// The command it replaces, which the cases below keep driving: it sends the
+/// same request and prints the same output with the same exit status, after a
+/// line on standard error naming `useful runner integration sync`
+/// (REQ-INTEGRATION-15).
 pub(super) const SYNC: [&str; 3] = ["runner", "grant", "sync"];
-/// Its earlier spelling, which sends the same request and prints the same
-/// output with the same exit status, after a line on standard error naming
-/// `useful runner grant sync` (REQ-GRANT-77).
+/// Its earlier spelling, which does the same (REQ-GRANT-77).
 pub(super) const EARLIER_SYNC: [&str; 3] = ["runner", "agent-login", "sync"];
+/// The command the notice of either earlier spelling names.
+const SYNC_REPLACEMENT: &str = "useful runner integration sync";
 
 const BUSY_RESPONSE: &[u8] =
     b"{\"schemaVersion\":1,\"outcome\":\"error\",\"error\":\"runner_busy\"}\n";
 
-/// Runs `command --config PATH` and `extra` against a fake control socket
-/// that answers `response` to one request, and returns the command's output
-/// with the request the socket received.
+/// [`sync_printing`] without the notice an earlier spelling prints first, so a
+/// case reads what the command prints under any spelling.
 fn sync_against(command: [&str; 3], response: Vec<u8>, extra: &[&str]) -> (Output, Vec<u8>) {
+    let (output, request) = sync_printing(command, response, extra);
+    (without_notice(output, SYNC_REPLACEMENT), request)
+}
+
+/// Runs `command --config PATH` and `extra` against a fake control socket
+/// that answers `response` to one request, and returns the command's output,
+/// any notice included, with the request the socket received.
+fn sync_printing(command: [&str; 3], response: Vec<u8>, extra: &[&str]) -> (Output, Vec<u8>) {
     let directory = private_credential_directory();
     let runtime = tempfile::tempdir_in("/tmp").unwrap();
     let socket_path = runtime.path().join("runner.sock");
@@ -137,8 +149,13 @@ fn sync_asks_the_live_runner_and_prints_each_provider_readiness() {
 
 // REQ-GRANT-41
 // REQ-GRANT-77
+// REQ-INTEGRATION-14
+// REQ-INTEGRATION-15
+// `runner integration sync` sends the request and prints what the earlier
+// spellings print, with no notice; each earlier one prints first a line naming
+// it and then exactly what it prints.
 #[test]
-fn the_earlier_sync_spelling_prints_the_same_output_and_exit_status() {
+fn the_earlier_sync_spellings_print_what_runner_integration_sync_prints() {
     let refused = READY_CODEX.replace(
         r#""installedAt""#,
         r#""selected":true,"lastUse":"refused","installedAt""#,
@@ -149,33 +166,41 @@ fn the_earlier_sync_spelling_prints_the_same_output_and_exit_status() {
         (BUSY_RESPONSE.to_vec(), 4),
     ] {
         for extra in [&[][..], &["--json"][..]] {
-            let (output, request) = sync_against(SYNC, response.clone(), extra);
-            let (earlier, earlier_request) = sync_against(EARLIER_SYNC, response.clone(), extra);
+            let (output, request) = sync_printing(INTEGRATION_SYNC, response.clone(), extra);
             assert_eq!(request, SYNC_REQUEST);
-            assert_eq!(earlier_request, SYNC_REQUEST);
             assert_eq!(output.status.code(), Some(code), "{extra:?}");
-            assert_eq!(earlier.status.code(), Some(code), "{extra:?}");
-            assert_eq!(earlier.stdout, output.stdout, "{extra:?}");
-            assert_eq!(
-                after_notice(&earlier, "useful runner grant sync").as_bytes(),
-                output.stderr,
-                "{extra:?}"
-            );
+            if code == 0 {
+                assert!(output.stderr.is_empty(), "{extra:?}");
+            }
+            for spelling in [SYNC, EARLIER_SYNC] {
+                let (earlier, earlier_request) = sync_printing(spelling, response.clone(), extra);
+                assert_eq!(earlier_request, SYNC_REQUEST);
+                assert_eq!(earlier.status.code(), Some(code), "{spelling:?} {extra:?}");
+                assert_eq!(earlier.stdout, output.stdout, "{spelling:?} {extra:?}");
+                assert_eq!(
+                    after_notice(&earlier, SYNC_REPLACEMENT).as_bytes(),
+                    output.stderr,
+                    "{spelling:?} {extra:?}"
+                );
+            }
         }
     }
 
     let directory = private_credential_directory();
     let runtime = tempfile::tempdir_in("/tmp").unwrap();
     let config = write_status_config(&directory, &runtime.path().join("runner.sock"));
-    let output = sync_with_no_live_runner(SYNC, &config);
-    let earlier = sync_with_no_live_runner(EARLIER_SYNC, &config);
+    let output = sync_with_no_live_runner(INTEGRATION_SYNC, &config);
     assert_eq!(output.status.code(), Some(4));
-    assert_eq!(earlier.status.code(), Some(4));
-    assert_eq!(earlier.stdout, output.stdout);
-    assert_eq!(
-        after_notice(&earlier, "useful runner grant sync").as_bytes(),
-        output.stderr
-    );
+    for spelling in [SYNC, EARLIER_SYNC] {
+        let earlier = sync_with_no_live_runner(spelling, &config);
+        assert_eq!(earlier.status.code(), Some(4), "{spelling:?}");
+        assert_eq!(earlier.stdout, output.stdout, "{spelling:?}");
+        assert_eq!(
+            after_notice(&earlier, SYNC_REPLACEMENT).as_bytes(),
+            output.stderr,
+            "{spelling:?}"
+        );
+    }
 }
 
 /// Asserts that `stdout` has exactly one line per provider, in order, each

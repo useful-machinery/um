@@ -139,7 +139,7 @@ impl AgentLoginProvider {
     }
 
     /// An OAuth provider's name as a grant's provider, which the grant-token
-    /// route and `useful grant` take: GitLab is the instance `gitlab.com`.
+    /// route and `useful integration` take: GitLab is the instance `gitlab.com`.
     /// `None` for an installable provider.
     pub const fn grant_provider(self) -> Option<&'static str> {
         match self {

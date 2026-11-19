@@ -14,7 +14,7 @@ fn prepared(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, Stri
     write_credential_fixture(&path, &server.api_url, TOKEN, "2999-01-01T00:00:00Z");
     (server, directory, path.to_str().unwrap().to_owned())
 }
-fn session(status: &str) -> serde_json::Value {
+pub(super) fn session(status: &str) -> serde_json::Value {
     let mut value = serde_json::json!({"id": SESSION, "organizationId": ORG_ID, "operation":"connect", "status":status,
         "createdAt":"2026-09-05T12:00:00Z", "expiresAt":"2026-09-05T12:15:00Z", "verifier":SECRET});
     if status == "pending" {
@@ -25,10 +25,20 @@ fn session(status: &str) -> serde_json::Value {
     }
     value
 }
-fn connection() -> serde_json::Value {
+/// An active connection of the workspace `Research`, with a member the contract does not name.
+pub(super) fn connection() -> serde_json::Value {
     serde_json::json!({"id":CONNECTION,"organizationId":ORG_ID,"status":"active", "workspaceId":"workspace-1",
         "workspaceName":"Research", "requiredScopes":["read"], "grantedScopes":["read"], "stateUpdatesConsented":false,
         "lifecycleGeneration":1,"createdAt":"2026-09-05T12:00:00Z","updatedAt":"2026-09-05T12:01:00Z", "token":SECRET})
+}
+/// A session completed with the connection it made.
+pub(super) fn completed_session() -> serde_json::Value {
+    let mut value = session("completed");
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("resultConnection".into(), connection());
+    value
 }
 fn env_run(server: &ScriptedServer, credential: &str, args: &[&str]) -> Output {
     run_with_env(args, &deployment_environment(&server.api_url, credential))
@@ -189,14 +199,7 @@ fn discovery_rejects_open_or_inconsistent_suggestion_records() {
 fn consent_handoff_and_later_authorization_inspection_are_nonsecret() {
     let (server, _dir, credential) = prepared(vec![
         json_http_response("201 Created", session("pending")),
-        json_http_response("200 OK", {
-            let mut value = session("completed");
-            value
-                .as_object_mut()
-                .unwrap()
-                .insert("resultConnection".into(), connection());
-            value
-        }),
+        json_http_response("200 OK", completed_session()),
     ]);
     let started = env_run(
         &server,
@@ -262,14 +265,9 @@ fn consent_handoff_and_later_authorization_inspection_are_nonsecret() {
 // REQ-CONNECTION-41, REQ-CONNECTION-42
 #[test]
 fn polling_completion_uses_the_same_session_and_shows_connection_metadata() {
-    let mut done = session("completed");
-    done.as_object_mut().unwrap().remove("authorizationUrl");
-    done.as_object_mut()
-        .unwrap()
-        .insert("resultConnection".into(), connection());
     let (server, _dir, credential) = prepared(vec![
         json_http_response("201 Created", session("pending")),
-        json_http_response("200 OK", done),
+        json_http_response("200 OK", completed_session()),
     ]);
     let output = env_run(
         &server,

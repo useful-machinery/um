@@ -21,7 +21,7 @@ pub struct ServedGrantProvider {
     /// The provider, named as a grant names it.
     #[serde(rename = "provider")]
     pub provider: String,
-    /// `oauth` for a provider the deployment holds an OAuth application for; `native` for a coding agent the deployment lists a target for.
+    /// `oauth` for a provider the deployment holds an OAuth application for; `native` for a coding agent the deployment lists a target for; `token` for a token service of the provider table, which authenticates with a plain token a member or an organization stores, served where the deployment holds the integration credential key.
     #[serde(rename = "kind")]
     pub kind: Kind,
     /// The provider's name for people, at most 64 bytes, such as `GitHub` or `Claude Code`.
@@ -39,13 +39,15 @@ impl ServedGrantProvider {
         }
     }
 }
-/// `oauth` for a provider the deployment holds an OAuth application for; `native` for a coding agent the deployment lists a target for.
+/// `oauth` for a provider the deployment holds an OAuth application for; `native` for a coding agent the deployment lists a target for; `token` for a token service of the provider table, which authenticates with a plain token a member or an organization stores, served where the deployment holds the integration credential key.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum Kind {
     #[serde(rename = "oauth")]
     ServedGrantProviderKindOAuth,
     #[serde(rename = "native")]
     ServedGrantProviderKindNative,
+    #[serde(rename = "token")]
+    ServedGrantProviderKindToken,
 }
 
 impl Default for Kind {

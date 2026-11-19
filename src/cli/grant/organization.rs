@@ -1,11 +1,12 @@
-//! The one organization a native grant `useful grant create` makes is for (REQ-GRANT-72): the one
-//! `--organization` names, or else the member's only active membership. The runner choice of
-//! `authorize` and `deauthorize` reads the member's active organizations here too
-//! (REQ-GRANT-81).
+//! The one organization a native grant `useful integration connect` makes is for (REQ-GRANT-72):
+//! the one `--organization` names, or else the member's only active membership. The runner choice
+//! of `authorize` and `deauthorize` reads the member's active organizations here too
+//! (REQ-GRANT-81), and `useful integration list` the memberships whose organizations' tokens and
+//! connections it lists (REQ-INTEGRATION-19, REQ-INTEGRATION-22).
 
 use anyhow::anyhow;
 
-use useful_api::{MemberGrantApi, MemberGrantFailure};
+use useful_api::{ActiveMembership, MemberGrantApi, MemberGrantFailure};
 
 // The largest page the membership list serves.
 const PAGE: i32 = 200;
@@ -58,14 +59,25 @@ pub(super) fn resolve(
 
 /// Every organization the member is an active member of, by ID and slug, read to the last
 /// page.
-pub(super) fn active(api: &MemberGrantApi) -> Result<Vec<(String, String)>, MemberGrantFailure> {
-    let invalid = MemberGrantFailure::InvalidResponse {
-        credential_rejected: false,
-    };
-    super::every_page(invalid, |cursor| {
+pub(in crate::cli) fn active(
+    api: &MemberGrantApi,
+) -> Result<Vec<(String, String)>, MemberGrantFailure> {
+    super::every_page(INVALID, |cursor| {
         api.active_organizations(Some(PAGE), cursor)
     })
 }
+
+/// Every active membership of the member, with its organization's ID and slug and whether the
+/// member is its owner, read to the last page.
+pub(in crate::cli) fn memberships(
+    api: &MemberGrantApi,
+) -> Result<Vec<ActiveMembership>, MemberGrantFailure> {
+    super::every_page(INVALID, |cursor| api.active_memberships(Some(PAGE), cursor))
+}
+
+const INVALID: MemberGrantFailure = MemberGrantFailure::InvalidResponse {
+    credential_rejected: false,
+};
 
 /// The organization `named` names: an ID as given, a slug to the ID of the organization it
 /// names among the member's.

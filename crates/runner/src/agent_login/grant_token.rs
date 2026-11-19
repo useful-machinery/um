@@ -1,27 +1,27 @@
 //! The grant tokens of the assignment the serving runner holds
 //! (REQ-GRANT-86): at each admission the runner asks Cloud for the
-//! assignment's providers, then for the token of the run's grant of each
-//! provider listed that the host does not provide (REQ-GRANT-87), keeps each
-//! token it is issued in a private file of its own in its agent-login
-//! directory, records the outcome of each of GitHub, GitLab.com and Linear
-//! for the run in the readiness document (REQ-GRANT-88), and writes a
-//! `runner.grant_token` record for each changed state and each failure
-//! (REQ-TELEMETRY-46). A token file is only ever the token of the assignment
-//! the runner holds (INV-RUNNER-28): the admission removes every token file
-//! before it uses any answer, an idle setup removes what an interrupted
-//! runner left, and the hold an admission returns removes them when the
-//! assignment ends. The admission offers each token it holds, and its file,
-//! to the steps of its workflow that pass their names or, for the runner's
-//! own three, declare the provider (REQ-WFEXEC-78): the runner's own names
-//! for its three, and the names of a listed provider's entry once it has
-//! checked them (REQ-GRANT-87, INV-RUNNER-32). While
-//! the assignment runs, a task the hold owns keeps each file current
-//! (REQ-GRANT-89): it asks again when the wait Cloud named has passed and
-//! replaces the file in one step, retries a request Cloud did not answer,
-//! removes the file at a refusal or once the held token has expired, and
-//! stops when the hold is dropped. Dropping the hold then marks the entries
-//! ended, unless a later admission has recorded its own since
-//! (INV-RUNNER-30).
+//! assignment's providers and, at the same time, its token services
+//! (REQ-INTEGRATION-12), then for the token of the run's grant of each
+//! provider listed, and of each token service, that the host does not provide
+//! (REQ-GRANT-87), keeps each token it is issued in a private file of its own
+//! in its agent-login directory, records the outcome of each of GitHub,
+//! GitLab.com and Linear for the run in the readiness document
+//! (REQ-GRANT-88), and writes a `runner.grant_token` record for each changed
+//! state and each failure (REQ-TELEMETRY-46). A token file is only ever the
+//! token of the assignment the runner holds (INV-RUNNER-28): the admission
+//! removes every token file before it uses any answer, an idle setup removes
+//! what an interrupted runner left, and the hold an admission returns removes
+//! them when the assignment ends. The admission offers each token it holds,
+//! and its file, to the steps of its workflow that pass their names or, for
+//! the runner's own three, declare the provider (REQ-WFEXEC-78): the runner's
+//! own names for its three, and the names of a listed provider's entry once
+//! it has checked them (REQ-GRANT-87, INV-RUNNER-32). While the assignment
+//! runs, a task the hold owns keeps each file current (REQ-GRANT-89): it asks
+//! again when the wait Cloud named has passed and replaces the file in one
+//! step, retries a request Cloud did not answer, removes the file at a
+//! refusal or once the held token has expired, and stops when the hold is
+//! dropped. Dropping the hold then marks the entries ended, unless a later
+//! admission has recorded its own since (INV-RUNNER-30).
 
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -40,6 +40,7 @@ use useful_execution::{
 use super::cloud::{
     AgentLoginCloud, CloudFailure, GrantAccessToken, GrantProvider, GrantProvidersFailure,
     GrantProvidersRequest, GrantTokenFailure, GrantTokenRefusal, GrantTokenRequest, IssuedToken,
+    ListedProvider, ReportedTokenService, TokenServiceSource,
 };
 use super::directory::{self, LoginDirectory};
 use super::readiness::{GrantReadiness, IssuedGrant, ReadinessDocument, brokered_providers};
@@ -84,6 +85,13 @@ const MAXIMUM_RETRY: Duration = Duration::from_secs(5 * 60);
 /// (REQ-TELEMETRY-46).
 const ASSIGNMENT_NOT_CURRENT_STATUS: u16 = 409;
 
+/// What an admission's two lists answered: the OAuth providers' and the
+/// token services'.
+type Lists = (
+    Result<Vec<ListedProvider>, GrantProvidersFailure>,
+    Result<Vec<ListedProvider>, GrantProvidersFailure>,
+);
+
 /// Which of an assignment's requests a record is of (REQ-TELEMETRY-46).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Phase {
@@ -105,7 +113,7 @@ impl Phase {
 /// Where a grant token's setup failed, as its record names it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Stage {
-    /// Asking Cloud for the assignment's providers.
+    /// Asking Cloud for the assignment's providers or its token services.
     List,
     /// Asking Cloud for the token.
     Issue,
@@ -344,8 +352,9 @@ impl TokenFiles {
 #[derive(Clone, Debug)]
 struct HeldToken {
     offering: Offering,
-    /// The `pgr_` ID of the grant, which the admission reports
-    /// (REQ-GRANT-93).
+    /// The `pgr_` ID of the grant, or for a token service the `itk_` ID of
+    /// its integration token, as issued at the admission, which the
+    /// admission reports (REQ-GRANT-93, REQ-INTEGRATION-12).
     grant_id: String,
     file: PathBuf,
     generation: u64,
@@ -369,6 +378,11 @@ pub(crate) struct AssignmentGrantTokens {
     assignment_id: String,
     /// Each token the admission kept.
     held: Vec<HeldToken>,
+    /// Each token service Cloud's list named whose names the runner
+    /// checked, in the list's order, whether or not a token of it was kept:
+    /// those whose source the admission reports (REQ-INTEGRATION-12). None
+    /// where Cloud did not answer the list.
+    services: Vec<Offering>,
     /// The task keeping the files current, once started.
     refresh: Option<GrantTokenRefresh>,
     /// Where each readiness document a refresh or the end records is
@@ -441,10 +455,12 @@ impl AssignmentGrantTokens {
             .map(|held| Due {
                 offering: held.offering.clone(),
                 file: held.file.clone(),
+                grant_id: held.grant_id.clone(),
                 generation: held.generation,
                 expires_at: Some(held.expires_at),
                 recorded: Recorded {
                     state: AgentLoginState::Ready,
+                    grant_id: Some(held.grant_id.clone()),
                     generation: Some(held.generation),
                 },
                 at: after(started, held.refresh_after),
@@ -487,13 +503,17 @@ struct Due {
     offering: Offering,
     /// The file the admission kept the token in.
     file: PathBuf,
+    /// The ID of the grant or integration token the token the runner last
+    /// kept was issued from.
+    grant_id: String,
     /// The generation of the token the runner last kept.
     generation: u64,
-    /// The expiry of the token in the file; `None` once it is removed.
+    /// The expiry of the token in the file, as the last answer for it named
+    /// it; `None` once it is removed.
     expires_at: Option<OffsetDateTime>,
-    /// The state and generation the assignment last recorded of the
-    /// provider: `ready` with the kept generation when the task starts,
-    /// then what each refresh recorded.
+    /// The state, grant and generation the assignment last recorded of the
+    /// provider: `ready` with the kept token when the task starts, then what
+    /// each refresh recorded.
     recorded: Recorded,
     at: Instant,
     /// The wait after the next failure.
@@ -507,36 +527,43 @@ pub(crate) struct RefreshStep {
     offering: Offering,
     /// The file the admission kept the token in.
     file: PathBuf,
+    /// The ID of the grant or integration token the token the runner last
+    /// kept was issued from.
+    grant_id: String,
     /// The generation of the token the runner last kept.
     generation: u64,
     /// Whether its file still holds that token.
     held: bool,
     /// Whether the token's expiry has passed, on the task's clock.
     expired: bool,
-    /// The state and generation the task carries for the provider, which
-    /// the refresh of a provider with no readiness entry compares against.
+    /// The state, grant and generation the task carries for the provider,
+    /// which the refresh of a provider with no readiness entry compares
+    /// against.
     recorded: Recorded,
 }
 
-/// The state and generation last recorded of a provider, which a refresh
-/// compares its outcome against to tell whether to write a record
+/// The state, grant and generation last recorded of a provider, which a
+/// refresh compares its outcome against to tell whether to write a record
 /// (REQ-TELEMETRY-46) and, for one of the runner's three, its readiness
 /// entry: the three's from the readiness document, and any other
-/// provider's as the refresh task carries it for the assignment.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// provider's as the refresh task carries it for the assignment. A token
+/// issued from another grant or integration token is a change, whatever
+/// its generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Recorded {
     state: AgentLoginState,
+    grant_id: Option<String>,
     generation: Option<u64>,
 }
 
 impl Recorded {
     /// What `grant` records; a provider never recorded is `not_delivered`.
     fn of(grant: Option<&GrantReadiness>) -> Self {
+        let issued = grant.and_then(|grant| grant.issued.as_ref());
         Self {
             state: grant.map_or(AgentLoginState::NotDelivered, |grant| grant.state),
-            generation: grant
-                .and_then(|grant| grant.issued.as_ref())
-                .map(|issued| issued.generation),
+            grant_id: issued.map(|issued| issued.grant_id.clone()),
+            generation: issued.map(|issued| issued.generation),
         }
     }
 
@@ -544,22 +571,32 @@ impl Recorded {
     fn outcome(outcome: &Settled) -> Self {
         Self {
             state: outcome.state,
+            grant_id: outcome
+                .issued
+                .as_ref()
+                .map(|issued| issued.grant_id.clone()),
             generation: outcome.issued.as_ref().map(|issued| issued.generation),
         }
     }
 }
 
 /// What the refresh task does after a refresh.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum Next {
-    /// A token of a newer generation is in the file: ask again after `wait`.
+    /// A token of a newer generation, or issued from another grant or
+    /// integration token, is in the file: ask again after `wait`.
     Kept {
+        grant_id: String,
         generation: u64,
         expires_at: OffsetDateTime,
         wait: Duration,
     },
-    /// The token in the file is the current one: ask again after `wait`.
-    Unchanged { wait: Duration },
+    /// The token in the file is the current one, which expires at
+    /// `expires_at` as the answer names it: ask again after `wait`.
+    Unchanged {
+        expires_at: OffsetDateTime,
+        wait: Duration,
+    },
     /// Ask again after the next retry; `removed` when the file was removed,
     /// since its token had expired.
     Retry { removed: bool },
@@ -599,12 +636,13 @@ impl Refresh {
                 let step = RefreshStep {
                     offering: due.offering.clone(),
                     file: due.file.clone(),
+                    grant_id: due.grant_id.clone(),
                     generation: due.generation,
                     held: due.expires_at.is_some(),
                     expired: due
                         .expires_at
                         .is_some_and(|expires_at| sleeper.utc_now() >= expires_at),
-                    recorded: due.recorded,
+                    recorded: due.recorded.clone(),
                 };
                 let asking = Arc::clone(&refresh);
                 let answered = tokio::task::spawn_blocking(move || {
@@ -632,16 +670,21 @@ impl Refresh {
                 let answered_at = sleeper.now();
                 match next {
                     Next::Kept {
+                        grant_id,
                         generation,
                         expires_at,
                         wait,
                     } => {
+                        due.grant_id = grant_id;
                         due.generation = generation;
                         due.expires_at = Some(expires_at);
                         due.at = after(answered_at, wait);
                         due.retry = MINIMUM_WAIT;
                     }
-                    Next::Unchanged { wait } => {
+                    // Each answer for the held token names the expiry the
+                    // file stands until (REQ-INTEGRATION-12).
+                    Next::Unchanged { expires_at, wait } => {
+                        due.expires_at = Some(expires_at);
                         due.at = after(answered_at, wait);
                         due.retry = MINIMUM_WAIT;
                     }
@@ -667,6 +710,7 @@ impl std::fmt::Debug for AssignmentGrantTokens {
             .field("run_id", &self.run_id)
             .field("assignment_id", &self.assignment_id)
             .field("held", &self.held)
+            .field("services", &self.services)
             .field("refreshing", &self.refresh.is_some())
             .finish_non_exhaustive()
     }
@@ -731,22 +775,19 @@ pub(crate) fn offer(
 ) -> EnvironmentSnapshot {
     let mut variables = environment.variables().clone();
     for held in tokens.map_or(&[][..], |tokens| tokens.held.as_slice()) {
-        let Offering {
-            variable,
-            file_variable,
-            ..
-        } = &held.offering;
         // The host provides a provider either of whose names `environment`
         // carries, whatever the admission held (INV-RUNNER-17).
-        if [variable, file_variable]
-            .into_iter()
-            .any(|name| environment.variable(OsStr::new(name)).is_some())
-        {
+        if carried(environment, &held.offering) {
             continue;
         }
         let Some(token) = read_token(&held.file) else {
             continue;
         };
+        let Offering {
+            variable,
+            file_variable,
+            ..
+        } = &held.offering;
         variables.insert(
             OsString::from(variable),
             OsString::from_vec(token.as_bytes().to_vec()),
@@ -757,6 +798,53 @@ pub(crate) fn offer(
         );
     }
     EnvironmentSnapshot::new(variables)
+}
+
+/// Whether `environment` carries either name `offering` offers its token
+/// under: the host's providing it, whatever the admission held
+/// (INV-RUNNER-17).
+fn carried(environment: &EnvironmentSnapshot, offering: &Offering) -> bool {
+    [&offering.variable, &offering.file_variable]
+        .into_iter()
+        .any(|name| environment.variable(OsStr::new(name)).is_some())
+}
+
+/// The source of each token service Cloud listed for the assignment of
+/// `tokens` whose names the runner checked, in the list's order, settled
+/// from what `offer` reads of `environment` and `tokens` (REQ-INTEGRATION-12,
+/// INV-RUNNER-31): `host` where `environment` carries either of its names,
+/// else `token`, with the `itk_` ID it was issued from, where the
+/// admission kept its token and the file reads back, else none, and no
+/// entry. None where Cloud did not answer the list, or there is no hold.
+pub(crate) fn token_service_sources(
+    environment: &EnvironmentSnapshot,
+    tokens: Option<&AssignmentGrantTokens>,
+) -> Vec<ReportedTokenService> {
+    let Some(tokens) = tokens else {
+        return Vec::new();
+    };
+    tokens
+        .services
+        .iter()
+        .filter_map(|offering| {
+            let source = if carried(environment, offering) {
+                TokenServiceSource::Host
+            } else {
+                let held = tokens
+                    .held
+                    .iter()
+                    .find(|held| held.offering.provider == offering.provider)
+                    .filter(|held| read_token(&held.file).is_some())?;
+                TokenServiceSource::Token {
+                    integration_token_id: held.grant_id.clone(),
+                }
+            };
+            Some(ReportedTokenService {
+                provider: offering.provider.cloud_id().to_owned(),
+                source,
+            })
+        })
+        .collect()
 }
 
 /// The token in the file at `path` (`directory::read_token`); `None` when
@@ -809,14 +897,64 @@ impl Listed {
     }
 }
 
-/// A provider other than the runner's three that Cloud lists, as the runner
-/// checked the two names its entry gives (`usable_names`).
+/// A provider other than the runner's three that Cloud lists, a token
+/// service included, as the runner checked the two names its entry gives
+/// (`usable_names`).
 enum Configured {
     /// Its token may be offered under both names (INV-RUNNER-32).
     Checked(Offering),
-    /// A name may not carry its token: the entry is not used, and its
-    /// provider is asked for nothing (REQ-GRANT-87).
+    /// A name may not carry its token, or a token service's id is one the
+    /// OAuth list also names: the entry is not used, and its provider is
+    /// asked for nothing (REQ-GRANT-87, REQ-INTEGRATION-12).
     Refused(GrantProvider),
+}
+
+impl Configured {
+    /// The entry of `listed`, as `provider`, checked against the names of
+    /// each configured entry before it, `earlier`, which it then joins; an
+    /// entry `refused` already is refused whatever its names.
+    fn check<'l>(
+        listed: &'l ListedProvider,
+        provider: GrantProvider,
+        refused: bool,
+        earlier: &mut Vec<&'l str>,
+    ) -> Self {
+        let usable = !refused && usable_names(&listed.token, &listed.token_file, earlier);
+        earlier.extend([listed.token.as_str(), listed.token_file.as_str()]);
+        if usable {
+            Self::Checked(Offering {
+                provider,
+                variable: listed.token.clone(),
+                file_variable: listed.token_file.clone(),
+            })
+        } else {
+            Self::Refused(provider)
+        }
+    }
+
+    fn provider(&self) -> &GrantProvider {
+        match self {
+            Self::Checked(offering) => &offering.provider,
+            Self::Refused(provider) => provider,
+        }
+    }
+}
+
+/// What a list answered that the admission uses: its entries, none for a
+/// Cloud without the route, or the failure of a list Cloud did not answer
+/// usefully, `assignment_not_current` as Cloud's 409 as the token route's
+/// is.
+fn listed_entries(
+    answer: &Result<Vec<ListedProvider>, GrantProvidersFailure>,
+) -> Result<Option<&[ListedProvider]>, CloudFailure> {
+    match answer {
+        Ok(providers) => Ok(Some(providers)),
+        Err(GrantProvidersFailure::NoRoute) => Ok(None),
+        Err(GrantProvidersFailure::AssignmentNotCurrent) => {
+            Err(CloudFailure::Status(ASSIGNMENT_NOT_CURRENT_STATUS))
+        }
+        Err(GrantProvidersFailure::Cloud(failure)) => Err(*failure),
+    }
 }
 
 /// The outcome of a request for one provider, before it is recorded: the
@@ -833,14 +971,20 @@ struct Settled {
 
 impl Asking<'_> {
     /// Once every token file is gone, asks Cloud once for the assignment's
-    /// providers (REQ-GRANT-97), then for the token of the grant of each
-    /// provider the list names and the host, whose environment is
-    /// `service`, does not provide (REQ-GRANT-86, REQ-GRANT-87), the token
-    /// requests at once so that a Cloud that does not answer them costs one
-    /// bounded request; a Cloud without the list is asked for each of the
-    /// runner's three as before it, one of the three a list does not name is
-    /// `not_authorized`, and a list Cloud did not answer usefully asks for
-    /// none and leaves each of the three `cloud_unavailable`
+    /// providers (REQ-GRANT-97) and, at the same time, once for its token
+    /// services (REQ-INTEGRATION-12), then for the token of the grant of
+    /// each provider the first list names, and of each token service the
+    /// second names, that the host, whose environment is `service`, does not
+    /// provide (REQ-GRANT-86, REQ-GRANT-87), the token requests at once so
+    /// that a Cloud that does not answer them costs one bounded request; the
+    /// two lists are independent. A token service is asked for, kept,
+    /// offered and recorded as a configured provider is; a Cloud without its
+    /// list lists none and records nothing, and a list Cloud did not answer
+    /// usefully lists none and is recorded once, with no provider
+    /// (REQ-TELEMETRY-46). A Cloud without the OAuth list is asked for each
+    /// of the runner's three as before it, one of the three a list does not
+    /// name is `not_authorized`, and a list Cloud did not answer usefully
+    /// asks for none and leaves each of the three `cloud_unavailable`
     /// (REQ-GRANT-88). A listed provider other than the three is asked for
     /// only when the names its entry gives may carry its token
     /// (`usable_names`, INV-RUNNER-32), and an entry whose names may not is
@@ -866,8 +1010,24 @@ impl Asking<'_> {
             *holder = None;
             self.files.remove_all()
         };
-        let listed = self.list();
-        let configured = listed.as_ref().map_or(&[][..], Listed::configured);
+        let (providers, services) = self.lists();
+        // The names of each configured entry so far, used or not, of the
+        // OAuth list and then of the token-service list.
+        let mut earlier: Vec<&str> = Vec::new();
+        let listed = Self::list(&providers, &mut earlier);
+        let oauth = listed.as_ref().map_or(&[][..], Listed::configured);
+        let services = Self::token_services(&services, oauth, &mut earlier);
+        let service_entries = services.as_ref().map_or(&[][..], Vec::as_slice);
+        // The token services whose source the report names: each the list
+        // named whose names the runner checked, kept or not.
+        let checked_services: Vec<Offering> = service_entries
+            .iter()
+            .filter_map(|entry| match entry {
+                Configured::Checked(offering) => Some(offering.clone()),
+                Configured::Refused(_) => None,
+            })
+            .collect();
+        let configured: Vec<&Configured> = oauth.iter().chain(service_entries).collect();
         let asked: Vec<GrantProvider> = brokered_providers()
             .filter(|&provider| {
                 !service.provides(provider)
@@ -875,7 +1035,7 @@ impl Asking<'_> {
                     && listed.as_ref().is_ok_and(|listed| listed.names(provider))
             })
             .filter_map(|provider| GrantProvider::try_from(provider).ok())
-            .chain(configured.iter().filter_map(|entry| match entry {
+            .chain(configured.iter().copied().filter_map(|entry| match entry {
                 Configured::Checked(offering)
                     if !offering.provided_by(service) && removal.configured.is_none() =>
                 {
@@ -915,10 +1075,12 @@ impl Asking<'_> {
                 };
                 settled.push(outcome);
             }
-            for entry in configured {
+            for &entry in &configured {
                 let outcome = match entry {
                     // Its entry names its token after a name the runner
-                    // offers no token under: an answer it cannot use.
+                    // offers no token under, or a token service's id is
+                    // one the OAuth list names too: an answer it cannot
+                    // use.
                     Configured::Refused(provider) => {
                         self.unavailable(provider, Stage::List, CloudFailure::InvalidResponse)
                     }
@@ -948,6 +1110,7 @@ impl Asking<'_> {
                 .iter_mut()
                 .filter_map(|outcome| outcome.kept.take())
                 .collect(),
+            services: checked_services,
             refresh: None,
             publish: None,
         };
@@ -956,33 +1119,39 @@ impl Asking<'_> {
                 Some(provider) => {
                     let mut entry = self.entry(provider, outcome);
                     entry.source = credential_source(provider, service, None, Some(&tokens));
-                    self.record(Phase::Admission, Recorded::of(recorded(provider)), outcome);
+                    self.record(Phase::Admission, &Recorded::of(recorded(provider)), outcome);
                     document.record_grant(entry);
                 }
                 // A provider other than the three has no entry in the
                 // document and no source: what it was issued is its record
                 // alone, its state compared against `not_delivered` at each
                 // admission.
-                None => self.record(Phase::Admission, Recorded::of(None), outcome),
+                None => self.record(Phase::Admission, &Recorded::of(None), outcome),
             }
+        }
+        if let Err(failure) = services {
+            self.record_list_failure(failure);
         }
         tokens
     }
 
     /// Asks Cloud again for the token `step` names, for the assignment
     /// whose files these are (REQ-GRANT-89): keeps a token of a newer
-    /// generation in place of the held one, at the same path in one step,
-    /// leaves the file as it is when Cloud did not answer usefully, unless
-    /// the held token has expired, when it removes it, and removes it at a
-    /// refusal. Writes one record per changed state or failure, against the
+    /// generation, or one issued from another grant or integration token
+    /// whatever its generation, in place of the held one, at the same path
+    /// in one step; answers the expiry an answer for the held token names,
+    /// which the task holds for the file from then on; leaves the file as it
+    /// is when Cloud did not answer usefully, unless the held token has
+    /// expired, when it removes it, and removes it at a refusal. Writes one
+    /// record per changed state, grant, generation or failure, against the
     /// provider's entry as `previous` recorded it for one of the runner's
-    /// three, and against the state the task carries in `step` for any
-    /// other provider. Records the entry of one of the three in `document`
-    /// when its state or generation changed; any other provider has no
+    /// three, and against what the task carries in `step` for any other
+    /// provider. Records the entry of one of the three in `document` when
+    /// its state, grant or generation changed; any other provider has no
     /// entry, so its refresh changes no document. Answers what the task does
-    /// next, the state and generation now recorded for it to carry on, and
-    /// whether it changed `document`. It asks nothing, and changes nothing,
-    /// once the files are no longer the assignment's.
+    /// next, the state, grant and generation now recorded for it to carry
+    /// on, and whether it changed `document`. It asks nothing, and changes
+    /// nothing, once the files are no longer the assignment's.
     pub(crate) fn refresh(
         &self,
         step: &RefreshStep,
@@ -992,25 +1161,34 @@ impl Asking<'_> {
         let offering = &step.offering;
         let provider = &offering.provider;
         if !self.files.held_for(self.assignment_id) {
-            return (Next::End, step.recorded, false);
+            return (Next::End, step.recorded.clone(), false);
         }
         let answer = self.grant_token(provider);
         let holder = self.files.holder();
         if holder.as_deref() != Some(self.assignment_id) {
-            return (Next::End, step.recorded, false);
+            return (Next::End, step.recorded.clone(), false);
         }
         let (outcome, next) = match &answer {
-            // The token in the file is still the current one.
-            Ok(issued) if step.held && issued.generation <= step.generation => (
-                self.ready(provider, issued),
-                Next::Unchanged {
-                    wait: issued.refresh_after,
-                },
-            ),
+            // The token in the file is still the current one: issued from
+            // the grant or integration token it was, at no newer generation.
+            Ok(issued)
+                if step.held
+                    && issued.grant_id == step.grant_id
+                    && issued.generation <= step.generation =>
+            {
+                (
+                    self.ready(provider, issued),
+                    Next::Unchanged {
+                        expires_at: issued.expires_at,
+                        wait: issued.refresh_after,
+                    },
+                )
+            }
             Ok(issued) => {
                 let outcome = self.keep(offering, issued);
                 let next = match &outcome.kept {
                     Some(kept) => Next::Kept {
+                        grant_id: kept.grant_id.clone(),
                         generation: kept.generation,
                         expires_at: kept.expires_at,
                         wait: kept.refresh_after,
@@ -1038,8 +1216,9 @@ impl Asking<'_> {
         let entry = provider
             .agent_login_provider()
             .map(|own| (own, previous.and_then(|document| document.grant(own))));
-        let recorded = entry.map_or(step.recorded, |(_, grant)| Recorded::of(grant));
-        self.record(Phase::Refresh, recorded, &outcome);
+        let recorded =
+            entry.map_or_else(|| step.recorded.clone(), |(_, grant)| Recorded::of(grant));
+        self.record(Phase::Refresh, &recorded, &outcome);
         let now = Recorded::outcome(&outcome);
         let changed = match entry {
             Some((own, grant)) if now != recorded => {
@@ -1075,29 +1254,47 @@ impl Asking<'_> {
         }
     }
 
-    /// Cloud's list of the assignment's providers (REQ-GRANT-97): the
-    /// runner's three it names, and each other provider it names with the
-    /// names its entry gives, checked in the list's order; a list Cloud did
-    /// not answer usefully is its failure, and `assignment_not_current` is
-    /// Cloud's 409 as the token route's is.
-    fn list(&self) -> Result<Listed, CloudFailure> {
+    /// Cloud's answers for the assignment's providers and its token
+    /// services, each asked once with the same request, the second on a
+    /// thread of its own so that a Cloud that answers neither costs one
+    /// bounded request, or after the first when no thread can be started.
+    fn lists(&self) -> Lists {
         let request = GrantProvidersRequest {
             boot_id: self.boot_id.to_owned(),
             assignment_id: self.assignment_id.to_owned(),
         };
-        let providers = match self.cloud.grant_providers(&request) {
-            Ok(providers) => providers,
-            Err(GrantProvidersFailure::NoRoute) => return Ok(Listed::NoRoute),
-            Err(GrantProvidersFailure::AssignmentNotCurrent) => {
-                return Err(CloudFailure::Status(ASSIGNMENT_NOT_CURRENT_STATUS));
-            }
-            Err(GrantProvidersFailure::Cloud(failure)) => return Err(failure),
+        let request = &request;
+        std::thread::scope(|scope| {
+            let services = std::thread::Builder::new()
+                .name("useful-token-services".to_owned())
+                .spawn_scoped(scope, move || self.cloud.token_services(request));
+            let providers = self.cloud.grant_providers(request);
+            let services = match services {
+                // A request whose thread panicked got no answer.
+                Ok(thread) => thread
+                    .join()
+                    .unwrap_or(Err(GrantProvidersFailure::Cloud(CloudFailure::Transport))),
+                Err(_) => self.cloud.token_services(request),
+            };
+            (providers, services)
+        })
+    }
+
+    /// Cloud's list of the assignment's providers (REQ-GRANT-97) as it
+    /// answered it: the runner's three it names, and each other provider it
+    /// names with the names its entry gives, checked in the list's order
+    /// against `earlier`; a list Cloud did not answer usefully is its
+    /// failure.
+    fn list<'l>(
+        answer: &'l Result<Vec<ListedProvider>, GrantProvidersFailure>,
+        earlier: &mut Vec<&'l str>,
+    ) -> Result<Listed, CloudFailure> {
+        let Some(providers) = listed_entries(answer)? else {
+            return Ok(Listed::NoRoute);
         };
         let mut runner = Vec::new();
         let mut configured = Vec::new();
-        // The names of each configured entry so far, used or not.
-        let mut earlier: Vec<&str> = Vec::new();
-        for listed in &providers {
+        for listed in providers {
             let Some(provider) = GrantProvider::listed(&listed.provider) else {
                 continue;
             };
@@ -1105,19 +1302,35 @@ impl Asking<'_> {
                 runner.push(own);
                 continue;
             }
-            let usable = usable_names(&listed.token, &listed.token_file, &earlier);
-            earlier.extend([listed.token.as_str(), listed.token_file.as_str()]);
-            configured.push(if usable {
-                Configured::Checked(Offering {
-                    provider,
-                    variable: listed.token.clone(),
-                    file_variable: listed.token_file.clone(),
-                })
-            } else {
-                Configured::Refused(provider)
-            });
+            configured.push(Configured::check(listed, provider, false, earlier));
         }
         Ok(Listed::Named { runner, configured })
+    }
+
+    /// Cloud's list of the assignment's token services
+    /// (REQ-INTEGRATION-12) as it answered it: each entry checked in the
+    /// list's order against `earlier`, which holds the names of the OAuth
+    /// list's configured entries `oauth` first, and refused when one of
+    /// them has its id; none for a Cloud without the list, and a list Cloud
+    /// did not answer usefully is its failure.
+    fn token_services<'l>(
+        answer: &'l Result<Vec<ListedProvider>, GrantProvidersFailure>,
+        oauth: &[Configured],
+        earlier: &mut Vec<&'l str>,
+    ) -> Result<Vec<Configured>, CloudFailure> {
+        let Some(services) = listed_entries(answer)? else {
+            return Ok(Vec::new());
+        };
+        Ok(services
+            .iter()
+            .filter_map(|listed| {
+                let provider = GrantProvider::token_service(&listed.provider)?;
+                let shared = oauth
+                    .iter()
+                    .any(|entry| entry.provider().cloud_id() == provider.cloud_id());
+                Some(Configured::check(listed, provider, shared, earlier))
+            })
+            .collect())
     }
 
     /// Cloud's answer for the provider's token.
@@ -1309,12 +1522,12 @@ impl Asking<'_> {
         }
     }
 
-    /// Writes the provider's record of `phase` when its state or generation
-    /// changed from `previous`, or a step failed; none otherwise. The record
-    /// names the provider as `record_name` does, never a name it is offered
-    /// under, a path or a token.
-    fn record(&self, phase: Phase, previous: Recorded, outcome: &Settled) {
-        if previous == Recorded::outcome(outcome) && outcome.failure.is_none() {
+    /// Writes the provider's record of `phase` when its state, grant or
+    /// generation changed from `previous`, or a step failed; none otherwise.
+    /// The record names the provider as `record_name` does, never a name it
+    /// is offered under, a path or a token.
+    fn record(&self, phase: Phase, previous: &Recorded, outcome: &Settled) {
+        if *previous == Recorded::outcome(outcome) && outcome.failure.is_none() {
             return;
         }
         let mut attributes = vec![
@@ -1341,6 +1554,25 @@ impl Asking<'_> {
             } else {
                 Outcome::Success
             });
+    }
+
+    /// Records a token-service list Cloud did not answer usefully
+    /// (REQ-INTEGRATION-12, REQ-TELEMETRY-46): a failure of the admission's
+    /// stage `list` with its cause, which names no provider and no state,
+    /// since the list named none.
+    fn record_list_failure(&self, failure: CloudFailure) {
+        let mut attributes = vec![
+            KeyValue::new(attribute::GRANT_TOKEN_PHASE, Phase::Admission.as_str()),
+            KeyValue::new(attribute::ASSIGNMENT_ID, self.assignment_id.to_owned()),
+        ];
+        attributes.extend(failure_attributes(Failure {
+            stage: Stage::List,
+            cause: failure.cause(),
+        }));
+        self.files
+            .recorder
+            .start(GRANT_TOKEN_EVENT, attributes)
+            .finish(Outcome::Failure);
     }
 }
 

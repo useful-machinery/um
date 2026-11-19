@@ -1,6 +1,7 @@
 // CLI families keep their domain imports local rather than introducing a cross-family module.
-mod github;
+pub(in crate::cli) mod github;
 mod gitlab;
+pub(in crate::cli) mod organization;
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -264,6 +265,36 @@ fn with_api<T>(
 #[derive(Clone)]
 struct Recovery {
     session: Option<String>,
+}
+
+/// Starts the Linear authorization of a new workspace for `organization` and, unless `no_wait`,
+/// waits for it for `timeout` or the default, as `useful connection linear authorization create`
+/// does, under the human session, asking for no state-update consent and with the report or
+/// `--json` output `json` selects: `useful integration connect linear --org`
+/// (REQ-INTEGRATION-21).
+pub(in crate::cli) fn authorize_workspace(
+    deployment: Deployment,
+    organization: OrganizationArg,
+    json: bool,
+    allow_insecure_http: bool,
+    no_wait: bool,
+    timeout: Option<Duration>,
+) -> super::CommandResult {
+    Start {
+        enable_state_updates: false,
+        organization,
+        connection_id: None,
+        wait: super::WaitTimeoutArgs { timeout },
+        no_wait,
+        options: Options::new(
+            json,
+            PrincipalAuthenticationArgs::default(),
+            super::HttpOptions {
+                allow_insecure_http,
+            },
+        ),
+    }
+    .start(deployment)
 }
 
 impl Start {

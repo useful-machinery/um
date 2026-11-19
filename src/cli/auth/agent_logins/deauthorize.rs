@@ -25,7 +25,7 @@ pub(super) struct Command {
 
 /// The stop Cloud requests of the runner's run (REQ-GRANT-48).
 impl Stated for Command {
-    const COMMAND: &'static str = "useful grant deauthorize";
+    const COMMAND: &'static str = "useful integration deauthorize";
     type Usage = crate::cli::grant::deauthorize::Command;
     const STATEMENT: Statement = Statement::Fixed(NATIVE_DEAUTHORIZE);
     const ACTION: &'static str = "to end the runner's authorization";

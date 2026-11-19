@@ -49,6 +49,22 @@ pub enum AuthorizeGrantRunnerError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`authorize_integration_token_runner`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AuthorizeIntegrationTokenRunnerError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`begin_docs_account_handoff`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -351,6 +367,18 @@ pub enum ListGrantsError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`list_integration_tokens`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ListIntegrationTokensError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`redeem_docs_account_handoff`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -487,6 +515,34 @@ pub enum RevokeGrantAuthorizationError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`revoke_integration_token`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RevokeIntegrationTokenError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`revoke_integration_token_authorization`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RevokeIntegrationTokenAuthorizationError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`signup_human`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -496,6 +552,21 @@ pub enum SignupHumanError {
     Status403(models::Problem),
     Status409(models::Problem),
     Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`store_integration_token`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum StoreIntegrationTokenError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status409(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
     UnknownValue(serde_json::Value),
 }
 
@@ -640,6 +711,75 @@ pub fn authorize_grant_runner(
     } else {
         let content = resp.text()?;
         let entity: Option<AuthorizeGrantRunnerError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Authorizes one runner registration of an organization the active human is an active member of to use one of their own integration tokens, and answers 201 with the authorization (REQ-INTEGRATION-5). A token is used on no runner until its owner authorizes that runner. A token that is unknown, revoked, another member's or an organization's is `integration-token-not-found`; a runner that is unknown, deleted or outside those organizations is `integration-token-runner-not-found`; a token already authorized for the runner is `integration-token-already-authorized`. A token whose provider the deployment no longer serves as a token service is refused `provider-unavailable`.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing integrationTokenId and runnerId. Exact replay returns the original created response. Reusing the key for another request conflicts.  Problem types: 404 `integration-token-not-found`, `integration-token-runner-not-found`; 409 `integration-token-already-authorized`; 503 `provider-unavailable`.
+pub fn authorize_integration_token_runner(
+    configuration: &configuration::Configuration,
+    integration_token_id: &str,
+    idempotency_key: &str,
+    authorize_integration_token_runner_request: models::AuthorizeIntegrationTokenRunnerRequest,
+) -> Result<models::IntegrationTokenAuthorization, Error<AuthorizeIntegrationTokenRunnerError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_integration_token_id = integration_token_id;
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_authorize_integration_token_runner_request =
+        authorize_integration_token_runner_request;
+
+    let uri_str = format!(
+        "{}/v1/me/integration-tokens/{integrationTokenId}/authorizations",
+        configuration.base_path,
+        integrationTokenId = crate::generated::apis::urlencode(p_path_integration_token_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_authorize_integration_token_runner_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::IntegrationTokenAuthorization`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::IntegrationTokenAuthorization`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<AuthorizeIntegrationTokenRunnerError> =
+            serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,
@@ -1993,7 +2133,7 @@ pub fn list_current_service_credentials(
     }
 }
 
-/// Returns the providers for which this deployment makes grants, each with its kind and its display name (REQ-GRANT-78): every `oauth` provider of the deployment's provider table for which it holds an OAuth application, in table order, then a `native` provider (Claude Code or Codex) for which it lists a target. No other provider is named, and a deployment that serves neither kind answers an empty list. The answer is the deployment's, not the member's: it names no grant and carries no material. A client reads it before a coding agent's sign-in, so that a provider the deployment does not serve is passed over before any provider token is minted.  The list is not paged and has no fixed length: it names as many providers as the deployment serves, and a client passes over a provider it does not know.
+/// Returns the providers for which this deployment makes grants, each with its kind and its display name (REQ-GRANT-78): every `oauth` provider of the deployment's provider table for which it holds an OAuth application, in table order, then a `native` provider (Claude Code or Codex) for which it lists a target, then, where the deployment is configured with the integration credential key, each `token` service of its table in table order (REQ-PROVIDER-7). No other provider is named, and a deployment that serves none of the three kinds answers an empty list. The answer is the deployment's, not the member's: it names no grant and carries no material. A client reads it before a coding agent's sign-in, so that a provider the deployment does not serve is passed over before any provider token is minted.  The list is not paged and has no fixed length: it names as many providers as the deployment serves, and a client passes over a provider or a kind it does not know.
 pub fn list_grant_providers(
     configuration: &configuration::Configuration,
 ) -> Result<models::GrantProviderList, Error<ListGrantProvidersError>> {
@@ -2183,6 +2323,69 @@ pub fn list_grants(
     } else {
         let content = resp.text()?;
         let entity: Option<ListGrantsError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Returns one page of the active human's own unrevoked integration tokens, oldest first by creation time and opaque token ID, each with its ID, provider, side, version, the member who stored the current version and when, its creation time and its authorizations in force, each with its runner's ID and name and that runner's organization (REQ-INTEGRATION-4). No answer carries a token, and another member's tokens are never listed. The cursor is opaque and may be used only with this operation. A deployment configured without the integration credential key answers `provider-unavailable` (REQ-INTEGRATION-1).  Problem types: 503 `provider-unavailable`.
+pub fn list_integration_tokens(
+    configuration: &configuration::Configuration,
+    limit: Option<i32>,
+    cursor: Option<&str>,
+) -> Result<models::IntegrationTokenList, Error<ListIntegrationTokensError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_query_limit = limit;
+    let p_query_cursor = cursor;
+
+    let uri_str = format!("{}/v1/me/integration-tokens", configuration.base_path);
+    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
+
+    if let Some(ref param_value) = p_query_limit {
+        req_builder = req_builder.query(&[("limit", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_cursor {
+        req_builder = req_builder.query(&[("cursor", &param_value.to_string())]);
+    }
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::IntegrationTokenList`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::IntegrationTokenList`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<ListIntegrationTokensError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,
@@ -2726,6 +2929,100 @@ pub fn revoke_grant_authorization(
     }
 }
 
+/// Revokes one of the active human's own integration tokens and answers 204; a token already revoked answers 204 too (REQ-INTEGRATION-6). The request accepts no body. The token is erased, every authorization of it ends and it is no longer listed; a token stored for the same provider afterwards is a new record at version 1. Revoking serves every provider, whether or not the deployment's table still holds it. Revoking a token in Cloud does not end it at its service. A token that is unknown, another member's or an organization's is `integration-token-not-found`.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing integrationTokenId. Exact replay returns the original 204 response. Reusing the key for another token conflicts.  Problem types: 404 `integration-token-not-found`; 503 `provider-unavailable`.
+pub fn revoke_integration_token(
+    configuration: &configuration::Configuration,
+    integration_token_id: &str,
+    idempotency_key: &str,
+) -> Result<(), Error<RevokeIntegrationTokenError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_integration_token_id = integration_token_id;
+    let p_header_idempotency_key = idempotency_key;
+
+    let uri_str = format!(
+        "{}/v1/me/integration-tokens/{integrationTokenId}",
+        configuration.base_path,
+        integrationTokenId = crate::generated::apis::urlencode(p_path_integration_token_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::DELETE, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+
+    if !status.is_client_error() && !status.is_server_error() {
+        Ok(())
+    } else {
+        let content = resp.text()?;
+        let entity: Option<RevokeIntegrationTokenError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Ends one authorization in force of one of the active human's own integration tokens and answers 204; an authorization already ended answers 204 too (REQ-INTEGRATION-5). The request accepts no body. Ending one serves every provider, whether or not the deployment's table still holds it, and asks no run to stop. An authorization that is unknown or not on one of the caller's tokens is `integration-token-authorization-not-found`.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing integrationTokenId and authorizationId. Exact replay returns the original 204 response. Reusing the key for another authorization conflicts.  Problem types: 404 `integration-token-authorization-not-found`; 503 `provider-unavailable`.
+pub fn revoke_integration_token_authorization(
+    configuration: &configuration::Configuration,
+    integration_token_id: &str,
+    authorization_id: &str,
+    idempotency_key: &str,
+) -> Result<(), Error<RevokeIntegrationTokenAuthorizationError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_integration_token_id = integration_token_id;
+    let p_path_authorization_id = authorization_id;
+    let p_header_idempotency_key = idempotency_key;
+
+    let uri_str = format!(
+        "{}/v1/me/integration-tokens/{integrationTokenId}/authorizations/{authorizationId}",
+        configuration.base_path,
+        integrationTokenId = crate::generated::apis::urlencode(p_path_integration_token_id),
+        authorizationId = crate::generated::apis::urlencode(p_path_authorization_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::DELETE, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+
+    if !status.is_client_error() && !status.is_server_error() {
+        Ok(())
+    } else {
+        let content = resp.text()?;
+        let entity: Option<RevokeIntegrationTokenAuthorizationError> =
+            serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
 /// Explicitly provisions a human principal for the authenticated identity when the deployment's signup policy admits that identity: any authenticated human identity under `open`; under `invitation`, only an identity whose access token asserts a verified email that an outstanding, unexpired email invitation of an active organization is addressed to, the request naming no invitation; and none under `disabled`. The request has no body; identity and optional profile attributes come only from verified access-token claims.  Idempotency-Key is required. Keys are scoped to the authenticated identity and this operation and are retained for seven days. Retrying with the same key returns the original 201 response without repeating the principal or audit-record mutation. After signup, a new key for the same identity receives a conflict response.  Problem types: 403 `signup-not-permitted`; 409 `principal-already-provisioned`.
 pub fn signup_human(
     configuration: &configuration::Configuration,
@@ -2776,6 +3073,67 @@ pub fn signup_human(
     } else {
         let content = resp.text()?;
         let entity: Option<SignupHumanError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Stores the active human's token for one token service of the deployment's provider table, held sealed in Cloud custody, and answers 201 with the token's record at version 1 (REQ-INTEGRATION-2). The body names the provider, the token and, optionally, `replace`. A token is 1 to 4096 printable ASCII characters without a space; any other is refused `integration-token-invalid`, and no answer repeats it. Cloud does not present the token to its service.  Where the member already holds an unrevoked token of the provider, a request without `replace` true is refused `integration-token-exists` with nothing changed, and one with it stores the new token as the next version and answers 200: the record keeps its ID and its authorizations, the earlier version's token is erased, and `connectedBy` and `connectedAt` become the caller and that moment. `replace` true where the member holds none stores version 1.  A provider that is not a token service of the deployment's table, an OAuth provider's included, and every request to a deployment without the integration credential key, is refused `provider-unavailable` and changes nothing (REQ-INTEGRATION-1).  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing provider, replace and a keyed digest of the token. Exact replay returns the original status with the token's record as it now is. Reusing the key for another request conflicts.  Problem types: 400 `integration-token-invalid`; 409 `integration-token-exists`; 503 `provider-unavailable`.
+pub fn store_integration_token(
+    configuration: &configuration::Configuration,
+    idempotency_key: &str,
+    store_integration_token_request: models::StoreIntegrationTokenRequest,
+) -> Result<models::IntegrationToken, Error<StoreIntegrationTokenError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_store_integration_token_request = store_integration_token_request;
+
+    let uri_str = format!("{}/v1/me/integration-tokens", configuration.base_path);
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_store_integration_token_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::IntegrationToken`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::IntegrationToken`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<StoreIntegrationTokenError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,

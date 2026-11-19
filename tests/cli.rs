@@ -56,6 +56,8 @@ mod grant;
 mod grants;
 #[path = "cli/identities.rs"]
 mod identities;
+#[path = "cli/integration.rs"]
+mod integration;
 #[path = "cli/invitation.rs"]
 mod invitation;
 #[path = "cli/organization.rs"]

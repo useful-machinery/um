@@ -21,7 +21,7 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum AuthCommand {
-    // The earlier families `useful grant` replaces, kept for one release out of help
+    // The earlier families `useful integration` replaces, kept for one release out of help
     // (REQ-GRANT-77).
     #[command(about = agent_logins::ABOUT, hide = true)]
     AgentLogin(agent_logins::Command),

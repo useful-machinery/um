@@ -1,27 +1,43 @@
-//! The earlier commands `useful grant` and `useful runner grant` replace (REQ-GRANT-77). Each stays for
-//! one release, absent from help, with its arguments, output and exit statuses unchanged; an
-//! invocation of one first prints a line on standard error naming the command that replaces it.
+//! The earlier commands `useful integration` and `useful runner integration` replace
+//! (REQ-GRANT-77, REQ-INTEGRATION-15). Each stays, absent from help, with its arguments, output
+//! and exit statuses unchanged; an invocation of one first prints a line on standard error
+//! naming the command that replaces it.
 
 use std::io::{self, Write};
 
 /// Each earlier leaf, by its path under `useful`, with the command that replaces it.
-pub(in crate::cli) const EARLIER: [(&str, &str); 13] = [
-    ("auth agent-login authorize", "useful grant authorize"),
-    ("auth agent-login deauthorize", "useful grant deauthorize"),
-    ("auth agent-login import", "useful grant create PROVIDER"),
-    ("auth agent-login list", "useful grant list"),
+pub(in crate::cli) const EARLIER: [(&str, &str); 19] = [
+    ("auth agent-login authorize", "useful integration authorize"),
+    (
+        "auth agent-login deauthorize",
+        "useful integration deauthorize",
+    ),
+    (
+        "auth agent-login import",
+        "useful integration connect PROVIDER",
+    ),
+    ("auth agent-login list", "useful integration list"),
     (
         "auth agent-login reconnect",
-        "useful grant create PROVIDER --replace",
+        "useful integration connect PROVIDER --replace",
     ),
-    ("auth agent-login revoke", "useful grant revoke"),
-    ("auth agent-login show", "useful grant list GRANT"),
-    ("auth credential status", "useful grant list"),
-    ("auth grant create", "useful grant create PROVIDER"),
-    ("auth grant list", "useful grant list"),
-    ("auth grant revoke", "useful grant revoke"),
-    ("auth grant uses", "useful grant list GRANT"),
-    ("runner agent-login sync", "useful runner grant sync"),
+    ("auth agent-login revoke", "useful integration revoke"),
+    (
+        "auth agent-login show",
+        "useful integration list INTEGRATION",
+    ),
+    ("auth credential status", "useful integration list"),
+    ("auth grant create", "useful integration connect PROVIDER"),
+    ("auth grant list", "useful integration list"),
+    ("auth grant revoke", "useful integration revoke"),
+    ("auth grant uses", "useful integration list INTEGRATION"),
+    ("grant authorize", "useful integration authorize"),
+    ("grant create", "useful integration connect"),
+    ("grant deauthorize", "useful integration deauthorize"),
+    ("grant list", "useful integration list"),
+    ("grant revoke", "useful integration revoke"),
+    ("runner agent-login sync", "useful runner integration sync"),
+    ("runner grant sync", "useful runner integration sync"),
 ];
 
 /// The earlier leaf an invocation named, by its path under `useful`.

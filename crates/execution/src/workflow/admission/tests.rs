@@ -2011,8 +2011,8 @@ fn node_narrowing_drops_only_root_names_the_node_omits() {
     );
 }
 
-/// The eight environment names of the five declarable integrations (REQ-WFEXEC-78).
-const INTEGRATION_ENVIRONMENT: [(&str, &str); 8] = [
+/// The twelve environment names of the seven declarable integrations (REQ-WFEXEC-78).
+const INTEGRATION_ENVIRONMENT: [(&str, &str); 12] = [
     ("GH_TOKEN", "launching-gh-token"),
     ("GH_TOKEN_FILE", "/launching/gh-token"),
     ("GITLAB_TOKEN", "launching-gitlab-token"),
@@ -2021,6 +2021,10 @@ const INTEGRATION_ENVIRONMENT: [(&str, &str); 8] = [
     ("USEFUL_LINEAR_ACCESS_TOKEN_FILE", "/launching/linear-token"),
     ("CLAUDE_CODE_OAUTH_TOKEN", "launching-claude-token"),
     ("CODEX_HOME", "/launching/codex"),
+    ("MERGIFY_TOKEN", "launching-mergify-token"),
+    ("MERGIFY_TOKEN_FILE", "/launching/mergify-token"),
+    ("BUILDKITE_API_TOKEN", "launching-buildkite-token"),
+    ("BUILDKITE_API_TOKEN_FILE", "/launching/buildkite-token"),
 ];
 
 fn integration_launching_environment() -> EnvironmentSnapshot {
@@ -2086,6 +2090,11 @@ fn admission_keeps_the_environment_names_of_each_declared_integration() {
         ),
         ("claude_code", &["CLAUDE_CODE_OAUTH_TOKEN"][..]),
         ("codex", &["CODEX_HOME"][..]),
+        ("mergify", &["MERGIFY_TOKEN", "MERGIFY_TOKEN_FILE"][..]),
+        (
+            "buildkite",
+            &["BUILDKITE_API_TOKEN", "BUILDKITE_API_TOKEN_FILE"][..],
+        ),
     ] {
         let fixture = WorkflowFixture::new(&declaring_workflow(&format!(
             "requires:\n  integrations:\n    {provider}: {{}}\n"

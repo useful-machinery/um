@@ -20,7 +20,8 @@ use useful_execution::{
 
 use super::git::origin_remote_host;
 
-/// A provider or harness whose credential a workflow needs, in report order.
+/// A provider, harness or declared token service whose credential a workflow needs, in report
+/// order (REQ-CREDREADY-3).
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum CredentialKind {
     Github,
@@ -28,6 +29,10 @@ pub enum CredentialKind {
     Linear,
     ClaudeCode,
     Codex,
+    /// A token service, which only a declared integration calls for (REQ-CREDREADY-29).
+    Mergify,
+    /// A token service, which only a declared integration calls for (REQ-CREDREADY-29).
+    Buildkite,
 }
 
 impl CredentialKind {
@@ -38,6 +43,8 @@ impl CredentialKind {
             Self::Linear => "linear",
             Self::ClaudeCode => "claude_code",
             Self::Codex => "codex",
+            Self::Mergify => "mergify",
+            Self::Buildkite => "buildkite",
         }
     }
 
@@ -49,16 +56,25 @@ impl CredentialKind {
             Self::Linear => "Linear",
             Self::ClaudeCode => "Claude Code",
             Self::Codex => "Codex",
+            Self::Mergify => "Mergify",
+            Self::Buildkite => "Buildkite",
         }
     }
 
     /// Whether Cloud holds the organization's connections for this kind (REQ-CREDREADY-16);
-    /// a harness is signed in on the runner host, which nothing reads.
+    /// a harness is signed in on the runner host, which nothing reads, and nothing about a
+    /// token service is verified (REQ-CREDREADY-29).
     const fn held_by_cloud(self) -> bool {
         match self {
             Self::Github | Self::Gitlab | Self::Linear => true,
-            Self::ClaudeCode | Self::Codex => false,
+            Self::ClaudeCode | Self::Codex | Self::Mergify | Self::Buildkite => false,
         }
+    }
+
+    /// Whether the kind is a token service, which a declared integration alone calls for
+    /// (REQ-CREDREADY-29).
+    pub const fn is_token_service(self) -> bool {
+        matches!(self, Self::Mergify | Self::Buildkite)
     }
 
     /// The kind a declared integration's provider id names (REQ-CREDREADY-27).
@@ -69,6 +85,8 @@ impl CredentialKind {
             IntegrationProvider::Linear => Self::Linear,
             IntegrationProvider::ClaudeCode => Self::ClaudeCode,
             IntegrationProvider::Codex => Self::Codex,
+            IntegrationProvider::Mergify => Self::Mergify,
+            IntegrationProvider::Buildkite => Self::Buildkite,
         }
     }
 
@@ -81,6 +99,8 @@ impl CredentialKind {
             Self::Linear => IntegrationProvider::Linear,
             Self::ClaudeCode => IntegrationProvider::ClaudeCode,
             Self::Codex => IntegrationProvider::Codex,
+            Self::Mergify => IntegrationProvider::Mergify,
+            Self::Buildkite => IntegrationProvider::Buildkite,
         }
     }
 
@@ -302,7 +322,9 @@ impl CredentialRequirement {
 
     /// What the operator can do about the requirement (REQ-CREDREADY-7, REQ-CREDREADY-14 to
     /// REQ-CREDREADY-16, REQ-CREDREADY-19 to REQ-CREDREADY-21), for `organization` and
-    /// `project` when they were named. It names commands, never a credential.
+    /// `project` when they were named. It names commands, never a credential; for a token
+    /// service it names the variable a step reads the token from and the commands that
+    /// connect the service and authorize a runner for it (REQ-CREDREADY-29).
     pub fn next_action(&self, organization: Option<&str>, project: Option<&str>) -> String {
         let organization = organization.unwrap_or("ORGANIZATION");
         let title = self.kind.title();
@@ -346,9 +368,16 @@ impl CredentialRequirement {
                     "Reauthorize the Linear connection with useful connection linear authorization create {organization} --connection-id CONNECTION; useful connection linear list {organization} shows its ID."
                 ),
             ),
+            CredentialKind::Mergify | CredentialKind::Buildkite => {
+                let id = self.kind.as_str();
+                return format!(
+                    "Nothing verifies the {title} token; a step reads it from {} when the runner offers one. Connect it with useful integration connect {id}, or useful integration connect {id} --org {organization} for the organization's token, and authorize a runner for it with useful integration authorize {id} RUNNER --yes.",
+                    self.kind.integration().environment_names()[0]
+                );
+            }
             CredentialKind::ClaudeCode | CredentialKind::Codex => {
                 return format!(
-                    "Sign {title} in on the runner host as the user that runs useful runner serve, or give the runner your own login with useful grant create {} and useful grant authorize GRANT RUNNER --yes.",
+                    "Sign {title} in on the runner host as the user that runs useful runner serve, or give the runner your own login with useful integration connect {} and useful integration authorize INTEGRATION RUNNER --yes.",
                     self.kind.as_str()
                 );
             }
@@ -576,7 +605,8 @@ impl Named {
     }
 
     /// Where its integrations and a reading of the files it covers and the repository disagree,
-    /// in kind order. The reading's unknown entries are not differences.
+    /// in kind order. The reading's unknown entries are not differences, and a declared token
+    /// service, which no reading derives, is compared with nothing (REQ-CREDREADY-29).
     fn differences(
         &self,
         resolved: &BTreeMap<String, ResolvedWorkflow>,
@@ -593,6 +623,9 @@ impl Named {
         let mut differences = Vec::new();
         for provider in &self.integrations {
             let kind = CredentialKind::of_integration(*provider);
+            if kind.is_token_service() {
+                continue;
+            }
             if inferred.remove(&kind).is_none() {
                 differences.push(self.difference(
                     Difference::DeclaredNotInferred,
@@ -1027,9 +1060,9 @@ mod tests {
 
     use super::super::git::{MAXIMUM_STDOUT_BYTES, SYSTEM_TIMEOUT};
     use super::{
-        CredentialKind, Declaration, DerivedCredentials, Difference, ForwardedVariable,
-        IntegrationDifference, Node, NodeKind, OriginDeclaration, RepositorySource,
-        UnknownDeclaration, WorkflowCredentials, classify_forwarded_variable,
+        CredentialKind, CredentialRequirement, Declaration, DerivedCredentials, Difference,
+        ForwardedVariable, IntegrationDifference, Node, NodeKind, OriginDeclaration, ReadinessCode,
+        RepositorySource, UnknownDeclaration, WorkflowCredentials, classify_forwarded_variable,
         read_workflow_credentials,
     };
 
@@ -1711,6 +1744,122 @@ steps:
         assert_eq!(agrees.differences, Some(Vec::new()));
         assert_eq!(undeclared.differences, None);
         assert_eq!(beside.differences, Some(Vec::new()));
+    }
+
+    // REQ-CREDREADY-29
+    #[test]
+    fn a_declared_token_service_is_an_unverified_requirement_nothing_infers() {
+        let declaring = PLAIN.replacen(
+            "schemaVersion: 1\n",
+            "schemaVersion: 1\nrequires:\n  integrations:\n    linear: {}\n    buildkite: {}\n    mergify: {}\n",
+            1,
+        );
+
+        let derived = derive_files(&[("main.yaml", &declaring)], &["main.yaml"]);
+
+        assert_eq!(
+            kinds_and_origins(&derived.reported),
+            [
+                (
+                    CredentialKind::Linear,
+                    vec![integration("main.yaml", "linear")]
+                ),
+                (
+                    CredentialKind::Mergify,
+                    vec![integration("main.yaml", "mergify")]
+                ),
+                (
+                    CredentialKind::Buildkite,
+                    vec![integration("main.yaml", "buildkite")]
+                ),
+            ]
+        );
+        for requirement in &derived.reported.requirements[1..] {
+            assert_eq!(requirement.code, ReadinessCode::RunnerUnverified);
+            assert_eq!(requirement.state(), "unverified");
+            assert_eq!(requirement.cloud(), None);
+            assert!(!requirement.fails());
+        }
+        // The forwarded `LINEAR_API_KEY` agrees with `linear`, and nothing calls for either
+        // token service, yet neither is a difference.
+        assert_eq!(derived.differences, Some(Vec::new()));
+        assert!(
+            !derived
+                .inferred
+                .requirements
+                .iter()
+                .any(|requirement| requirement.kind.is_token_service()),
+            "{:?}",
+            derived.inferred.requirements
+        );
+
+        let forwarding = PLAIN.replace("LINEAR_API_KEY", "MERGIFY_TOKEN, BUILDKITE_API_TOKEN");
+        let derived = derive_files(&[("main.yaml", &forwarding)], &["main.yaml"]);
+        assert!(
+            !derived
+                .reported
+                .requirements
+                .iter()
+                .any(|requirement| requirement.kind.is_token_service()),
+            "{:?}",
+            derived.reported.requirements
+        );
+        let forwarded = derived
+            .reported
+            .unknown
+            .iter()
+            .filter(|unknown| unknown.declaration == UnknownDeclaration::ForwardedVariable)
+            .map(|unknown| unknown.name.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            forwarded,
+            [Some("BUILDKITE_API_TOKEN"), Some("MERGIFY_TOKEN")]
+        );
+
+        for (kind, variable) in [
+            (CredentialKind::Mergify, "MERGIFY_TOKEN"),
+            (CredentialKind::Buildkite, "BUILDKITE_API_TOKEN"),
+        ] {
+            let requirement = CredentialRequirement {
+                kind,
+                code: ReadinessCode::RunnerUnverified,
+                origins: Vec::new(),
+            };
+            let id = kind.as_str();
+            for (organization, named) in [(Some("acme"), "acme"), (None, "ORGANIZATION")] {
+                let next_action = requirement.next_action(organization, None);
+                assert!(next_action.contains(variable), "{next_action}");
+                for command in [
+                    format!("useful integration connect {id}"),
+                    format!("--org {named}"),
+                    format!("useful integration authorize {id} RUNNER --yes"),
+                ] {
+                    assert!(next_action.contains(&command), "{command}: {next_action}");
+                }
+            }
+        }
+    }
+
+    // REQ-CREDREADY-7
+    #[test]
+    fn a_coding_agents_next_action_names_the_integration_commands() {
+        for kind in [CredentialKind::ClaudeCode, CredentialKind::Codex] {
+            let next_action = CredentialRequirement {
+                kind,
+                code: ReadinessCode::RunnerUnverified,
+                origins: Vec::new(),
+            }
+            .next_action(Some("acme"), None);
+            assert!(
+                next_action.contains(&format!("useful integration connect {}", kind.as_str())),
+                "{next_action}"
+            );
+            assert!(
+                next_action.contains("useful integration authorize"),
+                "{next_action}"
+            );
+            assert!(!next_action.contains("useful grant"), "{next_action}");
+        }
     }
 
     // REQ-CREDREADY-5

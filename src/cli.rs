@@ -37,6 +37,7 @@ mod delegation;
 mod deletion;
 mod entity;
 pub(crate) mod grant;
+mod integration;
 mod invitation;
 mod organization;
 mod principal;
@@ -559,8 +560,12 @@ enum Command {
     Connection(connection::Command),
     #[command(about = delegation::ABOUT)]
     Delegation(delegation::Command),
-    #[command(about = grant::ABOUT)]
+    // The earlier spelling of `integration`, kept out of help until the stage that removes it
+    // (REQ-INTEGRATION-15).
+    #[command(about = grant::ABOUT, hide = true)]
     Grant(grant::Command),
+    #[command(about = integration::ABOUT)]
+    Integration(integration::Command),
     #[command(about = invitation::ABOUT)]
     Invitation(invitation::Command),
     #[command(about = organization::ABOUT)]
@@ -618,6 +623,7 @@ impl Cli {
             Some(Command::Delegation(command)) => command.execute(),
             Some(Command::Connection(command)) => command.execute(),
             Some(Command::Grant(command)) => command.execute(),
+            Some(Command::Integration(command)) => command.execute(),
             Some(Command::Invitation(command)) => command.execute(),
             Some(Command::Organization(command)) => command.execute(),
             Some(Command::Project(command)) => command.execute(),
@@ -2531,12 +2537,30 @@ mod tests {
         paths
     }
 
-    /// The families `useful grant` and `useful runner grant` replace (REQ-GRANT-77).
-    const EARLIER_FAMILIES: [[&str; 2]; 4] = [
-        ["auth", "agent-login"],
-        ["auth", "credential"],
-        ["auth", "grant"],
-        ["runner", "agent-login"],
+    /// The families `useful integration` and `useful runner integration` replace
+    /// (REQ-GRANT-77, REQ-INTEGRATION-15).
+    const EARLIER_FAMILIES: [&[&str]; 6] = [
+        &["auth", "agent-login"],
+        &["auth", "credential"],
+        &["auth", "grant"],
+        &["grant"],
+        &["runner", "agent-login"],
+        &["runner", "grant"],
+    ];
+
+    /// Each `useful integration` and `useful runner integration` leaf with the `useful grant`
+    /// or `useful runner grant` leaf of the same purpose (REQ-INTEGRATION-13,
+    /// REQ-INTEGRATION-14).
+    const INTEGRATION_LEAVES: [(&[&str], &[&str]); 6] = [
+        (&["integration", "authorize"], &["grant", "authorize"]),
+        (&["integration", "connect"], &["grant", "create"]),
+        (&["integration", "deauthorize"], &["grant", "deauthorize"]),
+        (&["integration", "list"], &["grant", "list"]),
+        (&["integration", "revoke"], &["grant", "revoke"]),
+        (
+            &["runner", "integration", "sync"],
+            &["runner", "grant", "sync"],
+        ),
     ];
 
     fn subcommand<'a>(root: &'a clap::Command, path: &[&str]) -> &'a clap::Command {
@@ -2548,11 +2572,12 @@ mod tests {
     }
 
     // REQ-GRANT-77
+    // REQ-INTEGRATION-15
     #[test]
     fn the_earlier_families_are_hidden_but_still_in_the_command_surface() {
         let root = Cli::command();
         for family in EARLIER_FAMILIES {
-            assert!(subcommand(&root, &family).is_hide_set(), "{family:?}");
+            assert!(subcommand(&root, family).is_hide_set(), "{family:?}");
         }
         let visible = subcommand(&root, &["auth"])
             .get_subcommands()
@@ -2573,12 +2598,13 @@ mod tests {
     }
 
     // REQ-GRANT-77
+    // REQ-INTEGRATION-15
     #[test]
     fn the_notice_table_names_exactly_the_earlier_leaves() {
         let root = Cli::command();
         let mut leaves = Vec::new();
         for family in EARLIER_FAMILIES {
-            for leaf in subcommand(&root, &family).get_subcommands() {
+            for leaf in subcommand(&root, family).get_subcommands() {
                 leaves.push(format!("{} {}", family.join(" "), leaf.get_name()));
             }
         }
@@ -2588,6 +2614,131 @@ mod tests {
             .map(|(path, _)| (*path).to_owned())
             .collect::<Vec<_>>();
         assert_eq!(noticed, leaves);
+    }
+
+    // REQ-GRANT-77
+    // REQ-INTEGRATION-15
+    // Every earlier leaf names a visible `useful integration` or `useful runner integration`
+    // leaf, and each `grant` leaf names the one of its own purpose.
+    #[test]
+    fn the_notice_table_names_the_integration_leaves() {
+        let root = Cli::command();
+        for (earlier, replacement) in super::grant::alias::EARLIER {
+            let command = replacement
+                .strip_prefix("useful ")
+                .unwrap_or_else(|| panic!("{earlier}: {replacement}"));
+            assert!(
+                command.starts_with("integration ") || command.starts_with("runner integration "),
+                "{earlier}: {replacement}"
+            );
+            let path = command
+                .split(' ')
+                .take_while(|word| word.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'))
+                .collect::<Vec<_>>();
+            assert!(
+                !subcommand(&root, &path).is_hide_set(),
+                "{earlier}: {replacement}"
+            );
+        }
+        for (integration, grant) in INTEGRATION_LEAVES {
+            let path = grant.join(" ");
+            let replacement = super::grant::alias::EARLIER
+                .iter()
+                .find(|(earlier, _)| *earlier == path)
+                .map(|(_, replacement)| *replacement);
+            assert_eq!(
+                replacement,
+                Some(format!("useful {}", integration.join(" ")).as_str()),
+                "{path}"
+            );
+        }
+    }
+
+    // REQ-INTEGRATION-13
+    // REQ-INTEGRATION-14
+    #[test]
+    fn the_integration_families_are_listed_with_their_leaves() {
+        let root = Cli::command();
+        for (family, leaves) in [
+            (
+                &["integration"][..],
+                &["authorize", "connect", "deauthorize", "list", "revoke"][..],
+            ),
+            (&["runner", "integration"], &["sync"]),
+        ] {
+            let command = subcommand(&root, family);
+            assert!(!command.is_hide_set(), "{family:?}");
+            let names = command
+                .get_subcommands()
+                .map(clap::Command::get_name)
+                .filter(|name| *name != "help")
+                .collect::<Vec<_>>();
+            assert_eq!(names, leaves, "{family:?}");
+            for leaf in command.get_subcommands() {
+                assert!(!leaf.is_hide_set(), "{family:?} {}", leaf.get_name());
+            }
+        }
+    }
+
+    // REQ-INTEGRATION-13
+    // REQ-INTEGRATION-14
+    // Each integration leaf takes every argument of the grant leaf of its purpose, spelled and
+    // checked as that leaf spells and checks it.
+    #[test]
+    fn the_integration_leaves_take_the_arguments_of_the_grant_leaves() {
+        let mut root = Cli::command();
+        root.build();
+        for (integration, grant) in INTEGRATION_LEAVES {
+            let integration = subcommand(&root, integration);
+            let grant = subcommand(&root, grant);
+            assert!(grant.get_arguments().next().is_some(), "{grant:?}");
+            for expected in grant.get_arguments() {
+                let id = expected.get_id();
+                let actual = integration
+                    .get_arguments()
+                    .find(|arg| arg.get_id() == id)
+                    .unwrap_or_else(|| panic!("{} lacks {id}", integration.get_name()));
+                assert_eq!(actual.get_long(), expected.get_long(), "{id}");
+                assert_eq!(actual.get_value_names(), expected.get_value_names(), "{id}");
+                assert_eq!(
+                    format!("{:?}", actual.get_action()),
+                    format!("{:?}", expected.get_action()),
+                    "{id}"
+                );
+                assert_eq!(actual.is_required_set(), expected.is_required_set(), "{id}");
+                assert_eq!(actual.is_positional(), expected.is_positional(), "{id}");
+            }
+        }
+    }
+
+    // REQ-INTEGRATION-16
+    // `integration connect` takes the arguments of `grant create` and `--org` alone, so no
+    // argument of the leaf can carry a token.
+    #[test]
+    fn integration_connect_takes_the_arguments_of_grant_create_and_org_alone() {
+        let mut root = Cli::command();
+        root.build();
+        let ids = |path: &[&str]| {
+            subcommand(&root, path)
+                .get_arguments()
+                .map(|arg| arg.get_id().to_string())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let mut expected = ids(&["grant", "create"]);
+        expected.insert("org".to_owned());
+        assert_eq!(ids(&["integration", "connect"]), expected);
+        assert!(parse(["useful", "integration", "connect", "mergify", "a-token"]).is_err());
+        assert!(
+            parse([
+                "useful",
+                "integration",
+                "connect",
+                "mergify",
+                "--org",
+                "acme"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
@@ -2664,6 +2815,8 @@ mod tests {
         );
     }
 
+    // REQ-INTEGRATION-13
+    // REQ-INTEGRATION-14
     #[test]
     fn customer_command_surface_is_exact_and_has_no_operator_entrypoint() {
         let actual = customer_command_paths();
@@ -2750,6 +2903,12 @@ mod tests {
             "grant deauthorize",
             "grant list",
             "grant revoke",
+            "integration",
+            "integration authorize",
+            "integration connect",
+            "integration deauthorize",
+            "integration list",
+            "integration revoke",
             "invitation",
             "invitation accept",
             "invitation decline",
@@ -2856,6 +3015,8 @@ mod tests {
             "runner enroll",
             "runner grant",
             "runner grant sync",
+            "runner integration",
+            "runner integration sync",
             "runner join-key",
             "runner join-key issue",
             "runner join-key list",

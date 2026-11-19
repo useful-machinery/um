@@ -17,6 +17,7 @@ mod http_client;
 mod http_util;
 mod human_principal;
 mod identities;
+mod integration_tokens;
 mod lifecycle;
 mod linear;
 mod member_grants;
@@ -131,6 +132,10 @@ pub use identities::{
     ListIdentitiesOutcome, OidcIdentity, RemoveIdentityOutcome, link_identity, list_identities,
     remove_identity,
 };
+pub use integration_tokens::{
+    IntegrationToken, IntegrationTokenAuthorization, IntegrationTokenList, IntegrationTokenOwner,
+    IntegrationTokenSide, ServedIntegrations, ServedTokenService,
+};
 pub use lifecycle::{
     CancelDeletionOutcome, CommonLifecycleFailure, DeletionSchedule, LifecycleApiError,
     LifecycleResourceKind, LifecycleState, LifecycleTransition, RequestDeletionOutcome,
@@ -142,9 +147,10 @@ pub use linear::{
     LinearSessionStatus, LinearTeamList, LinearTeamStateList,
 };
 pub use member_grants::{
-    GrantEndedAuthorization, GrantReport, MEMBER_GRANT_PAGE, MemberGrant, MemberGrantApi,
-    MemberGrantApiError, MemberGrantAuthorization, MemberGrantFailure, MemberGrantKind,
-    MemberGrantList, MemberGrantProvider, MemberGrantState, ServedGrantProvider, valid_provider_id,
+    ActiveMembership, GrantEndedAuthorization, GrantReport, MEMBER_GRANT_PAGE, MemberGrant,
+    MemberGrantApi, MemberGrantApiError, MemberGrantAuthorization, MemberGrantFailure,
+    MemberGrantKind, MemberGrantList, MemberGrantProvider, MemberGrantState, ServedGrantProvider,
+    valid_provider_id,
 };
 pub use organizations::{
     AcceptInvitationOutcome, AcceptedInvitationMembership, AuditActor, AuditProjectionWarning,

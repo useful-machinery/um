@@ -49,7 +49,10 @@ pub(super) const fn read_for(kind: CredentialKind) -> Option<Read> {
         CredentialKind::Github => Some(read_github),
         CredentialKind::Gitlab => Some(read_gitlab),
         CredentialKind::Linear => Some(read_linear),
-        CredentialKind::ClaudeCode | CredentialKind::Codex => None,
+        CredentialKind::ClaudeCode
+        | CredentialKind::Codex
+        | CredentialKind::Mergify
+        | CredentialKind::Buildkite => None,
     }
 }
 

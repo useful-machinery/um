@@ -18,7 +18,8 @@ fn initial_connection() -> serde_json::Value {
     value["version"] = 1.into();
     value
 }
-fn active_connection() -> serde_json::Value {
+/// An active connection at `https://gitlab.com` whose bot user is `automation-bot`.
+pub(super) fn active_connection() -> serde_json::Value {
     let mut value = connection();
     value["state"] = "active".into();
     value["credentialReason"] = serde_json::Value::Null;

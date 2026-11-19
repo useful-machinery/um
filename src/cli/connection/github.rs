@@ -1,4 +1,4 @@
-mod output;
+pub(super) mod output;
 
 use anyhow::{Context, anyhow};
 use clap::{Args, Subcommand};
@@ -190,6 +190,28 @@ impl RepositoryCommand {
     }
 }
 
+/// Begins the GitHub App setup of `organization` as `useful connection github setup begin` does,
+/// under the human session, with the report or `--json` output `json` selects:
+/// `useful integration connect github --org` (REQ-INTEGRATION-21).
+pub(in crate::cli) fn begin_setup(
+    deployment: &Deployment,
+    organization: OrganizationArg,
+    json: bool,
+    allow_insecure_http: bool,
+) -> anyhow::Result<ExitCode> {
+    OrganizationTarget {
+        organization,
+        options: GitHubOptions::new(
+            json,
+            super::super::PrincipalAuthenticationArgs::default(),
+            super::super::HttpOptions {
+                allow_insecure_http,
+            },
+        ),
+    }
+    .begin_setup(deployment)
+}
+
 impl OrganizationTarget {
     fn begin_setup(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let result = with_api(
@@ -291,7 +313,7 @@ impl InstallationTarget {
     }
 }
 
-fn with_api<T>(
+pub(super) fn with_api<T>(
     deployment: &Deployment,
     transport_policy: HttpTransportPolicy,
     authentication: &super::super::PrincipalAuthenticationArgs,

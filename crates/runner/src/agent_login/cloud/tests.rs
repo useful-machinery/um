@@ -9,6 +9,7 @@ use crate::runner_http::test_server::{self, RecordedRequest};
 
 const AGENT_LOGIN: &str = "agl_01k0z6r1w8f4jy2m7q9v3x5abc";
 const GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abc";
+const INTEGRATION_TOKEN_ID: &str = "itk_01k0z6r1w8f4jy2m7q9v3x5abc";
 const MATERIAL: &str = r#"{"tokens":{"access_token":"sentinel-agent-login-material"}}"#;
 
 fn client(endpoint: &Url) -> HttpAgentLoginCloud {
@@ -925,6 +926,185 @@ fn a_token_request_for_a_configured_provider_names_its_id_and_reads_only_its_ans
     );
 }
 
+fn answer_token_services(
+    status: &str,
+    headers: &str,
+    body: &str,
+) -> Result<Vec<ListedProvider>, GrantProvidersFailure> {
+    let (endpoint, _request, server) = test_server::respond_once(status, headers, body);
+    let result = client(&endpoint).token_services(&grant_providers_request());
+    server.join().unwrap();
+    result
+}
+
+// REQ-INTEGRATION-12
+#[test]
+fn a_token_service_list_request_posts_the_pinned_body_and_reads_each_token_service() {
+    let pinned = grant_providers_fixture("token-services.json");
+    let (endpoint, request, server) =
+        test_server::respond_once("200 OK", &test_server::broker_headers("", &pinned), &pinned);
+
+    let services = client(&endpoint)
+        .token_services(&grant_providers_request())
+        .unwrap();
+
+    let request = request.recv().unwrap();
+    server.join().unwrap();
+    assert!(
+        request
+            .head
+            .starts_with("POST /v1/runner/integrations/providers HTTP/1.1\r\n")
+    );
+    assert_eq!(
+        header(&request, "authorization"),
+        Some(format!("Bearer {}", test_credential().bearer_value()).as_str())
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&request.body).unwrap(),
+        serde_json::from_str::<serde_json::Value>(&grant_providers_fixture("request.json"))
+            .unwrap()
+    );
+    assert_eq!(
+        services,
+        [
+            listed("mergify", "MERGIFY_TOKEN", "MERGIFY_TOKEN_FILE"),
+            listed(
+                "buildkite",
+                "BUILDKITE_API_TOKEN",
+                "BUILDKITE_API_TOKEN_FILE"
+            ),
+        ]
+    );
+}
+
+// REQ-INTEGRATION-12
+#[test]
+fn a_token_service_list_is_no_route_assignment_not_current_or_invalid_as_cloud_answers_it() {
+    assert_eq!(
+        answer_token_services("404 Not Found", "", ""),
+        Err(GrantProvidersFailure::NoRoute)
+    );
+    let refusal = grant_providers_fixture("refusal.json");
+    assert_eq!(
+        answer_token_services(
+            "409 Conflict",
+            &test_server::broker_headers("", &refusal),
+            &refusal
+        ),
+        Err(GrantProvidersFailure::AssignmentNotCurrent)
+    );
+    assert_eq!(
+        answer_token_services("503 Service Unavailable", "", ""),
+        Err(GrantProvidersFailure::Cloud(CloudFailure::Status(503)))
+    );
+
+    let valid = grant_providers_fixture("token-services.json");
+    let mut bodies = vec![
+        valid.replace(r#""schemaVersion": 1"#, r#""schemaVersion": 2"#),
+        valid.replace(
+            r#""provider": "mergify","#,
+            r#""provider": "mergify", "integrationTokenId": "x","#,
+        ),
+        // A repeated id.
+        valid.replace(r#""provider": "buildkite""#, r#""provider": "mergify""#),
+    ];
+    // An id of the runner's three is never a token service.
+    for id in ["github", "gitlab.com", "linear"] {
+        bodies.push(valid.replace(
+            r#""provider": "buildkite""#,
+            &format!(r#""provider": "{id}""#),
+        ));
+    }
+    for body in &bodies {
+        assert_ne!(*body, valid);
+        assert_eq!(
+            answer_token_services("200 OK", &test_server::broker_headers("", body), body),
+            Err(GrantProvidersFailure::Cloud(CloudFailure::InvalidResponse)),
+            "{body}"
+        );
+    }
+}
+
+// REQ-INTEGRATION-12
+#[test]
+fn a_token_request_for_a_token_service_reads_only_an_integration_tokens_answer() {
+    let mergify = GrantTokenRequest {
+        provider: GrantProvider::token_service("mergify").unwrap(),
+        ..grant_token_request()
+    };
+    let issued = grant_token_fixture("issued-integration-token.json");
+    let (endpoint, request, server) =
+        test_server::respond_once("200 OK", &test_server::broker_headers("", &issued), &issued);
+
+    let token = client(&endpoint).grant_token(&mergify).unwrap();
+
+    let request = request.recv().unwrap();
+    server.join().unwrap();
+    let mut expected =
+        serde_json::from_str::<serde_json::Value>(&grant_token_fixture("request.json")).unwrap();
+    expected["provider"] = "mergify".into();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&request.body).unwrap(),
+        expected
+    );
+    assert_eq!(token.grant_id, INTEGRATION_TOKEN_ID);
+    assert_eq!(token.generation, 2);
+    assert_eq!(
+        token.access_token.as_bytes(),
+        b"synthetic-integration-token"
+    );
+
+    // A grant's ID is not a token service's.
+    let grant = issued.replace(INTEGRATION_TOKEN_ID, GRANT_ID);
+    let (endpoint, _request, server) =
+        test_server::respond_once("200 OK", &test_server::broker_headers("", &grant), &grant);
+    assert_eq!(
+        client(&endpoint).grant_token(&mergify).unwrap_err(),
+        GrantTokenFailure::Cloud(CloudFailure::InvalidResponse)
+    );
+    server.join().unwrap();
+
+    // And an integration token's ID is no other provider's.
+    let integration = grant_token_fixture("issued.json").replace(GRANT_ID, INTEGRATION_TOKEN_ID);
+    assert_eq!(
+        answer_grant_token(
+            "200 OK",
+            &test_server::broker_headers("", &integration),
+            &integration
+        )
+        .unwrap_err(),
+        GrantTokenFailure::Cloud(CloudFailure::InvalidResponse)
+    );
+    let example = GrantTokenRequest {
+        provider: GrantProvider::listed("example").unwrap(),
+        ..grant_token_request()
+    };
+    let configured = integration.replace(r#""provider": "gitlab.com""#, r#""provider": "example""#);
+    let (endpoint, _request, server) = test_server::respond_once(
+        "200 OK",
+        &test_server::broker_headers("", &configured),
+        &configured,
+    );
+    assert_eq!(
+        client(&endpoint).grant_token(&example).unwrap_err(),
+        GrantTokenFailure::Cloud(CloudFailure::InvalidResponse)
+    );
+    server.join().unwrap();
+
+    // The runner's three are never token services, and a token service is
+    // never a configured provider of the same id.
+    for id in ["github", "gitlab.com", "linear", "Mergify", ""] {
+        assert_eq!(GrantProvider::token_service(id), None, "{id}");
+    }
+    assert_ne!(
+        GrantProvider::token_service("mergify"),
+        GrantProvider::listed("mergify")
+    );
+    let service = GrantProvider::token_service("mergify").unwrap();
+    assert_eq!(service.cloud_id(), "mergify");
+    assert_eq!(service.agent_login_provider(), None);
+}
+
 const BOOT: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abe";
 const ASSIGNMENT: &str = "asn_01k0z6r1w8f4jy2m7q9v3x5abc";
 
@@ -968,6 +1148,7 @@ fn credential_sources_request() -> CredentialSourcesRequest {
                 None,
             ),
         ],
+        token_services: Vec::new(),
     }
 }
 
@@ -1013,6 +1194,52 @@ fn a_credential_source_report_posts_the_closed_body_and_a_204_records_it() {
                 {"provider": "codex", "source": "grant"},
                 {"provider": "github", "source": "host"},
                 {"provider": "gitlab.com", "source": "grant", "grantId": GRANT_ID},
+            ],
+        })
+    );
+}
+
+// REQ-INTEGRATION-12, REQ-GRANT-93
+#[test]
+fn a_credential_source_report_names_each_token_service_after_the_providers_by_its_listed_id() {
+    let (endpoint, request, server) =
+        test_server::respond_once("204 No Content", "Cache-Control: private, no-store\r\n", "");
+
+    client(&endpoint)
+        .credential_sources(&CredentialSourcesRequest {
+            token_services: vec![
+                ReportedTokenService {
+                    provider: "mergify".to_owned(),
+                    source: TokenServiceSource::Token {
+                        integration_token_id: INTEGRATION_TOKEN_ID.to_owned(),
+                    },
+                },
+                ReportedTokenService {
+                    provider: "buildkite".to_owned(),
+                    source: TokenServiceSource::Host,
+                },
+            ],
+            ..credential_sources_request()
+        })
+        .unwrap();
+
+    let request = request.recv().unwrap();
+    server.join().unwrap();
+    // The providers' entries are as they are without token services; a
+    // token service's names no grant or agent login.
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&request.body).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "bootId": BOOT,
+            "assignmentId": ASSIGNMENT,
+            "sources": [
+                {"provider": "claude_code", "source": "grant", "agentLoginId": AGENT_LOGIN},
+                {"provider": "codex", "source": "grant"},
+                {"provider": "github", "source": "host"},
+                {"provider": "gitlab.com", "source": "grant", "grantId": GRANT_ID},
+                {"provider": "mergify", "source": "token", "integrationTokenId": INTEGRATION_TOKEN_ID},
+                {"provider": "buildkite", "source": "host"},
             ],
         })
     );

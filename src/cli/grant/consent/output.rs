@@ -91,14 +91,14 @@ pub(in crate::cli) fn report(deployment: &str, failure: &GrantFailure) -> ApiFai
         GrantFailure::NotFound => ApiFailureReport::new(
             "not_found",
             "error: provider grant not found",
-            "List your grants:\n  useful grant list",
+            "List your grants:\n  useful integration list",
             OutcomeClass::GeneralFailure,
         ),
         GrantFailure::IdempotencyConflict => ApiFailureReport::idempotency_conflict(SUBJECT),
         GrantFailure::ConsentInProgress => ApiFailureReport::new(
             "consent_in_progress",
             "error: a consent for this provider is already in progress",
-            "Finish that consent or wait for it to expire, then list your grants:\n  useful grant list",
+            "Finish that consent or wait for it to expire, then list your grants:\n  useful integration list",
             OutcomeClass::GeneralFailure,
         ),
         GrantFailure::ProviderUnavailable => ApiFailureReport::new(

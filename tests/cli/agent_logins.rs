@@ -1,6 +1,6 @@
 use super::*;
 
-use super::grant::{after_notice, assert_next_actions_name_the_grant_commands};
+use super::grant::{after_notice, assert_next_actions_name_the_integration_commands};
 
 const TOKEN: &str = "unique-agent-login-session-token";
 const AGENT_LOGIN_ID: &str = "agl_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -294,7 +294,7 @@ fn list_json_prints_one_page_with_its_cursor_and_passes_the_page_options() {
     );
     // The earlier command names its replacement on standard error, and only that
     // (REQ-GRANT-77).
-    assert_eq!(after_notice(&output, "useful grant list"), "");
+    assert_eq!(after_notice(&output, "useful integration list"), "");
     assert_no_secret_output(&output, &[SENTINEL]);
     let request = server.finish().pop().unwrap();
     assert!(
@@ -331,7 +331,10 @@ fn show_reads_one_agent_login() {
         })
     );
     // The replacement reads the one grant by its id (REQ-GRANT-77).
-    assert_eq!(after_notice(&output, "useful grant list GRANT"), "");
+    assert_eq!(
+        after_notice(&output, "useful integration list INTEGRATION"),
+        ""
+    );
     assert_no_secret_output(&output, &[SENTINEL]);
     let request = server.finish().pop().unwrap();
     assert!(request.starts_with(&format!(
@@ -408,6 +411,8 @@ fn has_line(text: &str, line: &str) -> bool {
 
 // REQ-GRANT-29
 // REQ-GRANT-48
+// REQ-GRANT-77
+// REQ-INTEGRATION-15
 #[test]
 fn show_prints_ended_authorizations_with_their_removal_stop_and_a_reports_last_use() {
     let login = with_ended_authorization();
@@ -468,10 +473,10 @@ fn show_prints_ended_authorizations_with_their_removal_stop_and_a_reports_last_u
         "{text}"
     );
     assert!(
-        in_force.contains("useful grant create codex --replace"),
+        in_force.contains("useful integration connect codex --replace"),
         "{text}"
     );
-    assert_next_actions_name_the_grant_commands(&text);
+    assert_next_actions_name_the_integration_commands(&text);
     assert!(!ended.contains("availability"), "{text}");
     assert!(!in_force.contains(THIRD_RUNNER_ID), "{text}");
     assert!(
@@ -881,7 +886,7 @@ fn refusals_report_their_outcome_with_exit_status_1() {
     )]);
     let output = run_agent_login(&server, &credential, &["show", AGENT_LOGIN_ID], &[]);
     assert_eq!(output.status.code(), Some(1));
-    assert!(after_notice(&output, "useful grant list").contains("useful grant list"));
+    assert!(after_notice(&output, "useful integration list").contains("useful integration list"));
     server.finish();
 }
 
@@ -970,7 +975,7 @@ fn import_codex_sends_the_file_byte_for_byte_and_prints_the_login() {
     // The replacement names the provider, without which it signs in to every provider
     // lacked (REQ-GRANT-77).
     for output in [&human, &labelled] {
-        after_notice(output, "useful grant create PROVIDER");
+        after_notice(output, "useful integration connect PROVIDER");
     }
     let document = json_output(&labelled);
     assert_eq!(document["outcome"], "imported");
@@ -2198,12 +2203,12 @@ fn authorize_states_who_can_use_the_login_before_it_authorizes_the_runner() {
     );
     // The earlier command names its replacement on standard error before the statement
     // (REQ-GRANT-77).
-    assert_states_both_exposures(after_notice(&human, "useful grant authorize").as_bytes());
+    assert_states_both_exposures(after_notice(&human, "useful integration authorize").as_bytes());
     let text = String::from_utf8(human.stdout).unwrap();
     assert!(text.contains(AUTHORIZATION_ID), "{text}");
     assert!(text.contains(RUNNER_ID), "{text}");
     assert!(output.status.success());
-    assert_states_both_exposures(after_notice(&output, "useful grant authorize").as_bytes());
+    assert_states_both_exposures(after_notice(&output, "useful integration authorize").as_bytes());
     let document = json_output(&output);
     assert_eq!(document["outcome"], "authorized");
     assert_eq!(document["agentLoginId"], AGENT_LOGIN_ID);
@@ -2420,12 +2425,12 @@ fn authorize_refusals_exit_1_with_their_remedy() {
         (
             agent_login_problem("409 Conflict", 409, "agent-login-runner-conflict"),
             "runner_holds_login",
-            "useful grant deauthorize",
+            "useful integration deauthorize",
         ),
         (
             agent_login_problem("409 Conflict", 409, "agent-login-already-authorized"),
             "login_already_authorized",
-            "useful grant deauthorize GRANT RUNNER --yes",
+            "useful integration deauthorize INTEGRATION RUNNER --yes",
         ),
     ];
     for (response, outcome, remedy) in cases {
@@ -2442,12 +2447,12 @@ fn authorize_refusals_exit_1_with_their_remedy() {
         assert_eq!(output.status.code(), Some(1), "{outcome}");
         assert_eq!(json_output(&output)["outcome"], outcome);
         assert_eq!(human.status.code(), Some(1), "{outcome}");
-        let text = after_notice(&human, "useful grant authorize");
+        let text = after_notice(&human, "useful integration authorize");
         assert!(text.contains(remedy), "{outcome}: {text}");
         // A Codex login already authorized cannot be served by another sign-in: the held
         // grant is refused or replaced in place (REQ-GRANT-73).
         assert!(
-            !text.contains("useful grant create codex"),
+            !text.contains("useful integration connect codex"),
             "{outcome}: {text}"
         );
         assert_eq!(server.finish().len(), 2, "{outcome}");

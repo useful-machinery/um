@@ -1,9 +1,10 @@
 //! A runner's authorization of a grant as the member reads it: what was last delivered to the
-//! runner and what it reported (REQ-GRANT-13), its availability and next action
-//! (REQ-GRANT-53), and, once it ended, whether the runner has confirmed removing its copy
-//! (REQ-GRANT-47) and the stop requested of the run it was serving (REQ-GRANT-48).
-//! `useful grant list` prints it for a grant of either kind, and the earlier commands it replaces
-//! for an agent login.
+//! runner and what it reported (REQ-GRANT-13), its availability and next action (REQ-GRANT-53),
+//! and, once it ended, whether the runner has confirmed removing its copy (REQ-GRANT-47) and the
+//! stop requested of the run it was serving (REQ-GRANT-48). `useful integration list` prints it for
+//! a grant of either kind, and the earlier commands it replaces for an agent login. The
+//! authorization of a token `useful integration authorize` makes is printed here too
+//! (REQ-INTEGRATION-20).
 
 use std::io::{self, Write};
 
@@ -14,8 +15,9 @@ use crate::exit_code::ExitCode;
 
 use useful_api::{
     AgentLogin, AgentLoginAuthorization, AgentLoginReportState, GrantEndedAuthorization,
-    MemberGrantAuthorization,
+    IntegrationTokenAuthorization, MemberGrantAuthorization,
 };
+use useful_execution::visible_text;
 
 use super::projection::{MemberStatus, Subject, agent_login_provider, authorization_status};
 
@@ -27,6 +29,9 @@ use super::projection::{MemberStatus, Subject, agent_login_provider, authorizati
 pub(in crate::cli) struct AuthorizationView<'a> {
     pub(in crate::cli) id: &'a str,
     pub(in crate::cli) runner_id: &'a str,
+    // The runner's name, which a token's authorization names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runner_name: Option<&'a str>,
     // The runner's organization, which a grant's authorization names.
     #[serde(skip_serializing_if = "Option::is_none")]
     organization_id: Option<&'a str>,
@@ -35,7 +40,7 @@ pub(in crate::cli) struct AuthorizationView<'a> {
     delivery: Option<DeliveryView<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     report: Option<ReportView<'a>>,
-    // The runner's last use of a native grant where `useful grant list` prints no exchange
+    // The runner's last use of a native grant where `useful integration list` prints no exchange
     // (REQ-GRANT-64).
     #[serde(flatten)]
     last_use: Option<LastUseView<'a>>,
@@ -44,7 +49,7 @@ pub(in crate::cli) struct AuthorizationView<'a> {
     #[serde(flatten)]
     status: Option<MemberStatus>,
     // Whether the text form prints what was delivered and reported: an OAuth grant's
-    // authorization has no exchange, and `useful grant list` leaves it to `list GRANT`.
+    // authorization has no exchange, and `useful integration list` leaves it to `list INTEGRATION`.
     #[serde(skip)]
     exchange: bool,
 }
@@ -116,6 +121,7 @@ macro_rules! authorization_view {
         AuthorizationView {
             id: &authorization.id,
             runner_id: &authorization.runner_id,
+            runner_name: None,
             organization_id: None,
             created_at: &authorization.created_at,
             delivery: authorization
@@ -272,13 +278,31 @@ impl<'a> AuthorizationView<'a> {
         }
     }
 
-    /// The authorization of a grant `useful grant authorize` just made, with the runner's
+    /// The authorization of a grant `useful integration authorize` just made, with the runner's
     /// organization: nothing has been delivered or reported under it yet.
     pub(in crate::cli) fn made(authorization: &'a MemberGrantAuthorization) -> Self {
         Self {
             organization_id: Some(&authorization.organization_id),
             exchange: false,
             ..authorization_view!(authorization)
+        }
+    }
+
+    /// The authorization of a token `useful integration authorize` just made (REQ-INTEGRATION-20):
+    /// the runner by ID and name, its organization and when. A token's runner reports nothing
+    /// back, so there is no delivery or report.
+    pub(in crate::cli) fn of_token(authorization: &'a IntegrationTokenAuthorization) -> Self {
+        Self {
+            id: &authorization.id,
+            runner_id: &authorization.runner_id,
+            runner_name: Some(&authorization.runner_name),
+            organization_id: Some(&authorization.organization_id),
+            created_at: &authorization.created_at,
+            delivery: None,
+            report: None,
+            last_use: None,
+            status: None,
+            exchange: false,
         }
     }
 
@@ -315,7 +339,16 @@ impl<'a> AuthorizationView<'a> {
 
     fn write_heading(&self, output: &mut impl Write) -> io::Result<()> {
         writeln!(output, "  authorization: {}", self.id)?;
-        writeln!(output, "    runner: {}", self.runner_id)?;
+        match self.runner_name {
+            // Another party's text bound for a terminal.
+            Some(name) => writeln!(
+                output,
+                "    runner: {} ({})",
+                visible_text(name),
+                self.runner_id
+            )?,
+            None => writeln!(output, "    runner: {}", self.runner_id)?,
+        }
         if let Some(organization_id) = self.organization_id {
             writeln!(output, "    organization: {organization_id}")?;
         }
@@ -433,21 +466,34 @@ pub(in crate::cli) fn write_session_note(output: &mut impl Write) -> io::Result<
     )
 }
 
-/// What a runner's authorization was made or ended on: a grant, or, for the earlier agent-login
-/// commands, an agent login, each under the member its result has always named.
+/// What a runner's authorization was made or ended on: a grant, an integration token
+/// (REQ-INTEGRATION-20), or, for the earlier agent-login commands, an agent login, each under the
+/// member its result has always named.
 #[derive(Clone, Copy, Serialize)]
 pub(in crate::cli) enum Holder<'a> {
     #[serde(rename = "agentLoginId")]
     AgentLogin(&'a str),
     #[serde(rename = "grantId")]
     Grant(&'a str),
+    #[serde(rename = "integrationTokenId")]
+    IntegrationToken(&'a str),
 }
 
 impl Holder<'_> {
+    /// What the holder is called in a sentence.
+    pub(in crate::cli) const fn noun(self) -> &'static str {
+        match self {
+            Self::AgentLogin(_) => "agent login",
+            Self::Grant(_) => "grant",
+            Self::IntegrationToken(_) => "token",
+        }
+    }
+
     fn write_human(self, output: &mut impl Write) -> io::Result<()> {
         match self {
-            Self::AgentLogin(id) => writeln!(output, "agent login: {id}"),
-            Self::Grant(id) => writeln!(output, "grant: {id}"),
+            Self::AgentLogin(id) | Self::Grant(id) | Self::IntegrationToken(id) => {
+                writeln!(output, "{}: {id}", self.noun())
+            }
         }
     }
 }

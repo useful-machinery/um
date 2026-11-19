@@ -147,6 +147,18 @@ pub enum OrganizationAuditAction {
     RunnerJoinKeyUsed,
     #[serde(rename = "runner_join_key.revoked")]
     RunnerJoinKeyRevoked,
+    #[serde(rename = "integration_token.created")]
+    IntegrationTokenCreated,
+    #[serde(rename = "integration_token.replaced")]
+    IntegrationTokenReplaced,
+    #[serde(rename = "integration_token.revoked")]
+    IntegrationTokenRevoked,
+    #[serde(rename = "integration_token.runner_authorized")]
+    IntegrationTokenRunnerAuthorized,
+    #[serde(rename = "integration_token.runner_deauthorized")]
+    IntegrationTokenRunnerDeauthorized,
+    #[serde(rename = "integration_token.issued")]
+    IntegrationTokenIssued,
     #[serde(rename = "github_installation.connected")]
     GithubInstallationConnected,
     #[serde(rename = "github_installation.reactivated")]
@@ -368,6 +380,16 @@ impl std::fmt::Display for OrganizationAuditAction {
             Self::RunnerJoinKeyIssued => write!(f, "runner_join_key.issued"),
             Self::RunnerJoinKeyUsed => write!(f, "runner_join_key.used"),
             Self::RunnerJoinKeyRevoked => write!(f, "runner_join_key.revoked"),
+            Self::IntegrationTokenCreated => write!(f, "integration_token.created"),
+            Self::IntegrationTokenReplaced => write!(f, "integration_token.replaced"),
+            Self::IntegrationTokenRevoked => write!(f, "integration_token.revoked"),
+            Self::IntegrationTokenRunnerAuthorized => {
+                write!(f, "integration_token.runner_authorized")
+            }
+            Self::IntegrationTokenRunnerDeauthorized => {
+                write!(f, "integration_token.runner_deauthorized")
+            }
+            Self::IntegrationTokenIssued => write!(f, "integration_token.issued"),
             Self::GithubInstallationConnected => write!(f, "github_installation.connected"),
             Self::GithubInstallationReactivated => write!(f, "github_installation.reactivated"),
             Self::GithubInstallationDisconnected => write!(f, "github_installation.disconnected"),

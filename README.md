@@ -911,12 +911,18 @@ the option is not global.
 
 ## Grants
 
-`useful grant` manages what Useful Machinery may do as you at other providers. A grant is an
-OAuth grant, your consent at the provider, whose ID begins `pgr_`, or a native grant
+`useful integration` manages what Useful Machinery may do as you at other providers, which it
+holds as grants. A grant is an OAuth grant, your consent at the provider, whose ID begins
+`pgr_`, or a native grant
 (`claude_code`, `codex`), a coding agent's own login imported for one organization, whose ID
 begins `agl_`. The built-in OAuth providers are `github`, `gitlab.com` and `linear`; any other
 OAuth provider your deployment serves is given by its id. Each grant is used only on the
-runners you authorize for it. The commands take your signed-in session only, never a service API key.
+runners you authorize for it. `useful integration` also connects a token service, such as
+`mergify` or `buildkite`, by its token, for you or with `--org` for an organization; a token,
+whose ID begins `itk_`, is used only on the runners its owner authorizes for it. With `--org`,
+an owner also connects the organization itself at GitHub or Linear, and `useful integration
+list` shows each organization's GitHub, Linear and GitLab connections after the tokens. The
+commands take your signed-in session only, never a service API key.
 
 ```sh
 # Make a grant through the provider's own sign-in. For an OAuth provider this starts the
@@ -924,14 +930,14 @@ runners you authorize for it. The commands take your signed-in session only, nev
 # over SSH, and on Linux only with a display), and waits until the grant is active; approving
 # the URL in any browser completes it. --no-wait returns once the consent has started. The
 # built-in OAuth providers are github, gitlab.com and linear; any other OAuth provider your
-# deployment serves is given by its id, as useful grant list shows it, and the command checks
-# that the deployment serves it before starting anything. When you already hold a grant of the
-# provider, the command asks before replacing it on a terminal and otherwise exits 2 unless you
-# pass --replace; the new sign-in becomes that grant's next generation, keeping its ID and the
-# runners it is authorized for.
-useful grant create linear
-useful grant create github --replace --json
-useful grant create example
+# deployment serves is given by its id, as useful integration list shows it, and the command
+# checks that the deployment serves it before starting anything. When you already hold a grant
+# of the provider, the command asks before replacing it on a terminal and otherwise exits 2
+# unless you pass --replace; the new sign-in becomes that grant's next generation, keeping its
+# ID and the runners it is authorized for.
+useful integration connect linear
+useful integration connect github --replace --json
+useful integration connect example
 
 # For codex this runs `codex login` in a private temporary Codex home (mode 0700) that it
 # removes afterwards, and imports the login it writes; your own Codex home is never read or
@@ -941,9 +947,9 @@ useful grant create example
 # existing auth.json from an owned mode-0600 file, or - for standard input, instead. The grant
 # is for your only organization, or the one --organization names. A coding agent's sign-in
 # has no consent to wait for, so --no-wait and --timeout are refused for codex and claude_code.
-useful grant create codex
-useful grant create codex --device --organization acme
-useful grant create codex --from-file ~/backup/auth.json --replace
+useful integration connect codex
+useful integration connect codex --device --organization acme
+useful integration connect codex --from-file ~/backup/auth.json --replace
 
 # For claude_code this runs `claude setup-token` with a private temporary configuration
 # directory (mode 0700) that it removes afterwards; your own Claude Code configuration is never
@@ -952,8 +958,48 @@ useful grant create codex --from-file ~/backup/auth.json --replace
 # standard input the command fails at once, starting no sign-in, and names --token-file -.
 # --token-file imports a token claude setup-token printed from an owned mode-0600 file, or -
 # for standard input, instead.
-useful grant create claude_code
-useful grant create claude_code --token-file - --organization acme < token.txt
+useful integration connect claude_code
+useful integration connect claude_code --token-file - --organization acme < token.txt
+
+# For a token service the deployment serves, such as mergify or buildkite, store its token.
+# The command first checks that the deployment serves the service and whether the token is
+# already held, and only then reads the token: from --from-file PATH, an owned mode-0600 file,
+# or - for standard input; without --from-file, from standard input when that is not a
+# terminal, and otherwise at a prompt that does not echo what you type. No argument, option
+# value or environment variable carries it. The token is 1 to 4096 printable ASCII characters
+# with no space; one trailing line ending is dropped, and anything else exits 2 with nothing
+# sent. The command prints the token's record (ID, service, side, version, who connected it
+# and when, and its runners) with outcome connected, never the token. --org ORGANIZATION, an
+# ID or slug, stores the organization's token instead of yours, which only an owner may do: a
+# refusal exits 1. Where the token is already held, the command asks before replacing it on a
+# terminal and otherwise exits 2 unless you pass --replace; the replacement is the token's next
+# version, keeps its ID and runners, and reaches each authorized runner within five minutes.
+# The sign-in options --login, --device, --token-file, --no-wait, --timeout and --organization
+# are refused for a token service. useful integration list shows the token after your grants,
+# and authorize, deauthorize and revoke act on it named by its service, with --org for the
+# organization's; revoking erases it from Cloud but does not end it at the service.
+useful integration connect mergify
+useful integration connect mergify --from-file ~/secrets/mergify-token
+useful integration connect buildkite --from-file - < buildkite-token.txt
+useful integration connect mergify --org acme --replace
+
+# With --org and github or linear, connect the organization at the provider instead, which only
+# an owner may do. For github this begins the GitHub App setup that
+# useful connection github setup begin ORGANIZATION begins; finish it with the
+# useful connection github setup complete command its report names. For linear it starts the
+# authorization of a new Linear workspace and waits for it, as
+# useful connection linear authorization create ORGANIZATION does, with --no-wait and --timeout
+# as that command takes them. Each sends that command's requests, prints its report and --json
+# output, exits as it does, and creates no grant, consent or identity link of yours.
+# --organization, --login, --device, --from-file, --token-file and --replace are refused with
+# exit 2 before any request, as are --no-wait and --timeout with github. gitlab.com is refused
+# with --org: its connection is the several steps of
+# useful connection gitlab create ORGANIZATION INSTANCE_URL. An organization's connection acts
+# for Cloud and is authorized for no runner, so authorize, deauthorize and revoke refuse --org
+# with github, gitlab.com and linear, and revoke names the useful connection command that
+# removes one.
+useful integration connect github --org acme
+useful integration connect linear --org acme --no-wait --json
 
 # Without a provider, or with --all, run the sign-in of each provider you hold no active or
 # reconnect_required grant of, one after another: github, gitlab.com, linear, each other OAuth
@@ -969,8 +1015,8 @@ useful grant create claude_code --token-file - --organization acme < token.txt
 # the Codex sign-in; --no-wait and --timeout apply to the consents. --from-file and --token-file
 # need a provider, and --replace a provider or --workflow. With --json each provider's events
 # are followed by a summary event.
-useful grant create
-useful grant create --all --organization acme --json
+useful integration connect
+useful integration connect --all --organization acme --json
 
 # With --workflow FILE, which repeats, sign in to only the providers those workflows and the
 # workflows their workflow steps run call for, derived as useful runner doctor --workflow derives
@@ -984,21 +1030,31 @@ useful grant create --all --organization acme --json
 # reported its login refused) is planned to reconnect: on a terminal the command asks first,
 # before any sign-in, and --replace replaces it without asking, storing the sign-in as the
 # grant's next generation so it keeps its ID and its runners; it never replaces a healthy
-# grant. One you keep is reported reconnect_required, naming useful grant create PROVIDER
+# grant. One you keep is reported reconnect_required, naming useful integration connect PROVIDER
 # --replace. With --json the plan is a first workflow_requirements event, whose selected,
 # reconnect and held arrays name each provider and what calls for it.
-useful grant create --workflow workflow.yaml --workflow ../other/workflow.yaml
-useful grant create --workflow workflow.yaml --source-root . --json
-useful grant create --workflow workflow.yaml --replace
+useful integration connect --workflow workflow.yaml --workflow ../other/workflow.yaml
+useful integration connect --workflow workflow.yaml --source-root . --json
+useful integration connect --workflow workflow.yaml --replace
 
 # List every grant you hold: its ID, provider, kind, the account it acts as (an OAuth grant's
 # linked identity, a native grant's organization), its state and generation, and each runner
 # it is authorized for with that runner's availability and next action and, for a native
 # grant, the last use the runner reported and when. Then name each provider you hold nothing
-# for, in the order useful grant create signs in to them: github, gitlab.com, linear, each other
-# OAuth provider this deployment serves, claude_code and codex. It reads every page; there is
-# no --limit or --cursor.
-useful grant list
+# for, in the order useful integration connect signs in to them: github, gitlab.com, linear,
+# each other OAuth provider this deployment serves, claude_code and codex. It reads every page;
+# there is no --limit or --cursor.
+useful integration list
+
+# After the grants, list your tokens and each organization's, and then each organization's
+# connections: its GitHub App installations, its Linear connections and its GitLab connections,
+# each as side org with its service (github, linear or gitlab.com), ID, account and state as
+# useful connection prints it. A read you may not make, such as the GitHub installations for a
+# member who is not an owner, or one the deployment has not configured, is left out and fails
+# nothing. --org keeps that organization's tokens and connections alone, with no grant. A
+# connection is named to no other useful integration command; useful connection shows and
+# removes it.
+useful integration list --org acme --json
 
 # Show one grant in detail: for a native grant what each runner was last delivered and
 # reported, its last use and when, and for each runner whose authorization has ended the one
@@ -1006,15 +1062,15 @@ useful grant list
 # again; for an OAuth grant its scopes, last use and expiries, and the newest 20 tokens issued
 # from it with the run and assignment of each (--uses LIMIT, 1 to 200, shows another number).
 # Name it by its ID, or by its provider when you hold one grant of it.
-useful grant list agl_01k0z6r1w8f4jy2m7q9v3x5abc
-useful grant list codex --json
+useful integration list agl_01k0z6r1w8f4jy2m7q9v3x5abc
+useful integration list codex --json
 
 # Authorize one runner, named by the rnr_ ID that `useful runner list acme` prints, to use a
 # grant. For an OAuth grant, every run on that runner that you start can then be issued tokens
 # from it; for a native grant, every run that runner serves, whichever member caused it, can
 # use the login, and every step on that runner can read it. The command reads the grant, says
 # which applies, and does nothing without --yes. A Codex grant serves one runner at a time.
-useful grant authorize codex rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+useful integration authorize codex rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 
 # Leave the runner out to choose it from a list. At a terminal it shows the runners the grant
 # can be authorized for and is not yet, each by name, pool, online or offline, mode when not
@@ -1022,15 +1078,15 @@ useful grant authorize codex rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 # states what authorizing does, naming the runner, and asks before it acts unless --yes was
 # given: any answer but y, or Esc at the list, sends nothing and exits 2. Where the command
 # cannot prompt (no terminal, or --json), it lists the same runners and exits 2 having sent
-# nothing. `useful grant authorize --all` offers the runners of your organizations, and
-# `useful grant deauthorize GRANT` only the runners the grant is authorized for.
-useful grant authorize codex
+# nothing. `useful integration authorize --all` offers the runners of your organizations, and
+# `useful integration deauthorize INTEGRATION` only the runners the grant is authorized for.
+useful integration authorize codex
 
 # Offered more than one runner, the list ends with a choice of all of them, except for a Codex
 # grant, which serves one runner at a time, and for --all. With all chosen the command states
 # how many runners it covers, acts on each in turn and prints one outcome per runner; it exits
 # 1 when any runner was refused, and a failure that is not one runner's refusal ends it there.
-useful grant authorize claude_code
+useful integration authorize claude_code
 
 # Authorize that runner for every grant of yours that can serve it: each OAuth grant and each
 # native grant of the runner's organization. It prints one outcome per grant (`authorized`,
@@ -1039,20 +1095,20 @@ useful grant authorize claude_code
 # and exits 1 when any grant was refused. A failure that is not one grant's refusal, such as a
 # rate limit, ends it at that grant: it prints the outcomes so far, then the failure naming
 # that grant, and exits 1.
-useful grant authorize --all rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+useful integration authorize --all rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 
 # End that runner's authorization. For a native grant Cloud also asks the run that runner is
 # serving, whichever member started it, to stop, and the command prints whether the runner has
 # confirmed removing its copy and the run asked to stop; for an OAuth grant no run is stopped
 # and no further token is issued there.
-useful grant deauthorize codex rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+useful integration deauthorize codex rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 
 # Revoke a grant everywhere. An OAuth grant is erased and revoked at the provider where the
 # provider offers it. A native grant is erased and the command prints each runner it was
 # authorized for with its removal state and the run asked to stop there; a confirmation covers
 # only the copy that runner kept, and the session at the provider stays signed in until you
 # sign out there.
-useful grant revoke github --yes
+useful integration revoke github --yes
 ```
 
 `list --json` prints one schema-version-1 document with outcome `listed`, `grants` (each with
@@ -1061,11 +1117,19 @@ useful grant revoke github --yes
 `runnerId`, `organizationId`, `availability` and `nextAction` and, for a native grant whose
 runner reported a last use, `lastUse` (`accepted` or `refused`) and, where Cloud holds it,
 `lastUseAt`, or the grant's own `availability` and `nextAction` when no runner is authorized)
-and `notConnected`; `list GRANT --json` prints outcome `shown` with `grant`. A provider name
-you hold no grant of reports `grant_not_found` and exits 1; one you hold several grants of
-exits 2 and names their IDs.
+and `notConnected`; `list INTEGRATION --json` prints outcome `shown` with `grant`. Each grant
+in either document also carries `side`, `member`, which no `notConnected` entry has. A
+provider name you hold no grant of reports `grant_not_found` and exits 1; one you hold several
+grants of exits 2 and names their IDs. `useful integration list --json` also carries `tokens`,
+present whatever it holds: your tokens and then each organization's, each with its `id`,
+`service`, `side`, for an organization's `organization`, `version`, `connectedBy`,
+`connectedAt`, `createdAt` and `authorizations`, none of which holds the token itself.
+It and `list --org ORGANIZATION --json` also carry `connections`, present whatever it holds:
+each organization connection with its `id`, `service`, `side` (`org`), `organization`,
+`account` where the read names one, `instanceUrl` for a GitLab connection, and `state`, and
+never a credential. `useful grant list` carries no `tokens` and no `connections`.
 
-`create --json` prints newline-delimited events: `consent_required` with `sessionId`,
+`connect --json` prints newline-delimited events: `consent_required` with `sessionId`,
 `provider`, `authorizationUrl` and `expiresAt`, then `consent_result` with its `outcome`
 (`completed` with `grant`, or `failed`, `expired` or `recovery_required` with `reason`, which
 exit 1). A consent that cannot start reports `provider_unavailable` or `consent_in_progress`.
@@ -1098,29 +1162,40 @@ A refusal exits 1 with its outcome (`runner_not_found`, `runner_holds_login`,
 Every runner authorization `list` prints, and every provider you hold nothing for, carries one
 `availability` (`available`, `unverified`, `reconnect_required`, `pending`, `delivery_failed`,
 `not_delivered` or `not_connected`) and one `nextAction`, and the
-text form names the command or step that next action means: `useful grant create PROVIDER
---replace` to reconnect, `useful grant authorize GRANT RUNNER --yes` for a grant no runner is
-authorized for, `useful runner grant sync` on the runner's host after a failed
-delivery, and `useful grant create PROVIDER` for a provider you hold nothing for. A runner that
+text form names the command or step that next action means:
+`useful integration connect PROVIDER --replace` to reconnect,
+`useful integration authorize INTEGRATION RUNNER --yes` for a grant no runner is authorized
+for, `useful runner integration sync` on the runner's host after a failed delivery, and
+`useful integration connect PROVIDER` for a provider you hold nothing for. A runner that
 has not yet reported installing what Cloud holds is `pending` with `wait_for_runner`, and a
 login in place that the runner has neither checked with its provider nor had a step use at
 this generation is `unverified`.
 
-On the runner's host, `useful runner grant sync` asks the live runner, through the control socket
-its runner home's configuration names or, with `--config PATH`, that file's, to set up the
-agent logins authorized for it now and prints each provider's readiness; see
+On the runner's host, `useful runner integration sync` asks the live runner, through the
+control socket its runner home's configuration names or, with `--config PATH`, that file's, to
+set up the agent logins authorized for it now and prints each provider's readiness; see
 [Runner serve](#runner-serve).
 
 The earlier commands remain for one release with their arguments, output and exit statuses
 unchanged, but are absent from help, and each first prints a line on standard error naming
-the command that replaces it: `useful auth grant create` and `useful auth agent-login import` are
-`useful grant create PROVIDER`; `useful auth agent-login reconnect` is
-`useful grant create PROVIDER --replace`; `useful auth grant list`, `useful auth agent-login list` and
-`useful auth credential status` are `useful grant list`; `useful auth agent-login show` is
-`useful grant list GRANT`; `useful auth agent-login authorize`, `deauthorize` and `revoke` and
-`useful auth grant revoke` are the `useful grant` leaf of the same name; and
-`useful runner agent-login sync` is `useful runner grant sync`; and `useful auth grant uses` is
-`useful grant list GRANT`.
+the command that replaces it: `useful auth grant create` and `useful auth agent-login import`
+are `useful integration connect PROVIDER`; `useful auth agent-login reconnect` is
+`useful integration connect PROVIDER --replace`; `useful auth grant list`,
+`useful auth agent-login list` and `useful auth credential status` are
+`useful integration list`; `useful auth agent-login show` is
+`useful integration list INTEGRATION`; `useful auth agent-login authorize`, `deauthorize` and
+`revoke` and `useful auth grant revoke` are the `useful integration` leaf of the same name;
+and `useful runner agent-login sync` is `useful runner integration sync`; and
+`useful auth grant uses` is `useful integration list INTEGRATION`.
+
+`useful grant` and `useful runner grant sync` are the earlier names of `useful integration`
+and `useful runner integration sync`: `useful grant create` is `useful integration connect`,
+and `list`, `authorize`, `deauthorize` and `revoke` keep their names. They are absent from
+help and still work with the same arguments, standard output and exit statuses, but
+`useful grant list` states no `side`, none of them takes `--org` or reaches a token
+service's token, and each first prints a line on standard error naming
+the command that replaces it. They are the names a release that predates
+`useful integration` has.
 
 ## Account management
 
@@ -1404,6 +1479,10 @@ listens for an inbound callback. Begin a ten-minute, single-use setup session:
 useful connection github setup begin acme-labs
 ```
 
+`useful integration connect github --org acme-labs` begins the same setup session and prints
+the same report under your human session; `--service-api-key-file` stays on the
+`useful connection github` commands.
+
 Open the reported URL in a browser and approve the GitHub account and repositories.
 GitHub then returns the browser to a Useful Machinery setup page that shows the decimal
 installation ID and the completion command. Run that command with the ID to complete the
@@ -1595,6 +1674,11 @@ useful connection linear authorization create acme-labs --connection-id lcn_01k0
 # To request write consent explicitly on a new or read-only connection:
 useful connection linear authorization create acme-labs --enable-state-updates
 ```
+
+`useful integration connect linear --org acme-labs` starts the same authorization of a new
+workspace under your human session and waits for it the same way, taking `--no-wait` and
+`--timeout`; `--service-api-key-file`, `--enable-state-updates` and `--connection-id` stay on
+the `useful connection linear` commands.
 
 Open the URL in a browser as the initiating owner. By default, the command polls the
 owner-bound authorization session until completion, failure, expiry, or recovery-required
@@ -2428,7 +2512,10 @@ With `--workflow FILE` the doctor runs no check and instead lists the credential
 tree needs: it resolves each named workflow and every child workflow
 its `workflow` steps name, as `useful workflow validate` does, and reports one requirement per
 kind (`github`, `gitlab`, `linear`, `claude_code`, `codex`) with every declaration that calls
-for it, followed by the nodes and forwarded variables whose credentials it cannot see. Agent
+for it, followed by the nodes and forwarded variables whose credentials it cannot see. A
+`mergify` or `buildkite` that a workflow declares under `requires.integrations` is reported as
+a kind of its own that nothing verifies: it stays `unverified`, names the variable a step reads
+its token from, and no Cloud read is made for it. Agent
 profiles on Claude Code or Codex and credential-like names in the root
 `environmentPassthrough` count; nothing runs, no harness sign-in or variable value is read,
 and Cloud is not contacted, so every requirement reads `unverified` with a next action.
@@ -2454,32 +2541,32 @@ with code `provider_unavailable` while the deployment's GitLab admission is clos
 
 With `--grants` the doctor also reads your own grants and shows, beneath each requirement, what
 you hold of its provider: each grant with, for every runner it is authorized for, its
-availability and next action as `useful grant list` reports them, or `not_connected` with the
-`useful grant create` command that makes one. Add `--runner-id RUNNER`, the runner's ID as
-`useful runner list` prints it, to see each grant's status on that runner alone, or
-`not_connected` with the `useful grant authorize` command when it is not authorized there;
-`--organization-id` keeps only that organization's coding agent grants. Your grants change a
-requirement's state and the exit status only with `--require-grants`, which needs `--grants`
-and `--runner-id`: a provider for which you hold no grant that runner can use (one
-`available`, `unverified` or `pending` there) then reads `missing` or `reconnect_required`
-and the doctor exits 1. `--grants` uses your own sign-in, never a service API key.
+availability and next action as `useful integration list` reports them, or `not_connected` with
+the `useful integration connect` command that makes one. Add `--runner-id RUNNER`, the runner's
+ID as `useful runner list` prints it, to see each grant's status on that runner alone, or
+`not_connected` with the `useful integration authorize` command when it is not authorized
+there; `--organization-id` keeps only that organization's coding agent grants. Your grants
+change a requirement's state and the exit status only with `--require-grants`, which needs
+`--grants` and `--runner-id`: a provider for which you hold no grant that runner can use (one
+`available`, `unverified` or `pending` there) then reads `missing` or `reconnect_required` and
+the doctor exits 1. `--grants` uses your own sign-in, never a service API key.
 
 With `--connect` the doctor signs you in to what the workflows need and then checks again. It
-runs the flow `useful grant create --workflow` runs over the same files: it prints the plan of the
-providers to sign in to, to reconnect and already held, runs the same sign-ins in the same
-order, and prints the same summary. `--organization-id ORGANIZATION` names the organization of
-a coding agent's grant, and `--replace` replaces each grant that needs reconnecting without
-asking. Once the sign-ins end it reads your grants again and prints the `--grants` report,
-with the organization's connections when `--readiness` is given; add `--runner-id RUNNER` to
-see each grant's status on that runner. With `--json` every line is one JSON document: the
-events `useful grant create --workflow --json` prints, then the report as a last event `report`.
-A failure before the summary, or a signal that stops a sign-in, ends the command with that
-status and no report. Otherwise it exits 1 when a sign-in failed, when every provider selected
-was passed over, or when `--readiness` finds a requirement failing, and 0 otherwise.
-`--connect` uses your own sign-in, never a service API key. The doctor runs no step of the
-workflow in any mode, and it does not authorize a runner: the report names the
-`useful grant authorize` command that does. Without `--readiness`, `--grants` or `--connect`
-nothing is contacted.
+runs the flow `useful integration connect --workflow` runs over the same files: it prints the
+plan of the providers to sign in to, to reconnect and already held, runs the same sign-ins in
+the same order, and prints the same summary. `--organization-id ORGANIZATION` names the
+organization of a coding agent's grant, and `--replace` replaces each grant that needs
+reconnecting without asking. Once the sign-ins end it reads your grants again and prints the
+`--grants` report, with the organization's connections when `--readiness` is given; add
+`--runner-id RUNNER` to see each grant's status on that runner. With `--json` every line is one
+JSON document: the events `useful integration connect --workflow --json` prints, then the
+report as a last event `report`. A failure before the summary, or a signal that stops a
+sign-in, ends the command with that status and no report. Otherwise it exits 1 when a sign-in
+failed, when every provider selected was passed over, or when `--readiness` finds a requirement
+failing, and 0 otherwise. `--connect` uses your own sign-in, never a service API key. The
+doctor runs no step of the workflow in any mode, and it does not authorize a runner: the report
+names the `useful integration authorize` command that does. Without `--readiness`, `--grants`
+or `--connect` nothing is contacted.
 
 ```sh
 # List the credentials a workflow tree needs without running it.
@@ -2589,7 +2676,7 @@ signed-in registration, or by joining a pool with a join key when the service fi
 starts. The service never reads human OAuth credentials: `runner serve` uses the human
 sign-in only to register a host that holds no enrolled state when `--personal` or
 `--pool-id` is given, and the runner it then serves uses its own credential. Enrollment,
-service startup, `runner status` and `runner grant sync` consume the same closed operator
+service startup, `runner status` and `runner integration sync` consume the same closed operator
 configuration. Without `--config` it is the runner home's: the
 directory `runner` under the `useful` home (`$USEFUL_HOME` when it is set and not empty, otherwise
 `$HOME/.useful`, a relative home taken from the working directory) holds the configuration and
@@ -2620,7 +2707,7 @@ configuration, reported as an invalid configuration; or when the configuration n
 `runnerStatePath` other than the home's `runner/state.json` while a file exists there, as
 in a home that was moved or copied, reported as a conflict naming both paths.
 
-`runner status` and `runner grant sync` given no `--config` create and change nothing under
+`runner status` and `runner integration sync` given no `--config` create and change nothing under
 the `useful` home. When the runner home holds a configuration they ask the control socket it
 names, and one that does not load is their failure; when it holds none they ask
 `runner/control.sock`, so a home no runner serves from answers as an absent socket does,
@@ -2875,8 +2962,8 @@ status` shows each provider's readiness once it has set up, and you can ask the 
 to set up now:
 
 ```sh
-useful runner grant sync
-useful runner grant sync --json
+useful runner integration sync
+useful runner integration sync --json
 ```
 
 The command goes only through the local control socket and prints one line per provider

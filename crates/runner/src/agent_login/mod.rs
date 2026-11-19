@@ -310,6 +310,12 @@ pub(crate) struct Offer {
     /// environment, the directory and the grant tokens the offer is built
     /// from (INV-RUNNER-31).
     pub(crate) sources: Vec<ProviderSource>,
+    /// Each token service Cloud listed for the assignment that has a
+    /// source, in the list's order, as `grant_token::token_service_sources`
+    /// settles it from the environment and the grant tokens the offer is
+    /// built from (REQ-INTEGRATION-12, INV-RUNNER-31); none where Cloud did
+    /// not answer the list.
+    pub(crate) token_services: Vec<cloud::ReportedTokenService>,
 }
 
 /// A login the runner added to an admission's environment, as the
@@ -335,16 +341,18 @@ pub(crate) fn offer(process: &EnvironmentSnapshot, directory: Option<&LoginDirec
         environment,
         offered,
         sources: sources(&service, directory, None),
+        token_services: Vec::new(),
     }
 }
 
 /// What an assignment's admission is offered: `offer`'s, with the grant
 /// tokens it holds, `grant_tokens`, and their files offered as well
 /// (`grant_token::offer`, REQ-GRANT-87), and each provider's source settled
-/// with them (REQ-GRANT-92, INV-RUNNER-31). The admission holds no token of
-/// a provider the host provides, whose names stay as the process
-/// environment has them, and nothing is withheld. No `OfferedLogin` records
-/// a grant token, whose uses are not noted.
+/// with them (REQ-GRANT-92, INV-RUNNER-31), each token service Cloud
+/// listed for the assignment included (REQ-INTEGRATION-12). The admission
+/// holds no token of a provider the host provides, whose names stay as the
+/// process environment has them, and nothing is withheld. No
+/// `OfferedLogin` records a grant token, whose uses are not noted.
 pub(crate) fn offer_with_grant_tokens(
     process: &EnvironmentSnapshot,
     directory: Option<&LoginDirectory>,
@@ -354,6 +362,7 @@ pub(crate) fn offer_with_grant_tokens(
     Offer {
         environment: grant_token::offer(&offered.environment, grant_tokens),
         sources: sources(&ServiceEnvironment::of(process), directory, grant_tokens),
+        token_services: grant_token::token_service_sources(&offered.environment, grant_tokens),
         ..offered
     }
 }
@@ -448,19 +457,33 @@ fn sources(
         .collect()
 }
 
-/// What an admission reports to Cloud of its `sources` (REQ-GRANT-93): each
-/// provider that has one, an OAuth grant by the ID of the grant its token in
-/// `grant_tokens` was issued from, and a coding agent's grant by the agent
-/// login the offer's `offered` records for it, absent when the readiness
-/// document records no install. An OAuth grant whose token's grant is not
-/// known is left out, since Cloud records no such entry; `offer` gives it a
-/// source only for a token it holds.
+/// What an admission reports to Cloud of the sources its offer settled,
+/// in one request (REQ-GRANT-93).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ReportedSources {
+    /// Each provider's that has one, in `AgentLoginProvider::ALL`'s order.
+    pub(crate) sources: Vec<cloud::ReportedSource>,
+    /// Each token service's that has one, in Cloud's list's order, after
+    /// the providers' (REQ-INTEGRATION-12).
+    pub(crate) token_services: Vec<cloud::ReportedTokenService>,
+}
+
+/// What an admission reports to Cloud of `offer`'s sources (REQ-GRANT-93):
+/// each provider that has one, an OAuth grant by the ID of the grant its
+/// token in `grant_tokens` was issued from, and a coding agent's grant by
+/// the agent login the offer's `offered` records for it, absent when the
+/// readiness document records no install; then each token service the
+/// offer settled a source of, a token by the `itk_` ID it was issued from
+/// (REQ-INTEGRATION-12). An OAuth grant whose token's grant is not known is
+/// left out, since Cloud records no such entry; `offer` gives it a source
+/// only for a token it holds.
 pub(crate) fn reported_sources(
-    sources: &[ProviderSource],
-    offered: &[OfferedLogin],
+    offer: &Offer,
     grant_tokens: Option<&grant_token::AssignmentGrantTokens>,
-) -> Vec<cloud::ReportedSource> {
-    sources
+) -> ReportedSources {
+    let offered = &offer.offered;
+    let sources = offer
+        .sources
         .iter()
         .filter_map(|&ProviderSource { provider, source }| {
             let (grant_id, agent_login_id) = match source {
@@ -483,7 +506,11 @@ pub(crate) fn reported_sources(
                 agent_login_id,
             })
         })
-        .collect()
+        .collect();
+    ReportedSources {
+        sources,
+        token_services: offer.token_services.clone(),
+    }
 }
 
 /// The readiness document beside `directory`; none when there is none or it

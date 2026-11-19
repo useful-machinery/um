@@ -1,5 +1,5 @@
 //! The provider's consent that makes an OAuth grant (REQ-GRANT-1, REQ-GRANT-69), which both
-//! `useful grant create` and its earlier spelling run: it starts the session with one key,
+//! `useful integration connect` and its earlier spellings run: it starts the session with one key,
 //! replayed once on a lost response, prints where to approve it, opens that URL when asked to,
 //! and polls the session until it settles.
 
@@ -28,7 +28,8 @@ type OperationControl = super::super::OperationControl<Recovery>;
 const CONSENT_TIMEOUT: Duration = Duration::from_secs(900);
 
 /// The command a member ran the consent with, as its remedies name it: its input, and the
-/// commands it is to run next, which are `useful grant`'s from either (REQ-GRANT-77).
+/// commands it is to run next, which are `useful integration`'s from any (REQ-GRANT-77,
+/// REQ-INTEGRATION-15).
 #[derive(Clone, Copy)]
 pub(in crate::cli) struct Front {
     create: &'static str,
@@ -42,8 +43,8 @@ impl Front {
         ..Self::GRANT
     };
     pub(in crate::cli) const GRANT: Self = Self {
-        create: "useful grant create",
-        list: "useful grant list",
+        create: "useful integration connect",
+        list: "useful integration list",
         check_input: "Check the provider.",
     };
 }

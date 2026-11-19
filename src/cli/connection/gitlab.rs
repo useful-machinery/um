@@ -300,9 +300,18 @@ fn deployment<T>(
 fn with_api<T>(
     d: &Deployment,
     base: &Base,
+    call: impl FnMut(&GitLabApi) -> Result<T, GitLabFailure>,
+) -> anyhow::Result<Result<T, GitLabFailure>> {
+    with_options(d, &base.options, call)
+}
+/// Runs `call` against the GitLab connections of the deployment `d` with the authentication and
+/// transport `options` select.
+pub(super) fn with_options<T>(
+    d: &Deployment,
+    options: &Options,
     mut call: impl FnMut(&GitLabApi) -> Result<T, GitLabFailure>,
 ) -> anyhow::Result<Result<T, GitLabFailure>> {
-    let policy = base.options.http.transport_policy();
+    let policy = options.http.transport_policy();
     let client = HttpClient::new(policy)
         .map_err(|e| anyhow!(e))
         .context("prepare human session networking")?;
@@ -310,7 +319,7 @@ fn with_api<T>(
         super::super::principal_api_context(
             &client,
             d,
-            &base.options.authentication,
+            &options.authentication,
             "acquire human session",
         ),
         |token| {

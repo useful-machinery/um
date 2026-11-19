@@ -638,7 +638,7 @@ fn runner_status_prints_each_provider_readiness_once_the_runner_has_set_up() {
     assert!(line("github").contains("(generation 4)"), "{stdout}");
     assert!(line("gitlab").contains("sync_runner"), "{stdout}");
     assert!(
-        !line("gitlab").contains("useful runner grant sync"),
+        !line("gitlab").contains("useful runner integration sync"),
         "{stdout}"
     );
     assert!(output.stderr.is_empty());
@@ -747,7 +747,9 @@ fn runner_status_names_the_grant_to_reconnect_by_its_grant_provider() {
             .find(|line| line.starts_with(&format!("{provider} login:")))
             .unwrap();
         assert!(
-            line.contains(&format!("`useful grant create {grant_provider} --replace`")),
+            line.contains(&format!(
+                "`useful integration connect {grant_provider} --replace`"
+            )),
             "{stdout}"
         );
     }
@@ -783,10 +785,10 @@ fn runner_status_prints_the_availability_the_state_and_last_use_give() {
         .unwrap();
     assert!(line.contains("reconnect"), "{line}");
     assert!(line.contains("agl_01k0z6r1w8f4jy2m7q9v3x5abc"), "{line}");
-    // Its owner reconnects it with `useful grant create` (REQ-GRANT-77).
+    // Its owner reconnects it with `useful integration connect` (REQ-GRANT-77).
     let codex = stdout.lines().find(|line| line.starts_with("codex login:"));
     assert!(
-        codex.is_some_and(|line| line.contains("`useful grant create codex --replace`")),
+        codex.is_some_and(|line| line.contains("`useful integration connect codex --replace`")),
         "{stdout}"
     );
     assert!(output.stderr.is_empty());

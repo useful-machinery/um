@@ -1,5 +1,5 @@
-//! The plan `useful grant create --workflow` prints before any sign-in (REQ-GRANT-76): the providers
-//! a workflow tree calls for, derived by `useful runner doctor --workflow`'s grouping
+//! The plan `useful integration connect --workflow` prints before any sign-in (REQ-GRANT-76): the
+//! providers a workflow tree calls for, derived by `useful runner doctor --workflow`'s grouping
 //! ([`Roots`](crate::cli::runner::doctor::roots::Roots)).
 
 use std::io::{self, Write};
@@ -135,7 +135,7 @@ fn write_declaration<K: useful_runner::DeclarationKind + doctor::HumanLabel>(
     )
 }
 
-/// The first event of `useful grant create --workflow --json`.
+/// The first event of `useful integration connect --workflow --json`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JsonPlan<'a> {

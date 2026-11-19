@@ -236,7 +236,7 @@ pub(super) fn write_revoke(
         Some(_) => {}
         None if after.is_none() => writeln!(
             stdout,
-            "\nTo see which runners have confirmed removing it:\n  useful grant list {agent_login_id}"
+            "\nTo see which runners have confirmed removing it:\n  useful integration list {agent_login_id}"
         )?,
         None => {}
     }
@@ -309,7 +309,7 @@ fn report(deployment: &str, failure: &AgentLoginFailure) -> ApiFailureReport {
         AgentLoginFailure::AgentLoginNotFound => refused(
             "agent_login_not_found",
             "error: agent login not found",
-            "List your grants:\n  useful grant list",
+            "List your grants:\n  useful integration list",
         ),
         AgentLoginFailure::OrganizationNotFound => refused(
             "organization_not_found",
@@ -324,7 +324,7 @@ fn report(deployment: &str, failure: &AgentLoginFailure) -> ApiFailureReport {
         AgentLoginFailure::LimitReached => refused(
             "limit_reached",
             "error: you hold the most agent logins this organization allows",
-            "Revoke one you no longer use:\n  useful grant revoke GRANT --yes",
+            "Revoke one you no longer use:\n  useful integration revoke INTEGRATION --yes",
         ),
         AgentLoginFailure::RunnerNotFound => refused(
             "runner_not_found",
@@ -334,7 +334,7 @@ fn report(deployment: &str, failure: &AgentLoginFailure) -> ApiFailureReport {
         AgentLoginFailure::RunnerHoldsLogin => refused(
             "runner_holds_login",
             "error: that runner already holds an agent login for this coding agent",
-            "The owner of the login the runner holds must end that authorization first:\n  useful grant deauthorize GRANT RUNNER --yes",
+            "The owner of the login the runner holds must end that authorization first:\n  useful integration deauthorize INTEGRATION RUNNER --yes",
         ),
         AgentLoginFailure::LoginAlreadyAuthorized => refused(
             "login_already_authorized",
@@ -344,7 +344,7 @@ fn report(deployment: &str, failure: &AgentLoginFailure) -> ApiFailureReport {
         AgentLoginFailure::AuthorizationNotFound => refused(
             "authorization_not_found",
             "error: that runner holds no authorization of this agent login",
-            "Show the grant's authorizations:\n  useful grant list GRANT",
+            "Show the grant's authorizations:\n  useful integration list INTEGRATION",
         ),
         AgentLoginFailure::RateLimited { retry_after } => {
             ApiFailureReport::rate_limited(SUBJECT, *retry_after)

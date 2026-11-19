@@ -9,7 +9,7 @@ use super::runner_doctor_workflow::{
     LINEAR_LIST, connection_page, held as held_grant, requirement,
 };
 
-const TOKEN: &str = "unique-grant-list-session-token";
+pub(super) const TOKEN: &str = "unique-grant-list-session-token";
 pub(super) const OAUTH_GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abc";
 pub(super) const REVOKED_OAUTH_GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abd";
 pub(super) const NATIVE_GRANT_ID: &str = "agl_01k0z6r1w8f4jy2m7q9v3x5abc";
@@ -24,7 +24,9 @@ const EMAIL: &str = "ada@example.test";
 // names, so it stands for anything a response might wrongly add.
 pub(super) const SENTINEL: &str = "private-grant-list-material-sentinel";
 
-fn prepared(responses: Vec<Vec<u8>>) -> (ScriptedServer, tempfile::TempDir, std::path::PathBuf) {
+pub(super) fn prepared(
+    responses: Vec<Vec<u8>>,
+) -> (ScriptedServer, tempfile::TempDir, std::path::PathBuf) {
     let server = ScriptedServer::respond(responses);
     let directory = private_credential_directory();
     let path = directory.path().join("credentials.json");
@@ -49,6 +51,29 @@ fn run_grant(server: &ScriptedServer, credential: &Path, args: &[&str]) -> Outpu
     );
     let output = run_with_env(&arguments, &environment);
     assert_no_secret_output(&output, &[SENTINEL, TOKEN]);
+    without_notice(output, &replacement(args[0]))
+}
+
+/// The `useful integration` command that replaces the `useful grant` leaf `leaf`
+/// (REQ-INTEGRATION-15).
+pub(super) fn replacement(leaf: &str) -> String {
+    let leaf = if leaf == "create" { "connect" } else { leaf };
+    format!("useful integration {leaf}")
+}
+
+/// `output` without the notice an earlier command prints first on standard error, recognized
+/// as a first line naming `replacement`, the command that replaces it. Where no leaf ran, as
+/// when clap refuses the arguments, there is none to remove. `integration.rs` pins the notice
+/// itself, so the cases here read standard error as the command that replaces it prints it.
+pub(super) fn without_notice(mut output: Output, replacement: &str) -> Output {
+    let notice = output
+        .stderr
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .filter(|end| String::from_utf8_lossy(&output.stderr[..*end]).contains(replacement));
+    if let Some(end) = notice {
+        output.stderr.drain(..=end);
+    }
     output
 }
 
@@ -66,7 +91,7 @@ pub(super) fn page(items: &[serde_json::Value], next_cursor: Option<&str>) -> Ve
     json_http_response("200 OK", body)
 }
 
-fn one(grant: &serde_json::Value) -> Vec<u8> {
+pub(super) fn one(grant: &serde_json::Value) -> Vec<u8> {
     json_http_response("200 OK", with_material(grant.clone()))
 }
 
@@ -94,7 +119,7 @@ pub(super) fn oauth_grant(id: &str, provider: &str, state: &str) -> serde_json::
 }
 
 // The GitHub grant with no runner authorized.
-fn oauth_grant_unauthorized(id: &str) -> serde_json::Value {
+pub(super) fn oauth_grant_unauthorized(id: &str) -> serde_json::Value {
     let mut grant = oauth_grant(id, "github", "active");
     grant["authorizations"] = serde_json::json!([]);
     grant
@@ -153,11 +178,11 @@ pub(super) fn native_grant_in_use() -> serde_json::Value {
     grant
 }
 
-fn identities(items: serde_json::Value) -> Vec<u8> {
+pub(super) fn identities(items: serde_json::Value) -> Vec<u8> {
     json_http_response("200 OK", serde_json::json!({"items": items}))
 }
 
-fn ada() -> serde_json::Value {
+pub(super) fn ada() -> serde_json::Value {
     serde_json::json!([{
         "id": IDENTITY_ID,
         "kind": "oidc",
@@ -170,7 +195,7 @@ fn ada() -> serde_json::Value {
     }])
 }
 
-fn organization() -> Vec<u8> {
+pub(super) fn organization() -> Vec<u8> {
     json_http_response(
         "200 OK",
         serde_json::json!({
@@ -184,7 +209,7 @@ fn organization() -> Vec<u8> {
     )
 }
 
-fn problem(status: &str, code: u16, slug: &str) -> Vec<u8> {
+pub(super) fn problem(status: &str, code: u16, slug: &str) -> Vec<u8> {
     problem_http_response(
         status,
         serde_json::json!({
@@ -195,7 +220,7 @@ fn problem(status: &str, code: u16, slug: &str) -> Vec<u8> {
     )
 }
 
-fn json_output(output: &Output) -> serde_json::Value {
+pub(super) fn json_output(output: &Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
@@ -243,15 +268,17 @@ pub(super) fn after_notice(output: &Output, replacement: &str) -> String {
     rest.to_owned()
 }
 
-/// Every command a printed next action names is a `useful grant` or `useful runner grant` command, and
-/// none of the earlier commands is named anywhere in `text` (REQ-GRANT-77).
-pub(super) fn assert_next_actions_name_the_grant_commands(text: &str) {
+/// Every command a printed next action names is a `useful integration` or
+/// `useful runner integration` command, and none of the earlier commands is named anywhere in
+/// `text` (REQ-GRANT-77, REQ-INTEGRATION-15).
+pub(super) fn assert_next_actions_name_the_integration_commands(text: &str) {
     let mut commands = 0;
     for line in text.lines().filter(|line| line.contains("next action:")) {
         for command in line.split('`').skip(1).step_by(2) {
             commands += 1;
             assert!(
-                command.starts_with("useful grant ") || command.starts_with("useful runner grant "),
+                command.starts_with("useful integration ")
+                    || command.starts_with("useful runner integration "),
                 "{line}"
             );
         }
@@ -261,6 +288,8 @@ pub(super) fn assert_next_actions_name_the_grant_commands(text: &str) {
         "useful auth agent-login",
         "useful auth grant",
         "useful runner agent-login",
+        "useful grant ",
+        "useful runner grant ",
     ] {
         assert!(!text.contains(earlier), "{earlier} in\n{text}");
     }
@@ -268,7 +297,7 @@ pub(super) fn assert_next_actions_name_the_grant_commands(text: &str) {
 
 // The two pages of the member's grants: an active GitHub grant, then an active Codex grant and
 // a revoked Linear grant.
-fn two_pages() -> [Vec<u8>; 2] {
+pub(super) fn two_pages() -> [Vec<u8>; 2] {
     [
         page(
             &[oauth_grant(OAUTH_GRANT_ID, "github", "active")],
@@ -288,7 +317,8 @@ pub(super) const LIST_FIRST_PAGE: &str =
     "GET /api/v1/me/grants?kind=all&limit=200&vocabulary=2 HTTP/1.1";
 const LIST_SECOND_PAGE: &str =
     "GET /api/v1/me/grants?kind=all&limit=200&cursor=grants-2&vocabulary=2 HTTP/1.1";
-const READ_IDENTITIES: &str = "GET /api/v1/me/identities?limit=200&vocabulary=2 HTTP/1.1";
+pub(super) const READ_IDENTITIES: &str =
+    "GET /api/v1/me/identities?limit=200&vocabulary=2 HTTP/1.1";
 const READ_ORGANIZATION: &str = "GET /api/v1/organizations/org_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
 const READ_USES: &str =
     "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc/uses?limit=20&vocabulary=2 HTTP/1.1";
@@ -395,7 +425,8 @@ fn list_prints_every_grant_with_its_account_runners_and_status_and_names_the_res
     }
     assert!(!text.contains(REVOKED_OAUTH_GRANT_ID), "{text}");
     // REQ-GRANT-77
-    assert_next_actions_name_the_grant_commands(&text);
+    // REQ-INTEGRATION-15
+    assert_next_actions_name_the_integration_commands(&text);
 
     let requests = server.finish();
     assert_member_requests(&requests);
@@ -494,7 +525,7 @@ fn list_names_the_command_that_authorizes_a_runner_for_an_oauth_grant_with_none(
     assert_eq!(
         commands,
         [format!(
-            "useful grant authorize {OAUTH_GRANT_ID} RUNNER --yes"
+            "useful integration authorize {OAUTH_GRANT_ID} RUNNER --yes"
         )],
         "{line}"
     );
@@ -849,7 +880,7 @@ fn three_uses() -> [serde_json::Value; 3] {
     })
 }
 
-fn uses(items: &[serde_json::Value]) -> Vec<u8> {
+pub(super) fn uses(items: &[serde_json::Value]) -> Vec<u8> {
     page(items, None)
 }
 
@@ -1225,7 +1256,7 @@ fn list_names_each_other_oauth_provider_served_that_the_member_holds_nothing_of(
     );
     let next_action = lines[at("example") + 2];
     assert!(
-        next_action.contains("`useful grant create example`"),
+        next_action.contains("`useful integration connect example`"),
         "{text}"
     );
     assert_eq!(shown.status.code(), Some(0), "{}", stderr(&shown));
@@ -1286,15 +1317,15 @@ fn a_service_api_key_is_refused() {
 
 const LINEAR_GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abe";
 const OTHER_ORGANIZATION_ID: &str = "org_01k0z6r1w8f4jy2m7q9v3x5abd";
-const NEW_RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abe";
+pub(super) const NEW_RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abe";
 const CANCELLATION_REQUEST_ID: &str = "cmd_01k0z6r1w8f4jy2m7q9v3x5abc";
 
-fn request_body(request: &str) -> serde_json::Value {
+pub(super) fn request_body(request: &str) -> serde_json::Value {
     serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
 }
 
 // The authorization Cloud makes of `grant_id` for `runner_id`, under the prefix its kind names.
-fn authorized(grant_id: &str, runner_id: &str) -> Vec<u8> {
+pub(super) fn authorized(grant_id: &str, runner_id: &str) -> Vec<u8> {
     let prefix = if grant_id.starts_with("pgr_") {
         "pga_"
     } else {
@@ -1314,7 +1345,7 @@ fn authorized(grant_id: &str, runner_id: &str) -> Vec<u8> {
     )
 }
 
-fn deleted() -> Vec<u8> {
+pub(super) fn deleted() -> Vec<u8> {
     http_response_with_headers(
         "204 No Content",
         None,
@@ -1323,14 +1354,14 @@ fn deleted() -> Vec<u8> {
     )
 }
 
-fn stderr(output: &Output) -> String {
+pub(super) fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).unwrap()
 }
 
 // What a leaf states on standard error before it acts: the line naming the grant it acts on,
 // then each statement indented under it. The wording is not a contract, so a statement is
 // identified by where it is printed and compared only with the refusal that states it too.
-fn statement(output: &Output, grant_id: &str) -> Vec<String> {
+pub(super) fn statement(output: &Output, grant_id: &str) -> Vec<String> {
     let text = stderr(output);
     let mut lines = text.lines();
     let heading = lines.next().unwrap_or_default();
@@ -1349,16 +1380,13 @@ fn refusal_without_yes(server: &ScriptedServer, credential: &Path, args: &[&str]
     assert!(output.stdout.is_empty(), "{args:?}");
     let text = stderr(&output);
     assert!(text.contains("--yes"), "{args:?}: {text}");
-    assert!(
-        text.contains(&format!("useful grant {}", args[0])),
-        "{args:?}: {text}"
-    );
+    assert!(text.contains(&replacement(args[0])), "{args:?}: {text}");
     text
 }
 
 // A statement made before acting is one the refusal without `--yes` states for both kinds,
 // each on a line of its own (REQ-GRANT-66, REQ-GRANT-67, REQ-GRANT-68).
-fn assert_stated_by_the_refusal(statement: &[String], refusal: &str) {
+pub(super) fn assert_stated_by_the_refusal(statement: &[String], refusal: &str) {
     assert!(!statement.is_empty(), "no statement before acting");
     for line in statement {
         assert_eq!(
@@ -1713,7 +1741,7 @@ fn authorize_all_exits_1_when_a_grant_is_refused_for_another_reason() {
     assert_eq!(human.status.code(), Some(1));
     let text = format!("{}{}", stdout(&human), stderr(&human));
     assert!(text.contains("runner_holds_login"), "{text}");
-    assert!(text.contains("useful grant deauthorize"), "{text}");
+    assert!(text.contains("useful integration deauthorize"), "{text}");
     assert_eq!(server.finish().len(), 8);
 }
 
@@ -1781,7 +1809,7 @@ fn authorize_all_tells_a_codex_grant_authorized_elsewhere_from_one_authorized_he
     );
     // The refusal's remedy names the command that frees the grant.
     assert!(
-        stderr(&human).contains("useful grant deauthorize"),
+        stderr(&human).contains("useful integration deauthorize"),
         "{}",
         stderr(&human)
     );
@@ -2230,7 +2258,7 @@ fn each_refusal_these_leaves_meet_exits_1_with_its_remedy() {
             &["revoke", NATIVE_GRANT_ID, "--yes"],
             vec![problem("404 Not Found", 404, "grant-not-found")],
             "grant_not_found",
-            Some("useful grant list"),
+            Some("useful integration list"),
         ),
         (
             authorize,
@@ -2258,14 +2286,14 @@ fn each_refusal_these_leaves_meet_exits_1_with_its_remedy() {
                 problem("409 Conflict", 409, "grant-runner-conflict"),
             ],
             "runner_holds_login",
-            Some("useful grant deauthorize"),
+            Some("useful integration deauthorize"),
         ),
         // The runner holds no authorization in force, so nothing is deleted.
         (
             &["deauthorize", NATIVE_GRANT_ID, RUNNER_ID, "--yes"],
             vec![native()],
             "authorization_not_found",
-            Some("useful grant list"),
+            Some("useful integration list"),
         ),
     ];
     for (args, responses, outcome, remedy) in cases {
@@ -2322,12 +2350,12 @@ fn a_codex_grant_authorized_for_another_runner_names_the_deauthorize_that_moves_
     assert_eq!(human.status.code(), Some(1));
     let text = stderr(&human);
     assert!(
-        text.contains("useful grant deauthorize GRANT RUNNER --yes"),
+        text.contains("useful integration deauthorize INTEGRATION RUNNER --yes"),
         "{text}"
     );
     // Another sign-in cannot serve the other runner: the held grant is refused or replaced
     // in place (REQ-GRANT-73).
-    assert!(!text.contains("useful grant create codex"), "{text}");
+    assert!(!text.contains("useful integration connect codex"), "{text}");
     let requests = server.finish();
     assert_member_requests(&requests);
     assert_eq!(requests.len(), 4);
@@ -2341,11 +2369,11 @@ fn a_codex_grant_authorized_for_another_runner_names_the_deauthorize_that_moves_
 // `useful grant authorize` and `deauthorize` given no `RUNNER`, run here with a null standard
 // input, where they cannot prompt (REQ-GRANT-81).
 const GLOBEX_RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abf";
-const LIST_ACME_RUNNERS: &str = "GET /api/v1/organizations/org_01k0z6r1w8f4jy2m7q9v3x5abc/runner-registrations?limit=200 HTTP/1.1";
+pub(super) const LIST_ACME_RUNNERS: &str = "GET /api/v1/organizations/org_01k0z6r1w8f4jy2m7q9v3x5abc/runner-registrations?limit=200 HTTP/1.1";
 const LIST_GLOBEX_RUNNERS: &str = "GET /api/v1/organizations/org_01k0z6r1w8f4jy2m7q9v3x5abe/runner-registrations?limit=200 HTTP/1.1";
 
 // A runner of `organization_id` in the pool `builders`, as the runner registrations list it.
-fn registration(
+pub(super) fn registration(
     (id, organization_id, name): (&str, &str, &str),
     connectivity: &str,
     mode: &str,
@@ -2366,13 +2394,13 @@ fn registration(
     })
 }
 
-fn registrations(items: &[serde_json::Value]) -> Vec<u8> {
+pub(super) fn registrations(items: &[serde_json::Value]) -> Vec<u8> {
     json_http_response("200 OK", serde_json::json!({"items": items}))
 }
 
-const ALPHA: (&str, &str, &str) = (ENDED_RUNNER_ID, ORGANIZATION_ID, "alpha");
-const BRAVO: (&str, &str, &str) = (NEW_RUNNER_ID, ORGANIZATION_ID, "bravo");
-const CHARLIE: (&str, &str, &str) = (RUNNER_ID, ORGANIZATION_ID, "charlie");
+pub(super) const ALPHA: (&str, &str, &str) = (ENDED_RUNNER_ID, ORGANIZATION_ID, "alpha");
+pub(super) const BRAVO: (&str, &str, &str) = (NEW_RUNNER_ID, ORGANIZATION_ID, "bravo");
+pub(super) const CHARLIE: (&str, &str, &str) = (RUNNER_ID, ORGANIZATION_ID, "charlie");
 const DELTA: (&str, &str, &str) = (GLOBEX_RUNNER_ID, GLOBEX_ORGANIZATION_ID, "delta");
 
 // Acme's three runners: an offline one, an online draining one, and, listed last, the one
@@ -2439,7 +2467,7 @@ fn authorize_without_a_runner_where_it_cannot_prompt_names_each_runner_it_offers
     let text = stderr(&human);
     let last = text.lines().last().unwrap_or_default();
     assert!(
-        last.contains("useful grant authorize")
+        last.contains("useful integration authorize")
             && last.contains(RUNNER_ID)
             && last.contains("--yes"),
         "{text}"
@@ -2659,6 +2687,17 @@ fn a_command_with_no_runner_to_offer_exits_1_with_why() {
 /// controlling terminal is its standard input, the terminal the list measures to draw on. The
 /// CLI test environment includes Python.
 fn grant_on_terminal(server: &ScriptedServer, credential: &Path, args: &[&str]) -> Command {
+    family_on_terminal("grant", server, credential, args)
+}
+
+/// `useful FAMILY args`, for a pseudo-terminal to run as the command's controlling terminal,
+/// which the runner list draws on.
+pub(super) fn family_on_terminal(
+    family: &str,
+    server: &ScriptedServer,
+    credential: &Path,
+    args: &[&str],
+) -> Command {
     let mut command = Command::new("python3");
     command
         .args([
@@ -2666,7 +2705,7 @@ fn grant_on_terminal(server: &ScriptedServer, credential: &Path, args: &[&str]) 
             "import fcntl, os, sys, termios; os.setsid(); \
              fcntl.ioctl(0, termios.TIOCSCTTY, 0); os.execv(sys.argv[1], sys.argv[1:])",
             env!("CARGO_BIN_EXE_useful"),
-            "grant",
+            family,
         ])
         .args(args)
         .arg("--allow-insecure-http");
@@ -2927,7 +2966,7 @@ fn authorize_with_all_runners_chosen_authorizes_each_under_its_own_key() {
             assert_eq!(output.status.code(), Some(1), "{shown}");
             let after = &shown[shown.rfind(NEW_RUNNER_ID).unwrap()..];
             assert!(
-                after.contains("useful grant deauthorize GRANT RUNNER --yes"),
+                after.contains("useful integration deauthorize INTEGRATION RUNNER --yes"),
                 "{shown}"
             );
         } else {
@@ -3082,8 +3121,9 @@ const BROWSER_VARIABLES: [&str; 5] = [
     "DISPLAY",
     "WAYLAND_DISPLAY",
 ];
-const LIST_OAUTH: &str = "GET /api/v1/me/grants?kind=oauth&limit=200&vocabulary=2 HTTP/1.1";
-const START_CONSENT: &str = "POST /api/v1/me/grants?vocabulary=2 HTTP/1.1";
+pub(super) const LIST_OAUTH: &str =
+    "GET /api/v1/me/grants?kind=oauth&limit=200&vocabulary=2 HTTP/1.1";
+pub(super) const START_CONSENT: &str = "POST /api/v1/me/grants?vocabulary=2 HTTP/1.1";
 
 /// Where `useful grant create` runs.
 #[derive(Clone, Copy, Debug)]
@@ -3234,7 +3274,7 @@ fn run_create(
         .output()
         .unwrap();
     assert_no_secret_output(&output, &[SENTINEL, TOKEN]);
-    output
+    without_notice(output, &replacement("create"))
 }
 
 // The Linear consent as the API presents it, carrying material the CLI must drop.
@@ -3266,7 +3306,7 @@ fn session(status: &str) -> serde_json::Value {
     session
 }
 
-fn started() -> Vec<u8> {
+pub(super) fn started() -> Vec<u8> {
     json_http_response("201 Created", session("pending"))
 }
 
@@ -3274,7 +3314,7 @@ fn polled(session: serde_json::Value) -> Vec<u8> {
     json_http_response("200 OK", session)
 }
 
-fn nothing_held() -> Vec<u8> {
+pub(super) fn nothing_held() -> Vec<u8> {
     page(&[], None)
 }
 
@@ -3779,7 +3819,7 @@ fn create_replaces_a_held_grant_of_a_served_provider_only_with_replace() {
 /// Runs `command` with a pseudo-terminal as its standard input and standard error, waits for
 /// its `[y/N]` question, answers it with `answer`, and returns what the terminal showed up to
 /// the question and the command's output.
-fn answered(command: Command, answer: &str) -> (String, Output) {
+pub(super) fn answered(command: Command, answer: &str) -> (String, Output) {
     const QUESTION: &str = "[y/N]";
     let (shown, output) = on_terminal(command, &[(QUESTION, answer)]);
     let asked = shown
@@ -3799,7 +3839,7 @@ fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// error and its standard output piped. At each step it waits until the terminal shows the
 /// step's text, after what the step before waited for, then types the step's keys. Returns all
 /// the terminal showed until the command ended, and the command's output.
-fn on_terminal(mut command: Command, steps: &[(&str, &str)]) -> (String, Output) {
+pub(super) fn on_terminal(mut command: Command, steps: &[(&str, &str)]) -> (String, Output) {
     let size = rustix::termios::Winsize {
         ws_row: 40,
         ws_col: 160,
@@ -3899,7 +3939,7 @@ fn create_on_a_terminal_asks_before_it_replaces_a_held_grant() {
 
 const GLOBEX_ORGANIZATION_ID: &str = "org_01k0z6r1w8f4jy2m7q9v3x5abe";
 const THIRD_NATIVE_GRANT_ID: &str = "agl_01k0z6r1w8f4jy2m7q9v3x5abe";
-const LIST_MEMBERSHIPS: &str = "GET /api/v1/me/memberships?limit=200 HTTP/1.1";
+pub(super) const LIST_MEMBERSHIPS: &str = "GET /api/v1/me/memberships?limit=200 HTTP/1.1";
 const LIST_NATIVE: &str = "GET /api/v1/me/grants?kind=native&limit=200&vocabulary=2 HTTP/1.1";
 const IMPORT_GRANT: &str = "POST /api/v1/me/grant-imports HTTP/1.1";
 const READ_ACME: &str = "GET /api/v1/organizations/acme HTTP/1.1";
@@ -3910,7 +3950,12 @@ fn replace_line(grant_id: &str) -> String {
 
 // The member's memberships: an active one in each organization named, and an ended one, which
 // names no slug and makes no organization the member's.
-fn memberships(organizations: &[(&str, &str)]) -> Vec<u8> {
+pub(super) fn memberships(organizations: &[(&str, &str)]) -> Vec<u8> {
+    memberships_as(organizations, "member")
+}
+
+/// The member's memberships, as [`memberships`] makes them, with the active ones in `role`.
+pub(super) fn memberships_as(organizations: &[(&str, &str)], role: &str) -> Vec<u8> {
     let mut items: Vec<_> = organizations
         .iter()
         .enumerate()
@@ -3921,7 +3966,7 @@ fn memberships(organizations: &[(&str, &str)]) -> Vec<u8> {
                 "organizationState": "active",
                 "organizationDisplayName": slug,
                 "organizationSlug": slug,
-                "role": "member",
+                "role": role,
                 "state": "active",
                 "createdAt": "2026-11-01T08:00:00Z",
                 "updatedAt": "2026-11-01T08:00:00Z"
@@ -4149,7 +4194,11 @@ fn run_programs(
         ],
     );
     home.assert_untouched_and_clean();
-    output
+    if arguments.starts_with(GRANT_CREATE) {
+        without_notice(output, &replacement("create"))
+    } else {
+        output
+    }
 }
 
 fn assert_imported(request: &str, organization: &str, (provider, material): Login) {
@@ -5111,7 +5160,7 @@ fn create_claude_code_stores_the_token_as_the_held_grants_next_generation_with_r
 
 // `useful grant create` with no provider: every provider the member lacks, one after another.
 
-const LIST_EVERY_KIND: &str = LIST_FIRST_PAGE;
+pub(super) const LIST_EVERY_KIND: &str = LIST_FIRST_PAGE;
 
 // The URL a consent of `provider` asks the member to approve.
 fn consent_url(provider: &str) -> String {
@@ -5119,7 +5168,7 @@ fn consent_url(provider: &str) -> String {
 }
 
 // The consent of `provider` as the API presents it, carrying material the CLI must drop.
-fn consent_of(provider: &str, status: &str) -> serde_json::Value {
+pub(super) fn consent_of(provider: &str, status: &str) -> serde_json::Value {
     let mut consent = session(status);
     consent["provider"] = provider.into();
     match status {
@@ -5144,7 +5193,7 @@ fn claude_grant_of(id: &str) -> serde_json::Value {
 
 // The member's grants: an active one of each OAuth provider in `oauth`, and an active Codex and
 // Claude Code grant in Acme when `natives` is set.
-fn holding(oauth: &[&str], natives: bool) -> Vec<u8> {
+pub(super) fn holding(oauth: &[&str], natives: bool) -> Vec<u8> {
     let mut grants: Vec<_> = oauth
         .iter()
         .map(|provider| oauth_grant(OAUTH_GRANT_ID, provider, "active"))
@@ -5577,7 +5626,7 @@ fn a_provider_the_deployment_does_not_serve_is_reported_and_passed_over_without_
     assert_eq!(start_body(&requests[3]), "linear");
 }
 
-const READ_SERVED: &str = "GET /api/v1/me/grant-providers HTTP/1.1";
+pub(super) const READ_SERVED: &str = "GET /api/v1/me/grant-providers HTTP/1.1";
 
 /// The deployment's answer naming the providers it serves, each with its kind (REQ-GRANT-78).
 fn serving(providers: &[&str]) -> Vec<u8> {
@@ -5611,7 +5660,7 @@ fn serving_every() -> Vec<u8> {
 }
 
 /// The answer of a deployment that predates the read of the providers it serves.
-fn predating_served() -> Vec<u8> {
+pub(super) fn predating_served() -> Vec<u8> {
     problem("404 Not Found", 404, "not-found")
 }
 
@@ -5931,7 +5980,7 @@ fn a_summary_of_consents_only_started_is_no_success_verdict_and_names_where_to_s
     assert!(
         remedies(&report)
             .iter()
-            .any(|line| line.trim() == "useful grant list"),
+            .any(|line| line.trim() == "useful integration list"),
         "{text}"
     );
     assert_eq!(
@@ -5969,8 +6018,8 @@ fn a_summary_with_codex_missing_names_installing_it_before_running_the_command_a
         "{text}"
     );
     for command in [
-        "useful grant create codex --from-file PATH",
-        "useful grant create",
+        "useful integration connect codex --from-file PATH",
+        "useful integration connect",
     ] {
         assert!(
             remedies.iter().any(|line| line.trim() == command),
@@ -6076,7 +6125,7 @@ fn an_unresolved_organization_passes_over_the_coding_agents_and_the_consents_sti
             } else {
                 let text = stderr(&output);
                 assert!(
-                    text.contains("useful grant create --organization ORGANIZATION"),
+                    text.contains("useful integration connect --organization ORGANIZATION"),
                     "{case}: {text}"
                 );
             }
@@ -6249,7 +6298,7 @@ fn a_coding_agent_refuses_the_options_that_wait_for_a_consent_which_still_apply_
     assert!(
         shown
             .lines()
-            .any(|line| line.trim() == "useful grant create claude_code"),
+            .any(|line| line.trim() == "useful integration connect claude_code"),
         "{shown}"
     );
 
@@ -6676,7 +6725,7 @@ fn create_workflow_replaces_a_grant_that_needs_reconnecting_off_a_terminal_only_
     let report = stdout(&told);
     for provider in ["linear", "claude_code"] {
         assert!(
-            report.contains(&format!("useful grant create {provider} --replace")),
+            report.contains(&format!("useful integration connect {provider} --replace")),
             "{report}"
         );
     }

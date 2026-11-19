@@ -1,6 +1,6 @@
-//! The roots that bound the files of `useful runner doctor --workflow` and
-//! `useful grant create --workflow` (REQ-CREDREADY-1, REQ-GRANT-76): `--source-root`, or the root of
-//! the Git repository that holds each file, with each root's derivation merged into one.
+//! The roots that bound the files of `useful runner doctor --workflow` and `useful integration
+//! connect --workflow` (REQ-CREDREADY-1, REQ-GRANT-76): `--source-root`, or the root of the Git
+//! repository that holds each file, with each root's derivation merged into one.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

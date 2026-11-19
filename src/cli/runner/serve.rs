@@ -1,20 +1,14 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{self, IsTerminal, Write};
-use std::os::fd::{AsFd, BorrowedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::JoinHandle;
 
 use anyhow::Context;
 use clap::{ArgGroup, Args};
-use nix::sys::signal::{SigSet, SigmaskHow, Signal};
-use rustix::termios::{LocalModes, OptionalActions, QueueSelector, Termios};
-use zeroize::Zeroizing;
 
+use super::super::secret_file::prompt_without_echo;
 use super::super::{HttpOptions, OrganizationArg, PoolArg, PrincipalAuthenticationArgs};
 use crate::exit_code::ExitCode;
 use useful_api::{HttpTransportPolicy, RunnerApi, RunnerFailure};
@@ -685,15 +679,11 @@ impl JoinKeySource {
 /// A join key artifact's bound, in bytes.
 const JOIN_KEY_ARTIFACT_LIMIT: usize = 4096;
 
-/// The longest line the prompt reads, a join key artifact's bound.
-const PROMPTED_LINE_LIMIT: usize = JOIN_KEY_ARTIFACT_LIMIT;
-
 // A prompted key is read from the terminal on standard input with echo off and
 // held only in memory; it was never in the environment, so no `exec` follows.
 // A start that has no terminal fails rather than waiting for input.
 fn prompt_for_join_key() -> Result<JoinKeyArtifact, super::super::CommandFailure> {
-    let stdin = io::stdin();
-    if !stdin.is_terminal() {
+    if !io::stdin().is_terminal() {
         return Err(super::super::CommandFailure::with_exit_code(
             anyhow::anyhow!(
                 "read join key: --join-key needs a terminal on standard input\n\nGive the join key of a start without a terminal with --join-key-file PATH|- or {JOIN_KEY_VARIABLE}."
@@ -701,138 +691,11 @@ fn prompt_for_join_key() -> Result<JoinKeyArtifact, super::super::CommandFailure
             ExitCode::UsageError,
         ));
     }
-    let mut stderr = io::stderr();
-    stderr
-        .write_all(b"Paste the join key (input is hidden): ")
-        .and_then(|()| stderr.flush())
-        .context("write the join key prompt")?;
-    let line = read_line_without_echo(stdin.as_fd()).context("read join key from the terminal");
-    // The newline the terminal did not echo.
-    let _ = stderr.write_all(b"\n");
-    let line = line?;
+    let line = prompt_without_echo("Paste the join key (input is hidden): ")
+        .context("read join key from the terminal")?;
     let key = line.strip_suffix(b"\n").unwrap_or(&line);
     let key = key.strip_suffix(b"\r").unwrap_or(key);
     Ok(JoinKeyArtifact::parse(key).context("read join key from the terminal")?)
-}
-
-/// Reads one line of at most [`PROMPTED_LINE_LIMIT`] bytes from the terminal
-/// `input` with echo off, in canonical mode, and restores its settings however
-/// the read ends (see [`QuietTerminal`]). The rest of a longer line is
-/// discarded so that it never reaches the next program to read the terminal.
-fn read_line_without_echo(input: BorrowedFd<'_>) -> anyhow::Result<Zeroizing<Vec<u8>>> {
-    let quiet = QuietTerminal::enter(input)?;
-    let mut line = Zeroizing::new(vec![0; PROMPTED_LINE_LIMIT + 1]);
-    let mut filled = 0;
-    while filled < line.len() && !line[..filled].ends_with(b"\n") {
-        match rustix::io::read(input, &mut line[filled..]) {
-            Ok(0) => break,
-            Ok(count) => filled += count,
-            Err(rustix::io::Errno::INTR) => {}
-            Err(error) => return Err(anyhow::Error::new(error).context("read the terminal")),
-        }
-    }
-    if filled == line.len() && !line.ends_with(b"\n") {
-        rustix::termios::tcflush(input, QueueSelector::IFlush)
-            .context("discard the rest of the line")?;
-    }
-    drop(quiet);
-    line.truncate(filled);
-    Ok(line)
-}
-
-/// The signals whose default action would end the process during the prompt,
-/// and [`QUIET_TERMINAL_WAKE`], which ends the wait for them.
-const QUIET_TERMINAL_SIGNALS: [Signal; 5] = [
-    Signal::SIGINT,
-    Signal::SIGTERM,
-    Signal::SIGHUP,
-    Signal::SIGQUIT,
-    QUIET_TERMINAL_WAKE,
-];
-const QUIET_TERMINAL_WAKE: Signal = Signal::SIGUSR1;
-
-/// A terminal with echo turned off, restored when this is dropped. A guard's
-/// `Drop` does not run when a signal's default action ends the process, so
-/// while it lives the calling thread, which is the process's only thread at
-/// the prompt, blocks [`QUIET_TERMINAL_SIGNALS`] and a thread waits for them:
-/// it restores the saved settings first and then lets the signal take its
-/// default action. Dropping it restores the settings, wakes and joins that
-/// thread, and unblocks the signals, so one that arrived meanwhile takes its
-/// default action then.
-struct QuietTerminal<'a> {
-    input: BorrowedFd<'a>,
-    saved: Termios,
-    previous_mask: SigSet,
-    done: Arc<AtomicBool>,
-    waiter: Option<JoinHandle<()>>,
-}
-
-impl<'a> QuietTerminal<'a> {
-    fn enter(input: BorrowedFd<'a>) -> anyhow::Result<Self> {
-        let saved = rustix::termios::tcgetattr(input).context("read the terminal's settings")?;
-        let signals = QUIET_TERMINAL_SIGNALS.into_iter().collect::<SigSet>();
-        let previous_mask = signals
-            .thread_swap_mask(SigmaskHow::SIG_BLOCK)
-            .context("block signals during the prompt")?;
-        let done = Arc::new(AtomicBool::new(false));
-        let mut quiet = Self {
-            input,
-            saved: saved.clone(),
-            previous_mask,
-            done: Arc::clone(&done),
-            waiter: None,
-        };
-        // The waiter inherits the blocked signals, so it alone takes them.
-        quiet.waiter = Some(
-            std::thread::Builder::new()
-                .name("join-key-prompt-signals".to_owned())
-                .spawn(move || restore_terminal_on_signal(signals, &saved, &done))
-                .context("watch signals during the prompt")?,
-        );
-        let mut silent = quiet.saved.clone();
-        silent.local_modes.remove(LocalModes::ECHO);
-        rustix::termios::tcsetattr(input, OptionalActions::Now, &silent)
-            .context("turn off the terminal's echo")?;
-        Ok(quiet)
-    }
-}
-
-impl Drop for QuietTerminal<'_> {
-    fn drop(&mut self) {
-        let _ = rustix::termios::tcsetattr(self.input, OptionalActions::Now, &self.saved);
-        if let Some(waiter) = self.waiter.take() {
-            self.done.store(true, Ordering::Release);
-            // Blocked in both threads, the signal stays pending until the
-            // waiter takes it; a waiter that has already returned takes none.
-            if !waiter.is_finished()
-                && nix::sys::signal::kill(nix::unistd::Pid::this(), QUIET_TERMINAL_WAKE).is_ok()
-            {
-                let _ = waiter.join();
-            }
-        }
-        let _ = self.previous_mask.thread_set_mask();
-    }
-}
-
-fn restore_terminal_on_signal(signals: SigSet, saved: &Termios, done: &AtomicBool) {
-    let Ok(signal) = signals.wait() else {
-        return;
-    };
-    if signal == QUIET_TERMINAL_WAKE && done.load(Ordering::Acquire) {
-        return;
-    }
-    let _ = rustix::termios::tcsetattr(io::stdin(), OptionalActions::Now, saved);
-    let _ = rustix::io::write(io::stderr(), b"\n");
-    // Unblocked in this thread, the signal raised again takes its default
-    // action, which ends the process; exit as it would, should it not.
-    let _ = SigSet::from(signal).thread_unblock();
-    let _ = nix::sys::signal::raise(signal);
-    let exit_code = if signal == Signal::SIGINT {
-        ExitCode::Interrupted
-    } else {
-        ExitCode::Terminated
-    };
-    process::exit(i32::from(exit_code.as_u8()));
 }
 
 // A key in USEFUL_RUNNER_JOIN_KEY never stays in this process's environment block,

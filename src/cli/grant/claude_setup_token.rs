@@ -55,7 +55,7 @@ impl Failure {
     const fn remedy(&self) -> &'static str {
         match self {
             Self::NoTerminal => {
-                "Run claude setup-token where you can answer it and import the token it prints:\n  useful grant create claude_code --token-file -"
+                "Run claude setup-token where you can answer it and import the token it prints:\n  useful integration connect claude_code --token-file -"
             }
             Self::NotFound => {
                 "Install Claude Code so that claude is on your PATH, or import the token claude setup-token printed with --token-file PATH."
@@ -105,7 +105,7 @@ impl fmt::Display for Failure {
 }
 
 /// The failure a sign-in ends in before anything is run, read or sent when the member could
-/// not answer it: standard input is not a terminal (REQ-GRANT-71). `useful grant create
+/// not answer it: standard input is not a terminal (REQ-GRANT-71). `useful integration connect
 /// claude_code` asks this before its first request, and [`sign_in`] before anything else.
 pub(in crate::cli) fn unanswerable() -> Option<Failure> {
     (!io::stdin().is_terminal()).then_some(Failure::NoTerminal)

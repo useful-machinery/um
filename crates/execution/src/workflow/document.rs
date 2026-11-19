@@ -66,7 +66,7 @@ impl RootBlocks {
 /// The `requires` block: the tools admission probes, and the integrations the workflow
 /// declares with whose credentials act for them, kept as declared (REQ-WFDEF-34).
 /// Admission probes `tools` alone and keeps the environment names of each declared
-/// integration's id for every step (REQ-WFEXEC-78); no run reads an `as` or `bindings`.
+/// integration's id for every step (REQ-WFEXEC-78); the engine reads no `as` or `bindings`.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RootRequires {
     pub tools: Vec<String>,
@@ -81,6 +81,8 @@ pub struct RootRequires {
 /// as the ids sort.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum IntegrationProvider {
+    #[serde(rename = "buildkite")]
+    Buildkite,
     #[serde(rename = "claude_code")]
     ClaudeCode,
     #[serde(rename = "codex")]
@@ -91,26 +93,32 @@ pub enum IntegrationProvider {
     GitlabCom,
     #[serde(rename = "linear")]
     Linear,
+    #[serde(rename = "mergify")]
+    Mergify,
 }
 
 impl IntegrationProvider {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Buildkite => "buildkite",
             Self::ClaudeCode => "claude_code",
             Self::Codex => "codex",
             Self::Github => "github",
             Self::GitlabCom => "gitlab.com",
             Self::Linear => "linear",
+            Self::Mergify => "mergify",
         }
     }
 
     /// The environment names a run delivers to every step for a declared integration
     /// (REQ-WFEXEC-78, INV-ENGINE-43): the token and its file a runner offers an OAuth
-    /// provider's grant token under (REQ-GRANT-87), and the variable a runner offers a
-    /// coding agent's login as (REQ-GRANT-44, REQ-GRANT-37). None is a name admission
-    /// strips as runner-private.
+    /// provider's grant token under (REQ-GRANT-87), the variable a runner offers a coding
+    /// agent's login as (REQ-GRANT-44, REQ-GRANT-37), and the token and its file a runner
+    /// offers a token service's token under (REQ-INTEGRATION-12), the names Cloud lists for
+    /// a reviewed token row. None is a name admission strips as runner-private.
     pub fn environment_names(self) -> &'static [&'static str] {
         match self {
+            Self::Buildkite => &["BUILDKITE_API_TOKEN", "BUILDKITE_API_TOKEN_FILE"],
             Self::ClaudeCode => &[CLAUDE_CODE_LOGIN_VARIABLE],
             Self::Codex => &[CODEX_LOGIN_VARIABLE],
             Self::Github => &["GH_TOKEN", "GH_TOKEN_FILE"],
@@ -119,6 +127,7 @@ impl IntegrationProvider {
                 "USEFUL_LINEAR_ACCESS_TOKEN",
                 "USEFUL_LINEAR_ACCESS_TOKEN_FILE",
             ],
+            Self::Mergify => &["MERGIFY_TOKEN", "MERGIFY_TOKEN_FILE"],
         }
     }
 }

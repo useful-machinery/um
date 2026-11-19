@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "providers": [
+    {
+      "provider": "mergify",
+      "environment": {
+        "token": "MERGIFY_TOKEN",
+        "tokenFile": "MERGIFY_TOKEN_FILE"
+      }
+    },
+    {
+      "provider": "buildkite",
+      "environment": {
+        "token": "BUILDKITE_API_TOKEN",
+        "tokenFile": "BUILDKITE_API_TOKEN_FILE"
+      }
+    }
+  ]
+}

@@ -56,6 +56,8 @@ pub enum Kind {
     RunnerCredential,
     #[serde(rename = "runner_join_key")]
     RunnerJoinKey,
+    #[serde(rename = "integration_token")]
+    IntegrationToken,
     #[serde(rename = "github_installation")]
     GithubInstallation,
     #[serde(rename = "gitlab_connection")]

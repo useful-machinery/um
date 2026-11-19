@@ -7,8 +7,8 @@ use useful_execution::{
 
 use crate::agent_login::cloud::{
     CloudFailure, CredentialSourcesFailure, CredentialSourcesRequest, DeliveryRefusal,
-    GrantProvider, GrantTokenFailure, GrantTokenRefusal, ListedProvider, LoginStatus,
-    ProviderLogin, ReportedSource,
+    GrantProvider, GrantProvidersFailure, GrantTokenFailure, GrantTokenRefusal, ListedProvider,
+    LoginStatus, ProviderLogin, ReportedSource, ReportedTokenService, TokenServiceSource,
 };
 use crate::agent_login::directory::LoginDirectory;
 use crate::agent_login::readiness::{
@@ -19,10 +19,10 @@ use crate::control_protocol::{AgentLoginProvider, AgentLoginState, CredentialSou
 use crate::service::IdleAssignmentGate;
 use crate::service::control::{AdmissionAgentLogins, LiveStatus};
 use crate::service::test_support::{
-    CountedGate, FAKE_AGENT_LOGIN_ID, FAKE_GRANT_ID, FakeAgentLoginCloud, FakeGrantToken,
-    SleepRelease, controlled_sleeper, fake_agent_login_material, fake_agent_login_setup,
-    fake_agent_login_setup_serving, fake_codex_answer, fake_codex_authorized, fake_grant_expiry,
-    fake_grant_token,
+    CountedGate, FAKE_AGENT_LOGIN_ID, FAKE_GRANT_ID, FAKE_INTEGRATION_TOKEN_ID,
+    FakeAgentLoginCloud, FakeGrantToken, SleepRelease, controlled_sleeper,
+    fake_agent_login_material, fake_agent_login_setup, fake_agent_login_setup_serving,
+    fake_codex_answer, fake_codex_authorized, fake_grant_expiry, fake_grant_token,
 };
 use crate::telemetry::test_recorder;
 
@@ -1014,6 +1014,78 @@ async fn a_declared_providers_token_and_its_file_reach_every_step() {
     }
 }
 
+/// A workflow that declares no integration and lists no name: its one
+/// step must succeed at `check`.
+fn workflow_declaring_nothing(check: &str) -> String {
+    format!(
+        r#"schemaVersion: 1
+steps:
+  check:
+    kind: cmd
+    command:
+      argv: [sh, -c, '{check}']
+"#
+    )
+}
+
+/// A fake Cloud that lists `mergify` and `buildkite` as token services and
+/// issues Mergify's token from an integration token.
+fn cloud_issuing_mergify() -> Arc<FakeAgentLoginCloud> {
+    let cloud = FakeAgentLoginCloud::new(Ok(Vec::new()));
+    cloud.answer_token_services(Ok(mergify_and_buildkite()));
+    cloud.answer_grant_token(mergify(), FakeGrantToken::IssueIntegrationToken(1));
+    cloud
+}
+
+// REQ-WFEXEC-78, REQ-INTEGRATION-12
+#[tokio::test]
+async fn a_declared_token_services_token_and_its_file_reach_every_step() {
+    let token = fake_grant_token(mergify(), 1);
+    let fixture = SettingUp::running(
+        &workflow_declaring(
+            "mergify",
+            &format!(
+                r#"test "$MERGIFY_TOKEN" = {token} && test "$(cat "$MERGIFY_TOKEN_FILE")" = {token}"#
+            ),
+        ),
+        cloud_issuing_mergify(),
+    );
+    assert_succeeded(&fixture.run(&offer("bg")).await);
+
+    // The host provides Mergify: its two values reach every step, and the
+    // runner asks Cloud for no token of it.
+    let fixture = SettingUp::running_serving(
+        &workflow_declaring(
+            "mergify",
+            r#"test "$MERGIFY_TOKEN" = service-mergify-token && test "$MERGIFY_TOKEN_FILE" = /service/mergify-token"#,
+        ),
+        cloud_issuing_mergify(),
+        &[
+            ("MERGIFY_TOKEN", "service-mergify-token"),
+            ("MERGIFY_TOKEN_FILE", "/service/mergify-token"),
+        ],
+    );
+    assert_succeeded(&fixture.run(&offer("bg")).await);
+    assert!(
+        fixture
+            .cloud
+            .grant_requests()
+            .iter()
+            .all(|request| request.provider != mergify())
+    );
+}
+
+// REQ-WFEXEC-78, REQ-INTEGRATION-12
+#[tokio::test]
+async fn a_workflow_that_declares_no_token_service_receives_none_of_its_names() {
+    let fixture = SettingUp::running(
+        &workflow_declaring_nothing(&unset(&["MERGIFY_TOKEN", "MERGIFY_TOKEN_FILE"])),
+        cloud_issuing_mergify(),
+    );
+
+    assert_succeeded(&fixture.run(&offer("bg")).await);
+}
+
 // REQ-GRANT-44, REQ-WFEXEC-78
 #[tokio::test]
 async fn a_kept_token_reaches_every_step_of_a_workflow_that_declares_claude_code() {
@@ -1441,12 +1513,9 @@ fn reported(
     }
 }
 
-// REQ-GRANT-93, REQ-GRANT-92
-#[tokio::test]
-async fn an_admission_reports_each_providers_source_once_before_it_is_accepted() {
-    // The host provides GitHub, Cloud issues a Linear token, and the runner
-    // keeps a Claude Code login its readiness records as installed; it has
-    // no source of GitLab or Codex.
+/// A fake Cloud that authorizes the fake Claude Code login, issues a
+/// Linear token and records each credential-source report.
+fn cloud_issuing_linear_and_claude_code() -> Arc<FakeAgentLoginCloud> {
     let cloud = FakeAgentLoginCloud::new(Ok(vec![ProviderLogin {
         provider: AgentLoginProvider::ClaudeCode,
         agent_login_id: FAKE_AGENT_LOGIN_ID.to_owned(),
@@ -1457,11 +1526,47 @@ async fn an_admission_reports_each_providers_source_once_before_it_is_accepted()
     }]));
     cloud.answer_grant_token(AgentLoginProvider::Linear, FakeGrantToken::Issue(1));
     cloud.answer_credential_sources(Ok(()));
-    let fixture = SettingUp::running_serving(
-        &workflow_checking("OTHER_NAME", "true"),
-        cloud,
-        &[("GH_TOKEN", "service-gh-token")],
-    );
+    cloud
+}
+
+/// The entries of the five `cloud_issuing_linear_and_claude_code` and a
+/// service carrying `GH_TOKEN` report.
+fn reported_five() -> Vec<ReportedSource> {
+    vec![
+        reported(
+            AgentLoginProvider::ClaudeCode,
+            CredentialSource::Grant,
+            None,
+            Some(FAKE_AGENT_LOGIN_ID),
+        ),
+        reported(
+            AgentLoginProvider::Github,
+            CredentialSource::Host,
+            None,
+            None,
+        ),
+        reported(
+            AgentLoginProvider::Linear,
+            CredentialSource::Grant,
+            Some(FAKE_GRANT_ID),
+            None,
+        ),
+    ]
+}
+
+/// Admits an assignment against `cloud`, after a pass installs its Claude
+/// Code login, for a service whose environment carries `GH_TOKEN` and
+/// `service`, and answers the reports Cloud took and the assignment's id.
+async fn admission_reports(
+    cloud: Arc<FakeAgentLoginCloud>,
+    service: &[(&str, &str)],
+) -> (Vec<CredentialSourcesRequest>, String) {
+    let service: Vec<(&str, &str)> = [("GH_TOKEN", "service-gh-token")]
+        .into_iter()
+        .chain(service.iter().copied())
+        .collect();
+    let fixture =
+        SettingUp::running_serving(&workflow_checking("OTHER_NAME", "true"), cloud, &service);
     assert!(matches!(
         fixture.periodic_pass().await,
         SetupOutcome::Recorded(_)
@@ -1471,34 +1576,130 @@ async fn an_admission_reports_each_providers_source_once_before_it_is_accepted()
 
     fixture.admit(&offered).await;
 
+    (
+        fixture.cloud.credential_source_reports(),
+        offered.assignment_id,
+    )
+}
+
+// REQ-GRANT-93, REQ-GRANT-92
+#[tokio::test]
+async fn an_admission_reports_each_providers_source_once_before_it_is_accepted() {
+    // The host provides GitHub, Cloud issues a Linear token, and the runner
+    // keeps a Claude Code login its readiness records as installed; it has
+    // no source of GitLab or Codex.
+    let (reports, assignment_id) =
+        admission_reports(cloud_issuing_linear_and_claude_code(), &[]).await;
+
     // The report was made on the admission's preparation, so it is there
     // once the assignment is accepted, and only once.
     assert_eq!(
-        fixture.cloud.credential_source_reports(),
+        reports,
         [CredentialSourcesRequest {
             boot_id: SETTING_UP_BOOT.to_owned(),
-            assignment_id: offered.assignment_id.clone(),
-            sources: vec![
-                reported(
-                    AgentLoginProvider::ClaudeCode,
-                    CredentialSource::Grant,
-                    None,
-                    Some(FAKE_AGENT_LOGIN_ID),
-                ),
-                reported(
-                    AgentLoginProvider::Github,
-                    CredentialSource::Host,
-                    None,
-                    None,
-                ),
-                reported(
-                    AgentLoginProvider::Linear,
-                    CredentialSource::Grant,
-                    Some(FAKE_GRANT_ID),
-                    None,
-                ),
+            assignment_id,
+            sources: reported_five(),
+            token_services: Vec::new(),
+        }]
+    );
+}
+
+/// Cloud's token-service list naming `mergify` and `buildkite`, each with
+/// its two names.
+fn mergify_and_buildkite() -> Vec<ListedProvider> {
+    [
+        ("mergify", "MERGIFY_TOKEN", "MERGIFY_TOKEN_FILE"),
+        (
+            "buildkite",
+            "BUILDKITE_API_TOKEN",
+            "BUILDKITE_API_TOKEN_FILE",
+        ),
+    ]
+    .into_iter()
+    .map(|(provider, token, token_file)| ListedProvider {
+        provider: provider.to_owned(),
+        token: token.to_owned(),
+        token_file: token_file.to_owned(),
+    })
+    .collect()
+}
+
+fn mergify() -> GrantProvider {
+    GrantProvider::token_service("mergify").unwrap()
+}
+
+/// The service environment of the token-service report tests: it carries
+/// Buildkite's token and not Mergify's.
+const SERVICE_BUILDKITE: [(&str, &str); 1] = [("BUILDKITE_API_TOKEN", "service-buildkite-token")];
+
+// REQ-INTEGRATION-12, REQ-GRANT-93
+#[tokio::test]
+async fn an_admissions_one_report_names_each_listed_token_service_with_a_source_after_the_five() {
+    // Cloud lists both token services and issues Mergify's token from an
+    // integration token; the service carries Buildkite's.
+    let cloud = cloud_issuing_linear_and_claude_code();
+    cloud.answer_token_services(Ok(mergify_and_buildkite()));
+    cloud.answer_grant_token(mergify(), FakeGrantToken::IssueIntegrationToken(1));
+
+    let (reports, assignment_id) = admission_reports(cloud, &SERVICE_BUILDKITE).await;
+
+    assert_eq!(
+        reports,
+        [CredentialSourcesRequest {
+            boot_id: SETTING_UP_BOOT.to_owned(),
+            assignment_id,
+            sources: reported_five(),
+            token_services: vec![
+                ReportedTokenService {
+                    provider: "mergify".to_owned(),
+                    source: TokenServiceSource::Token {
+                        integration_token_id: FAKE_INTEGRATION_TOKEN_ID.to_owned(),
+                    },
+                },
+                ReportedTokenService {
+                    provider: "buildkite".to_owned(),
+                    source: TokenServiceSource::Host,
+                },
             ],
         }]
+    );
+}
+
+// REQ-INTEGRATION-12, REQ-COMPAT-17
+#[tokio::test]
+async fn a_report_names_no_token_service_cloud_did_not_list_or_the_runner_has_no_source_of() {
+    // A Cloud without the token-service list: the report is today's,
+    // although the service carries Buildkite's token.
+    let cloud = cloud_issuing_linear_and_claude_code();
+    cloud.answer_token_services(Err(GrantProvidersFailure::NoRoute));
+    cloud.answer_grant_token(mergify(), FakeGrantToken::IssueIntegrationToken(1));
+    let (reports, _) = admission_reports(cloud, &SERVICE_BUILDKITE).await;
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| (report.sources.clone(), report.token_services.clone()))
+            .collect::<Vec<_>>(),
+        [(reported_five(), Vec::new())]
+    );
+
+    // Cloud refuses Mergify's token, which the host does not provide: only
+    // Buildkite, which it does, is named.
+    let cloud = cloud_issuing_linear_and_claude_code();
+    cloud.answer_token_services(Ok(mergify_and_buildkite()));
+    cloud.answer_grant_token(mergify(), refused(GrantTokenRefusal::Unauthorized));
+    let (reports, _) = admission_reports(cloud, &SERVICE_BUILDKITE).await;
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| (report.sources.clone(), report.token_services.clone()))
+            .collect::<Vec<_>>(),
+        [(
+            reported_five(),
+            vec![ReportedTokenService {
+                provider: "buildkite".to_owned(),
+                source: TokenServiceSource::Host,
+            }]
+        )]
     );
 }
 

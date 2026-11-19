@@ -1985,7 +1985,7 @@ fn runner_doctor_grants_shows_the_members_grants_beside_each_requirement() {
         OAUTH_GRANT_ID,
         NATIVE_GRANT_ID,
         RUNNER_ID,
-        "useful grant create linear",
+        "useful integration connect linear",
         deployment.server.api_url.as_str(),
     ] {
         assert!(
@@ -2228,7 +2228,7 @@ fn runner_doctor_require_grants_fails_on_a_grant_the_runner_cannot_use() {
         "missing",
         "grant_not_authorized",
         "authorize_runner",
-        &format!("useful grant authorize {LINEAR_GRANT_ID}"),
+        &format!("useful integration authorize {LINEAR_GRANT_ID}"),
     );
     assert_grant_fails(
         &report,
@@ -2236,7 +2236,7 @@ fn runner_doctor_require_grants_fails_on_a_grant_the_runner_cannot_use() {
         "missing",
         "grant_not_connected",
         "connect",
-        "useful grant create claude_code",
+        "useful integration connect claude_code",
     );
     // The grants beside each requirement are those `--grants` shows.
     assert_eq!(held(&report, "linear")["nextAction"], "authorize_runner");
@@ -2289,7 +2289,7 @@ fn runner_doctor_require_grants_fails_on_a_grant_that_needs_reconnecting_or_is_n
             "reconnect_required",
             "grant_reconnect_required",
             "reconnect",
-            "useful grant create linear --replace",
+            "useful integration connect linear --replace",
         ),
         (
             vec![
@@ -2301,7 +2301,7 @@ fn runner_doctor_require_grants_fails_on_a_grant_that_needs_reconnecting_or_is_n
             "missing",
             "grant_not_ready",
             "sync_runner",
-            "useful runner grant sync",
+            "useful runner integration sync",
         ),
         // The runner's service has a login of its own, which a step would run on.
         (
@@ -2328,7 +2328,7 @@ fn runner_doctor_require_grants_fails_on_a_grant_that_needs_reconnecting_or_is_n
             "missing",
             "grant_not_ready",
             "sync_runner",
-            "useful runner grant sync",
+            "useful runner integration sync",
         ),
     ];
     for (grants, kind, state, code, next_action, command) in cases {
@@ -2468,18 +2468,19 @@ fn runner_doctor_grants_ends_without_a_report_when_not_signed_in() {
     assert!(signed_out.server.finish().is_empty());
 }
 
-// REQ-CREDREADY-22
-#[test]
-fn runner_doctor_grants_asks_nothing_when_no_kind_is_needed() {
-    let tree = single_file_tree(
-        r#"schemaVersion: 1
+// A tree of one command step, which calls for no kind.
+const COMMAND_WORKFLOW: &str = r#"schemaVersion: 1
 steps:
   build:
     kind: cmd
     command:
       argv: ["./build"]
-"#,
-    );
+"#;
+
+// REQ-CREDREADY-22
+#[test]
+fn runner_doctor_grants_asks_nothing_when_no_kind_is_needed() {
+    let tree = single_file_tree(COMMAND_WORKFLOW);
     let deployment = Deployment::signed_in(Vec::new());
 
     let output = deployment.doctor_grants(&tree, true, &[]);
@@ -2499,11 +2500,11 @@ fn runner_doctor_workflow_names_the_grant_commands_for_each_coding_agent() {
     for kind in ["claude_code", "codex"] {
         let next_action = next_action(requirement(&report, kind));
         assert!(
-            next_action.contains(&format!("useful grant create {kind}")),
+            next_action.contains(&format!("useful integration connect {kind}")),
             "{kind}: {next_action}"
         );
         assert!(
-            next_action.contains("useful grant authorize"),
+            next_action.contains("useful integration authorize"),
             "{kind}: {next_action}"
         );
     }
@@ -2726,4 +2727,127 @@ fn runner_doctor_workflow_names_the_provider_id_to_declare_for_an_undeclared_kin
         .collect::<Vec<_>>();
     assert_eq!(marked.len(), 1, "{stdout}");
     assert!(marked[0].contains("gitlab.com"), "{stdout}");
+}
+
+/// `COMMAND_WORKFLOW` declaring `integrations` alone.
+fn command_tree_declaring(integrations: &[&str]) -> WorkflowTree {
+    single_file_tree(&declaring(COMMAND_WORKFLOW, integrations))
+}
+
+// REQ-CREDREADY-29, REQ-CREDREADY-3, REQ-CREDREADY-8, REQ-CREDREADY-28
+#[test]
+fn runner_doctor_workflow_reports_a_declared_token_service_as_unverified() {
+    let tree = command_tree_declaring(&["mergify"]);
+
+    let output = doctor(&tree, true);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let report = json_report(&output);
+    assert_eq!(report["requirements"].as_array().map(Vec::len), Some(1));
+    let mergify = requirement(&report, "mergify");
+    assert_eq!(mergify["state"], "unverified", "{mergify}");
+    assert_eq!(mergify["code"], "runner_unverified", "{mergify}");
+    assert!(mergify.get("cloud").is_none(), "{mergify}");
+    assert!(
+        next_action(mergify).contains("useful integration connect mergify"),
+        "{mergify}"
+    );
+    assert_eq!(
+        mergify["origins"],
+        json!([{"declaration": "integration", "workflow": "main.yaml", "name": "mergify"}])
+    );
+    assert_eq!(report["summary"]["unverified"], 1);
+    assert_eq!(report["differences"], json!([]));
+
+    let human = doctor(&tree, false);
+
+    assert_eq!(human.status.code(), Some(0), "{human:?}");
+    let stdout = String::from_utf8(human.stdout).expect("report should be UTF-8");
+    assert!(
+        stdout
+            .lines()
+            .map(str::trim)
+            .any(|line| line == "kind: mergify"),
+        "{stdout}"
+    );
+}
+
+// REQ-CREDREADY-29, REQ-CREDREADY-22
+#[test]
+fn runner_doctor_grants_asks_nothing_when_only_a_token_service_is_declared() {
+    let tree = command_tree_declaring(&["mergify"]);
+    let signed_out = Deployment::new(Vec::new(), false);
+
+    let output = signed_out.doctor_grants(&tree, true, &[]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report = json_report(&output);
+    assert_eq!(report["requirements"].as_array().map(Vec::len), Some(1));
+    assert!(
+        requirement(&report, "mergify").get("grant").is_none(),
+        "{report}"
+    );
+    assert_eq!(report["deployment"], Value::Null);
+    assert!(signed_out.server.finish().is_empty());
+}
+
+// REQ-CREDREADY-29, REQ-CREDREADY-22
+#[test]
+fn runner_doctor_grants_shows_no_grant_beside_a_token_service() {
+    let tree = command_tree_declaring(&["github", "mergify"]);
+    let deployment = Deployment::signed_in(vec![held_grants()]);
+
+    let output = deployment.doctor_grants(&tree, true, &[]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report = json_report(&output);
+    assert_eq!(held(&report, "github")["id"], OAUTH_GRANT_ID);
+    assert!(
+        requirement(&report, "mergify").get("grant").is_none(),
+        "{report}"
+    );
+    assert_only_grants_lists(deployment, 1);
+}
+
+// REQ-CREDREADY-29, REQ-CREDREADY-13, REQ-CREDREADY-15
+#[test]
+fn runner_doctor_readiness_asks_nothing_about_a_token_service() {
+    let tree = command_tree_declaring(&["linear", "buildkite"]);
+    let deployment = Deployment::signed_in(vec![connection_page(
+        &[linear_connection("active", &["read"])],
+        None,
+    )]);
+
+    let output = deployment.doctor(&tree, true);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report = json_report(&output);
+    assert_eq!(requirement(&report, "linear")["cloud"], "ready");
+    let buildkite = requirement(&report, "buildkite");
+    assert_eq!(buildkite["state"], "unverified", "{buildkite}");
+    assert_eq!(buildkite["code"], "runner_unverified", "{buildkite}");
+    assert!(buildkite.get("cloud").is_none(), "{buildkite}");
+    assert_eq!(deployment.linear_list_requests().len(), 1);
+}
+
+// REQ-CREDREADY-29, REQ-CREDREADY-26
+#[test]
+fn runner_doctor_require_grants_never_fails_a_token_service() {
+    let tree = command_tree_declaring(&["github", "mergify"]);
+    let deployment = Deployment::signed_in(vec![page(
+        &[oauth_grant(OAUTH_GRANT_ID, "github", "active")],
+        None,
+    )]);
+
+    let output =
+        deployment.doctor_grants(&tree, true, &["--runner-id", RUNNER_ID, "--require-grants"]);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report = json_report(&output);
+    let mergify = requirement(&report, "mergify");
+    assert_eq!(mergify["state"], "unverified", "{mergify}");
+    assert_eq!(mergify["code"], "runner_unverified", "{mergify}");
+    assert_eq!(report["summary"]["unverified"], 2);
+    assert_only_grants_lists(deployment, 1);
 }

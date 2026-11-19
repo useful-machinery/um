@@ -18,7 +18,7 @@ use super::{FailureStage, InstallRefusal, ServiceEnvironment, login_file_present
 const AUTH_FILE: &str = "auth.json";
 const CONFIG_FILE: &str = "config.toml";
 /// The runner's Codex home's whole configuration: keep the login in
-/// `auth.json`. The same bytes `useful grant create codex` gives the Codex it
+/// `auth.json`. The same bytes `useful integration connect codex` gives the Codex it
 /// signs in with.
 const CONFIG: &[u8] = b"cli_auth_credentials_store = \"file\"\n";
 const AUTH_TEMPORARY_PREFIX: &str = ".useful-auth.json.tmp";

@@ -1,8 +1,8 @@
-//! Settling, before any sign-in starts, whether `useful grant create` may replace a grant the
-//! member already holds (REQ-GRANT-73): asked on a terminal, refused without one unless
+//! Settling, before any sign-in starts, whether `useful integration connect` may replace a grant
+//! the member already holds (REQ-GRANT-73): asked on a terminal, refused without one unless
 //! `--replace` is given, and for a native provider refused when several are held in the
-//! organization. With `--workflow`, a grant that needs reconnecting is settled the same way,
-//! and one the member keeps is passed over rather than refused (REQ-GRANT-79).
+//! organization. With `--workflow`, a grant that needs reconnecting is settled the same way, and
+//! one the member keeps is passed over rather than refused (REQ-GRANT-79).
 
 use anyhow::anyhow;
 
@@ -74,20 +74,51 @@ pub(super) fn settle(
         return Ok(());
     }
     let ids = ids(held);
-    let refusal = match answer(
-        || format!("You already hold a {provider} grant: {ids}"),
+    settle_replacing(
+        &Replacing {
+            held: format!("you already hold a {provider} grant: {ids}"),
+            kept: format!("you kept your {provider} grant {ids}"),
+            by: "a new sign-in",
+        },
         replace,
-    )? {
+    )
+}
+
+/// A replacement to settle: what is held, as a refusal states it in lower case, such as
+/// `you already hold a github grant: pgr_…`; what keeping it is, as the refusal of a no states
+/// it; and what replaces it, such as `a new sign-in`.
+pub(in crate::cli) struct Replacing<'a> {
+    pub(in crate::cli) held: String,
+    pub(in crate::cli) kept: String,
+    pub(in crate::cli) by: &'a str,
+}
+
+/// Settles `replacing` as [`settle`] settles a grant's (REQ-GRANT-73): proceeds with `replace`,
+/// otherwise asks on a terminal and refuses with exit 2 without one or on any answer but yes,
+/// naming `--replace`. `useful integration connect` settles a token's this way too
+/// (REQ-INTEGRATION-18).
+pub(in crate::cli) fn settle_replacing(
+    replacing: &Replacing<'_>,
+    replace: bool,
+) -> Result<(), CommandFailure> {
+    let Replacing { held, kept, by } = replacing;
+    let refusal = match answer(|| capitalized(held), by, replace)? {
         Some(true) => return Ok(()),
-        Some(false) => format!("you kept your {provider} grant {ids}"),
-        None => format!("you already hold a {provider} grant: {ids}"),
+        Some(false) => kept,
+        None => held,
     };
     Err(CommandFailure::with_exit_code(
-        anyhow!(
-            "{refusal}\n\nTo replace it with a new sign-in, run the command again with --replace."
-        ),
+        anyhow!("{refusal}\n\nTo replace it with {by}, run the command again with --replace."),
         ExitCode::UsageError,
     ))
+}
+
+/// `text` with its first letter in upper case, as a question begins.
+fn capitalized(text: &str) -> String {
+    let mut characters = text.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(characters).collect()
+    })
 }
 
 /// Whether to replace the grants of `provider` the member holds, every one of which needs
@@ -102,6 +133,7 @@ pub(super) fn reconnects(
     let ids = ids(held);
     Ok(answer(
         || format!("Your {provider} grant needs reconnecting: {ids}"),
+        "a new sign-in",
         replace,
     )? == Some(true))
 }
@@ -115,8 +147,13 @@ fn ids(held: &[MemberGrant]) -> String {
 }
 
 /// Yes when `replace` is given; otherwise the member's answer to `question` on a terminal,
-/// where standard input and standard error both are one, and none without one.
-fn answer(question: impl FnOnce() -> String, replace: bool) -> anyhow::Result<Option<bool>> {
+/// where standard input and standard error both are one, whether to replace it `by` what
+/// replaces it, and none without one.
+fn answer(
+    question: impl FnOnce() -> String,
+    by: &str,
+    replace: bool,
+) -> anyhow::Result<Option<bool>> {
     if replace {
         return Ok(Some(true));
     }
@@ -125,7 +162,7 @@ fn answer(question: impl FnOnce() -> String, replace: bool) -> anyhow::Result<Op
     }
     let question = question();
     Ok(Some(confirmation::ask(format_args!(
-        "{question}\nReplace it with a new sign-in?"
+        "{question}\nReplace it with {by}?"
     ))?))
 }
 
@@ -143,7 +180,7 @@ pub(super) fn native_target(
             anyhow!(
                 "you hold several {} grants for this organization: {ids}\n\n\
                  Revoke the ones you no longer use, then run the command again:\n  \
-                 useful grant revoke GRANT --yes",
+                 useful integration revoke INTEGRATION --yes",
                 provider.as_str()
             ),
             ExitCode::UsageError,

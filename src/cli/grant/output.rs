@@ -5,15 +5,19 @@ use anyhow::Context;
 use serde::Serialize;
 
 use super::super::ApiFailureReport;
+use super::Subject;
 use super::authorization::{
-    AuthorizationView, EndedAuthorizationView, ended_authorization_views, write_revoked_runners,
-    write_session_note,
+    AuthorizationView, EndedAuthorizationView, Holder, ended_authorization_views,
+    write_revoked_runners, write_session_note,
 };
 use super::authorize::{MOVE_CODEX_GRANT, Outcome};
 use super::projection::{MemberStatus, Provider, grant_authorization_status, grant_subject};
 use super::runner_choice::{Nothing, Runner};
+use crate::cli::integration::{Connections, Listing, Tokens};
 use crate::exit_code::{ExitCode, OutcomeClass};
-use useful_api::{GrantUse, MemberGrant, MemberGrantFailure, MemberGrantKind};
+use useful_api::{
+    GrantUse, IntegrationTokenSide, MemberGrant, MemberGrantFailure, MemberGrantKind,
+};
 
 /// The names the member's other reads give a grant's account: each linked identity's, and
 /// each organization's slug, by ID.
@@ -63,15 +67,22 @@ impl<'a> AccountView<'a> {
     }
 }
 
-/// A grant as `useful grant list` presents it (REQ-GRANT-64): the model's named fields only, enums
-/// as their wire strings, so nothing a response adds beyond the model reaches output
-/// (REQ-GRANT-4, REQ-GRANT-14). The members after `status` are those `list GRANT` adds.
+/// The side `useful integration list` states of each grant, whose integration it is
+/// (REQ-INTEGRATION-13): a grant is always the member's own.
+pub(in crate::cli) const MEMBER_SIDE: &str = "member";
+
+/// A grant as `useful integration list` presents it (REQ-GRANT-64): the model's named fields only,
+/// enums as their wire strings, so nothing a response adds beyond the model reaches output
+/// (REQ-GRANT-4, REQ-GRANT-14). The members after `status` are those `list GRANT` adds; `side` is
+/// present only where `useful integration list` presents it.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GrantView<'a> {
     id: &'a str,
     provider: &'a str,
     kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    side: Option<&'static str>,
     account: AccountView<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     label: Option<&'a str>,
@@ -86,8 +97,9 @@ struct GrantView<'a> {
     detail: Option<DetailView<'a>>,
 }
 
-/// What `useful grant list GRANT` adds for each kind: an OAuth grant's scopes, last use, expiries
-/// and the tokens issued from it; a native grant's record, import and ended authorizations.
+/// What `useful integration list INTEGRATION` adds for each kind: an OAuth grant's scopes, last
+/// use, expiries and the tokens issued from it; a native grant's record, import and ended
+/// authorizations.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DetailView<'a> {
@@ -195,6 +207,7 @@ impl<'a> GrantView<'a> {
             id: &grant.id,
             provider: grant.provider.as_str(),
             kind: grant.kind.as_str(),
+            side: None,
             account: AccountView::new(grant, accounts),
             label: grant.label.as_deref(),
             state: grant.state.as_str(),
@@ -226,6 +239,9 @@ impl<'a> GrantView<'a> {
         writeln!(output, "grant: {}", self.id)?;
         writeln!(output, "provider: {}", self.provider)?;
         writeln!(output, "kind: {}", self.kind)?;
+        if let Some(side) = self.side {
+            writeln!(output, "side: {side}")?;
+        }
         self.account.write_human(output)?;
         if let Some(label) = self.label {
             writeln!(output, "label: {label}")?;
@@ -292,21 +308,33 @@ struct ListResult<'a> {
     deployment: &'a str,
     outcome: &'static str,
     grants: &'a [GrantView<'a>],
+    // Present under `useful integration list` whatever they hold, absent under `useful grant list`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens: Option<&'a Tokens>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connections: Option<&'a Connections>,
     not_connected: &'a [NotConnectedView<'a>],
 }
 
-/// Writes the member's unrevoked grants, then each of `providers`, in its order, they hold none
-/// of (REQ-GRANT-64); it exits 0 whatever they report.
+/// Writes the member's unrevoked grants, then the integration tokens and the organizations'
+/// connections `listing` holds where token services were in reach (REQ-INTEGRATION-19,
+/// REQ-INTEGRATION-22), then each of `providers`, in its order, they hold no grant of
+/// (REQ-GRANT-64); it exits 0 whatever they report.
 pub(super) fn write_list(
     deployment: &str,
     grants: &[MemberGrant],
     providers: &[Provider<'_>],
     accounts: &Accounts,
+    side: Option<&'static str>,
+    listing: Option<&Listing>,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     let views: Vec<_> = grants
         .iter()
-        .map(|grant| GrantView::new(grant, accounts, false))
+        .map(|grant| GrantView {
+            side,
+            ..GrantView::new(grant, accounts, false)
+        })
         .collect();
     let not_connected: Vec<_> = providers
         .iter()
@@ -326,6 +354,8 @@ pub(super) fn write_list(
             deployment,
             outcome: "listed",
             grants: &views,
+            tokens: listing.map(Listing::tokens),
+            connections: listing.map(Listing::connections),
             not_connected: &not_connected,
         })?;
         return Ok(ExitCode::Success);
@@ -337,6 +367,9 @@ pub(super) fn write_list(
     for view in &views {
         writeln!(stdout, "\n── grant ──")?;
         view.write_human(&mut stdout)?;
+    }
+    if let Some(listing) = listing {
+        listing.write_human(&mut stdout)?;
     }
     if !not_connected.is_empty() {
         writeln!(stdout, "\n── not connected ──")?;
@@ -365,9 +398,13 @@ pub(super) fn write_grant(
     grant: &MemberGrant,
     accounts: &Accounts,
     uses: Option<&[GrantUse]>,
+    side: Option<&'static str>,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    let mut view = GrantView::new(grant, accounts, true);
+    let mut view = GrantView {
+        side,
+        ..GrantView::new(grant, accounts, true)
+    };
     if let Some(detail) = &mut view.detail {
         detail.uses = uses.map(|uses| uses.iter().map(UseView::new).collect());
     }
@@ -422,7 +459,7 @@ pub(super) fn write_ambiguous(
             "error: you hold {} grants of {provider}: {}\n\nName one by its ID, for example:\n  {}",
             ids.len(),
             ids.join(", "),
-            example(ids.first().map_or("GRANT", String::as_str)),
+            example(ids.first().map_or("INTEGRATION", String::as_str)),
         )?;
     }
     Ok(ExitCode::UsageError)
@@ -461,8 +498,9 @@ struct RunnerRequiredResult<'a> {
     schema_version: u8,
     deployment: &'a str,
     outcome: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    grant_id: Option<&'a str>,
+    // What the runner is asked for: a grant, or a token (REQ-INTEGRATION-20).
+    #[serde(flatten)]
+    holder: Option<Holder<'a>>,
     runners: Vec<OfferedRunnerView<'a>>,
 }
 
@@ -472,7 +510,7 @@ struct RunnerRequiredResult<'a> {
 /// `runner_required`.
 pub(super) fn write_runner_required(
     deployment: &str,
-    grant_id: Option<&str>,
+    holder: Option<Holder<'_>>,
     runners: &[Runner],
     diagnostic: &str,
     example: &str,
@@ -483,7 +521,7 @@ pub(super) fn write_runner_required(
             schema_version: 1,
             deployment,
             outcome: "runner_required",
-            grant_id,
+            holder,
             runners: runners.iter().map(OfferedRunnerView::new).collect(),
         })?;
     } else {
@@ -497,32 +535,34 @@ pub(super) fn write_runner_required(
     Ok(ExitCode::UsageError)
 }
 
-/// Reports that a command given no `RUNNER` has none to offer (REQ-GRANT-81), with exit 1 and
-/// a remedy.
+/// Reports that a command given no `RUNNER` has none to offer (REQ-GRANT-81) for the grant or
+/// token `noun` names, with exit 1 and a remedy.
 pub(super) fn write_nothing_offered(
     deployment: &str,
     nothing: Nothing,
+    noun: &str,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    let refused = |outcome, summary: &str, remedy: &str| {
+    let refused = |outcome, summary: String, remedy: String| {
         ApiFailureReport::new(outcome, summary, remedy, OutcomeClass::GeneralFailure)
     };
     match nothing {
         Nothing::RunnerNotFound => refused(
             "runner_not_found",
-            "error: no runner found in the organizations the command can act in",
-            "Register a runner in the organization, then run the command again. List an organization's runners:\n  useful runner list ORGANIZATION",
+            "error: no runner found in the organizations the command can act in".to_owned(),
+            "Register a runner in the organization, then run the command again. List an organization's runners:\n  useful runner list ORGANIZATION".to_owned(),
         ),
         Nothing::AlreadyAuthorized => refused(
             "already_authorized",
-            "error: this grant is already authorized for every runner it can serve",
-            "Show the grant's authorizations:\n  useful grant list GRANT",
+            format!("error: this {noun} is already authorized for every runner it can serve"),
+            format!("Show the {noun}'s authorizations:\n  useful integration list INTEGRATION"),
         ),
         Nothing::AuthorizedElsewhere => authorized_elsewhere(),
         Nothing::AuthorizationNotFound => refused(
             "authorization_not_found",
-            "error: this grant is authorized for no runner",
-            "Authorize a runner for it first:\n  useful grant authorize GRANT",
+            format!("error: this {noun} is authorized for no runner"),
+            "Authorize a runner for it first:\n  useful integration authorize INTEGRATION"
+                .to_owned(),
         ),
     }
     .write(deployment, json)
@@ -578,7 +618,7 @@ pub(super) fn write_revoke(
             Some(ended) if !ended.is_empty() => write_revoked_runners(&mut stdout, ended)?,
             None if after.is_none() => writeln!(
                 stdout,
-                "\nTo see which runners have confirmed removing it:\n  useful grant list {}",
+                "\nTo see which runners have confirmed removing it:\n  useful integration list {}",
                 grant.id
             )?,
             _ => {}
@@ -601,6 +641,20 @@ struct AuthorizedGrantView<'a> {
     authorization: Option<AuthorizationView<'a>>,
 }
 
+/// One token's outcome under `useful integration authorize --all` (REQ-INTEGRATION-20).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AuthorizedTokenView<'a> {
+    integration_token_id: &'a str,
+    service: &'a str,
+    side: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    organization_id: Option<&'a str>,
+    outcome: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorization: Option<AuthorizationView<'a>>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AuthorizeAllResult<'a> {
@@ -609,52 +663,75 @@ struct AuthorizeAllResult<'a> {
     outcome: &'static str,
     runner_id: &'a str,
     grants: &'a [AuthorizedGrantView<'a>],
+    // Present under `useful integration authorize --all` whatever it holds, absent under
+    // `useful grant authorize --all`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens: Option<&'a [AuthorizedTokenView<'a>]>,
 }
 
-/// Reports what `authorize --all` did with each grant (REQ-GRANT-66), and each refusal with
-/// its remedy. It exits 1 when any grant was refused for a reason other than serving another
-/// organization or being authorized for the runner already, a Codex grant authorized for
-/// another runner among them, or when a failure `ended` the command: then
-/// `outcomes` are those of the grants before the one it ended at, which follow them in
-/// `grants`, and the failure is reported after them.
+/// Reports what `authorize --all` did with each grant (REQ-GRANT-66) and, under
+/// `useful integration`, where `tokens` says token services are in reach, each token
+/// (REQ-INTEGRATION-20), and each refusal with its remedy. It exits 1 when any was refused for a
+/// reason other than serving another organization or being authorized for the runner already,
+/// a Codex grant authorized for another runner among them, or when the failure `ended` reports
+/// ended the command: then `outcomes` are those of the subjects before the one it ended at,
+/// which follow them in `subjects`, and the failure is reported after them.
 pub(super) fn write_authorize_all(
     deployment: &str,
     runner_id: &str,
-    grants: &[MemberGrant],
+    subjects: &[Subject],
     outcomes: &[Outcome],
-    ended: Option<&MemberGrantFailure>,
+    ended: Option<ApiFailureReport>,
+    tokens: bool,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    let refusals: Vec<_> = grants
+    let refusals: Vec<_> = subjects
         .iter()
         .zip(outcomes)
-        .filter_map(|(grant, outcome)| match outcome {
-            Outcome::AuthorizedElsewhere => Some((grant, authorized_elsewhere())),
-            Outcome::Refused(failure) => Some((grant, report(deployment, failure))),
+        .filter_map(|(subject, outcome)| match outcome {
+            Outcome::AuthorizedElsewhere => Some((subject, authorized_elsewhere())),
+            Outcome::Refused(failure) => Some((subject, report(deployment, failure))),
             _ => None,
         })
         .collect();
-    let views: Vec<_> = grants
-        .iter()
-        .zip(outcomes)
-        .map(|(grant, outcome)| AuthorizedGrantView {
-            grant_id: &grant.id,
-            provider: grant.provider.as_str(),
-            kind: grant.kind.as_str(),
-            outcome: match outcome {
-                Outcome::Authorized(_) => "authorized",
-                Outcome::AlreadyAuthorized => "already_authorized",
-                Outcome::AuthorizedElsewhere => authorized_elsewhere().outcome,
-                Outcome::OtherOrganization => "other_organization",
-                Outcome::Refused(failure) => report(deployment, failure).outcome,
-            },
-            authorization: match outcome {
-                Outcome::Authorized(authorization) => Some(AuthorizationView::made(authorization)),
-                _ => None,
-            },
-        })
-        .collect();
-    let ended = ended.map(|failure| (grants.get(outcomes.len()), report(deployment, failure)));
+    let named = |outcome: &Outcome| match outcome {
+        Outcome::Authorized(_) => "authorized",
+        Outcome::AlreadyAuthorized => "already_authorized",
+        Outcome::AuthorizedElsewhere => authorized_elsewhere().outcome,
+        Outcome::OtherOrganization => "other_organization",
+        Outcome::Refused(failure) => report(deployment, failure).outcome,
+    };
+    fn made(outcome: &Outcome) -> Option<AuthorizationView<'_>> {
+        match outcome {
+            Outcome::Authorized(made) => Some(made.view()),
+            _ => None,
+        }
+    }
+    let mut grant_views = Vec::new();
+    let mut token_views = Vec::new();
+    for (subject, outcome) in subjects.iter().zip(outcomes) {
+        match subject {
+            Subject::Grant(grant) => grant_views.push(AuthorizedGrantView {
+                grant_id: &grant.id,
+                provider: grant.provider.as_str(),
+                kind: grant.kind.as_str(),
+                outcome: named(outcome),
+                authorization: made(outcome),
+            }),
+            Subject::Token(token) => token_views.push(AuthorizedTokenView {
+                integration_token_id: &token.id,
+                service: &token.provider,
+                side: match token.side {
+                    IntegrationTokenSide::IntegrationTokenSideMember => "member",
+                    IntegrationTokenSide::IntegrationTokenSideOrg => "org",
+                },
+                organization_id: token.organization_id.as_deref(),
+                outcome: named(outcome),
+                authorization: made(outcome),
+            }),
+        }
+    }
+    let ended = ended.map(|report| (subjects.get(outcomes.len()), report));
     let (outcome, exit) = if refusals.is_empty() && ended.is_none() {
         ("authorized", ExitCode::Success)
     } else {
@@ -666,7 +743,8 @@ pub(super) fn write_authorize_all(
             deployment,
             outcome,
             runner_id,
-            grants: &views,
+            grants: &grant_views,
+            tokens: tokens.then_some(token_views.as_slice()),
         })?;
         if let Some((_, report)) = &ended {
             // The command's exit status is 1 whatever the failure's own would be.
@@ -674,32 +752,46 @@ pub(super) fn write_authorize_all(
         }
         return Ok(exit);
     }
+    // What the runner was authorized for: grants, as `useful grant` has always said, or the
+    // member's integrations where a token was among them.
+    let what = if subjects
+        .iter()
+        .any(|subject| matches!(subject, Subject::Token(_)))
+    {
+        ("integrations", "integration")
+    } else {
+        ("grants", "grant")
+    };
     let mut stdout = io::stdout().lock();
     if ended.is_some() {
         writeln!(
             stdout,
-            "Runner not authorized for every grant: a failure ended the command."
+            "Runner not authorized for every {}: a failure ended the command.",
+            what.1
         )?;
     } else if refusals.is_empty() {
-        writeln!(stdout, "✓ Runner authorized for your grants.")?;
+        writeln!(stdout, "✓ Runner authorized for your {}.", what.0)?;
     } else {
         writeln!(
             stdout,
-            "Runner not authorized for every grant: some refused it."
+            "Runner not authorized for every {}: some refused it.",
+            what.1
         )?;
     }
     writeln!(stdout, "runner: {runner_id}")?;
     writeln!(stdout, "deployment: {deployment}")?;
     writeln!(stdout)?;
-    for (view, outcome) in views.iter().zip(outcomes) {
+    for (subject, outcome) in subjects.iter().zip(outcomes) {
         write!(
             stdout,
             "{} {}: {}",
-            view.grant_id, view.provider, view.outcome
+            subject.id(),
+            subject.provider(),
+            named(outcome)
         )?;
         match outcome {
-            Outcome::Authorized(authorization) => {
-                writeln!(stdout, " (authorization {})", authorization.id)?;
+            Outcome::Authorized(made) => {
+                writeln!(stdout, " (authorization {})", made.view().id)?;
             }
             Outcome::OtherOrganization => {
                 writeln!(
@@ -714,11 +806,11 @@ pub(super) fn write_authorize_all(
     }
     stdout.flush()?;
     let mut stderr = io::stderr().lock();
-    for (grant, report) in &refusals {
-        write_grant_failure(&mut stderr, Some(*grant), report)?;
+    for (subject, report) in &refusals {
+        write_subject_failure(&mut stderr, Some(*subject), report)?;
     }
-    if let Some((grant, report)) = &ended {
-        write_grant_failure(&mut stderr, *grant, report)?;
+    if let Some((subject, report)) = &ended {
+        write_subject_failure(&mut stderr, *subject, report)?;
     }
     Ok(exit)
 }
@@ -734,27 +826,28 @@ fn authorized_elsewhere() -> ApiFailureReport {
     )
 }
 
-/// Writes a failure of `authorize --all` with the grant it met, then its remedy.
-fn write_grant_failure(
+/// Writes a failure of `authorize --all` with the grant or token it met, then its remedy.
+fn write_subject_failure(
     output: &mut impl Write,
-    grant: Option<&MemberGrant>,
+    subject: Option<&Subject>,
     report: &ApiFailureReport,
 ) -> io::Result<()> {
     writeln!(output, "{}", report.summary)?;
-    if let Some(grant) = grant {
-        writeln!(output, "grant: {} ({})", grant.id, grant.provider.as_str())?;
+    if let Some(subject) = subject {
+        writeln!(
+            output,
+            "{}: {} ({})",
+            subject.holder().noun(),
+            subject.id(),
+            subject.provider()
+        )?;
     }
     writeln!(output, "\n{}\n", report.remedy)
 }
 
-/// Reports, with its remedy, the refusal of the runner `named` among all a command acts on
-/// (REQ-GRANT-83), or the failure that ended the command at it.
-pub(super) fn write_runner_failure(
-    deployment: &str,
-    named: &str,
-    failure: &MemberGrantFailure,
-) -> io::Result<()> {
-    let report = report(deployment, failure);
+/// Reports `report`, with its remedy, the refusal of the runner `named` among all a command acts
+/// on (REQ-GRANT-83), or the failure that ended the command at it.
+pub(super) fn write_runner_failure(named: &str, report: &ApiFailureReport) -> io::Result<()> {
     let mut stderr = io::stderr().lock();
     writeln!(stderr, "{}", report.summary)?;
     writeln!(stderr, "runner: {named}")?;
@@ -762,8 +855,8 @@ pub(super) fn write_runner_failure(
 }
 
 /// A grant operation's failure as the member reads it: each refusal of REQ-GRANT-65 with exit
-/// status 1 and its remedy.
-pub(super) fn report(deployment: &str, failure: &MemberGrantFailure) -> ApiFailureReport {
+/// status 1 and its remedy. An integration token's operations fall back on it too.
+pub(in crate::cli) fn report(deployment: &str, failure: &MemberGrantFailure) -> ApiFailureReport {
     const SUBJECT: &str = "grant";
     let refused = |outcome, summary: &str, remedy: &str| {
         ApiFailureReport::new(outcome, summary, remedy, OutcomeClass::GeneralFailure)
@@ -785,7 +878,7 @@ pub(super) fn report(deployment: &str, failure: &MemberGrantFailure) -> ApiFailu
         MemberGrantFailure::GrantNotFound => refused(
             "grant_not_found",
             "error: grant not found among your unrevoked grants",
-            "List your grants:\n  useful grant list",
+            "List your grants:\n  useful integration list",
         ),
         MemberGrantFailure::OrganizationNotFound => refused(
             "organization_not_found",
@@ -800,7 +893,7 @@ pub(super) fn report(deployment: &str, failure: &MemberGrantFailure) -> ApiFailu
         MemberGrantFailure::LimitReached => refused(
             "limit_reached",
             "error: you hold the most grants of coding agents this organization allows",
-            "Revoke one you no longer use:\n  useful grant revoke GRANT --yes",
+            "Revoke one you no longer use:\n  useful integration revoke INTEGRATION --yes",
         ),
         MemberGrantFailure::RunnerNotFound => refused(
             "runner_not_found",
@@ -810,7 +903,7 @@ pub(super) fn report(deployment: &str, failure: &MemberGrantFailure) -> ApiFailu
         MemberGrantFailure::RunnerHoldsLogin => refused(
             "runner_holds_login",
             "error: that runner already holds a login of this coding agent",
-            "The owner of the login that runner holds must end its authorization first:\n  useful grant deauthorize GRANT RUNNER --yes",
+            "The owner of the login that runner holds must end its authorization first:\n  useful integration deauthorize INTEGRATION RUNNER --yes",
         ),
         MemberGrantFailure::AlreadyAuthorized => refused(
             "already_authorized",
@@ -820,7 +913,37 @@ pub(super) fn report(deployment: &str, failure: &MemberGrantFailure) -> ApiFailu
         MemberGrantFailure::AuthorizationNotFound => refused(
             "authorization_not_found",
             "error: that runner holds no authorization of this grant",
-            "Show the grant's authorizations:\n  useful grant list GRANT",
+            "Show the grant's authorizations:\n  useful integration list INTEGRATION",
+        ),
+        MemberGrantFailure::IntegrationTokenInvalid => refused(
+            "token_invalid",
+            "error: the deployment did not accept the token",
+            "Give the token the service issued, unchanged: 1 to 4096 printable characters with no space.",
+        ),
+        MemberGrantFailure::IntegrationTokenExists => refused(
+            "token_exists",
+            "error: a token of this service is already connected",
+            "Replace it:\n  useful integration connect PROVIDER --replace",
+        ),
+        MemberGrantFailure::IntegrationTokenNotFound => refused(
+            "token_not_found",
+            "error: integration token not found",
+            "List your integrations:\n  useful integration list",
+        ),
+        MemberGrantFailure::IntegrationTokenRunnerNotFound => refused(
+            "runner_not_found",
+            "error: runner not found in an organization this token can serve",
+            "List the organization's runners and use a runner ID:\n  useful runner list ORGANIZATION",
+        ),
+        MemberGrantFailure::IntegrationTokenAlreadyAuthorized => refused(
+            "already_authorized",
+            "error: this token is already authorized for that runner",
+            "Show the token's authorizations:\n  useful integration list INTEGRATION",
+        ),
+        MemberGrantFailure::IntegrationTokenAuthorizationNotFound => refused(
+            "authorization_not_found",
+            "error: that runner holds no authorization of this token",
+            "Show the token's authorizations:\n  useful integration list INTEGRATION",
         ),
         MemberGrantFailure::RateLimited { retry_after } => {
             ApiFailureReport::rate_limited(SUBJECT, *retry_after)
@@ -842,8 +965,8 @@ pub(in crate::cli) fn failure(
     report(deployment, failure).write(deployment, json)
 }
 
-/// The one event `useful grant create` prints for a coding agent's login: the grant it imported
-/// or replaced, or the refusal that stored nothing.
+/// The one event `useful integration connect` prints for a coding agent's login: the grant it
+/// imported or replaced, or the refusal that stored nothing.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ImportEvent<'a> {
@@ -873,8 +996,8 @@ impl<'a> ImportEvent<'a> {
     }
 }
 
-/// Writes the native grant `useful grant create` imported, or stored as the next generation of
-/// the grant it `replaced` (REQ-GRANT-70, REQ-GRANT-73), naming its organization by `slug` when
+/// Writes the native grant `useful integration connect` imported, or stored as the next generation
+/// of the grant it `replaced` (REQ-GRANT-70, REQ-GRANT-73), naming its organization by `slug` when
 /// that is known.
 pub(super) fn write_imported(
     deployment: &str,
@@ -929,12 +1052,13 @@ pub(super) fn write_import_refusal(
     Ok(report.class.exit_code())
 }
 
-/// The outcome of a coding agent `useful grant create` without `PROVIDER` passes over because no
-/// organization was resolved for its grant (REQ-GRANT-75).
+/// The outcome of a coding agent `useful integration connect` without `PROVIDER` passes over
+/// because no organization was resolved for its grant (REQ-GRANT-75).
 pub(super) const ORGANIZATION_REQUIRED: &str = "organization_required";
 
-/// The outcome of a provider `useful grant create --workflow` passes over because every grant the
-/// member holds of it needs reconnecting and its replacement was not settled (REQ-GRANT-79).
+/// The outcome of a provider `useful integration connect --workflow` passes over because every
+/// grant the member holds of it needs reconnecting and its replacement was not settled
+/// (REQ-GRANT-79).
 pub(super) const RECONNECT_REQUIRED: &str = "reconnect_required";
 
 /// Reports a coding agent passed over for want of an organization: as its `import_result`
@@ -954,8 +1078,8 @@ pub(super) fn write_organization_required(
     Ok(())
 }
 
-/// Names on standard error the provider whose sign-in `useful grant create` runs next, so the
-/// member knows whose prompt follows (REQ-GRANT-75), and in a report parts it from the one
+/// Names on standard error the provider whose sign-in `useful integration connect` runs next, so
+/// the member knows whose prompt follows (REQ-GRANT-75), and in a report parts it from the one
 /// `after` another provider's sign-in printed.
 pub(super) fn write_provider_heading(
     provider: &str,
@@ -973,15 +1097,15 @@ pub(super) fn write_provider_heading(
     Ok(())
 }
 
-/// One provider's entry in the summary of `useful grant create` without a provider.
+/// One provider's entry in the summary of `useful integration connect` without a provider.
 #[derive(Serialize)]
 struct CreateOutcome<'a> {
     provider: &'a str,
     outcome: &'static str,
 }
 
-/// The event that ends `useful grant create` without a provider: how the command ended and one
-/// outcome per provider it signed in to, or the refusal that started none.
+/// The event that ends `useful integration connect` without a provider: how the command ended and
+/// one outcome per provider it signed in to, or the refusal that started none.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateSummary<'a> {
@@ -1010,8 +1134,8 @@ impl<'a> CreateSummary<'a> {
     }
 }
 
-/// The providers `useful grant create` without `PROVIDER` chose among, and the command that ran
-/// the choice, as its report names them.
+/// The providers `useful integration connect` without `PROVIDER` chose among, and the command that
+/// ran the choice, as its report names them.
 #[derive(Clone, Copy)]
 pub(in crate::cli) enum Scope {
     /// Every provider (REQ-GRANT-75).
@@ -1035,16 +1159,18 @@ impl Scope {
 
     const fn again(self) -> &'static str {
         match self {
-            Self::Every => "useful grant create",
-            Self::Workflows => "useful grant create --workflow FILE",
+            Self::Every => "useful integration connect",
+            Self::Workflows => "useful integration connect --workflow FILE",
             Self::Doctor => "useful runner doctor --workflow FILE --connect",
         }
     }
 
     pub(super) const fn organization(self) -> &'static str {
         match self {
-            Self::Every => "useful grant create --organization ORGANIZATION",
-            Self::Workflows => "useful grant create --workflow FILE --organization ORGANIZATION",
+            Self::Every => "useful integration connect --organization ORGANIZATION",
+            Self::Workflows => {
+                "useful integration connect --workflow FILE --organization ORGANIZATION"
+            }
             Self::Doctor => {
                 "useful runner doctor --workflow FILE --connect --organization-id ORGANIZATION"
             }
@@ -1057,21 +1183,21 @@ impl Scope {
 fn native_remedy(provider: &str) -> Option<&'static str> {
     match provider {
         "codex" => Some(
-            "When codex is not on your PATH, install Codex so that it is, or import an auth.json:\n  useful grant create codex --from-file PATH",
+            "When codex is not on your PATH, install Codex so that it is, or import an auth.json:\n  useful integration connect codex --from-file PATH",
         ),
         "claude_code" => Some(
-            "When claude is not on your PATH, install Claude Code so that it is, or import the token claude setup-token printed:\n  useful grant create claude_code --token-file PATH",
+            "When claude is not on your PATH, install Claude Code so that it is, or import the token claude setup-token printed:\n  useful integration connect claude_code --token-file PATH",
         ),
         _ => None,
     }
 }
 
-/// Prints one outcome per provider `useful grant create` signed in to or passed over, after their
-/// own output, as the last JSON event or a report on standard output; `code` is the command's
-/// exit status (REQ-GRANT-75). The report's verdict claims each grant made only when every
-/// provider ended with one, created or `replaced`, and its remedies name what each other
-/// outcome present leaves to do, `useful grant create PROVIDER --replace` for each provider passed
-/// over as `reconnect_required` (REQ-GRANT-79).
+/// Prints one outcome per provider `useful integration connect` signed in to or passed over, after
+/// their own output, as the last JSON event or a report on standard output; `code` is the command's
+/// exit status (REQ-GRANT-75). The report's verdict claims each grant made only when every provider
+/// ended with one, created or `replaced`, and its remedies name what each other outcome present
+/// leaves to do, `useful integration connect PROVIDER --replace` for each provider passed over as
+/// `reconnect_required` (REQ-GRANT-79).
 pub(super) fn write_create_summary(
     deployment: &str,
     outcomes: &[(&str, &'static str)],
@@ -1132,7 +1258,7 @@ pub(super) fn write_create_summary(
     if !started.is_empty() {
         writeln!(
             stdout,
-            "\nStarted, not yet approved: {}. Approve each at the URL printed for it to make its grant, then see your grants:\n  useful grant list",
+            "\nStarted, not yet approved: {}. Approve each at the URL printed for it to make its grant, then see your grants:\n  useful integration list",
             started.join(", ")
         )?;
     }
@@ -1158,7 +1284,7 @@ pub(super) fn write_create_summary(
             reconnect.join(", ")
         )?;
         for provider in &reconnect {
-            writeln!(stdout, "  useful grant create {provider} --replace")?;
+            writeln!(stdout, "  useful integration connect {provider} --replace")?;
         }
     }
     for remedy in failed.iter().filter_map(|provider| native_remedy(provider)) {
@@ -1181,8 +1307,8 @@ pub(super) fn write_create_summary(
     Ok(())
 }
 
-/// Reports a failure that ended `useful grant create` without a provider before any sign-in: as
-/// its summary event, or on standard error with its remedy.
+/// Reports a failure that ended `useful integration connect` without a provider before any sign-in:
+/// as its summary event, or on standard error with its remedy.
 pub(super) fn write_create_refusal(
     deployment: &str,
     report: &ApiFailureReport,

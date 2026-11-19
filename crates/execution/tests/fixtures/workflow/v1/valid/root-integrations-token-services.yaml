@@ -1,0 +1,13 @@
+# requires declares the token services mergify and buildkite beside its acting identity (REQ-WFFORMAT-82).
+schemaVersion: 1
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["true"]
+requires:
+  as: member
+  integrations:
+    mergify:
+      as: org
+    buildkite: {}

@@ -40,7 +40,7 @@ pub(super) struct Held<'a> {
 
 impl<'a> Request<'a> {
     /// Reads the member's grants with the human session, or the failure that ends the command
-    /// as it ends `useful grant list` (`grant::output::failure`), with no report.
+    /// as it ends `useful integration list` (`grant::output::failure`), with no report.
     pub(super) fn read(
         &self,
         deployment: &Deployment,
@@ -63,18 +63,19 @@ impl Held<'_> {
             .filter(move |grant| grant.provider.as_str() == provider.name())
     }
 
-    /// What the member holds of the provider `kind` names.
-    pub(super) fn of(&self, kind: CredentialKind) -> ProviderView<'_> {
-        let provider = Provider::of_kind(kind);
+    /// What the member holds of the provider `kind` names, or `None` for a kind with no grant
+    /// provider, a token service (REQ-CREDREADY-29).
+    pub(super) fn of(&self, kind: CredentialKind) -> Option<ProviderView<'_>> {
+        let provider = Provider::of_kind(kind)?;
         let grants: Vec<_> = self
             .of_provider(provider)
             .map(|grant| GrantView::new(grant, self.runner))
             .collect();
-        ProviderView {
+        Some(ProviderView {
             provider: provider.name(),
             status: grants.is_empty().then(|| provider.not_connected()),
             grants,
-        }
+        })
     }
 
     /// Why the requirement of `kind` fails when `--require-grants` asks for a grant of its
@@ -82,10 +83,11 @@ impl Held<'_> {
     /// holds one (REQ-CREDREADY-26). A grant is usable there when its availability is
     /// `available`, `unverified` or `pending`: a runner sets a login up for each assignment it
     /// admits before offering anything (REQ-GRANT-49). Of several grants the one nearest to
-    /// usable is reported, one authorized for the runner before one that is not.
+    /// usable is reported, one authorized for the runner before one that is not. A kind with no
+    /// grant provider, a token service, never falls short (REQ-CREDREADY-29).
     pub(super) fn shortfall(&self, kind: CredentialKind) -> Option<Shortfall> {
         let runner = self.runner.filter(|_| self.require)?;
-        let provider = Provider::of_kind(kind);
+        let provider = Provider::of_kind(kind)?;
         let nearest = self
             .of_provider(provider)
             .map(|grant| {
@@ -176,8 +178,8 @@ pub(super) struct ProviderView<'a> {
     status: Option<MemberStatus>,
 }
 
-/// A grant as the doctor shows it: the fields of `useful grant list`'s view that say which grant
-/// it is and whose account, and its status on each runner reported (REQ-GRANT-64).
+/// A grant as the doctor shows it: the fields of `useful integration list`'s view that say which
+/// grant it is and whose account, and its status on each runner reported (REQ-GRANT-64).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct GrantView<'a> {

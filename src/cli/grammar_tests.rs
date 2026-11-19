@@ -5,21 +5,26 @@ use clap::{Arg, ArgAction, Command, CommandFactory};
 
 use super::Cli;
 
-const LEAVES: &str = "accept activate answer approve authorize archive begin cancel complete continue create deauthorize decline delete disable doctor download drain enable end enroll event hand-back history import interrupt issue leave lift link list login logout move preview propose publish reconnect reference release remove rename replay request restart resume retire retry revoke revoke-previous-secret rotate-secret run schema seal serve set set-principal show signup status stop sync test unarchive update upgrade upload uses validate version view wait withdraw";
-const GROUPS: &str = "account action activation agent-login artifact audit auth authorization cloud connection credential definition delegation deletion delivery github gitlab grant identity input input-set installation invitation join-key linear member occurrence organization pool project publication repository run runner runner-pool schedule service-principal setup state team trigger evaluation webhook workflow";
+const LEAVES: &str = "accept activate answer approve authorize archive begin cancel complete connect continue create deauthorize decline delete disable doctor download drain enable end enroll event hand-back history import interrupt issue leave lift link list login logout move preview propose publish reconnect reference release remove rename replay request restart resume retire retry revoke revoke-previous-secret rotate-secret run schema seal serve set set-principal show signup status stop sync test unarchive update upgrade upload uses validate version view wait withdraw";
+const GROUPS: &str = "account action activation agent-login artifact audit auth authorization cloud connection credential definition delegation deletion delivery github gitlab grant identity input input-set installation integration invitation join-key linear member occurrence organization pool project publication repository run runner runner-pool schedule service-principal setup state team trigger evaluation webhook workflow";
 const COMMON: [&str; 3] = ["json", "service-api-key-file", "allow-insecure-http"];
 // These leaves have no limit/cursor contract; see cli/docs/output-style.md.
-const UNPAGINATED_LISTS: [&str; 5] = [
+const UNPAGINATED_LISTS: [&str; 6] = [
     "connection github installation list",
     "connection github repository list",
     "grant list",
+    "integration list",
     "workflow definition list",
     "workflow run list",
 ];
 // These destructive leaves' own confirmation refuses a missing --yes with the statement the
 // leaf makes before it acts, which clap's refusal of a required argument cannot carry;
 // destructive_leaves_require_confirmation_but_runner_modes_do_not pins that refusal.
-const SELF_CONFIRMING: [&str; 2] = ["auth agent-login revoke", "grant revoke"];
+const SELF_CONFIRMING: [&str; 3] = [
+    "auth agent-login revoke",
+    "grant revoke",
+    "integration revoke",
+];
 
 // These identities are backed by shared Args or identifier argument types in cli/src/cli.rs
 // and cli/src/cli/entity.rs. A long spelling alone is never a help identity.
@@ -88,6 +93,7 @@ fn semantic_class(path: &str, long: &str) -> Option<String> {
                 "auth login"
                     | "auth grant create"
                     | "grant create"
+                    | "integration connect"
                     | "auth identity link"
                     | "account deletion cancel"
                     | "organization deletion cancel"
@@ -403,6 +409,7 @@ fn entity_identifier_flags_match_the_command_tree_and_parser() {
 // REQ-GRANT-66
 // REQ-GRANT-67
 // REQ-GRANT-68
+// REQ-INTEGRATION-13
 #[test]
 fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
     let gated: &[&[&str]] = &[
@@ -480,6 +487,25 @@ fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
             "pgr_01k0z6r1w8f4jy2m7q9v3x5abc",
             "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
         ],
+        &["integration", "revoke", "codex"],
+        &[
+            "integration",
+            "authorize",
+            "agl_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+        ],
+        &[
+            "integration",
+            "authorize",
+            "--all",
+            "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+        ],
+        &[
+            "integration",
+            "deauthorize",
+            "pgr_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+        ],
         &["auth", "identity", "remove", "identity"],
         &[
             "connection",
@@ -515,11 +541,19 @@ fn destructive_leaves_require_confirmation_but_runner_modes_do_not() {
 // REQ-GRANT-65
 // REQ-GRANT-66
 // REQ-GRANT-81
+// REQ-INTEGRATION-13
 // `authorize` parses `GRANT RUNNER`, `GRANT`, `--all RUNNER` and `--all`, and a leaf given no
 // `RUNNER` runs without `--yes` to offer the runners, while one given `RUNNER` is refused
-// without it (`destructive_leaves_require_confirmation_but_runner_modes_do_not`).
+// without it (`destructive_leaves_require_confirmation_but_runner_modes_do_not`), under both
+// spellings of the family.
 #[test]
 fn authorize_and_deauthorize_take_runner_as_an_option_and_refuse_a_malformed_target() {
+    for family in ["grant", "integration"] {
+        authorize_and_deauthorize_parse_under(family);
+    }
+}
+
+fn authorize_and_deauthorize_parse_under(family: &str) {
     const GRANT: &str = "agl_01k0z6r1w8f4jy2m7q9v3x5abc";
     const RUNNER: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abc";
     for args in [
@@ -531,8 +565,8 @@ fn authorize_and_deauthorize_take_runner_as_an_option_and_refuse_a_malformed_tar
         &["authorize", "--all", RUNNER, "--yes"],
         &["authorize", RUNNER, "--all", "--yes"],
     ] {
-        let input = ["useful", "grant"].into_iter().chain(args.iter().copied());
-        assert!(super::parse(input).is_ok(), "{args:?}");
+        let input = ["useful", family].into_iter().chain(args.iter().copied());
+        assert!(super::parse(input).is_ok(), "{family} {args:?}");
     }
     for (args, kind) in [
         (
@@ -567,9 +601,42 @@ fn authorize_and_deauthorize_take_runner_as_an_option_and_refuse_a_malformed_tar
             clap::error::ErrorKind::ValueValidation,
         ),
     ] {
-        let input = ["useful", "grant"].into_iter().chain(args.iter().copied());
-        assert_eq!(super::parse(input).unwrap_err().kind(), kind, "{args:?}");
+        let input = ["useful", family].into_iter().chain(args.iter().copied());
+        assert_eq!(
+            super::parse(input).unwrap_err().kind(),
+            kind,
+            "{family} {args:?}"
+        );
     }
+}
+
+// REQ-INTEGRATION-15
+// REQ-INTEGRATION-17
+// `--org` acts on an organization's token, which only `useful integration` reaches: each of its
+// leaves takes it and no leaf of `useful grant` does.
+#[test]
+fn org_is_an_option_of_every_integration_leaf_and_of_no_grant_leaf() {
+    let mut root = Cli::command();
+    root.build();
+    let takes_org = |family: &str| {
+        let family = root
+            .find_subcommand(family)
+            .unwrap_or_else(|| panic!("no {family}"));
+        family
+            .get_subcommands()
+            .filter(|leaf| leaf.get_name() != "help")
+            .map(|leaf| {
+                let org = leaf.get_arguments().any(|arg| arg.get_id() == "org");
+                (leaf.get_name().to_owned(), org)
+            })
+            .collect::<Vec<_>>()
+    };
+    let integration = takes_org("integration");
+    assert_eq!(integration.len(), 5, "{integration:?}");
+    assert!(integration.iter().all(|(_, org)| *org), "{integration:?}");
+    let grant = takes_org("grant");
+    assert_eq!(grant.len(), 5, "{grant:?}");
+    assert!(grant.iter().all(|(_, org)| !*org), "{grant:?}");
 }
 
 // REQ-CONNECTION-88

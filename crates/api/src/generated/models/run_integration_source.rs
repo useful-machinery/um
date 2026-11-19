@@ -15,28 +15,28 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// RunIntegrationSource : Where the credential of one integration the run's workflow declares came from. Cloud records `host` and `grant` sources today, `actedAs` `member` for a grant, and no token version.
+/// RunIntegrationSource : Where the credential of one integration the run's workflow declares came from. Cloud records `host`, `grant` and `token` sources, `actedAs` `member` for a grant and the token's side for a token, and a token version for a token alone.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunIntegrationSource {
     /// The provider id the workflow declares, such as `github` or `claude_code`; providers are added over time, so a reader must accept an id it does not know.
     #[serde(rename = "integration")]
     pub integration: String,
-    /// Whom the run acted as for the integration, `member` or `org`; null where Cloud recorded none, as for `host` and for an integration with no source. Cloud records `member` for a grant today.
+    /// Whom the run acted as for the integration, `member` or `org`; null where Cloud recorded none, as for `host` and for an integration with no source. Cloud records `member` for a grant and the token's side, `member` or `org`, for a token.
     #[serde(rename = "actedAs", deserialize_with = "Option::deserialize")]
     pub acted_as: Option<ActedAs>,
-    /// The member who connected the credential, such as the member whose grant a `grant` source is; null where Cloud recorded none, as for `host`.
+    /// The member who connected the credential, such as the member whose grant a `grant` source is or the member who stored the version of a `token` source that was issued; null where Cloud recorded none, as for `host`.
     #[serde(rename = "connectedBy", deserialize_with = "Option::deserialize")]
     pub connected_by: Option<String>,
-    /// Where the credential came from: `grant` for a member's grant, `org_connection` for an organization's connection, `token` for a stored token, and `host` for a credential the runner's host provides; null where none provided one. Cloud records `host` and `grant` today.
+    /// Where the credential came from: `grant` for a member's grant, `org_connection` for an organization's connection, `token` for a stored token, and `host` for a credential the runner's host provides; null where none provided one. Cloud records `host`, `grant` and `token`, and no `org_connection`.
     #[serde(rename = "source", deserialize_with = "Option::deserialize")]
     pub source: Option<Source>,
-    /// The version of the token the run used; null where Cloud recorded none, as it records none today.
+    /// The version of the token the run was issued, the newest issued the run's assignment before its runner's report; null for every source but `token`.
     #[serde(rename = "tokenVersion", deserialize_with = "Option::deserialize")]
     pub token_version: Option<i64>,
 }
 
 impl RunIntegrationSource {
-    /// Where the credential of one integration the run's workflow declares came from. Cloud records `host` and `grant` sources today, `actedAs` `member` for a grant, and no token version.
+    /// Where the credential of one integration the run's workflow declares came from. Cloud records `host`, `grant` and `token` sources, `actedAs` `member` for a grant and the token's side for a token, and a token version for a token alone.
     pub fn new(
         integration: String,
         acted_as: Option<ActedAs>,
@@ -53,7 +53,7 @@ impl RunIntegrationSource {
         }
     }
 }
-/// Whom the run acted as for the integration, `member` or `org`; null where Cloud recorded none, as for `host` and for an integration with no source. Cloud records `member` for a grant today.
+/// Whom the run acted as for the integration, `member` or `org`; null where Cloud recorded none, as for `host` and for an integration with no source. Cloud records `member` for a grant and the token's side, `member` or `org`, for a token.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum ActedAs {
     #[serde(rename = "member")]
@@ -67,7 +67,7 @@ impl Default for ActedAs {
         Self::RunIntegrationActedAsMember
     }
 }
-/// Where the credential came from: `grant` for a member's grant, `org_connection` for an organization's connection, `token` for a stored token, and `host` for a credential the runner's host provides; null where none provided one. Cloud records `host` and `grant` today.
+/// Where the credential came from: `grant` for a member's grant, `org_connection` for an organization's connection, `token` for a stored token, and `host` for a credential the runner's host provides; null where none provided one. Cloud records `host`, `grant` and `token`, and no `org_connection`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum Source {
     #[serde(rename = "grant")]

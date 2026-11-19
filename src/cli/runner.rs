@@ -44,7 +44,8 @@ pub(super) struct Command {
 enum RunnerCommand {
     #[command(about = activation::ABOUT)]
     Activation(activation::Command),
-    // The earlier spelling of `runner grant`, kept for one release out of help (REQ-GRANT-77).
+    // The earlier spelling of `runner integration`, kept for one release out of help
+    // (REQ-GRANT-77).
     #[command(about = agent_login::ABOUT, hide = true)]
     AgentLogin(agent_login::Command),
     #[command(about = "Create a runner registration and enrollment activation")]
@@ -66,11 +67,19 @@ enum RunnerCommand {
     Enable(ModeCommand),
     #[command(about = enroll::ABOUT)]
     Enroll(enroll::Command),
+    // The earlier spelling of `runner integration`, kept out of help until the stage that
+    // removes it (REQ-INTEGRATION-15).
     #[command(
         about = agent_login::GRANT_ABOUT,
+        hide = true,
         mut_subcommand("sync", |sync| sync.about(agent_login::GRANT_SYNC_ABOUT))
     )]
     Grant(agent_login::Command),
+    #[command(
+        about = agent_login::INTEGRATION_ABOUT,
+        mut_subcommand("sync", |sync| sync.about(agent_login::INTEGRATION_SYNC_ABOUT))
+    )]
+    Integration(agent_login::Command),
     #[command(about = join_key::ABOUT)]
     JoinKey(join_key::Command),
     #[command(about = "List runner registrations")]
@@ -231,6 +240,7 @@ impl Command {
             Some(RunnerCommand::Activation(command)) => command.execute(),
             Some(RunnerCommand::AgentLogin(command)) => command.execute(&[NAME, "agent-login"]),
             Some(RunnerCommand::Grant(command)) => command.execute(&[NAME, "grant"]),
+            Some(RunnerCommand::Integration(command)) => command.execute(&[NAME, "integration"]),
             Some(RunnerCommand::Credential(command)) => command.execute(),
             Some(RunnerCommand::Enroll(command)) => command.execute(),
             Some(RunnerCommand::JoinKey(command)) => command.execute(),

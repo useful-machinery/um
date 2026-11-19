@@ -74,25 +74,25 @@ multiple YAML documents, `%YAML` and unknown directives, and floating-point numb
 100 levels deep.
 
 Root `requires` holds at least one of `tools`, `as`, and `integrations`, which declares
-needed services by provider id: `github`, `gitlab.com`, `linear`, `claude_code`, or
-`codex`. `as` is `member` or `org`; an entry's own `as` overrides `requires.as`.
-An entry's `bindings` map names to `{kind, default?}`: `team` or `state` under `linear`,
-`repository` under `github`, none elsewhere; `default` is text. Reference one as
-`$<id>.<name>`, such as `$linear.done` (a `state` under `linear` serves as a mirror state),
-and name a declared integration as a trigger's `source: linear`. A flat `bindings` key that
-is a name declared under an integration, or the id of one with bindings, is
-`binding_declared_twice`. A publish's `--bindings` file gives an integration's values
-under its id, `{"linear": {"team": "AUTO"}}`, beside the flat members.
-`useful runner doctor --workflow` reports the declared integrations; `useful run show`
-prints where a Cloud run got each one's credential. Every step, finalizer, and recovery
-handler inherits each declared integration's variables, whatever any
-`environmentPassthrough` says: `github` `GH_TOKEN` and `GH_TOKEN_FILE`, `gitlab.com`
-`GITLAB_TOKEN` and `GITLAB_TOKEN_FILE`, `linear` `USEFUL_LINEAR_ACCESS_TOKEN` and
-`USEFUL_LINEAR_ACCESS_TOKEN_FILE`, `claude_code` `CLAUDE_CODE_OAUTH_TOKEN`, `codex`
-`CODEX_HOME`; missing ones are unset. A tree's root declaration covers every file. That
-delivery reads no `as` or `bindings`; only `tools` is probed. Another workflow file of a
-tree may carry `requires` without `tools` as an override; `useful workflow definition
-validate` and `publish` refuse one naming an integration the root does not declare
+needed services by provider id: `github`, `gitlab.com`, `linear`, `claude_code`, `codex`,
+`mergify`, or `buildkite`. `as` is `member` or `org`; an entry's own `as` overrides
+`requires.as`. An entry's `bindings` map names to `{kind, default?}`: `team` or `state`
+under `linear`, `repository` under `github`, none elsewhere; `default` is text. Reference
+one as `$<id>.<name>` (`$linear.done`; a `linear` `state` can be a mirror state) and name
+a declared integration as a trigger's `source: linear`. A flat `bindings` key naming an
+integration's binding, or the id of one with bindings, is `binding_declared_twice`. A
+publish's `--bindings` file gives an integration's values under its id,
+`{"linear": {"team": "AUTO"}}`, beside the flat members. `useful runner doctor --workflow`
+reports the declared integrations; `useful run show` prints where a Cloud run got each
+credential. Every step, finalizer, and recovery handler gets each declared integration's
+variables, whatever `environmentPassthrough` says (missing ones are unset): `GH_TOKEN`,
+`GITLAB_TOKEN`, `USEFUL_LINEAR_ACCESS_TOKEN`, `MERGIFY_TOKEN`, and `BUILDKITE_API_TOKEN`,
+each with a `_FILE` twin, `CLAUDE_CODE_OAUTH_TOKEN`, and `CODEX_HOME`. A tree's root
+declaration covers every file. Unless its host sets them, a Cloud run gets the
+organization's `mergify` or `buildkite` token with `as: org`, else its member's. Runs read
+no other `as` or `bindings`; only `tools` is probed. Another workflow file of a tree may
+carry `requires` without `tools` as an override; `useful workflow definition validate` and
+`publish` refuse one naming an integration the root does not declare
 (`integration_undeclared`).
 
 ```yaml
@@ -150,17 +150,17 @@ never activates.
 
 ## Provider tokens from grants
 
-To call GitHub, GitLab.com, or Linear as the person who started the run, declare `github`,
-`gitlab.com`, or `linear` under `requires.integrations`, or pass the provider's two
-variables (above) in the root `environmentPassthrough`; a step's own list must keep passed
-names. A runner that sets either name of a provider itself keeps both; the run acts as the
-host. Otherwise the token is the run's member's, issued only if the member holds a grant
-(`useful grant create`) and authorized the runner (`useful grant authorize`); a run acting
-for nobody (a service principal's or a schedule's) gets none. A local run uses its
-environment. The variable is fixed when the runner takes the run; the file stays current.
-Tokens live about 8 hours (GitHub), 2 (GitLab.com), or 24 (Linear) and are replaced a
-fifth of that before expiry, ending the old one, so a long step rereads the file. For Git
-(user `oauth2` and `$GITLAB_TOKEN_FILE` for GitLab.com):
+To call GitHub, GitLab.com, or Linear as the person who started the run, declare it under
+`requires.integrations` or pass its two variables (above) in the root
+`environmentPassthrough`; a step's own list must keep passed names. A runner that sets
+either name of a provider itself keeps both; the run acts as the host. Otherwise the token
+is the run's member's, issued only if they hold a grant (`useful integration connect`) and
+authorized the runner (`useful integration authorize`); a run acting for nobody (a service
+principal's or a schedule's) gets none. A local run uses its environment. The variable is
+fixed when the runner takes the run; the file stays current. Tokens live about 8 hours
+(GitHub), 2 (GitLab.com), or 24 (Linear) and are replaced a fifth of that before expiry,
+ending the old one, so a long step rereads the file. For Git (user `oauth2` and
+`$GITLAB_TOKEN_FILE` for GitLab.com):
 
 ```sh
 git -c credential.helper= \

@@ -17,6 +17,8 @@ use super::super::{CommandFailure, CommandResult, JsonArgs, RunnerJson};
 pub(super) const ABOUT: &str = "Set up agent logins on the live runner";
 pub(super) const GRANT_ABOUT: &str = "Set up grants on the live runner";
 pub(super) const GRANT_SYNC_ABOUT: &str = "Ask Runner Serve to set up grants now";
+pub(super) const INTEGRATION_ABOUT: &str = "Set up integrations on the live runner";
+pub(super) const INTEGRATION_SYNC_ABOUT: &str = "Ask Runner Serve to set up integrations now";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -44,8 +46,9 @@ struct SyncCommand {
 
 impl Command {
     /// Runs the family under `path`, the spelling the invocation used:
-    /// `runner grant` or its earlier, hidden spelling (REQ-GRANT-41,
-    /// REQ-GRANT-77).
+    /// `runner integration` or one of its earlier, hidden spellings, `runner grant` and
+    /// `runner agent-login` (REQ-GRANT-41, REQ-GRANT-77, REQ-INTEGRATION-14,
+    /// REQ-INTEGRATION-15).
     pub(super) fn execute(self, path: &[&str]) -> CommandResult {
         match self.command {
             None => super::super::print_help(path),
@@ -289,7 +292,7 @@ fn grant_step(status: CredentialStatus, provider: AgentLoginProvider) -> Option<
                 .to_owned(),
         ),
         NextAction::Reconnect => Some(format!(
-            "the owner of the grant consents again with `useful grant create {provider} --replace`; only they can"
+            "the owner of the grant consents again with `useful integration connect {provider} --replace`; only they can"
         )),
         _ => runner_step(status, None),
     }
@@ -303,7 +306,8 @@ pub(super) struct Login<'a> {
 }
 
 /// The command or step a runner's next action names, each command a
-/// `useful grant` or `useful runner grant` one (REQ-GRANT-77). Reconnecting a login
+/// `useful integration` or `useful runner integration` one (REQ-GRANT-77,
+/// REQ-INTEGRATION-15). Reconnecting a login
 /// is the agent login's owner's to do, not the runner operator's, so that
 /// names the agent login.
 pub(super) fn runner_step(status: CredentialStatus, login: Option<Login<'_>>) -> Option<String> {
@@ -314,11 +318,11 @@ pub(super) fn runner_step(status: CredentialStatus, login: Option<Login<'_>>) ->
     );
     match status.next_action {
         NextAction::Reconnect => Some(format!(
-            "the owner of {agent_login} stores a new sign-in with `useful grant create {} --replace`; only they can",
+            "the owner of {agent_login} stores a new sign-in with `useful integration connect {} --replace`; only they can",
             login.as_ref().map_or("PROVIDER", |login| login.provider)
         )),
         NextAction::SyncRunner => {
-            Some("set grants up again with `useful runner grant sync`".to_owned())
+            Some("set grants up again with `useful runner integration sync`".to_owned())
         }
         NextAction::CheckTarget => Some(
             "the deployment does not serve this provider for the runner's operating system"

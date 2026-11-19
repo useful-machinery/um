@@ -3,6 +3,7 @@ use std::io::{self, Write as _};
 
 use clap::Args;
 
+use crate::cli::integration::{ListedToken, Listing, Reach};
 use crate::exit_code::ExitCode;
 use useful_api::{
     CommonIdentityFailure, GrantApi, GrantFailure, GrantUseList, HttpTransportPolicy,
@@ -13,7 +14,10 @@ use useful_human_auth::Deployment;
 
 use super::output::{self, Accounts};
 use super::projection;
-use super::{GRANT_HELP, GrantArg, Options, Resolved, every_grant, every_page, resolve, unrevoked};
+use super::{
+    Found, GrantArg, INTEGRATION_HELP, Options, Resolved, every_grant, every_page, lookup,
+    unrevoked,
+};
 
 pub(super) const ABOUT: &str = "List your grants with where each may run, or show one";
 
@@ -25,8 +29,8 @@ const IDENTITY_PAGE: u16 = 200;
 const USES_SHOWN: u16 = 20;
 
 #[derive(Debug, Args)]
-pub(super) struct Command {
-    #[arg(value_name = "GRANT", value_parser = super::parse_grant, help = GRANT_HELP)]
+pub(in crate::cli) struct Command {
+    #[arg(value_name = "INTEGRATION", value_parser = super::parse_grant, help = INTEGRATION_HELP)]
     grant: Option<GrantArg>,
 
     #[arg(
@@ -42,19 +46,22 @@ pub(super) struct Command {
     options: Options,
 }
 
-/// What the leaf read: every grant of the member with the providers the deployment serves, or
-/// the one `GRANT` names.
+/// What the leaf read: every grant of the member with the providers the deployment serves and
+/// whether it serves a token service, the one grant or token `INTEGRATION` names, or with
+/// `--org` alone that organization's tokens, and then its connections.
 enum Read {
-    Every(Vec<MemberGrant>, Vec<ServedGrantProvider>),
+    Every(Vec<MemberGrant>, Vec<ServedGrantProvider>, bool),
     One(Resolved),
+    Token(ListedToken),
+    Tokens(Listing),
 }
 
 impl Read {
     fn grants(&self) -> &[MemberGrant] {
         match self {
-            Self::Every(grants, _) => grants,
+            Self::Every(grants, ..) => grants,
             Self::One(Resolved::Grant(grant)) => std::slice::from_ref(grant),
-            Self::One(Resolved::Ambiguous { .. }) => &[],
+            Self::One(Resolved::Ambiguous { .. }) | Self::Token(_) | Self::Tokens(_) => &[],
         }
     }
 }
@@ -64,27 +71,63 @@ impl Command {
     /// the other OAuth providers they hold nothing of (REQ-GRANT-64, REQ-GRANT-96), or with
     /// `GRANT` the one grant it names, with no such read (REQ-GRANT-65). A deployment that
     /// predates the served read names none, and a read that fails otherwise fails the command
-    /// as a failed grant read does.
-    pub(super) fn run(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
+    /// as a failed grant read does. Each grant listed or shown states the side `reach` gives,
+    /// where it gives one (REQ-INTEGRATION-13).
+    ///
+    /// Where `reach` puts token services in reach, under `useful integration`, the list then
+    /// reads the member's tokens and each of their organizations', once the served read named a
+    /// token service, and the memberships and each organization's connections whatever is
+    /// served; a name that names no grant is looked up among the member's tokens; and `--org`
+    /// keeps that organization's tokens and connections alone, with no grant
+    /// (REQ-INTEGRATION-19, REQ-INTEGRATION-22).
+    pub(super) fn run(self, deployment: &Deployment, reach: &Reach) -> anyhow::Result<ExitCode> {
         let json = self.options.json;
         let read = super::with_api(deployment, &self.options, |api| {
-            let read = match &self.grant {
-                None => {
+            let read = match (&self.grant, reach.org()) {
+                (None, Some(_)) => {
+                    Read::Tokens(reach.tokens_listed(api, true)?.unwrap_or_default())
+                }
+                (None, None) => {
                     let mut grants: Vec<_> =
                         every_grant(api)?.into_iter().filter(unrevoked).collect();
                     // Cloud lists OAuth grants first; the order is kept whatever it sends.
                     grants.sort_by_key(|grant| grant.kind != MemberGrantKind::GrantKindOAuth);
-                    Read::Every(grants, api.served_providers()?.unwrap_or_default())
+                    // One read names both the providers and whether any token service is served.
+                    let served = api.served_integrations()?;
+                    let tokens = served
+                        .as_ref()
+                        .is_some_and(|served| !served.token_services.is_empty());
+                    let providers = served.map(|served| served.providers).unwrap_or_default();
+                    Read::Every(grants, providers, tokens)
                 }
-                Some(grant) => Read::One(resolve(api, grant)?),
+                (Some(name), _) => match lookup(api, name, reach)? {
+                    Found::Grant(resolved) => Read::One(resolved),
+                    Found::Token(token) => Read::Token(reach.shown(api, &token)),
+                },
             };
             let organizations = organization_slugs(api, read.grants());
             Ok((read, organizations))
         })?;
         let api_url = deployment.fingerprint().api_url();
+        let failed = |failure: &MemberGrantFailure| match (&self.grant, reach.org()) {
+            (Some(name), Some(_)) => reach
+                .report(api_url, failure, name.as_str())
+                .write(api_url, json),
+            _ => output::failure(api_url, failure, json),
+        };
         let (read, organizations) = match read {
             Ok(read) => read,
-            Err(failure) => return output::failure(api_url, &failure, json),
+            Err(failure) => return failed(&failure),
+        };
+        let allow_insecure_http = self.options.http.allow_insecure_http;
+        let read = match read {
+            Read::Tokens(listing) => {
+                match reach.connections_listed(deployment, allow_insecure_http, Some(listing))? {
+                    Ok(listing) => Read::Tokens(listing.unwrap_or_default()),
+                    Err(failure) => return output::failure(api_url, &failure, json),
+                }
+            }
+            read => read,
         };
         let uses = match &read {
             Read::One(Resolved::Grant(grant)) if grant.kind == MemberGrantKind::GrantKindOAuth => {
@@ -94,7 +137,8 @@ impl Command {
                     Err(failure) => return output::failure(api_url, &failure, json),
                 }
             }
-            // A native grant issues no token, so Cloud records no use of it (REQ-GRANT-62).
+            // A native grant issues no token, so Cloud records no use of it (REQ-GRANT-62), and
+            // `--uses` shows nothing of an integration token either.
             _ => None,
         };
         let identities = if read
@@ -111,27 +155,45 @@ impl Command {
             organizations,
         };
         match &read {
-            Read::Every(grants, served) => output::write_list(
-                api_url,
-                grants,
-                &projection::providers(served),
-                &accounts,
-                json,
-            ),
+            Read::Every(grants, served, tokens_served) => {
+                let listing = match super::with_api(deployment, &self.options, |api| {
+                    reach.tokens_listed(api, *tokens_served)
+                })? {
+                    Ok(listing) => listing,
+                    Err(failure) => return output::failure(api_url, &failure, json),
+                };
+                let listing =
+                    match reach.connections_listed(deployment, allow_insecure_http, listing)? {
+                        Ok(listing) => listing,
+                        Err(failure) => return output::failure(api_url, &failure, json),
+                    };
+                output::write_list(
+                    api_url,
+                    grants,
+                    &projection::providers(served),
+                    &accounts,
+                    reach.side(),
+                    listing.as_ref(),
+                    json,
+                )
+            }
             Read::One(Resolved::Grant(grant)) => output::write_grant(
                 api_url,
                 grant,
                 &accounts,
                 uses.as_ref().map(|page| page.items.as_slice()),
+                reach.side(),
                 json,
             ),
             Read::One(Resolved::Ambiguous { provider, ids }) => output::write_ambiguous(
                 api_url,
                 provider,
                 ids,
-                |id| format!("useful grant list {id}"),
+                |id| format!("useful integration list {id}"),
                 json,
             ),
+            Read::Token(token) => token.write_shown(api_url, json),
+            Read::Tokens(listing) => listing.write_alone(api_url, json),
         }
     }
 }

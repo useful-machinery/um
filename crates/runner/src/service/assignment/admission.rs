@@ -514,16 +514,15 @@ impl AssignmentManager {
             );
             // The admission reports where each provider's credential comes
             // from to Cloud once, before any step starts, from what the
-            // offer settled (REQ-GRANT-93, INV-RUNNER-31). Whatever Cloud
+            // offer settled, each token service Cloud listed that has a
+            // source included (REQ-GRANT-93, REQ-INTEGRATION-12,
+            // INV-RUNNER-31). Whatever Cloud
             // answers, a panic included, the admission goes on with the
             // offer as it is; a report Cloud does not take is the setup's
             // own record (REQ-TELEMETRY-48).
             if let Some(setup) = &agent_login_setup {
-                let sources = crate::agent_login::reported_sources(
-                    &offered.sources,
-                    &offered.offered,
-                    runtime.grant_tokens.as_deref(),
-                );
+                let sources =
+                    crate::agent_login::reported_sources(&offered, runtime.grant_tokens.as_deref());
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     setup.report_sources(&worker_offer.assignment_id, sources);
                 }));
