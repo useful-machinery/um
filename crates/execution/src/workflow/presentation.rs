@@ -18,7 +18,9 @@ use super::super::ExecutionOutcome;
 use super::admission::{AdmissionFailure, CancellationReason};
 use super::definition_store::DefinitionError;
 use super::document::FailurePolicy;
-use super::evidence::{BlockedDetail, FailureDetail, Prerequisite, PrimaryIssueDetail};
+use super::evidence::{
+    BlockedDetail, FailedChild, FailureDetail, Prerequisite, PrimaryIssueDetail,
+};
 use super::local_run::{
     CarryMiss, LocalRetryRejection, RetryIneligibilityReason, TreeCopyMismatch,
 };
@@ -40,8 +42,8 @@ use super::run_timing::{ObservationClock, ObservationTime};
 #[cfg(test)]
 use super::runtime::FailurePhase;
 use super::runtime::{
-    ActiveStepInvocation, RecoveryDecisionKind, RecoveryHandlerActivity, RecoveryHandlerKind,
-    RunOutcome, StepState, StepStateKind, TransitionEvent,
+    ActiveStepInvocation, EnteredWait, RecoveryDecisionKind, RecoveryHandlerActivity,
+    RecoveryHandlerKind, RunOutcome, StepState, StepStateKind, TransitionEvent,
 };
 #[cfg(test)]
 use super::step_runtime::{CommandExecutionFailure, StepExecutionFailure, StepFailureCause};
@@ -1163,6 +1165,9 @@ fn tree_code_message(code: &str) -> &'static str {
         }
         "root_only_block_outside_root" => {
             "Move the root-only block into the tree's root workflow.yaml."
+        }
+        "integration_undeclared" => {
+            "Declare the integration under the root's `requires.integrations`, or remove it from the override."
         }
         "program_directory_missing" => {
             "Create the directory the root's `programs` names, or remove the entry."
@@ -2340,11 +2345,18 @@ where
                     PresentationFailureOperation::InvalidTerminalResult,
                 ));
             };
-            let Some((state, detail, role)) = summary_step(step, details.success) else {
+            let Some((state, mut detail, role)) = summary_step(step, details.success) else {
                 return Err(PresentationFailure::operation(
                     PresentationFailureOperation::InvalidTerminalResult,
                 ));
             };
+            // A failed stage the attempt waits at gives the wait's kind (REQ-LOCALRUN-220).
+            if let (StepState::Succeeded { .. }, Some(_), RunOutcome::Waiting { wait }) =
+                (&step.state, &step.failed_child, &run.outcome)
+                && wait.step() == step.id
+            {
+                detail.push_str(&format!(" · waiting for {}", wait.kind_name()));
+            }
             rows.push(SummaryRow {
                 step: visible_text(&id),
                 kind: step_kind(definition),
@@ -2506,18 +2518,23 @@ where
             }
             RunOutcome::Cancelled { reason } => self.write_cancellation_line(*reason)?,
             RunOutcome::Waiting { wait } => {
+                let mut detail = format!(
+                    "{} · step {} · then {}",
+                    wait.kind_name(),
+                    visible_text(wait.step()),
+                    visible_text(wait.then()),
+                );
+                if let Some((stage, failed_child)) = waiting_failed_stage(run, wait, publication) {
+                    detail.push_str(&format!(
+                        " · stage {} failed at {}",
+                        visible_text(&stage),
+                        failed_node_path(&stage, &failed_child)
+                    ));
+                }
                 let line = format!(
                     "{} {}\n",
                     self.styled_token("wait:", TokenRole::Blocked),
-                    self.styled_text(
-                        &format!(
-                            "{} · step {} · then {}",
-                            wait.kind_name(),
-                            visible_text(wait.step()),
-                            visible_text(wait.then()),
-                        ),
-                        TextTone::Secondary,
-                    ),
+                    self.styled_text(&detail, TextTone::Secondary),
                 );
                 self.write_line_bytes(line.as_bytes())?;
             }
@@ -2762,9 +2779,12 @@ impl StepRecords<'_> {
                 vec![("start", detail, TokenRole::Active)]
             }
             StepStateKind::Succeeded => {
-                let outputs = match observed {
-                    Some(ObservedStepTransition::OutputsCommitted { outputs }) => outputs,
-                    _ => Vec::new(),
+                let (outputs, failed_child) = match observed {
+                    Some(ObservedStepTransition::OutputsCommitted {
+                        outputs,
+                        failed_child,
+                    }) => (outputs, failed_child),
+                    _ => (Vec::new(), None),
                 };
                 let definition = self.definition.steps.get(step);
                 let mut records = Vec::new();
@@ -2778,6 +2798,14 @@ impl StepRecords<'_> {
                             );
                         ("output", detail, TokenRole::Output)
                     }));
+                }
+                // A stage whose child failed completes `failed` with the child's failing node
+                // (REQ-LOCALRUN-220) and the outputs it committed (REQ-OUTPUTS-17).
+                if let Some(failed_child) = failed_child {
+                    let detail = failed_stage_detail(step, &failed_child, outputs.len());
+                    let detail = completion_detail(detail, self.finish(step, observed_at));
+                    records.push(("failed", detail, TokenRole::Failure));
+                    return records;
                 }
                 let detail = definition.map_or_else(String::new, |definition| {
                     super::render_style::success_detail(
@@ -3132,6 +3160,72 @@ pub(crate) fn canonical_blocked_detail(detail: &BlockedDetail) -> String {
     format!("prerequisites_unsatisfied · {prerequisites}")
 }
 
+/// The detail of the `workflow` step `step` whose child failed (REQ-LOCALRUN-220,
+/// REQ-LOCALRUN-221), which every reader that shows the step failed gives: the failed child
+/// as `failed_child_detail` gives it under the stage's path, with the `committed` outputs the
+/// step committed (REQ-OUTPUTS-17).
+pub(crate) fn failed_stage_detail(
+    step: &str,
+    failed_child: &FailedChild,
+    committed: usize,
+) -> String {
+    format!(
+        "{} · {}",
+        failed_child_detail(&failed_child.step_path(step), failed_child),
+        super::render_style::success_detail(false, committed)
+    )
+}
+
+/// A stage's failed child (REQ-LOCALRUN-220): the outcome the child recorded and its failing
+/// node by its path under the stage at `stage`, `<stage>.<node>` (REQ-LOCALRUN-200), with the
+/// node's state and failure detail as the `primary issue:` line gives them. `stage` is the
+/// stage's full path, a fan-out's element and a carried wait's nested path included.
+pub fn failed_child_detail(stage: &str, failed_child: &FailedChild) -> String {
+    let issue = failed_child.primary_issue();
+    let (state, detail) = match &issue.detail {
+        PrimaryIssueDetail::Failed(detail) => ("failed", canonical_failure_detail(detail)),
+        PrimaryIssueDetail::Blocked(detail) => ("blocked", canonical_blocked_detail(detail)),
+    };
+    format!(
+        "child outcome {} · {} {state} · {}",
+        visible_text(failed_child.outcome()),
+        failed_node_path(stage, failed_child),
+        visible_text(&detail)
+    )
+}
+
+/// The failing node of the failed child of the stage at `stage`, `<stage>.<node>`.
+fn failed_node_path(stage: &str, failed_child: &FailedChild) -> String {
+    format!(
+        "{}.{}",
+        visible_text(stage),
+        visible_text(&failed_child.primary_issue().node.id)
+    )
+}
+
+/// The failed stage at which the attempt waits and its child's failure (REQ-LOCALRUN-220):
+/// read from the published wait record's payload, whose `step` is the stage's full path, a
+/// carried wait's included (REQ-WFEXEC-75), or, when publication failed, from the waiting
+/// step's own record. A payload without the record, or one that does not read as one, names
+/// none.
+fn waiting_failed_stage(
+    run: &WorkflowRunResult,
+    wait: &EnteredWait,
+    publication: &PublicationPresentation<'_>,
+) -> Option<(String, FailedChild)> {
+    match publication {
+        PublicationPresentation::Published(terminal) => {
+            let record = terminal.wait()?;
+            Some((record.step_path(), record.failed_child()?))
+        }
+        PublicationPresentation::Failed(_) => {
+            let step = run.steps.iter().find(|step| step.id == wait.step())?;
+            let failed_child = step.failed_child.clone()?;
+            Some((failed_child.step_path(&step.id), failed_child))
+        }
+    }
+}
+
 fn completion_detail(detail: String, duration: Option<Duration>) -> String {
     match duration {
         Some(duration) => format!("{detail} after {}", human_duration(duration)),
@@ -3144,14 +3238,22 @@ fn summary_step(
     success: StepSuccessPresentation,
 ) -> Option<(&'static str, String, TokenRole)> {
     let (state, mut detail, role) = match &step.state {
-        StepState::Succeeded { outputs } => Some((
-            "succeeded",
-            super::render_style::success_detail(
-                matches!(success, StepSuccessPresentation::Command),
-                outputs.len(),
+        // A stage whose child failed is shown failed (REQ-LOCALRUN-220).
+        StepState::Succeeded { outputs } => Some(match &step.failed_child {
+            Some(failed_child) => (
+                "failed",
+                failed_stage_detail(&step.id, failed_child, outputs.len()),
+                TokenRole::Failure,
             ),
-            TokenRole::Success,
-        )),
+            None => (
+                "succeeded",
+                super::render_style::success_detail(
+                    matches!(success, StepSuccessPresentation::Command),
+                    outputs.len(),
+                ),
+                TokenRole::Success,
+            ),
+        }),
         StepState::Inherited { detail, .. } => Some((
             "inherited",
             super::render_style::inherited_detail(detail),
@@ -3302,6 +3404,8 @@ fn terminal_counts(run: &WorkflowRunResult) -> [(&'static str, usize); 7] {
             .flat_map(|finalization| &finalization.finalizers),
     ) {
         let index = match step.state {
+            // A stage whose child failed counts as failed (REQ-WFEXEC-41, REQ-LOCALRUN-220).
+            StepState::Succeeded { .. } if step.failed_child.is_some() => Some(1),
             StepState::Succeeded { .. } | StepState::Inherited { .. } => Some(0),
             StepState::Failed { .. } => Some(1),
             StepState::Blocked { .. } => Some(2),

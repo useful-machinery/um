@@ -25,7 +25,6 @@ pub type MemberGrant = models::Grant;
 pub type MemberGrantList = models::GrantList;
 pub type MemberGrantAuthorization = models::GrantAuthorization;
 pub type MemberGrantKind = models::grant::Kind;
-pub type MemberGrantProvider = models::grant::Provider;
 pub type MemberGrantState = models::grant::State;
 // A native grant's exchange with a runner and its ended authorizations are the agent-login
 // models the grant carries unchanged (REQ-GRANT-13).
@@ -42,7 +41,33 @@ impl MemberGrantKind {
     }
 }
 
+/// A provider this client has a built-in name for: the three OAuth providers it signs in to
+/// without asking the deployment, and the coding agents, the only native providers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MemberGrantProvider {
+    GrantProviderGithub,
+    GrantProviderGitlabCom,
+    GrantProviderLinear,
+    GrantProviderClaudeCode,
+    GrantProviderCodex,
+}
+
 impl MemberGrantProvider {
+    const ALL: [Self; 5] = [
+        Self::GrantProviderGithub,
+        Self::GrantProviderGitlabCom,
+        Self::GrantProviderLinear,
+        Self::GrantProviderClaudeCode,
+        Self::GrantProviderCodex,
+    ];
+
+    /// The provider a wire name names, or `None` for a name this client does not know.
+    pub fn from_wire(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|provider| provider.as_str() == name)
+    }
+
     /// The provider's wire name.
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -239,6 +264,33 @@ fn classify_error<E>(error: apis::Error<E>) -> MemberGrantFailure {
 /// The largest page the list serves.
 pub const MEMBER_GRANT_PAGE: i32 = 200;
 
+/// The provider vocabulary this release decodes (REQ-GRANT-95, REQ-GRANT-96): an answer may name
+/// a grant of any provider of the deployment's table, which this client shows by its id. It is
+/// sent on every operation that takes it, the grant list, a grant, its uses, a consent begun by
+/// provider or from an identity, a consent session and the identity list; a deployment that
+/// predates the parameter ignores it and names only the built-in providers.
+pub(crate) const PROVIDER_VOCABULARY: i32 = 2;
+
+/// Whether `name` has the shape of a provider id: a lowercase letter followed by at most 62
+/// lowercase letters, digits, dots and hyphens, the shape the deployment's table admits
+/// (REQ-PROVIDER-1). Every OAuth provider is named so, and `codex`, but not `claude_code`.
+pub fn valid_provider_id(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes.next().is_some_and(|first| first.is_ascii_lowercase())
+        && name.len() <= 63
+        && bytes.all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'.' || byte == b'-'
+        })
+}
+
+/// Whether an answer may name `name` as an OAuth grant's provider (REQ-GRANT-96): any provider
+/// id but a coding agent's, since the coding agents are the native providers and no others.
+pub(crate) fn oauth_provider(name: &str) -> bool {
+    valid_provider_id(name)
+        && MemberGrantProvider::from_wire(name)
+            .is_none_or(|provider| provider.kind() == MemberGrantKind::GrantKindOAuth)
+}
+
 /// The member's active organizations on one page, each as its ID and slug, and the cursor of
 /// the next page.
 type OrganizationPage = (Vec<(String, String)>, Option<String>);
@@ -284,9 +336,14 @@ impl MemberGrantApi {
         cursor: Option<&str>,
     ) -> Result<MemberGrantList, MemberGrantFailure> {
         let filter = kind.map_or("all", MemberGrantKind::as_str);
-        let page =
-            apis::principals_api::list_grants(&self.configuration, Some(filter), limit, cursor)
-                .map_err(classify_error)?;
+        let page = apis::principals_api::list_grants(
+            &self.configuration,
+            Some(filter),
+            limit,
+            cursor,
+            Some(PROVIDER_VOCABULARY),
+        )
+        .map_err(classify_error)?;
         if !page
             .items
             .iter()
@@ -297,12 +354,12 @@ impl MemberGrantApi {
         Ok(page)
     }
 
-    /// The providers this deployment serves grants for (REQ-GRANT-78), or `None` from a
-    /// deployment that predates the read and answers its route 404, which says nothing of what
-    /// it serves. The answer is read as text rather than into the generated enumeration, so a
-    /// provider a later deployment serves and this client does not know is passed over
-    /// (REQ-GRANT-75).
-    pub fn served_providers(&self) -> Result<Option<Vec<MemberGrantProvider>>, MemberGrantFailure> {
+    /// The providers this deployment serves grants for that this release can use, in its order
+    /// (REQ-GRANT-78), or `None` from a deployment that predates the read and answers its route
+    /// 404, which says nothing of what it serves. The answer is read as text rather than into the
+    /// generated models, so a provider a later deployment serves that this release cannot use is
+    /// passed over (REQ-GRANT-75).
+    pub fn served_providers(&self) -> Result<Option<Vec<ServedGrantProvider>>, MemberGrantFailure> {
         let endpoint = format!(
             "{}/v1/me/grant-providers",
             self.configuration.base_path.trim_end_matches('/')
@@ -322,8 +379,12 @@ impl MemberGrantApi {
 
     /// One of the member's grants of either kind, by its ID (REQ-GRANT-58).
     pub fn get(&self, grant_id: &str) -> Result<MemberGrant, MemberGrantFailure> {
-        let grant = apis::principals_api::get_grant(&self.configuration, grant_id)
-            .map_err(classify_error)?;
+        let grant = apis::principals_api::get_grant(
+            &self.configuration,
+            grant_id,
+            Some(PROVIDER_VOCABULARY),
+        )
+        .map_err(classify_error)?;
         if grant.id != grant_id || !valid_grant(&grant) {
             return Err(invalid());
         }
@@ -476,7 +537,7 @@ impl MemberGrantApi {
         // A slug is not checked: the grant names its organization by ID.
         let named = !useful_support::valid_typed_id(organization, "org_")
             || grant.organization_id.as_deref() == Some(organization);
-        if grant.provider != provider || !named || !valid_grant(&grant) {
+        if grant.provider != provider.as_str() || !named || !valid_grant(&grant) {
             return Err(invalid());
         }
         Ok(grant)
@@ -549,39 +610,90 @@ fn authorization_prefix(grant_id: &str) -> Option<&'static str> {
     }
 }
 
-/// One entry of the served-providers answer, as the text it carries.
+/// A provider a deployment serves grants for that this release can use (REQ-GRANT-78): an OAuth
+/// provider named by a provider id, or a coding agent, with the name the deployment gives it for
+/// people when that name is fit to print.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ServedGrantProvider {
+    /// The provider's id, as a grant and a consent name it.
+    pub name: String,
+    pub kind: MemberGrantKind,
+    /// The deployment's name for the provider, kept only when it meets the rule the
+    /// deployment's table holds it to.
+    pub display_name: Option<String>,
+}
+
+/// One entry of the served-providers answer, as the text it carries. The display name is read as
+/// any value, since one that is not a printable string is as if absent.
 #[derive(serde::Deserialize)]
-struct ServedProvider {
+#[serde(rename_all = "camelCase")]
+struct ServedEntry {
     provider: String,
     kind: String,
+    #[serde(default)]
+    display_name: serde_json::Value,
 }
 
 #[derive(serde::Deserialize)]
-struct ServedProviders {
-    items: Vec<ServedProvider>,
+struct ServedEntries {
+    items: Vec<ServedEntry>,
 }
 
-/// The providers a served-providers answer names that this client knows, in its order. Each
-/// must be named once and with its own kind; a name this client does not know is ignored,
-/// whatever its kind.
-fn served(body: &[u8]) -> Result<Vec<MemberGrantProvider>, MemberGrantFailure> {
-    let list: ServedProviders = serde_json::from_slice(body).map_err(|_| invalid())?;
-    let mut served = Vec::with_capacity(list.items.len());
+/// The longest display name the deployment's table admits, in bytes.
+const DISPLAY_NAME_BYTES: usize = 64;
+
+/// The display name of a served entry when it meets the table's rule: 1 to 64 bytes, with no
+/// control character and no surrounding whitespace. It is another party's text bound for a
+/// terminal, so anything else is dropped rather than refused.
+fn display_name(value: serde_json::Value) -> Option<String> {
+    let serde_json::Value::String(name) = value else {
+        return None;
+    };
+    (!name.is_empty()
+        && name.len() <= DISPLAY_NAME_BYTES
+        && name.trim() == name
+        && !name.chars().any(char::is_control))
+    .then_some(name)
+}
+
+/// The providers a served-providers answer names that this release can use, in its order: each
+/// `oauth` entry named by a provider id, and `claude_code` and `codex` as `native`. An entry of
+/// another kind, another `native` name or an `oauth` name outside the id shape is passed over.
+/// A provider kept is named once, and a built-in one only with its own kind.
+fn served(body: &[u8]) -> Result<Vec<ServedGrantProvider>, MemberGrantFailure> {
+    let list: ServedEntries = serde_json::from_slice(body).map_err(|_| invalid())?;
+    let mut served: Vec<ServedGrantProvider> = Vec::with_capacity(list.items.len());
     for item in list.items {
-        let Ok(provider) =
-            serde_json::from_value::<MemberGrantProvider>(serde_json::Value::String(item.provider))
-        else {
-            continue;
+        let kind = match item.kind.as_str() {
+            "oauth" => MemberGrantKind::GrantKindOAuth,
+            "native" => MemberGrantKind::GrantKindNative,
+            _ => continue,
         };
-        if served.contains(&provider) || item.kind != provider.kind().as_str() {
+        let built_in = MemberGrantProvider::from_wire(&item.provider);
+        if built_in.is_some_and(|provider| provider.kind() != kind) {
             return Err(invalid());
         }
-        served.push(provider);
+        let usable = match kind {
+            MemberGrantKind::GrantKindOAuth => oauth_provider(&item.provider),
+            MemberGrantKind::GrantKindNative => built_in.is_some(),
+        };
+        if !usable {
+            continue;
+        }
+        if served.iter().any(|kept| kept.name == item.provider) {
+            return Err(invalid());
+        }
+        served.push(ServedGrantProvider {
+            name: item.provider,
+            kind,
+            display_name: display_name(item.display_name),
+        });
     }
     Ok(served)
 }
 
-/// A grant whose ID, provider and kind agree, with the members its kind requires.
+/// A grant whose ID, provider and kind agree, with the members its kind requires: a native
+/// grant's provider is a coding agent, and an OAuth grant's any other provider id.
 fn valid_grant(value: &MemberGrant) -> bool {
     let kind_members = match value.kind {
         MemberGrantKind::GrantKindOAuth => value
@@ -605,8 +717,13 @@ fn valid_grant(value: &MemberGrant) -> bool {
         MemberGrantKind::GrantKindOAuth => "pga_",
         MemberGrantKind::GrantKindNative => "aga_",
     };
+    let provider = match value.kind {
+        MemberGrantKind::GrantKindOAuth => oauth_provider(&value.provider),
+        MemberGrantKind::GrantKindNative => MemberGrantProvider::from_wire(&value.provider)
+            .is_some_and(|provider| provider.kind() == MemberGrantKind::GrantKindNative),
+    };
     authorization_prefix(&value.id) == Some(authorization_kind)
-        && value.provider.kind() == value.kind
+        && provider
         && value.generation >= 1
         && !value.created_at.is_empty()
         && kind_members
@@ -834,6 +951,90 @@ mod tests {
         }
     }
 
+    /// What `call` answers when the deployment answers `body`, and the request it sent.
+    fn read(
+        body: &serde_json::Value,
+        call: impl FnOnce(&MemberGrantApi) -> Result<(), MemberGrantFailure>,
+    ) -> (Result<(), MemberGrantFailure>, String) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let body = body.to_string();
+        let server = useful_test_support::ScriptedHttpServer::respond(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_bytes(),
+        );
+        let api = MemberGrantApi::new(
+            &server.api_url,
+            "fixture-token",
+            HttpTransportPolicy::AllowInsecureHttp,
+        )
+        .unwrap();
+        let result = call(&api);
+        (result, server.finish_one())
+    }
+
+    // REQ-GRANT-58
+    // REQ-GRANT-96
+    // REQ-COMPAT-20
+    #[test]
+    fn a_grant_of_any_well_formed_oauth_provider_is_read_and_one_of_another_kind_is_invalid() {
+        const ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abc";
+        const NATIVE_ID: &str = "agl_01k0z6r1w8f4jy2m7q9v3x5abc";
+        let longest = format!("a{}", "b".repeat(62));
+        let too_long = format!("a{}", "b".repeat(63));
+        for (id, kind, provider, want) in [
+            (ID, "oauth", "github", Ok(())),
+            (ID, "oauth", "example", Ok(())),
+            (ID, "oauth", "acme-2.example", Ok(())),
+            (ID, "oauth", longest.as_str(), Ok(())),
+            (ID, "oauth", too_long.as_str(), Err(invalid())),
+            (ID, "oauth", "codex", Err(invalid())),
+            (ID, "oauth", "claude_code", Err(invalid())),
+            (ID, "oauth", "Example", Err(invalid())),
+            (ID, "oauth", "exa_mple", Err(invalid())),
+            (ID, "oauth", "1password", Err(invalid())),
+            (ID, "oauth", "", Err(invalid())),
+            (NATIVE_ID, "native", "codex", Ok(())),
+            (NATIVE_ID, "native", "example", Err(invalid())),
+            (NATIVE_ID, "native", "github", Err(invalid())),
+        ] {
+            let mut grant = serde_json::json!({
+                "id": id,
+                "kind": kind,
+                "provider": provider,
+                "state": "active",
+                "generation": 1,
+                "createdAt": "2026-11-01T09:00:00Z",
+                "authorizations": [],
+                "identityId": "idn_01k0z6r1w8f4jy2m7q9v3x5abc"
+            });
+            if kind == "native" {
+                grant["identityId"] = serde_json::Value::Null;
+                grant["organizationId"] = "org_01k0z6r1w8f4jy2m7q9v3x5abc".into();
+            }
+            let page = serde_json::json!({"items": [grant.clone()], "nextCursor": null});
+            let (listed, request) = read(&page, |api| {
+                api.list(None, Some(MEMBER_GRANT_PAGE), Some("grants-2"))
+                    .map(|_| ())
+            });
+            assert_eq!(listed, want, "list {kind} {provider}");
+            assert!(
+                request.starts_with(
+                    "GET /api/v1/me/grants?kind=all&limit=200&cursor=grants-2&vocabulary=2 "
+                ),
+                "{request}"
+            );
+            let (got, request) = read(&grant, |api| api.get(id).map(|_| ()));
+            assert_eq!(got, want, "get {kind} {provider}");
+            assert!(
+                request.starts_with(&format!("GET /api/v1/me/grants/{id}?vocabulary=2 ")),
+                "{request}"
+            );
+        }
+    }
+
     // REQ-GRANT-64
     // REQ-GRANT-13
     // REQ-GRANT-27
@@ -892,31 +1093,86 @@ mod tests {
         }
     }
 
+    fn served_oauth(name: &str, display_name: Option<&str>) -> ServedGrantProvider {
+        ServedGrantProvider {
+            name: name.to_owned(),
+            kind: MemberGrantKind::GrantKindOAuth,
+            display_name: display_name.map(str::to_owned),
+        }
+    }
+
+    // REQ-GRANT-78
     // REQ-GRANT-75
     #[test]
-    fn a_served_provider_this_client_does_not_know_is_ignored() {
-        use MemberGrantProvider as P;
-        // A later deployment may serve a provider, of a kind, this client was built before.
+    fn a_served_provider_this_release_cannot_use_is_passed_over() {
+        // A later deployment may serve a provider of a kind, or named in a shape, this release was
+        // built before; it keeps every OAuth provider of the id shape and the two coding agents.
         let body = serde_json::json!({"items": [
-            {"provider": "github", "kind": "oauth"},
-            {"provider": "bitbucket", "kind": "oauth"},
+            {"provider": "github", "kind": "oauth", "displayName": "GitHub"},
+            {"provider": "example", "kind": "oauth", "displayName": "Example Cloud"},
+            {"provider": "acme-2.example", "kind": "oauth"},
+            {"provider": "Example", "kind": "oauth"},
+            {"provider": "exa_mple", "kind": "oauth"},
             {"provider": "cursor", "kind": "hosted"},
-            {"provider": "codex", "kind": "native"},
+            {"provider": "cursor", "kind": "hosted"},
+            {"provider": "aider", "kind": "native"},
+            {"provider": "codex", "kind": "native", "displayName": "Codex"},
         ]});
         assert_eq!(
             served(body.to_string().as_bytes()),
-            Ok(vec![P::GrantProviderGithub, P::GrantProviderCodex])
+            Ok(vec![
+                served_oauth("github", Some("GitHub")),
+                served_oauth("example", Some("Example Cloud")),
+                served_oauth("acme-2.example", None),
+                ServedGrantProvider {
+                    name: "codex".to_owned(),
+                    kind: MemberGrantKind::GrantKindNative,
+                    display_name: Some("Codex".to_owned()),
+                },
+            ])
         );
         assert_eq!(served(br#"{"items": []}"#), Ok(Vec::new()));
 
-        // A provider it does know is named once and with its own kind.
+        // A display name is kept only as the deployment's table holds one, since it is printed;
+        // any other is as if absent.
+        let longest = "\u{e9}".repeat(32);
+        let too_long = "\u{e9}".repeat(33);
+        for (display_name, kept) in [
+            (serde_json::json!("Example Cloud"), true),
+            (serde_json::json!(longest), true),
+            (serde_json::json!(too_long), false),
+            (serde_json::json!(""), false),
+            (serde_json::json!(" Example"), false),
+            (serde_json::json!("Example\t"), false),
+            (serde_json::json!("Exa\u{1b}[31mmple"), false),
+            (serde_json::json!(42), false),
+            (serde_json::Value::Null, false),
+        ] {
+            let body = serde_json::json!({"items": [
+                {"provider": "example", "kind": "oauth", "displayName": display_name},
+            ]});
+            let want = served_oauth("example", display_name.as_str().filter(|_| kept));
+            assert_eq!(
+                served(body.to_string().as_bytes()),
+                Ok(vec![want]),
+                "{display_name}"
+            );
+        }
+
+        // A provider it keeps is named once, and a built-in one with its own kind.
         for body in [
+            serde_json::json!({"items": [
+                {"provider": "example", "kind": "oauth"},
+                {"provider": "example", "kind": "oauth", "displayName": "Example Cloud"},
+            ]}),
             serde_json::json!({"items": [
                 {"provider": "codex", "kind": "native"},
                 {"provider": "codex", "kind": "native"},
             ]}),
             serde_json::json!({"items": [{"provider": "codex", "kind": "oauth"}]}),
+            serde_json::json!({"items": [{"provider": "github", "kind": "native"}]}),
             serde_json::json!({"items": [{"provider": "codex"}]}),
+            serde_json::json!({"items": [{"kind": "oauth"}]}),
             serde_json::json!({}),
         ] {
             assert_eq!(

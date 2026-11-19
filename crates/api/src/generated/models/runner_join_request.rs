@@ -21,6 +21,9 @@ pub struct RunnerJoinRequest {
     pub schema_version: i32,
     #[serde(rename = "credentialSecretVerifier")]
     pub credential_secret_verifier: String,
+    /// The runner the host was enrolled as before, which a rejoin names so the service can decide by that runner's registration in the key's organization. Optional and never null; a join without it is an ordinary join.
+    #[serde(rename = "previousRunnerId", skip_serializing_if = "Option::is_none")]
+    pub previous_runner_id: Option<String>,
 }
 
 impl RunnerJoinRequest {
@@ -28,6 +31,7 @@ impl RunnerJoinRequest {
         RunnerJoinRequest {
             schema_version,
             credential_secret_verifier,
+            previous_runner_id: None,
         }
     }
 }

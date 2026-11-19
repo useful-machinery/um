@@ -58,7 +58,8 @@ const RESOLUTION_FILE: &str = "resolution.json";
 /// The binding kinds whose resolved provider ids the mirror uses (REQ-WFDEF-32).
 const RESOLVED_KINDS: [&str; 2] = ["linear.team", "linear.state"];
 
-/// The executable a tree run supervises: this runner's own `useful` release.
+/// The executable a tree run supervises, or the one its workflow-Git helper runs: this
+/// runner's own `useful` release.
 pub(super) type UsefulExecutable = Arc<dyn Fn() -> std::io::Result<PathBuf> + Send + Sync>;
 
 /// What the runner needs to execute published trees.
@@ -66,6 +67,7 @@ pub(super) type UsefulExecutable = Arc<dyn Fn() -> std::io::Result<PathBuf> + Se
 pub(super) struct TreeRunDependencies {
     broker: Option<Arc<dyn TreeBroker>>,
     executable: UsefulExecutable,
+    helper_executable: UsefulExecutable,
     intervals: ResumeIntervals,
     command_bound: Duration,
     deliveries: Inbox<TriggerDelivery>,
@@ -77,6 +79,7 @@ impl TreeRunDependencies {
         Self {
             broker,
             executable: Arc::new(std::env::current_exe),
+            helper_executable: Arc::new(std::env::current_exe),
             intervals: ResumeIntervals::default(),
             command_bound: command::SHORT_COMMAND_BOUND,
             deliveries: Inbox::default(),
@@ -96,10 +99,24 @@ impl TreeRunDependencies {
         self.controls.push(assignment_id, control);
     }
 
+    /// The executable the workspace's workflow-Git helper runs in its internal helper mode
+    /// (REQ-RUNNERENROLL-121).
+    pub(super) fn helper_executable(&self) -> std::io::Result<PathBuf> {
+        (self.helper_executable)()
+    }
+
     /// Supervises `executable` in place of the running `useful` executable.
     #[cfg(test)]
     pub(super) fn with_executable(mut self, executable: PathBuf) -> Self {
         self.executable = Arc::new(move || Ok(executable.clone()));
+        self
+    }
+
+    /// Runs the workflow-Git helper with `executable` in place of the running `useful`
+    /// executable.
+    #[cfg(test)]
+    pub(super) fn with_helper_executable(mut self, executable: PathBuf) -> Self {
+        self.helper_executable = Arc::new(move || Ok(executable.clone()));
         self
     }
 
@@ -201,6 +218,10 @@ struct TreeLayout {
     tree: PathBuf,
     home: PathBuf,
     bindings: PathBuf,
+    /// The origin a GitHub project's workspace checkout cloned, recorded when the runner
+    /// installs its Git relay for it, which a continuation reinstalls for the same origin
+    /// (REQ-RUNNERENROLL-122).
+    origin: PathBuf,
     inputs: PathBuf,
     log: PathBuf,
     documents: PathBuf,
@@ -212,6 +233,7 @@ impl TreeLayout {
             tree: private.join("tree"),
             home: private.join("home"),
             bindings: private.join("bindings.json"),
+            origin: private.join("tree-origin"),
             inputs: private.join("tree-inputs"),
             log: private.join("tree-run.log"),
             documents: private.join("tree-run.json"),
@@ -223,6 +245,23 @@ impl TreeLayout {
 /// home an adopting attempt looks for in each earlier attempt of the run.
 pub(super) fn tree_home(private: &Path) -> PathBuf {
     TreeLayout::under(private).home
+}
+
+/// Records in the assignment's private directory, beside the run-scoped home, the origin
+/// its workspace checkout cloned and its Git relay serves: an attempt that adopts the run
+/// clones nothing, and reinstalls the relay for this origin (REQ-RUNNERENROLL-122).
+pub(super) fn record_origin(private: &Path, origin: &str) -> std::io::Result<()> {
+    write_private(&TreeLayout::under(private).origin, origin.as_bytes())
+}
+
+/// The origin the attempt whose private directory is `private` recorded, or none when it
+/// recorded none: its project is on GitLab, or an earlier release created the run.
+pub(super) fn recorded_origin(private: &Path) -> std::io::Result<Option<Arc<str>>> {
+    match std::fs::read_to_string(TreeLayout::under(private).origin) {
+        Ok(origin) => Ok(Some(Arc::from(origin))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
 }
 
 /// How a tree run's first command starts it.
@@ -604,7 +643,8 @@ fn resolution_record(resolution: &serde_json::Value) -> serde_json::Value {
 }
 
 /// `useful workflow run create` for the run: the run inputs, the start's owner, the stop step,
-/// and the Cloud run page as `external.url` (REQ-LOCALRUN-209). The stop step is the
+/// the Cloud run page as `external.url` (REQ-LOCALRUN-209), and the pinned source as the
+/// engine path derives it (REQ-RUNNERENROLL-120). The stop step is the
 /// start's own as named, which the runtime refuses when it cannot hold before it, or, on an
 /// edge-scheduled root with pending deliveries, the runner's own before the first step.
 fn create_arguments(
@@ -639,6 +679,17 @@ fn create_arguments(
     }
     if let Some(url) = &tree.run_url {
         arguments.extend(["--external".into(), format!("url={url}").into()]);
+    }
+    // Each value inside its name's argument, so a branch that begins with `-` is not read
+    // as a flag.
+    let source = super::assignment::source_revision(execution_spec);
+    let mut names = vec![("commit", source.commit_oid())];
+    names.extend(source.branch().map(|branch| ("branch", branch)));
+    if let Some((branch, commit_oid)) = source.definition() {
+        names.extend([("workflowBranch", branch), ("workflowCommit", commit_oid)]);
+    }
+    for (name, value) in names {
+        arguments.extend(["--source-revision".into(), format!("{name}={value}").into()]);
     }
     if let Some(step) = stop_before {
         arguments.extend(["--stop-before".into(), step.into()]);

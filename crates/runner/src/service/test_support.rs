@@ -25,9 +25,10 @@ use useful_test_support::watchdog::{FIXTURE_WAIT_BASE, WatchdogExpired, host_sca
 use crate::agent_login::ServiceEnvironment;
 use crate::agent_login::check::{LoginCheck, LoginCheckOutcome};
 use crate::agent_login::cloud::{
-    AgentLoginCloud, CloudFailure, Delivery, DeliveryFailure, DeliveryRefusal, DeliveryRequest,
-    GrantAccessToken, GrantTokenFailure, GrantTokenRequest, IssuedToken, LoginMaterial,
-    LoginStatus, ProviderLogin, StatusRequest,
+    AgentLoginCloud, CloudFailure, CredentialSourcesFailure, CredentialSourcesRequest, Delivery,
+    DeliveryFailure, DeliveryRefusal, DeliveryRequest, GrantAccessToken, GrantProvider,
+    GrantProvidersFailure, GrantProvidersRequest, GrantTokenFailure, GrantTokenRequest,
+    IssuedToken, ListedProvider, LoginMaterial, LoginStatus, ProviderLogin, StatusRequest,
 };
 use crate::agent_login::readiness::Installation;
 use crate::agent_login::setup::{AssignmentGate, SetupDependencies};
@@ -1000,12 +1001,41 @@ pub(crate) const FAKE_GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abc";
 /// token file may hold.
 pub(crate) const FAKE_GRANT_TOKEN_SENTINEL: &str = "grant-token-sentinel";
 
-/// The token the fake Cloud issues for `provider` at `generation`.
-pub(crate) fn fake_grant_token(provider: AgentLoginProvider, generation: u64) -> String {
-    format!(
-        "{FAKE_GRANT_TOKEN_SENTINEL}-{}-{generation}",
-        provider.as_str()
-    )
+/// The token the fake Cloud issues for `provider` at `generation`: one of
+/// the runner's three by the name `AgentLoginProvider::as_str` gives it, a
+/// configured provider by its id.
+pub(crate) fn fake_grant_token<P>(provider: P, generation: u64) -> String
+where
+    P: TryInto<GrantProvider>,
+    P::Error: std::fmt::Debug,
+{
+    let provider = grant_provider(provider);
+    let name = match provider.agent_login_provider() {
+        Some(provider) => provider.as_str(),
+        None => provider.cloud_id(),
+    };
+    format!("{FAKE_GRANT_TOKEN_SENTINEL}-{name}-{generation}")
+}
+
+/// `provider` as a grant provider: a `GrantProvider`, or one of the
+/// runner's three as an `AgentLoginProvider`.
+fn grant_provider<P>(provider: P) -> GrantProvider
+where
+    P: TryInto<GrantProvider>,
+    P::Error: std::fmt::Debug,
+{
+    provider
+        .try_into()
+        .expect("a test names a provider that has a grant token")
+}
+
+/// A request the fake Cloud took on a grant route, as it arrived.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum FakeGrantRequest {
+    /// A request for an assignment's providers.
+    Providers(GrantProvidersRequest),
+    /// A request for one provider's token.
+    Token(GrantTokenRequest),
 }
 
 /// What the fake Cloud answers a grant-token request for one provider.
@@ -1033,7 +1063,8 @@ type GrantRequestHook = Box<dyn Fn(&GrantTokenRequest) + Send + Sync>;
 /// request with what the test last set, or the next one only with what it set
 /// for it, and delivers the fake material for the generation asked for, or
 /// fails or refuses each delivery as the test last set. It counts both
-/// requests and keeps each status request.
+/// requests and keeps each status request, and each credential-source
+/// report, which it answers as the test last set.
 pub(crate) struct FakeAgentLoginCloud {
     answer: Mutex<Result<Vec<ProviderLogin>, CloudFailure>>,
     later: Mutex<Option<Result<Vec<ProviderLogin>, CloudFailure>>>,
@@ -1043,11 +1074,16 @@ pub(crate) struct FakeAgentLoginCloud {
     status_requests: AtomicU64,
     reports: Mutex<Vec<StatusRequest>>,
     deliveries: AtomicU64,
-    grant_tokens: Mutex<Vec<(AgentLoginProvider, FakeGrantToken)>>,
+    grant_tokens: Mutex<Vec<(GrantProvider, FakeGrantToken)>>,
     /// The wait and the expiry each issued token carries.
     grant_terms: Mutex<(Duration, time::OffsetDateTime)>,
-    grant_requests: Mutex<Vec<GrantTokenRequest>>,
+    grant_providers_answer: Mutex<Result<Vec<ListedProvider>, GrantProvidersFailure>>,
+    /// Each provider-list and grant-token request, in the order they
+    /// arrived.
+    grant_requests: Mutex<Vec<FakeGrantRequest>>,
     grant_request_hook: Mutex<Option<GrantRequestHook>>,
+    credential_sources_answer: Mutex<Result<(), CredentialSourcesFailure>>,
+    credential_source_reports: Mutex<Vec<CredentialSourcesRequest>>,
 }
 
 impl FakeAgentLoginCloud {
@@ -1063,17 +1099,55 @@ impl FakeAgentLoginCloud {
             deliveries: AtomicU64::new(0),
             grant_tokens: Mutex::new(Vec::new()),
             grant_terms: Mutex::new((FAKE_GRANT_REFRESH_AFTER, fake_grant_expiry())),
+            grant_providers_answer: Mutex::new(Err(GrantProvidersFailure::NoRoute)),
             grant_requests: Mutex::new(Vec::new()),
             grant_request_hook: Mutex::new(None),
+            credential_sources_answer: Mutex::new(Err(CredentialSourcesFailure::NoRoute)),
+            credential_source_reports: Mutex::new(Vec::new()),
         })
+    }
+
+    /// What later credential-source reports answer; until a test sets one,
+    /// each is answered as by a Cloud without the route.
+    pub(crate) fn answer_credential_sources(&self, answer: Result<(), CredentialSourcesFailure>) {
+        *self
+            .credential_sources_answer
+            .lock()
+            .expect("fake Cloud mutex poisoned") = answer;
+    }
+
+    /// Each credential-source report answered so far, in the order they
+    /// arrived.
+    pub(crate) fn credential_source_reports(&self) -> Vec<CredentialSourcesRequest> {
+        self.credential_source_reports
+            .lock()
+            .expect("fake Cloud mutex poisoned")
+            .clone()
     }
 
     /// What later grant-token requests for `provider` answer; until a test
     /// sets one, each is answered as by a Cloud without the route.
-    pub(crate) fn answer_grant_token(&self, provider: AgentLoginProvider, answer: FakeGrantToken) {
+    pub(crate) fn answer_grant_token<P>(&self, provider: P, answer: FakeGrantToken)
+    where
+        P: TryInto<GrantProvider>,
+        P::Error: std::fmt::Debug,
+    {
+        let provider = grant_provider(provider);
         let mut answers = self.grant_tokens.lock().expect("fake Cloud mutex poisoned");
         answers.retain(|(answered, _)| *answered != provider);
         answers.push((provider, answer));
+    }
+
+    /// What later provider-list requests answer; until a test sets one,
+    /// each is answered as by a Cloud without the route.
+    pub(crate) fn answer_grant_providers(
+        &self,
+        answer: Result<Vec<ListedProvider>, GrantProvidersFailure>,
+    ) {
+        *self
+            .grant_providers_answer
+            .lock()
+            .expect("fake Cloud mutex poisoned") = answer;
     }
 
     /// The wait before asking again and the expiry each later issued token
@@ -1100,7 +1174,31 @@ impl FakeAgentLoginCloud {
         self.grant_requests
             .lock()
             .expect("fake Cloud mutex poisoned")
-            .clone()
+            .iter()
+            .filter_map(|request| match request {
+                FakeGrantRequest::Token(request) => Some(request.clone()),
+                FakeGrantRequest::Providers(_) => None,
+            })
+            .collect()
+    }
+
+    /// Each provider-list request answered so far, in the order they
+    /// arrived, each with the number of grant-token requests that arrived
+    /// before it.
+    pub(crate) fn grant_providers_requests(&self) -> Vec<(usize, GrantProvidersRequest)> {
+        let mut tokens = 0;
+        self.grant_requests
+            .lock()
+            .expect("fake Cloud mutex poisoned")
+            .iter()
+            .filter_map(|request| match request {
+                FakeGrantRequest::Token(_) => {
+                    tokens += 1;
+                    None
+                }
+                FakeGrantRequest::Providers(request) => Some((tokens, request.clone())),
+            })
+            .collect()
     }
 
     /// What later status requests answer.
@@ -1233,7 +1331,7 @@ impl AgentLoginCloud for FakeAgentLoginCloud {
         self.grant_requests
             .lock()
             .expect("fake Cloud mutex poisoned")
-            .push(request.clone());
+            .push(FakeGrantRequest::Token(request.clone()));
         let answer = self
             .grant_tokens
             .lock()
@@ -1251,7 +1349,7 @@ impl AgentLoginCloud for FakeAgentLoginCloud {
                 grant_id: FAKE_GRANT_ID.to_owned(),
                 generation,
                 access_token: GrantAccessToken::new(
-                    fake_grant_token(request.provider, generation).as_bytes(),
+                    fake_grant_token(request.provider.clone(), generation).as_bytes(),
                 )
                 .expect("the fake grant token is one of the token's form"),
                 expires_at,
@@ -1259,6 +1357,34 @@ impl AgentLoginCloud for FakeAgentLoginCloud {
             }),
             FakeGrantToken::Fail(failure) => Err(failure),
         }
+    }
+
+    fn grant_providers(
+        &self,
+        request: &GrantProvidersRequest,
+    ) -> Result<Vec<ListedProvider>, GrantProvidersFailure> {
+        self.grant_requests
+            .lock()
+            .expect("fake Cloud mutex poisoned")
+            .push(FakeGrantRequest::Providers(request.clone()));
+        self.grant_providers_answer
+            .lock()
+            .expect("fake Cloud mutex poisoned")
+            .clone()
+    }
+
+    fn credential_sources(
+        &self,
+        request: &CredentialSourcesRequest,
+    ) -> Result<(), CredentialSourcesFailure> {
+        self.credential_source_reports
+            .lock()
+            .expect("fake Cloud mutex poisoned")
+            .push(request.clone());
+        *self
+            .credential_sources_answer
+            .lock()
+            .expect("fake Cloud mutex poisoned")
     }
 }
 
@@ -1359,11 +1485,33 @@ pub(crate) fn fake_agent_login_setup(
     state_directory: &Path,
     recorder: Arc<Recorder>,
 ) -> SetupDependencies {
+    fake_agent_login_setup_serving(cloud, home, &[], state_directory, recorder)
+}
+
+/// `fake_agent_login_setup`, for a service whose environment also carries
+/// `variables`.
+pub(crate) fn fake_agent_login_setup_serving(
+    cloud: Arc<FakeAgentLoginCloud>,
+    home: &Path,
+    variables: &[(&str, &str)],
+    state_directory: &Path,
+    recorder: Arc<Recorder>,
+) -> SetupDependencies {
     let home = std::ffi::OsString::from(home);
     SetupDependencies::new(
         cloud,
         FakeLoginCheck::new(),
-        ServiceEnvironment::from_lookup(|name| (name == "HOME").then(|| home.clone())),
+        ServiceEnvironment::from_variables(
+            variables
+                .iter()
+                .map(|(name, value)| {
+                    (
+                        std::ffi::OsString::from(name),
+                        std::ffi::OsString::from(value),
+                    )
+                })
+                .chain([(std::ffi::OsString::from("HOME"), home)]),
+        ),
         &state_directory.join("runner-state.json"),
         recorder,
     )

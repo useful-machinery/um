@@ -10,7 +10,7 @@ use serde::Serialize;
 use useful_api::{
     AgentLogin, AgentLoginAuthorization, AgentLoginProvider, AgentLoginReportState,
     AgentLoginState, Grant, GrantReport, GrantState, MemberGrant, MemberGrantAuthorization,
-    MemberGrantKind, MemberGrantState, provider_grant,
+    MemberGrantKind, MemberGrantState, ServedGrantProvider,
 };
 use useful_runner::CredentialKind;
 use useful_support::{Availability, CredentialStatus, NextAction};
@@ -150,9 +150,9 @@ const NOT_CONNECTED: CredentialStatus = CredentialStatus {
     next_action: NextAction::Connect,
 };
 
-/// The providers a workflow can use a credential of, grant providers first, in the order the
-/// rows are printed (REQ-GRANT-55, REQ-GRANT-64).
-pub(in crate::cli) const PROVIDERS: [Provider; 5] = [
+/// The providers a workflow can use a credential of, grant providers first: the baseline of
+/// [`providers`], named whether or not the deployment serves them.
+pub(in crate::cli) const PROVIDERS: [Provider<'static>; 5] = [
     Provider::Grant("github"),
     Provider::Grant("gitlab.com"),
     Provider::Grant("linear"),
@@ -160,14 +160,36 @@ pub(in crate::cli) const PROVIDERS: [Provider; 5] = [
     Provider::CodingAgent("codex"),
 ];
 
-/// A provider by its wire name: one an OAuth grant is made for, or a coding agent.
-#[derive(Clone, Copy)]
-pub(in crate::cli) enum Provider {
-    Grant(&'static str),
-    CodingAgent(&'static str),
+/// The providers a command names in turn, in the order it prints or signs in to them
+/// (REQ-GRANT-55, REQ-GRANT-64, REQ-GRANT-75): `github`, `gitlab.com` and `linear`, each other
+/// OAuth provider `served` names, in its order (REQ-GRANT-78), then `claude_code` and `codex`.
+/// The five of [`PROVIDERS`] are named whether or not the deployment serves them, and `served`
+/// is empty for a deployment that predates its read (REQ-GRANT-96).
+pub(in crate::cli) fn providers(served: &[ServedGrantProvider]) -> Vec<Provider<'_>> {
+    let (oauth, agents): (Vec<_>, Vec<_>) = PROVIDERS
+        .into_iter()
+        .partition(|provider| matches!(provider, Provider::Grant(_)));
+    let others = served.iter().filter(|served| {
+        served.kind == MemberGrantKind::GrantKindOAuth
+            && !PROVIDERS
+                .iter()
+                .any(|provider| provider.name() == served.name)
+    });
+    oauth
+        .into_iter()
+        .chain(others.map(|served| Provider::Grant(&served.name)))
+        .chain(agents)
+        .collect()
 }
 
-impl Provider {
+/// A provider by its wire name: one an OAuth grant is made for, or a coding agent.
+#[derive(Clone, Copy)]
+pub(in crate::cli) enum Provider<'a> {
+    Grant(&'a str),
+    CodingAgent(&'a str),
+}
+
+impl<'a> Provider<'a> {
     /// The provider whose grant a kind a workflow calls for names; `gitlab` is GitLab.com
     /// (REQ-GRANT-76, REQ-CREDREADY-22).
     pub(in crate::cli) const fn of_kind(kind: CredentialKind) -> Self {
@@ -180,7 +202,7 @@ impl Provider {
         }
     }
 
-    pub(in crate::cli) const fn name(self) -> &'static str {
+    pub(in crate::cli) const fn name(self) -> &'a str {
         match self {
             Self::Grant(name) | Self::CodingAgent(name) => name,
         }
@@ -210,13 +232,9 @@ pub(in crate::cli) enum Subject<'a> {
     CodingAgent { provider: &'a str },
 }
 
-/// A grant provider's name on the wire.
-pub(in crate::cli) const fn grant_provider(grant: &Grant) -> &'static str {
-    match grant.provider {
-        provider_grant::Provider::ProviderGrantProviderGithub => "github",
-        provider_grant::Provider::ProviderGrantProviderGitlabCom => "gitlab.com",
-        provider_grant::Provider::ProviderGrantProviderLinear => "linear",
-    }
+/// A grant provider's name on the wire: any provider id `GrantApi` admits (REQ-GRANT-96).
+pub(in crate::cli) fn grant_provider(grant: &Grant) -> &str {
+    &grant.provider
 }
 
 /// A coding agent's name on the wire.
@@ -304,11 +322,8 @@ fn member_step(next_action: NextAction, subject: Subject<'_>) -> Option<String> 
                 .to_owned(),
         ),
         (NextAction::ResolveServiceLogin, _) => Some(
-            "the runner's service uses its own login; remove it from the service environment to use the agent login"
+            "the runner's service uses its own login; remove it from the service's environment or home to use the agent login"
                 .to_owned(),
-        ),
-        (NextAction::RestoreMembership, _) => Some(
-            "the agent login's owner must be an active member of the organization again".to_owned(),
         ),
         _ => None,
     }

@@ -1325,8 +1325,13 @@ fn an_enrolled_host_removes_a_join_journal_its_state_already_holds() {
     let key = join_key(&server, JOIN_KEY_ID, &future_time());
     let state_directory = fixture.state_path.parent().expect("state directory");
     ensure_private_directory(state_directory).expect("create state directory");
-    let journal =
-        stage_join(&fixture.journal_path(), &key, DeploymentMode::Development).expect("stage join");
+    let journal = stage_join(
+        &fixture.journal_path(),
+        &key,
+        None,
+        DeploymentMode::Development,
+    )
+    .expect("stage join");
     let response: EnrollmentResponse =
         serde_json::from_value(enrollment_response_document()).expect("decode response");
     persist_enrollment_state(
@@ -1451,6 +1456,644 @@ fn host_files_name_exactly_one_activation_or_join_key() {
             "{document}"
         );
     }
+}
+
+const REJOINED_RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abd";
+const OTHER_RUNNER_ID: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abe";
+const REJOINED_CONNECTION_URL: &str = "ws://127.0.0.1:8766/v1/runner/connect";
+
+impl EnrollmentFixture {
+    // State enrolled by a join with `JOIN_KEY_ID`, holding the pending
+    // credential of a replacement that a rejoin discards.
+    fn write_joined_state(&self) -> Vec<u8> {
+        let state_directory = self.state_path.parent().expect("state directory");
+        ensure_private_directory(state_directory).expect("create state directory");
+        atomic_write_json(
+            &self.state_path,
+            &serde_json::json!({
+                "schemaVersion": 1,
+                "runnerId": RUNNER_ID,
+                "connectionUrl": "ws://127.0.0.1:8765/v1/runner/connect",
+                "currentCredential": {
+                    "id": CREDENTIAL_ID,
+                    "secret": ACTIVATION_SECRET,
+                    "joinKeyId": JOIN_KEY_ID,
+                    "enrolledAt": "2026-08-06T12:00:00Z"
+                },
+                "pendingCredential": {
+                    "id": REPLACEMENT_CREDENTIAL_ID,
+                    "secret": ACTIVATION_SECRET,
+                    "activationId": ACTIVATION_ID,
+                    "enrolledAt": "2026-08-07T12:00:00Z"
+                },
+                "updatedAt": "2026-08-07T12:00:00Z"
+            }),
+        )
+        .expect("write joined runner state");
+        fs::read(&self.state_path).expect("read joined runner state")
+    }
+
+    fn hold(&self, key: JoinKeyArtifact) -> HeldJoinKey {
+        match HeldJoinKey::hold(&self.config_path, key) {
+            Ok(JoinKeyHold::Held(held)) => held,
+            Ok(JoinKeyHold::Expired) => panic!("the join key was not held: it expired"),
+            Err(error) => panic!("hold the join key: {error:?}"),
+        }
+    }
+}
+
+// The answer Cloud gives a rejoin: another runner, credential and connection.
+fn rejoin_response() -> Vec<u8> {
+    let mut document = enrollment_response_document_with_credential(REPLACEMENT_CREDENTIAL_ID);
+    document["runnerId"] = REJOINED_RUNNER_ID.into();
+    document["connectionUrl"] = REJOINED_CONNECTION_URL.into();
+    json_response(&document)
+}
+
+fn problem_response(status: &str, problem_type: &str) -> Vec<u8> {
+    let body = serde_json::json!({
+        "type": format!("https://api.usefulmachinery.com/problems/{problem_type}"),
+        "title": "Refused",
+        "status": status.split_once(' ').expect("status code").0.parse::<u16>().expect("status"),
+        "detail": "Refused."
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/problem+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+    .into_bytes()
+}
+
+fn rejoined(outcome: Result<RejoinOutcome, EnrollmentError>) -> EnrollmentResponse {
+    match outcome {
+        Ok(RejoinOutcome::Rejoined(response)) => *response,
+        other => panic!("expected a completed rejoin, got {other:?}"),
+    }
+}
+
+fn unanswered(outcome: Result<RejoinOutcome, EnrollmentError>) -> AmbiguousCause {
+    match outcome {
+        Ok(RejoinOutcome::Unanswered(cause)) => cause,
+        other => panic!("expected an unanswered rejoin, got {other:?}"),
+    }
+}
+
+// What Cloud received for a rejoin and what the host keeps afterwards: the
+// request names the host's runner, and the state is the answer's, holding the
+// secret whose verifier was sent.
+fn assert_rejoined(fixture: &EnrollmentFixture, response: &EnrollmentResponse, request: &str) {
+    assert!(
+        request.starts_with(&format!("POST /v1/runner-join-keys/{JOIN_KEY_ID}/join ")),
+        "{request}"
+    );
+    assert_eq!(
+        request_header(request, "authorization"),
+        format!("Bearer {JOIN_KEY_ID}.{JOIN_SECRET}")
+    );
+    assert!(valid_idempotency_key(request_header(
+        request,
+        "idempotency-key"
+    )));
+    let body: serde_json::Value =
+        serde_json::from_str(request_body(request)).expect("decode rejoin body");
+    let body = body.as_object().expect("rejoin body object");
+    assert_eq!(
+        body.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        BTreeSet::from([
+            "schemaVersion",
+            "credentialSecretVerifier",
+            "previousRunnerId"
+        ])
+    );
+    assert_eq!(body["schemaVersion"], 1);
+    assert_eq!(body["previousRunnerId"], RUNNER_ID);
+
+    assert_eq!(response.runner_id, REJOINED_RUNNER_ID);
+    assert!(!fixture.journal_path().exists());
+    let state_bytes = fs::read(&fixture.state_path).expect("read rejoined state");
+    assert_json_matches_schema("runner state", RUNNER_STATE_SCHEMA, &state_bytes);
+    let document: serde_json::Value =
+        serde_json::from_slice(&state_bytes).expect("decode rejoined state");
+    assert_eq!(document["runnerId"], REJOINED_RUNNER_ID);
+    assert_eq!(document["connectionUrl"], REJOINED_CONNECTION_URL);
+    assert_eq!(
+        document["currentCredential"]["id"],
+        REPLACEMENT_CREDENTIAL_ID
+    );
+    assert_eq!(document["currentCredential"]["joinKeyId"], JOIN_KEY_ID);
+    assert!(document["currentCredential"].get("activationId").is_none());
+    assert!(document.get("pendingCredential").is_none());
+    assert!(document.get("lastPromotion").is_none());
+    let state: RunnerState = serde_json::from_slice(&state_bytes).expect("decode rejoined state");
+    let secret = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&state.current_credential.secret)
+        .expect("decode rejoined secret");
+    assert_eq!(
+        body["credentialSecretVerifier"],
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest(&SHA256, &secret).as_ref())
+    );
+}
+
+// INV-RUNNER-36, REQ-RUNNERENROLL-127
+#[test]
+fn a_rejoin_names_the_host_runner_and_replaces_the_state_with_its_answer() {
+    let server = ScriptedHttpServer::respond(rejoin_response());
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    fixture.write_joined_state();
+
+    assert!(enrolled_with_join_key(&fixture.config_path).expect("ask the state's origin"));
+    let held = fixture.hold(join_key(&server, JOIN_KEY_ID, &future_time()));
+    let response = rejoined(held.rejoin_once());
+
+    assert_rejoined(&fixture, &response, &server.finish_one());
+}
+
+// INV-RUNNER-36, REQ-RUNNERENROLL-127
+#[test]
+fn an_unanswered_rejoin_keeps_its_journal_and_resends_the_same_request() {
+    for (unanswered_response, expected) in [
+        (
+            empty_response("503 Service Unavailable"),
+            AmbiguousCause::CloudUnavailable(503),
+        ),
+        (
+            empty_response("429 Too Many Requests"),
+            AmbiguousCause::RateLimited,
+        ),
+        (Vec::new(), AmbiguousCause::Network),
+    ] {
+        let server =
+            ScriptedHttpServer::respond_in_sequence(vec![unanswered_response, rejoin_response()]);
+        let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+        let state = fixture.write_joined_state();
+        let held = fixture.hold(join_key(&server, JOIN_KEY_ID, &future_time()));
+
+        assert_eq!(unanswered(held.rejoin_once()), expected);
+        assert_eq!(fs::read(&fixture.state_path).expect("reread state"), state);
+        let journal_bytes = fs::read(fixture.journal_path()).expect("read kept rejoin journal");
+        assert_json_matches_schema(
+            "runner enrollment journal",
+            ENROLLMENT_JOURNAL_SCHEMA,
+            &journal_bytes,
+        );
+        let journal: serde_json::Value =
+            serde_json::from_slice(&journal_bytes).expect("decode rejoin journal");
+        assert_eq!(journal["joinKey"]["previousRunnerId"], RUNNER_ID);
+        assert!(!String::from_utf8_lossy(&journal_bytes).contains(JOIN_SECRET));
+
+        let response = rejoined(held.rejoin_once());
+
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2, "{expected:?}");
+        assert_eq!(
+            request_header(&requests[0], "idempotency-key"),
+            request_header(&requests[1], "idempotency-key")
+        );
+        assert_eq!(request_body(&requests[0]), request_body(&requests[1]));
+        assert_rejoined(&fixture, &response, &requests[1]);
+    }
+}
+
+// INV-RUNNER-36, REQ-RUNNERENROLL-127
+#[test]
+fn a_definite_refusal_of_a_rejoin_keeps_the_state_and_settles_the_journal() {
+    for (response, expected, code) in [
+        (
+            problem_response("409 Conflict", "runner-rejoin-unavailable"),
+            JoinRefusal::RejoinUnavailable,
+            "runner_rejoin_unavailable",
+        ),
+        (
+            problem_response("409 Conflict", "runner-pool-member-inactive"),
+            JoinRefusal::Conflict,
+            "join_conflict",
+        ),
+        (
+            empty_response("409 Conflict"),
+            JoinRefusal::Conflict,
+            "join_conflict",
+        ),
+        (
+            empty_response("410 Gone"),
+            JoinRefusal::Gone,
+            "join_key_gone",
+        ),
+        (
+            empty_response("401 Unauthorized"),
+            JoinRefusal::Unauthorized,
+            "join_key_unauthorized",
+        ),
+        (
+            empty_response("400 Bad Request"),
+            JoinRefusal::RejoinUnsupported,
+            "rejoin_unsupported",
+        ),
+    ] {
+        let server = ScriptedHttpServer::respond(response);
+        let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+        let state = fixture.write_joined_state();
+        let held = fixture.hold(join_key(&server, JOIN_KEY_ID, &future_time()));
+
+        let outcome = held.rejoin_once();
+        let Err(EnrollmentError::JoinRefused { refusal, resent }) = outcome else {
+            panic!("expected the {code} refusal, got {outcome:?}");
+        };
+        assert_eq!((refusal, resent), (expected, false));
+        assert_eq!(refusal.code(), code);
+        assert_eq!(fs::read(&fixture.state_path).expect("reread state"), state);
+        assert!(!fixture.journal_path().exists(), "{code} kept the journal");
+        server.finish_one();
+    }
+
+    // The unanswered send may have registered a runner, so a 401 to the
+    // resent journal keeps it.
+    let server = ScriptedHttpServer::respond_in_sequence(vec![
+        empty_response("503 Service Unavailable"),
+        empty_response("401 Unauthorized"),
+    ]);
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    let state = fixture.write_joined_state();
+    let held = fixture.hold(join_key(&server, JOIN_KEY_ID, &future_time()));
+    unanswered(held.rejoin_once());
+    let journal = fs::read(fixture.journal_path()).expect("read staged rejoin journal");
+
+    let outcome = held.rejoin_once();
+    let Err(EnrollmentError::StagedJoinUnauthorized {
+        journal: journal_path,
+        join_key_id,
+    }) = outcome
+    else {
+        panic!("expected the staged rejoin's refusal, got {outcome:?}");
+    };
+    assert_eq!(
+        (journal_path, join_key_id),
+        (fixture.journal_path(), JOIN_KEY_ID.to_owned())
+    );
+    assert_eq!(
+        fs::read(fixture.journal_path()).expect("reread kept rejoin journal"),
+        journal
+    );
+    assert_eq!(fs::read(&fixture.state_path).expect("reread state"), state);
+    assert_eq!(server.finish().len(), 2);
+}
+
+// INV-RUNNER-36, REQ-RUNNERENROLL-127
+#[test]
+fn a_rejoin_sends_nothing_over_a_journal_staged_for_anything_else() {
+    // The journal on disk: a join staged for a key and naming a runner, or an
+    // activation's replacement when the key is `None`.
+    for (journal_for, staged) in [
+        ("a first join", Some((JOIN_KEY_ID, None))),
+        (
+            "a rejoin of another runner",
+            Some((JOIN_KEY_ID, Some(OTHER_RUNNER_ID))),
+        ),
+        (
+            "a rejoin with another key",
+            Some((OTHER_JOIN_KEY_ID, Some(RUNNER_ID))),
+        ),
+        ("an activation", None),
+    ] {
+        let server = ScriptedHttpServer::respond_in_sequence(Vec::new());
+        let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+        let state = fixture.write_joined_state();
+        match staged {
+            Some((join_key_id, previous_runner_id)) => stage_join(
+                &fixture.journal_path(),
+                &join_key(&server, join_key_id, &future_time()),
+                previous_runner_id,
+                DeploymentMode::Development,
+            ),
+            None => stage_journal(
+                &fixture.journal_path(),
+                EnrollmentTarget::Activation(fixture.artifact.clone()),
+                true,
+            ),
+        }
+        .expect("stage the journal");
+        let journal = fs::read(fixture.journal_path()).expect("read staged journal");
+        let held = fixture.hold(join_key(&server, JOIN_KEY_ID, &future_time()));
+
+        let outcome = held.rejoin_once();
+        match (staged, &outcome) {
+            (
+                Some((OTHER_JOIN_KEY_ID, _)),
+                Err(EnrollmentError::JoinJournalForAnotherKey { join_key_id, .. }),
+            ) => assert_eq!(join_key_id, OTHER_JOIN_KEY_ID),
+            (Some((JOIN_KEY_ID, _)) | None, Err(EnrollmentError::UnresolvedJournal)) => {}
+            _ => panic!("{journal_for}: got {outcome:?}"),
+        }
+        assert_eq!(
+            fs::read(fixture.journal_path()).expect("reread staged journal"),
+            journal,
+            "{journal_for}"
+        );
+        assert_eq!(fs::read(&fixture.state_path).expect("reread state"), state);
+        assert!(server.finish().is_empty(), "{journal_for}");
+    }
+}
+
+// INV-RUNNER-36, REQ-RUNNERENROLL-127
+#[test]
+fn a_host_whose_credential_came_from_an_activation_does_not_rejoin() {
+    let server = ScriptedHttpServer::respond_in_sequence(Vec::new());
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    assert!(!enrolled_with_join_key(&fixture.config_path).expect("ask an unenrolled host"));
+    fixture.write_current_state();
+    let state = fs::read(&fixture.state_path).expect("read activated state");
+
+    assert!(!enrolled_with_join_key(&fixture.config_path).expect("ask the state's origin"));
+    let held = fixture.hold(join_key(&server, JOIN_KEY_ID, &future_time()));
+    let outcome = held.rejoin_once();
+    assert!(
+        matches!(outcome, Err(EnrollmentError::CredentialNotFromJoinKey)),
+        "{outcome:?}"
+    );
+
+    assert_eq!(fs::read(&fixture.state_path).expect("reread state"), state);
+    assert!(!fixture.journal_path().exists());
+    assert!(server.finish().is_empty());
+}
+
+// INV-RUNNER-36, REQ-RUNNERENROLL-127
+#[test]
+fn an_expired_key_is_held_only_for_the_unanswered_rejoin_staged_with_it() {
+    let server = ScriptedHttpServer::respond_in_sequence(vec![
+        empty_response("503 Service Unavailable"),
+        rejoin_response(),
+    ]);
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    fixture.write_joined_state();
+    let expired = |join_key_id| {
+        HeldJoinKey::hold(
+            &fixture.config_path,
+            join_key(&server, join_key_id, &expired_time()),
+        )
+    };
+
+    assert!(matches!(expired(JOIN_KEY_ID), Ok(JoinKeyHold::Expired)));
+    unanswered(
+        fixture
+            .hold(join_key(&server, JOIN_KEY_ID, &future_time()))
+            .rejoin_once(),
+    );
+    assert!(matches!(
+        expired(OTHER_JOIN_KEY_ID),
+        Ok(JoinKeyHold::Expired)
+    ));
+    let Ok(JoinKeyHold::Held(held)) = expired(JOIN_KEY_ID) else {
+        panic!("the expired key of the staged rejoin was not held");
+    };
+    let response = rejoined(held.rejoin_once());
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        request_header(&requests[0], "idempotency-key"),
+        request_header(&requests[1], "idempotency-key")
+    );
+    assert_eq!(request_body(&requests[0]), request_body(&requests[1]));
+    assert_rejoined(&fixture, &response, &requests[1]);
+}
+
+// The host's replaced-runner record, beside the state file.
+fn replaced_record_path(fixture: &EnrollmentFixture) -> PathBuf {
+    fixture.state_path.with_file_name(".runner-replaced.json")
+}
+
+fn write_replaced_record(fixture: &EnrollmentFixture, bytes: &[u8], mode: u32) {
+    let path = replaced_record_path(fixture);
+    fs::write(&path, bytes).expect("write replaced-runner record");
+    fs::set_permissions(&path, Permissions::from_mode(mode)).expect("set record mode");
+}
+
+fn replaced_record(runner_ids: &[&str]) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schemaVersion": 1,
+        "replacedRunnerIds": runner_ids
+    }))
+    .expect("encode replaced-runner record")
+}
+
+// The record is the user's private regular file listing exactly `expected`.
+fn assert_replaced_runners(fixture: &EnrollmentFixture, expected: &[&str]) {
+    let path = replaced_record_path(fixture);
+    let metadata = fs::symlink_metadata(&path).expect("inspect replaced-runner record");
+    assert!(metadata.file_type().is_file());
+    assert_eq!(metadata.mode() & 0o7777, 0o600);
+    let document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("read replaced-runner record"))
+            .expect("decode replaced-runner record");
+    assert_eq!(
+        document,
+        serde_json::json!({"schemaVersion": 1, "replacedRunnerIds": expected})
+    );
+}
+
+// A rejoin of `RUNNER_ID` answered 201 over `record`, the replaced-runner
+// record on disk before it, if any.
+fn rejoin_over_record(record: Option<&[u8]>) -> EnrollmentFixture {
+    let server = ScriptedHttpServer::respond(rejoin_response());
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    fixture.write_joined_state();
+    if let Some(record) = record {
+        write_replaced_record(&fixture, record, 0o600);
+    }
+    let held = fixture.hold(join_key(&server, JOIN_KEY_ID, &future_time()));
+    let response = rejoined(held.rejoin_once());
+    assert_rejoined(&fixture, &response, &server.finish_one());
+    fixture
+}
+
+// INV-RUNNER-37
+#[test]
+fn a_rejoin_records_the_runner_it_replaces() {
+    let fixture = rejoin_over_record(None);
+    assert_replaced_runners(&fixture, &[RUNNER_ID]);
+
+    let fixture = rejoin_over_record(Some(&replaced_record(&[OTHER_RUNNER_ID])));
+    assert_replaced_runners(&fixture, &[OTHER_RUNNER_ID, RUNNER_ID]);
+
+    let earlier: Vec<String> = (0..16)
+        .map(|index| format!("rnr_01k0z6r1w8f4jy2m7q9v3x5{index:03}"))
+        .collect();
+    let earlier: Vec<&str> = earlier.iter().map(String::as_str).collect();
+    let fixture = rejoin_over_record(Some(&replaced_record(&earlier)));
+    let mut kept = earlier[1..].to_vec();
+    kept.push(RUNNER_ID);
+    assert_replaced_runners(&fixture, &kept);
+}
+
+// INV-RUNNER-37
+#[test]
+fn a_rejoin_starts_a_new_record_over_one_that_does_not_check() {
+    let seventeen: Vec<String> = (0..17)
+        .map(|index| format!("rnr_01k0z6r1w8f4jy2m7q9v3x5{index:03}"))
+        .collect();
+    let seventeen: Vec<&str> = seventeen.iter().map(String::as_str).collect();
+    for record in [
+        b"not a record".to_vec(),
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "replacedRunnerIds": [OTHER_RUNNER_ID]
+        }))
+        .expect("encode record"),
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1,
+            "replacedRunnerIds": [OTHER_RUNNER_ID],
+            "clearedAt": "2026-08-07T12:00:00Z"
+        }))
+        .expect("encode record"),
+        replaced_record(&seventeen),
+        replaced_record(&[OTHER_RUNNER_ID, CREDENTIAL_ID]),
+    ] {
+        let fixture = rejoin_over_record(Some(&record));
+        assert_replaced_runners(&fixture, &[RUNNER_ID]);
+    }
+}
+
+// INV-RUNNER-37
+#[test]
+fn a_rejoin_that_replaces_no_state_records_no_runner() {
+    for (response, answered) in [
+        (empty_response("503 Service Unavailable"), false),
+        (empty_response("410 Gone"), true),
+    ] {
+        let server = ScriptedHttpServer::respond(response);
+        let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+        fixture.write_joined_state();
+        let held = fixture.hold(join_key(&server, JOIN_KEY_ID, &future_time()));
+        let outcome = held.rejoin_once();
+        if answered {
+            assert!(
+                matches!(
+                    outcome,
+                    Err(EnrollmentError::JoinRefused {
+                        refusal: JoinRefusal::Gone,
+                        ..
+                    })
+                ),
+                "{outcome:?}"
+            );
+        } else {
+            assert_eq!(unanswered(outcome), AmbiguousCause::CloudUnavailable(503));
+        }
+        server.finish_one();
+        assert!(!replaced_record_path(&fixture).exists());
+    }
+
+    let server = ScriptedHttpServer::respond(enrollment_response());
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    let outcome = join_unless_enrolled(
+        &fixture.config_path,
+        join_key(&server, JOIN_KEY_ID, &future_time()),
+        |_| {},
+    )
+    .expect("join a host with no state");
+    assert!(matches!(outcome, JoinOutcome::Joined(_)));
+    server.finish_one();
+    assert!(fixture.state_path.exists());
+    assert!(!replaced_record_path(&fixture).exists());
+}
+
+// INV-RUNNER-37
+#[test]
+fn a_resent_rejoin_does_not_record_its_runner_twice() {
+    // The start that sent the rejoin stopped after it recorded the runner and
+    // before it replaced the state.
+    let server = ScriptedHttpServer::respond_in_sequence(vec![
+        empty_response("503 Service Unavailable"),
+        rejoin_response(),
+    ]);
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    fixture.write_joined_state();
+    let held = fixture.hold(join_key(&server, JOIN_KEY_ID, &future_time()));
+    unanswered(held.rejoin_once());
+    write_replaced_record(&fixture, &replaced_record(&[RUNNER_ID]), 0o600);
+
+    let response = rejoined(held.rejoin_once());
+
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert_rejoined(&fixture, &response, &requests[1]);
+    assert_replaced_runners(&fixture, &[RUNNER_ID]);
+}
+
+// INV-RUNNER-37
+#[test]
+fn a_record_that_is_not_private_keeps_the_state_and_the_journal() {
+    let server = ScriptedHttpServer::respond(rejoin_response());
+    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
+    let state = fixture.write_joined_state();
+    let record = replaced_record(&[OTHER_RUNNER_ID]);
+    write_replaced_record(&fixture, &record, 0o644);
+    let held = fixture.hold(join_key(&server, JOIN_KEY_ID, &future_time()));
+
+    let outcome = held.rejoin_once();
+
+    assert!(
+        matches!(outcome, Err(EnrollmentError::UnsafePath(_))),
+        "{outcome:?}"
+    );
+    server.finish_one();
+    assert_eq!(fs::read(&fixture.state_path).expect("reread state"), state);
+    assert!(fixture.journal_path().exists());
+    let path = replaced_record_path(&fixture);
+    assert_eq!(fs::read(&path).expect("reread record"), record);
+    let mode = fs::symlink_metadata(&path).expect("inspect record").mode() & 0o7777;
+    assert_eq!(mode, 0o644);
+}
+
+fn read_replaced_runners(fixture: &EnrollmentFixture) -> Result<Vec<String>, ReplacedRunnersError> {
+    load_runner_service_configuration(&fixture.config_path)
+        .expect("load the enrolled host")
+        .state_access
+        .replaced_runners()
+}
+
+// INV-RUNNER-37
+#[test]
+fn the_service_reads_the_runners_the_rejoins_replaced() {
+    let fixture = rejoin_over_record(Some(&replaced_record(&[OTHER_RUNNER_ID])));
+    assert_eq!(
+        read_replaced_runners(&fixture).expect("read the record a rejoin wrote"),
+        [OTHER_RUNNER_ID, RUNNER_ID]
+    );
+
+    fs::remove_file(replaced_record_path(&fixture)).expect("remove the record");
+    assert_eq!(
+        read_replaced_runners(&fixture).expect("read an absent record"),
+        Vec::<String>::new()
+    );
+}
+
+// INV-RUNNER-37
+#[test]
+fn the_service_reads_no_list_from_a_record_that_does_not_check() {
+    let fixture = rejoin_over_record(None);
+    for record in [
+        b"not a record".to_vec(),
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "replacedRunnerIds": [OTHER_RUNNER_ID]
+        }))
+        .expect("encode record"),
+        replaced_record(&[OTHER_RUNNER_ID, CREDENTIAL_ID]),
+    ] {
+        write_replaced_record(&fixture, &record, 0o600);
+        let error = read_replaced_runners(&fixture).expect_err("a record that does not check");
+        assert!(matches!(error, ReplacedRunnersError::Invalid), "{error:?}");
+        assert_eq!(error.cause(), "invalid");
+    }
+
+    write_replaced_record(&fixture, &replaced_record(&[OTHER_RUNNER_ID]), 0o644);
+    let error = read_replaced_runners(&fixture).expect_err("a record that is not private");
+    assert!(
+        matches!(error, ReplacedRunnersError::Unreadable(_)),
+        "{error:?}"
+    );
+    assert_eq!(error.cause(), "unreadable");
 }
 
 // REQ-RUNNERENROLL-106

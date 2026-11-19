@@ -1080,6 +1080,12 @@ pub(super) async fn admit_continuation_in(
         Some(tree) => context.with_tree(tree),
         None => context,
     };
+    // REQ-LOCALRUN-217: every continuation, a successor's and a child's repair continuation
+    // included, sets the revision the run was created with.
+    let context = match pending.source_revision() {
+        Some(source_revision) => context.with_source_revision(source_revision.clone()),
+        None => context,
+    };
     let untested_advisories = context.untested_harness_advisories();
     let rejection = |admission: &[&useful_execution::AdmissionFailure]| {
         Unadmitted::Rejected(

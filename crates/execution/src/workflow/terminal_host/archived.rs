@@ -16,7 +16,7 @@ use crate::workflow::archived_presentation::{
     archived_cancellation_reason, archived_failure_detail, archived_finalization_trigger,
     blocked_detail, condition_false_detail, safe_path, safe_text,
 };
-use crate::workflow::evidence::{NodeDetail, PrimaryIssueDetail};
+use crate::workflow::evidence::{FailedChild, NodeDetail, PrimaryIssueDetail};
 use crate::workflow::presentation_feed::{
     NormalizedRetainedRecord, normalize_retained_prefix, normalize_terminal_shell_argument,
 };
@@ -302,6 +302,11 @@ struct ArchivedTerminalStepView {
     maximum_document_width: usize,
     recovery: Option<super::super::publication::StepRecoverySummaryV1>,
     invocations: Vec<super::super::publication::RecoveryInvocationV1>,
+    /// The failed child of a `succeeded` `workflow` step, which `state` presents `Failed`
+    /// (REQ-LOCALRUN-221).
+    failed_child: Option<FailedChild>,
+    /// The count of outputs the step committed (REQ-OUTPUTS-17).
+    committed_outputs: usize,
 }
 
 #[derive(Clone)]
@@ -387,6 +392,7 @@ impl ArchivedTerminalStepView {
                     }
                 });
         let document = output_document(&output);
+        let committed_outputs = step.committed_output_count(definition.outputs().len());
         let maximum_document_width = document
             .iter()
             .map(|row| display_width(&row.text))
@@ -399,12 +405,14 @@ impl ArchivedTerminalStepView {
             role: step.role,
             definition: safe_definition(definition),
             command,
-            state: archived_step_state(step.state),
+            state: archived_step_state(step.presented_state()),
             timing,
             recovery: step.recovery,
             invocations: step.invocations,
             detail: step.detail,
             output,
+            failed_child: step.failed_child,
+            committed_outputs,
         }
     }
 }
@@ -434,10 +442,12 @@ impl StepProjection for ArchivedTerminalStepView {
     fn dag_detail(&self) -> Option<String> {
         match &self.detail {
             ArchivedStepDetail::Succeeded => Some(self.with_recovery_detail(
-                crate::workflow::render_style::success_detail(
-                    matches!(self.definition, WorkflowPresentationStep::Command { .. }),
-                    self.definition.outputs().len(),
-                ),
+                self.failed_stage_detail().unwrap_or_else(|| {
+                    crate::workflow::render_style::success_detail(
+                        matches!(self.definition, WorkflowPresentationStep::Command { .. }),
+                        self.committed_outputs,
+                    )
+                }),
             )),
             ArchivedStepDetail::Evidence(NodeDetail::Inherited(detail)) => {
                 Some(crate::workflow::render_style::inherited_detail(detail))
@@ -490,11 +500,14 @@ impl StepProjection for ArchivedTerminalStepView {
             ));
         }
         match &self.detail {
-            ArchivedStepDetail::Succeeded => Some(InspectorField::new(
-                "outputs",
-                output_count_detail(self.definition.outputs().len()),
-                Tone::Success,
-            )),
+            ArchivedStepDetail::Succeeded => Some(match self.failed_stage_detail() {
+                Some(detail) => InspectorField::new("failure", detail, Tone::Failure),
+                None => InspectorField::new(
+                    "outputs",
+                    output_count_detail(self.committed_outputs),
+                    Tone::Success,
+                ),
+            }),
             ArchivedStepDetail::Evidence(NodeDetail::Inherited(detail)) => {
                 Some(InspectorField::new(
                     "inheritance",
@@ -549,6 +562,18 @@ impl StepProjection for ArchivedTerminalStepView {
 }
 
 impl ArchivedTerminalStepView {
+    /// The failed child of a stage whose child failed, with the outputs it committed
+    /// (REQ-LOCALRUN-221); `None` for any other step.
+    fn failed_stage_detail(&self) -> Option<String> {
+        self.failed_child.as_ref().map(|failed_child| {
+            crate::workflow::presentation::failed_stage_detail(
+                &self.id,
+                failed_child,
+                self.committed_outputs,
+            )
+        })
+    }
+
     fn with_recovery_detail(&self, base: String) -> String {
         let Some(recovery) = &self.recovery else {
             return base;

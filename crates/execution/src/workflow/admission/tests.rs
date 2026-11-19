@@ -1634,9 +1634,10 @@ fn cloud_source_revision_replaces_inherited_reserved_values_while_local_has_none
     let cloud = admit_runner_workflow(
         fixture.resolve(),
         text_and_attachments_inputs("request", Vec::new()),
-        context.with_source_revision(SourceRevisionProvenance::new(
-            "refs/heads/exact-source",
+        context.with_source_revision(SourceRevisionProvenance::from_parts(
             "0123456789abcdef0123456789abcdef01234567",
+            Some("refs/heads/exact-source"),
+            None::<(&str, &str)>,
         )),
     )
     .unwrap();
@@ -1729,6 +1730,30 @@ fn a_tree_run_rejects_a_missing_required_tool_by_name() {
     assert_eq!(
         admitted.tree().map(AdmittedTree::required_tools),
         Some(&[REQUIRED_TOOL.to_owned()][..])
+    );
+}
+
+// REQ-WFDEF-34, REQ-WFEXEC-55
+#[test]
+fn a_tree_run_admits_integrations_without_tools_and_probes_nothing() {
+    let fixture = WorkflowFixture::new(
+        "schemaVersion: 1\nrequires:\n  as: member\n  integrations:\n    linear: {as: org, bindings: {team: {kind: team}}}\n    github: {}\n    claude_code: {}\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+    let admitted = admit_local_workflow(
+        fixture.resolve(),
+        ResolvedInputs::default(),
+        ExecutionContext::new(
+            fixture.execution_root.clone(),
+            default_execution_policy_limits(1),
+            EnvironmentSnapshot::default(),
+            CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+        )
+        .with_tree(validated_tree(&fixture.source_root)),
+    )
+    .expect("a declaration of integrations alone admits");
+    assert_eq!(
+        admitted.tree().map(AdmittedTree::required_tools),
+        Some(&[][..])
     );
 }
 
@@ -1835,11 +1860,11 @@ fn direct_commit_selection_omits_workspace_branch_but_retains_definition_provena
         ]),
         CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
     )
-    .with_source_revision(
-        SourceRevisionProvenance::new("ignored", "fedcba9876543210fedcba9876543210fedcba98")
-            .without_workspace_branch()
-            .with_definition("main", "0123456789abcdef0123456789abcdef01234567"),
-    );
+    .with_source_revision(SourceRevisionProvenance::from_parts(
+        "fedcba9876543210fedcba9876543210fedcba98",
+        None::<&str>,
+        Some(("main", "0123456789abcdef0123456789abcdef01234567")),
+    ));
     let admitted = admit_runner_workflow(
         fixture.resolve(),
         text_and_attachments_inputs("request", Vec::new()),
@@ -1882,7 +1907,8 @@ fn workflow_admission_only_forwards_base_and_explicit_safe_names() {
         ("USEFUL_SOURCE_TOKEN_FD", "9"),
     ]);
 
-    let filtered = environment.for_workflow_children(&["VISIBLE".to_owned()].into());
+    let filtered =
+        environment.for_workflow_children(&["VISIBLE".to_owned()].into(), &BTreeSet::new());
     assert_eq!(
         filtered.variable(OsStr::new("PATH")),
         Some(OsStr::new("/bin"))
@@ -1921,7 +1947,7 @@ fn workflow_admission_forwards_only_the_declared_grant_token_names() {
 
     assert_eq!(
         environment
-            .for_workflow_children(&declared)
+            .for_workflow_children(&declared, &BTreeSet::new())
             .variables()
             .keys()
             .collect::<Vec<_>>(),
@@ -1929,7 +1955,7 @@ fn workflow_admission_forwards_only_the_declared_grant_token_names() {
     );
     assert_eq!(
         environment
-            .for_workflow_children(&BTreeSet::new())
+            .for_workflow_children(&BTreeSet::new(), &BTreeSet::new())
             .variables()
             .keys()
             .collect::<Vec<_>>(),
@@ -1937,7 +1963,7 @@ fn workflow_admission_forwards_only_the_declared_grant_token_names() {
     );
 }
 
-// INV-ENGINE-31
+// INV-ENGINE-31, INV-ENGINE-43
 #[test]
 fn node_narrowing_drops_only_root_names_the_node_omits() {
     let environment = EnvironmentSnapshot::new([
@@ -1946,16 +1972,241 @@ fn node_narrowing_drops_only_root_names_the_node_omits() {
         ("USEFUL_WORKFLOW_ROOT", "/tree"),
         ("VISIBLE", "kept"),
         ("HIDDEN_FROM_NODE", "dropped"),
+        ("GH_TOKEN", "declared"),
+        ("GH_TOKEN_FILE", "/declared"),
     ]);
-    let root = ["VISIBLE", "HIDDEN_FROM_NODE", "TMPDIR"]
+    let root = ["VISIBLE", "HIDDEN_FROM_NODE", "TMPDIR", "GH_TOKEN"]
         .map(str::to_owned)
         .into();
+    let kept = ["VISIBLE".to_owned()].into();
 
-    let narrowed = environment.narrowed_for_node(&root, &["VISIBLE".to_owned()].into());
-
+    let narrowed = environment.narrowed_for_node(&root, &kept, &BTreeSet::new());
     assert_eq!(
         narrowed.variables().keys().collect::<Vec<_>>(),
-        ["PATH", "TMPDIR", "USEFUL_WORKFLOW_ROOT", "VISIBLE"]
+        [
+            "GH_TOKEN_FILE",
+            "PATH",
+            "TMPDIR",
+            "USEFUL_WORKFLOW_ROOT",
+            "VISIBLE"
+        ]
+    );
+
+    let integrations = IntegrationProvider::Github
+        .environment_names()
+        .iter()
+        .copied()
+        .collect();
+    let narrowed = environment.narrowed_for_node(&root, &kept, &integrations);
+    assert_eq!(
+        narrowed.variables().keys().collect::<Vec<_>>(),
+        [
+            "GH_TOKEN",
+            "GH_TOKEN_FILE",
+            "PATH",
+            "TMPDIR",
+            "USEFUL_WORKFLOW_ROOT",
+            "VISIBLE"
+        ]
+    );
+}
+
+/// The eight environment names of the five declarable integrations (REQ-WFEXEC-78).
+const INTEGRATION_ENVIRONMENT: [(&str, &str); 8] = [
+    ("GH_TOKEN", "launching-gh-token"),
+    ("GH_TOKEN_FILE", "/launching/gh-token"),
+    ("GITLAB_TOKEN", "launching-gitlab-token"),
+    ("GITLAB_TOKEN_FILE", "/launching/gitlab-token"),
+    ("USEFUL_LINEAR_ACCESS_TOKEN", "launching-linear-token"),
+    ("USEFUL_LINEAR_ACCESS_TOKEN_FILE", "/launching/linear-token"),
+    ("CLAUDE_CODE_OAUTH_TOKEN", "launching-claude-token"),
+    ("CODEX_HOME", "/launching/codex"),
+];
+
+fn integration_launching_environment() -> EnvironmentSnapshot {
+    EnvironmentSnapshot::new(
+        [
+            ("PATH", "/bin"),
+            ("HIDDEN", "private"),
+            ("GITHUB_TOKEN", "launching-github-token"),
+        ]
+        .into_iter()
+        .chain(INTEGRATION_ENVIRONMENT),
+    )
+}
+
+fn declaring_workflow(declaration: &str) -> String {
+    format!(
+        "schemaVersion: 1\n{declaration}steps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n"
+    )
+}
+
+fn integration_context(
+    fixture: &WorkflowFixture,
+    environment: EnvironmentSnapshot,
+) -> ExecutionContext {
+    ExecutionContext::new(
+        fixture.execution_root.clone(),
+        default_execution_policy_limits(1),
+        environment,
+        CancellationPolicy::new(CancellationSource::new(), Duration::from_secs(1)),
+    )
+}
+
+fn named_values(environment: &EnvironmentSnapshot) -> Vec<(&str, &str)> {
+    environment
+        .variables()
+        .iter()
+        .map(|(name, value)| (name.to_str().unwrap(), value.to_str().unwrap()))
+        .collect()
+}
+
+fn launching_values(names: &[&'static str]) -> Vec<(&'static str, &'static str)> {
+    let mut values = INTEGRATION_ENVIRONMENT
+        .into_iter()
+        .filter(|(name, _)| names.contains(name))
+        .chain([("PATH", "/bin")])
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values
+}
+
+// REQ-WFEXEC-78, INV-ENGINE-43
+#[test]
+fn admission_keeps_the_environment_names_of_each_declared_integration() {
+    for (provider, names) in [
+        ("github", &["GH_TOKEN", "GH_TOKEN_FILE"][..]),
+        ("gitlab.com", &["GITLAB_TOKEN", "GITLAB_TOKEN_FILE"][..]),
+        (
+            "linear",
+            &[
+                "USEFUL_LINEAR_ACCESS_TOKEN",
+                "USEFUL_LINEAR_ACCESS_TOKEN_FILE",
+            ][..],
+        ),
+        ("claude_code", &["CLAUDE_CODE_OAUTH_TOKEN"][..]),
+        ("codex", &["CODEX_HOME"][..]),
+    ] {
+        let fixture = WorkflowFixture::new(&declaring_workflow(&format!(
+            "requires:\n  integrations:\n    {provider}: {{}}\n"
+        )));
+        let admitted = admit_workflow(
+            fixture.resolve(),
+            ResolvedInputs::default(),
+            integration_context(&fixture, integration_launching_environment()),
+        )
+        .unwrap();
+        assert_eq!(
+            named_values(admitted.execution().environment()),
+            launching_values(names),
+            "{provider}"
+        );
+    }
+
+    let undeclared = WorkflowFixture::new(&declaring_workflow(""));
+    let admitted = admit_workflow(
+        undeclared.resolve(),
+        ResolvedInputs::default(),
+        integration_context(&undeclared, integration_launching_environment()),
+    )
+    .unwrap();
+    assert_eq!(
+        named_values(admitted.execution().environment()),
+        [("PATH", "/bin")]
+    );
+
+    let github = WorkflowFixture::new(&declaring_workflow(
+        "requires:\n  integrations:\n    github: {}\n",
+    ));
+    let admitted = admit_workflow(
+        github.resolve(),
+        ResolvedInputs::default(),
+        integration_context(
+            &github,
+            EnvironmentSnapshot::new([("PATH", "/bin"), ("GH_TOKEN", "launching-gh-token")]),
+        ),
+    )
+    .unwrap();
+    assert_eq!(
+        named_values(admitted.execution().environment()),
+        [("GH_TOKEN", "launching-gh-token"), ("PATH", "/bin")],
+        "a declared name the launching environment lacks stays unset"
+    );
+}
+
+// REQ-WFEXEC-78, INV-ENGINE-43
+#[test]
+fn runner_admission_keeps_the_environment_names_of_a_declared_integration() {
+    let fixture = WorkflowFixture::new(&declaring_workflow(
+        "requires:\n  integrations:\n    github: {}\n",
+    ));
+    let admitted = admit_runner_workflow(
+        fixture.resolve(),
+        ResolvedInputs::default(),
+        integration_context(&fixture, integration_launching_environment()),
+    )
+    .unwrap();
+    assert_eq!(
+        named_values(admitted.execution().environment()),
+        launching_values(&["GH_TOKEN", "GH_TOKEN_FILE"])
+    );
+}
+
+// REQ-WFEXEC-78, REQ-WFEXEC-71, REQ-WFRECOVERY-64, INV-ENGINE-31, INV-ENGINE-43
+#[test]
+fn no_node_list_removes_the_names_of_a_declared_integration() {
+    let fixture = WorkflowFixture::new(
+        "schemaVersion: 1
+environmentPassthrough: [GH_TOKEN, OTHER]
+requires:
+  integrations:
+    github: {}
+steps:
+  narrowed:
+    kind: cmd
+    environmentPassthrough: []
+    command:
+      argv: [\"true\"]
+  handled:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+        environmentPassthrough: []
+        command:
+          argv: [\"true\"]
+    command:
+      argv: [\"true\"]
+",
+    );
+    let admitted = admit_workflow(
+        fixture.resolve(),
+        ResolvedInputs::default(),
+        integration_context(
+            &fixture,
+            integration_launching_environment().with_variable("OTHER".into(), "other".into()),
+        ),
+    )
+    .unwrap();
+    let declared = launching_values(&["GH_TOKEN", "GH_TOKEN_FILE"]);
+    assert_eq!(
+        named_values(&admitted.node_environment("narrowed")),
+        declared
+    );
+    assert_eq!(
+        named_values(&admitted.recovery_handler_environment("handled")),
+        declared
+    );
+    assert_eq!(
+        named_values(&admitted.node_environment("handled")),
+        [
+            ("GH_TOKEN", "launching-gh-token"),
+            ("GH_TOKEN_FILE", "/launching/gh-token"),
+            ("OTHER", "other"),
+            ("PATH", "/bin"),
+        ],
+        "a node without its own list keeps every root name"
     );
 }
 

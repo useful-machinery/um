@@ -6,20 +6,23 @@ use useful_execution::{
 };
 
 use crate::agent_login::cloud::{
-    CloudFailure, DeliveryRefusal, GrantTokenFailure, GrantTokenRefusal, LoginStatus,
+    CloudFailure, CredentialSourcesFailure, CredentialSourcesRequest, DeliveryRefusal,
+    GrantProvider, GrantTokenFailure, GrantTokenRefusal, ListedProvider, LoginStatus,
+    ProviderLogin, ReportedSource,
 };
 use crate::agent_login::directory::LoginDirectory;
 use crate::agent_login::readiness::{
     GrantReadiness, LoginReadiness, ReadinessDocument, UseOutcome, readiness_path,
 };
 use crate::agent_login::setup::{AgentLoginSetup, SetupOutcome};
-use crate::control_protocol::{AgentLoginProvider, AgentLoginState};
+use crate::control_protocol::{AgentLoginProvider, AgentLoginState, CredentialSource};
 use crate::service::IdleAssignmentGate;
 use crate::service::control::{AdmissionAgentLogins, LiveStatus};
 use crate::service::test_support::{
-    CountedGate, FakeAgentLoginCloud, FakeGrantToken, SleepRelease, controlled_sleeper,
-    fake_agent_login_material, fake_agent_login_setup, fake_codex_answer, fake_codex_authorized,
-    fake_grant_expiry, fake_grant_token,
+    CountedGate, FAKE_AGENT_LOGIN_ID, FAKE_GRANT_ID, FakeAgentLoginCloud, FakeGrantToken,
+    SleepRelease, controlled_sleeper, fake_agent_login_material, fake_agent_login_setup,
+    fake_agent_login_setup_serving, fake_codex_answer, fake_codex_authorized, fake_grant_expiry,
+    fake_grant_token,
 };
 use crate::telemetry::test_recorder;
 
@@ -316,23 +319,40 @@ impl SettingUp {
 
     /// `new`, for a manager whose assignments run `workflow`.
     fn running(workflow: &str, cloud: Arc<FakeAgentLoginCloud>) -> Self {
+        Self::running_serving(workflow, cloud, &[])
+    }
+
+    /// `running`, for a service whose environment also carries `service`.
+    fn running_serving(
+        workflow: &str,
+        cloud: Arc<FakeAgentLoginCloud>,
+        service: &[(&str, &str)],
+    ) -> Self {
         let (temporary, manager) = manager_without_agent_logins(workflow);
-        Self::serving(temporary, manager, cloud)
+        Self::serving(temporary, manager, cloud, service)
     }
 
     /// `new`, for `manager`, whose agent-login directory and service home
-    /// are in `temporary`.
+    /// are in `temporary`, and whose service environment, the admission's
+    /// and the setup's alike, also carries `service`.
     fn serving(
         temporary: tempfile::TempDir,
-        manager: AssignmentManager,
+        mut manager: AssignmentManager,
         cloud: Arc<FakeAgentLoginCloud>,
+        service: &[(&str, &str)],
     ) -> Self {
+        let mut environment = manager.environment.variables().clone();
+        for (name, value) in service {
+            environment.insert(OsString::from(name), OsString::from(value));
+        }
+        manager.environment = EnvironmentSnapshot::new(environment);
         let manager = Arc::new(Mutex::new(manager));
         let (recorder, _capture) = test_recorder("rbt_01k0z6r1w8f4jy2m7q9v3x5abc");
         let setup = Arc::new(AgentLoginSetup::new(
-            fake_agent_login_setup(
+            fake_agent_login_setup_serving(
                 Arc::clone(&cloud),
                 &temporary.path().join("service-home"),
+                service,
                 temporary.path(),
                 recorder,
             ),
@@ -379,16 +399,6 @@ impl SettingUp {
         let mut manager = self.manager.lock().unwrap();
         offer_then_prepare(&mut manager, offered).await;
         accepted_variable(&manager, CODEX_HOME)
-    }
-
-    /// Adds `variables` to the service's environment.
-    fn serve_with(&self, variables: &[(&str, &str)]) {
-        let mut manager = self.manager.lock().unwrap();
-        let mut environment = manager.environment.variables().clone();
-        for (name, value) in variables {
-            environment.insert(OsString::from(name), OsString::from(value));
-        }
-        manager.environment = EnvironmentSnapshot::new(environment);
     }
 
     /// Admits `offered`, runs it and answers its reports.
@@ -573,9 +583,11 @@ async fn an_admission_asks_nothing_while_the_readiness_names_no_login() {
 
 // REQ-GRANT-49, REQ-GRANT-51
 #[tokio::test]
-async fn an_admission_sets_up_a_selected_provider_that_holds_no_login() {
+async fn an_admission_asks_nothing_for_a_provider_cloud_refuses() {
     // Cloud names an authorization in force whose owner it refuses: the
-    // provider is selected, `not_authorized`, and holds nothing.
+    // provider is `not_authorized` and holds nothing, so no login is
+    // authorized and an admission asks nothing, even once Cloud would
+    // authorize it again; a periodic pass asks.
     let fixture = SettingUp::new(FakeAgentLoginCloud::new(fake_codex_answer(
         LoginStatus::Unauthorized,
     )));
@@ -583,16 +595,12 @@ async fn an_admission_sets_up_a_selected_provider_that_holds_no_login() {
         fixture.periodic_pass().await,
         SetupOutcome::Recorded(_)
     ));
-    let codex = fixture.codex();
-    assert_eq!(codex.state, AgentLoginState::NotAuthorized);
-    assert!(codex.selected);
+    assert_eq!(fixture.codex().state, AgentLoginState::NotAuthorized);
 
-    // Cloud authorizes it again; the next admission asks, rather than
-    // withhold the login until a periodic pass finds the runner idle.
     fixture.cloud.answer(fake_codex_authorized(1));
-    assert!(fixture.admit(&offer("bg")).await.is_some());
-    assert_eq!(fixture.installed(), Some(fake_agent_login_material(1)));
-    assert_eq!(fixture.codex().state, AgentLoginState::Ready);
+    let recorded = fixture.requests();
+    assert_eq!(fixture.admit(&offer("bg")).await, None);
+    assert_eq!(fixture.requests(), recorded);
 }
 
 // INV-RUNNER-15
@@ -614,268 +622,121 @@ async fn nothing_is_asked_for_installed_or_removed_between_an_offer_and_the_rele
     assert_eq!(fixture.codex().state, AgentLoginState::Ready);
 }
 
-/// A runner whose agent-login directory and readiness document are beside a
-/// state file in a fresh directory, served from an environment with no
-/// Claude Code or Codex login of its own: an empty home and nothing else.
-struct Selecting {
-    temporary: tempfile::TempDir,
-    directory: LoginDirectory,
-    service: BTreeMap<OsString, OsString>,
-}
-
-impl Selecting {
-    fn new() -> Self {
-        let temporary = tempfile::tempdir().unwrap();
-        let state = temporary.path().join("runner-state.json");
-        let home = temporary.path().join("service-home");
-        fs::create_dir(&home).unwrap();
-        Self {
-            directory: LoginDirectory::beside(&state),
-            service: BTreeMap::from([(OsString::from("HOME"), home.into_os_string())]),
-            temporary,
-        }
-    }
-
-    fn home(&self) -> &Path {
-        Path::new(&self.service[OsStr::new("HOME")])
-    }
-
-    fn readiness(&self) -> PathBuf {
-        readiness_path(&self.temporary.path().join("runner-state.json"))
-    }
-
-    /// Records one entry per `(provider, state, selected)`, as a pass leaves
-    /// the document.
-    fn record(&self, entries: &[(AgentLoginProvider, AgentLoginState, bool)]) {
-        let _ = fs::remove_file(self.readiness());
-        ReadinessDocument {
-            updated_at: time::OffsetDateTime::from_unix_timestamp(1_794_450_000).unwrap(),
-            logins: entries
+/// A readiness document as an earlier release left it for a runner that
+/// holds no login: each provider in `state` and recorded as selected.
+fn record_selected(state_file: &Path, entries: &[(AgentLoginProvider, AgentLoginState)]) {
+    let document = readiness_path(state_file);
+    fs::write(
+        &document,
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1,
+            "updatedAt": "2026-11-12T01:00:00Z",
+            "providers": entries
                 .iter()
-                .map(|&(provider, state, selected)| LoginReadiness {
-                    provider,
-                    state,
-                    checked_at: None,
-                    login: None,
-                    selected,
-                    last_use: None,
-                })
-                .collect(),
-            unknown: Vec::new(),
-        }
-        .write(&self.readiness())
-        .unwrap();
-    }
-
-    /// What an admission is offered now, with the service's environment.
-    fn admit(&self) -> crate::agent_login::Offer {
-        crate::agent_login::offer(
-            &EnvironmentSnapshot::new(self.service.clone()),
-            Some(&self.directory),
-        )
-    }
-
-    fn withheld(&self) -> Vec<&'static str> {
-        self.admit().withheld
-    }
-
-    fn service_environment(&self) -> EnvironmentSnapshot {
-        EnvironmentSnapshot::new(self.service.clone())
-    }
-}
-
-// REQ-GRANT-51, INV-RUNNER-17
-#[test]
-fn a_selected_codex_login_the_runner_holds_none_of_is_withheld() {
-    for state in [
-        AgentLoginState::InstallFailed,
-        // Cloud answered `unauthorized`: an authorization in force whose
-        // owner is not an active member.
-        AgentLoginState::NotAuthorized,
-        AgentLoginState::CloudUnavailable,
-    ] {
-        let runner = Selecting::new();
-        runner.record(&[(AgentLoginProvider::Codex, state, true)]);
-
-        let offered = runner.admit();
-
-        assert_eq!(offered.withheld, vec![CODEX_HOME], "{state:?}");
-        assert_eq!(
-            offered.environment,
-            runner.service_environment(),
-            "{state:?}"
-        );
-        assert_eq!(
-            offered.environment.variable(OsStr::new(CODEX_HOME)),
-            None,
-            "{state:?}"
-        );
-    }
-}
-
-// REQ-GRANT-51, REQ-GRANT-37
-#[test]
-fn a_selected_codex_login_the_runner_still_holds_is_offered_and_nothing_withheld() {
-    let runner = Selecting::new();
-    keep_codex_login(&runner.directory);
-    runner.record(&[(
-        AgentLoginProvider::Codex,
-        AgentLoginState::CloudUnavailable,
-        true,
-    )]);
-
-    let offered = runner.admit();
-
-    assert!(offered.withheld.is_empty());
-    assert_eq!(
-        offered.environment.variable(OsStr::new(CODEX_HOME)),
-        Some(runner.directory.codex_home().as_os_str())
-    );
-}
-
-// REQ-GRANT-51
-#[test]
-fn a_revoked_or_unselected_provider_leaves_the_service_environment() {
-    for (state, selected) in [
-        (AgentLoginState::Revoked, false),
-        (AgentLoginState::NotAuthorized, false),
-    ] {
-        let runner = Selecting::new();
-        runner.record(&[
-            (AgentLoginProvider::Codex, state, selected),
-            (AgentLoginProvider::ClaudeCode, state, selected),
-        ]);
-
-        let offered = runner.admit();
-
-        assert!(offered.withheld.is_empty(), "{state:?}");
-        assert_eq!(
-            offered.environment,
-            runner.service_environment(),
-            "{state:?}"
-        );
-    }
+                .map(|&(provider, state)| serde_json::json!({
+                    "provider": provider.as_str(),
+                    "state": state.as_str(),
+                    "selected": true,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&document, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(ReadinessDocument::load(&document).unwrap().is_some());
 }
 
 // REQ-GRANT-51, REQ-GRANT-37, INV-RUNNER-17
 #[test]
-fn a_service_codex_home_is_never_withheld_or_replaced() {
-    for (state, kept) in [
-        (AgentLoginState::InstallFailed, false),
-        (AgentLoginState::ForeignLogin, false),
-        (AgentLoginState::Ready, true),
-        (AgentLoginState::CloudUnavailable, true),
+fn a_provider_recorded_as_selected_has_nothing_removed_or_replaced() {
+    for state in [
+        AgentLoginState::InstallFailed,
+        AgentLoginState::NotAuthorized,
+        AgentLoginState::CloudUnavailable,
     ] {
-        let mut runner = Selecting::new();
-        let own = runner.temporary.path().join("service-codex");
-        runner
-            .service
-            .insert(OsString::from(CODEX_HOME), own.clone().into_os_string());
-        if kept {
-            keep_codex_login(&runner.directory);
-        }
-        runner.record(&[(AgentLoginProvider::Codex, state, true)]);
-
-        let offered = runner.admit();
-
-        assert!(offered.withheld.is_empty(), "{state:?}");
-        assert_eq!(
-            offered.environment.variable(OsStr::new(CODEX_HOME)),
-            Some(own.as_os_str()),
-            "{state:?}"
+        let temporary = tempfile::tempdir().unwrap();
+        let state_file = temporary.path().join("runner-state.json");
+        let home = temporary.path().join("service-home");
+        fs::create_dir(&home).unwrap();
+        record_selected(
+            &state_file,
+            &[
+                (AgentLoginProvider::Codex, state),
+                (AgentLoginProvider::ClaudeCode, state),
+            ],
         );
+        let directory = LoginDirectory::beside(&state_file);
+        let without_codex_home =
+            EnvironmentSnapshot::new([(OsString::from("HOME"), home.clone().into_os_string())]);
+        let own_codex_home = EnvironmentSnapshot::new([
+            (OsString::from("HOME"), home.into_os_string()),
+            (
+                OsString::from(CODEX_HOME),
+                temporary.path().join("service-codex").into_os_string(),
+            ),
+        ]);
+
+        for service in [without_codex_home, own_codex_home] {
+            let offered = crate::agent_login::offer(&service, Some(&directory));
+            assert_eq!(offered.environment, service, "{state:?}");
+            assert!(offered.offered.is_empty(), "{state:?}");
+        }
     }
 }
 
-// REQ-GRANT-51, REQ-GRANT-44, REQ-GRANT-45
-#[test]
-fn a_selected_claude_code_login_without_a_token_is_withheld_unless_the_service_has_its_own() {
-    let runner = Selecting::new();
-    runner.record(&[(
-        AgentLoginProvider::ClaudeCode,
-        AgentLoginState::InstallFailed,
-        true,
-    )]);
-    assert_eq!(runner.withheld(), vec![TOKEN_VARIABLE]);
-
-    let configuration = runner.home().join(".claude");
-    fs::create_dir(&configuration).unwrap();
-    fs::write(configuration.join(".credentials.json"), "{}").unwrap();
-
-    let offered = runner.admit();
-    assert!(offered.withheld.is_empty());
-    assert_eq!(offered.environment, runner.service_environment());
-}
-
-// REQ-GRANT-51
-#[test]
-fn no_readiness_document_or_an_unreadable_one_withholds_nothing() {
-    let runner = Selecting::new();
-    assert!(runner.withheld().is_empty());
-
-    write_private(&runner.readiness(), b"not a readiness document");
-    let offered = runner.admit();
-    assert!(offered.withheld.is_empty());
-    assert_eq!(offered.environment, runner.service_environment());
-}
-
-// REQ-GRANT-51, REQ-DIAG-41, INV-RUNNER-17
+// REQ-GRANT-51, REQ-GRANT-44, INV-RUNNER-17
 #[tokio::test]
-async fn an_agent_step_whose_codex_login_was_withheld_fails_before_codex_starts() {
-    let workflow = CODEX_ONLY_WORKFLOW.replacen(
+async fn an_agent_step_with_no_login_to_offer_starts_with_the_variable_unset() {
+    // A root list keeps only the names it declares, so it also passes the
+    // fixture's own `CLAUDE_CONFIG_DIR` rather than leave the harness to the
+    // service `HOME`.
+    let workflow = CLAUDE_CODE_ONLY_WORKFLOW.replacen(
         "schemaVersion: 1\n",
-        "schemaVersion: 1\nenvironmentPassthrough: [CODEX_HOME]\n",
+        "schemaVersion: 1\nenvironmentPassthrough: [CLAUDE_CODE_OAUTH_TOKEN, CLAUDE_CONFIG_DIR]\n",
+        1,
+    );
+    // The fixture notes the token it was started with, or that it had none.
+    let claude_code = SUCCESSFUL_CLAUDE_CODE.replacen(
+        "set -eu\n",
+        "set -eu\nprintf '%s' \"${CLAUDE_CODE_OAUTH_TOKEN-unset}\" > \"${0%/*}/claude.token\"\n",
         1,
     );
     let (temporary, mut manager) = super::harness_executable_tests::manager_fixture_with_harnesses(
         &workflow,
         None,
+        Some(&claude_code),
         None,
-        Some(SUCCESSFUL_CODEX),
     );
     let mut variables = manager.environment.variables().clone();
-    variables.remove(OsStr::new(CODEX_HOME));
+    variables.remove(OsStr::new(TOKEN_VARIABLE));
     manager.environment = EnvironmentSnapshot::new(variables);
     let state = temporary.path().join("runner-state.json");
     manager.agent_login_directory = Some(LoginDirectory::beside(&state));
-    ReadinessDocument {
-        updated_at: time::OffsetDateTime::from_unix_timestamp(1_794_450_000).unwrap(),
-        logins: vec![LoginReadiness {
-            provider: AgentLoginProvider::Codex,
-            state: AgentLoginState::InstallFailed,
-            checked_at: None,
-            login: None,
-            selected: true,
-            last_use: None,
-        }],
-        unknown: Vec::new(),
-    }
-    .write(&readiness_path(&state))
-    .unwrap();
+    // Cloud named an authorization in force whose owner it refused, and an
+    // earlier release recorded the provider as selected.
+    record_selected(
+        &state,
+        &[(
+            AgentLoginProvider::ClaudeCode,
+            AgentLoginState::NotAuthorized,
+        )],
+    );
     let offered = offer("bg");
 
     offer_then_prepare(&mut manager, &offered).await;
-    assert_eq!(accepted_variable(&manager, CODEX_HOME), None);
+    assert_eq!(accepted_variable(&manager, TOKEN_VARIABLE), None);
     let reports = execute_to_terminal(&mut manager, &offered).await;
 
-    let Some(ExecutionReport::Finished {
-        outcome,
-        diagnostic,
-        ..
-    }) = reports.last()
-    else {
-        panic!("unexpected reports: {reports:#?}");
-    };
-    assert_eq!(outcome["outcome"], "failed", "{outcome:#}");
-    assert_eq!(
-        outcome["primaryIssue"]["detail"]["code"], "harness_start_failed",
-        "{outcome:#}"
+    assert_succeeded(&reports);
+    assert!(
+        !format!("{reports:?}").contains("harness_start_failed"),
+        "{reports:#?}"
     );
     assert_eq!(
-        diagnostic,
-        &Some(json!({ "launchFailure": "agent_login_unavailable" }))
+        fs::read_to_string(temporary.path().join("claude.token")).unwrap(),
+        "unset"
     );
-    assert!(!temporary.path().join("codex.calls").exists());
 }
 
 /// The last use the readiness records of the runner's Codex login once an
@@ -889,15 +750,20 @@ async fn codex_last_use_after_a_codex_step(service_codex_home: bool) -> Option<U
         None,
         Some(SUCCESSFUL_CODEX),
     );
-    if !service_codex_home {
-        let mut variables = manager.environment.variables().clone();
-        variables.remove(OsStr::new(CODEX_HOME));
-        manager.environment = EnvironmentSnapshot::new(variables);
-    }
-    let state = temporary.path().join("runner-state.json");
-    manager.agent_login_directory = Some(LoginDirectory::beside(&state));
     let service_home = temporary.path().join("service-home");
     fs::create_dir(&service_home).unwrap();
+    // The admission's `HOME` is the service's empty one, which holds no Codex login.
+    let mut variables = manager.environment.variables().clone();
+    variables.insert(
+        OsString::from("HOME"),
+        service_home.clone().into_os_string(),
+    );
+    if !service_codex_home {
+        variables.remove(OsStr::new(CODEX_HOME));
+    }
+    manager.environment = EnvironmentSnapshot::new(variables);
+    let state = temporary.path().join("runner-state.json");
+    manager.agent_login_directory = Some(LoginDirectory::beside(&state));
     let (recorder, _capture) = test_recorder("rbt_01k0z6r1w8f4jy2m7q9v3x5abc");
     // The setup's own environment has no `CODEX_HOME`, so it installs the
     // login whichever environment the admission draws from.
@@ -1039,14 +905,13 @@ fn refused(refusal: GrantTokenRefusal) -> FakeGrantToken {
 
 // REQ-GRANT-87, REQ-WFEXEC-71
 #[tokio::test]
-async fn an_issued_token_and_its_file_reach_only_the_steps_that_pass_them_over_the_services() {
+async fn an_issued_token_and_its_file_reach_only_the_steps_that_pass_them() {
     for (provider, variable, file_variable) in GRANT_NAMES {
         let token = fake_grant_token(provider, 4);
         let fixture = SettingUp::running(
             &workflow_passing_a_grant(variable, file_variable, &token),
             FakeAgentLoginCloud::new(Ok(Vec::new())),
         );
-        fixture.serve_with(&SERVICE_GRANT_VALUES);
         fixture
             .cloud
             .answer_grant_token(provider, FakeGrantToken::Issue(4));
@@ -1071,76 +936,327 @@ async fn a_workflow_that_passes_no_grant_name_receives_no_token() {
     assert_succeeded(&fixture.run(&offer("bg")).await);
 }
 
-// REQ-GRANT-87, REQ-WORKSPACE-18
+/// The `requires.integrations` id that declares `provider` (REQ-WFDEF-34).
+fn declared_id(provider: AgentLoginProvider) -> &'static str {
+    match provider {
+        AgentLoginProvider::Github => "github",
+        AgentLoginProvider::Gitlab => "gitlab.com",
+        AgentLoginProvider::Linear => "linear",
+        other => panic!("{other:?} has no grant names"),
+    }
+}
+
+/// A workflow that declares the integration `id` and lists no name of it:
+/// `plain` and `narrowed`, whose own list is empty, must both succeed at
+/// `check`.
+fn workflow_declaring(id: &str, check: &str) -> String {
+    format!(
+        r#"schemaVersion: 1
+requires:
+  integrations:
+    {id}: {{}}
+steps:
+  plain:
+    kind: cmd
+    command:
+      argv: [sh, -c, '{check}']
+  narrowed:
+    kind: cmd
+    environmentPassthrough: []
+    command:
+      argv: [sh, -c, '{check}']
+"#
+    )
+}
+
+// REQ-GRANT-87, REQ-WFEXEC-78
 #[tokio::test]
-async fn an_unselected_provider_leaves_the_services_gitlab_token_and_never_its_gh_token() {
-    let check = format!(
-        r#"test "$GITLAB_TOKEN" = service-gitlab-token && test "$GITLAB_TOKEN_FILE" = /service/gitlab-token && test "$GH_TOKEN_FILE" = /service/gh-token && {}"#,
-        unset(&[
-            "GH_TOKEN",
-            "USEFUL_LINEAR_ACCESS_TOKEN",
-            "USEFUL_LINEAR_ACCESS_TOKEN_FILE"
-        ])
+async fn a_declared_providers_token_and_its_file_reach_every_step() {
+    for (provider, variable, file_variable) in GRANT_NAMES {
+        let token = fake_grant_token(provider, 4);
+        let fixture = SettingUp::running(
+            &workflow_declaring(
+                declared_id(provider),
+                &format!(
+                    r#"test "${variable}" = {token} && test "$(cat "${file_variable}")" = {token}"#
+                ),
+            ),
+            FakeAgentLoginCloud::new(Ok(Vec::new())),
+        );
+        fixture
+            .cloud
+            .answer_grant_token(provider, FakeGrantToken::Issue(4));
+        assert_succeeded(&fixture.run(&offer("bg")).await);
+
+        let service = |name: &str| {
+            SERVICE_GRANT_VALUES
+                .iter()
+                .find(|(service, _)| *service == name)
+                .map(|(_, value)| *value)
+                .unwrap()
+        };
+        let fixture = SettingUp::running_serving(
+            &workflow_declaring(
+                declared_id(provider),
+                &format!(
+                    r#"test "${variable}" = {} && test "${file_variable}" = {}"#,
+                    service(variable),
+                    service(file_variable)
+                ),
+            ),
+            FakeAgentLoginCloud::new(Ok(Vec::new())),
+            &SERVICE_GRANT_VALUES,
+        );
+        fixture
+            .cloud
+            .answer_grant_token(provider, FakeGrantToken::Issue(1));
+        assert_succeeded(&fixture.run(&offer("bg")).await);
+    }
+}
+
+// REQ-GRANT-44, REQ-WFEXEC-78
+#[tokio::test]
+async fn a_kept_token_reaches_every_step_of_a_workflow_that_declares_claude_code() {
+    let (_temporary, mut manager) = manager_without_agent_logins(&workflow_declaring(
+        "claude_code",
+        &format!(r#"test "${TOKEN_VARIABLE}" = {DELIVERED}"#),
+    ));
+    keep_token(login_directory(&manager));
+    let offered = offer("bg");
+
+    offer_then_prepare(&mut manager, &offered).await;
+
+    assert_eq!(accepted_token(&manager), Some(OsString::from(DELIVERED)));
+    assert_succeeded(&execute_to_terminal(&mut manager, &offered).await);
+}
+
+// REQ-GRANT-37, REQ-WFEXEC-78
+#[tokio::test]
+async fn a_kept_codex_login_reaches_every_step_of_a_workflow_that_declares_codex() {
+    let (_temporary, mut manager) = manager_without_agent_logins(&workflow_declaring(
+        "codex",
+        &format!(r#"test -f "${CODEX_HOME}/auth.json""#),
+    ));
+    keep_codex_login(login_directory(&manager));
+    let codex_home = login_directory(&manager).codex_home();
+    let offered = offer("bg");
+
+    offer_then_prepare(&mut manager, &offered).await;
+
+    assert_eq!(
+        accepted_variable(&manager, CODEX_HOME),
+        Some(codex_home.into_os_string())
     );
+    assert_succeeded(&execute_to_terminal(&mut manager, &offered).await);
+}
+
+/// A fake Cloud that lists `example`, a provider of its configuration, with
+/// `EXAMPLE_ACCESS_TOKEN` and `EXAMPLE_ACCESS_TOKEN_FILE` for each
+/// assignment, and issues its token at generation 2.
+fn cloud_listing_example() -> Arc<FakeAgentLoginCloud> {
+    let cloud = FakeAgentLoginCloud::new(Ok(Vec::new()));
+    cloud.answer_grant_providers(Ok(vec![ListedProvider {
+        provider: "example".to_owned(),
+        token: "EXAMPLE_ACCESS_TOKEN".to_owned(),
+        token_file: "EXAMPLE_ACCESS_TOKEN_FILE".to_owned(),
+    }]));
+    cloud.answer_grant_token(example(), FakeGrantToken::Issue(2));
+    cloud
+}
+
+fn example() -> GrantProvider {
+    GrantProvider::listed("example").unwrap()
+}
+
+// REQ-GRANT-87, REQ-WFEXEC-71
+#[tokio::test]
+async fn a_configured_providers_token_and_its_file_reach_only_the_steps_that_pass_them() {
+    let token = fake_grant_token(example(), 2);
     let fixture = SettingUp::running(
+        &workflow_passing_a_grant("EXAMPLE_ACCESS_TOKEN", "EXAMPLE_ACCESS_TOKEN_FILE", &token),
+        cloud_listing_example(),
+    );
+
+    assert_succeeded(&fixture.run(&offer("bg")).await);
+    assert_eq!(
+        fixture
+            .cloud
+            .grant_requests()
+            .iter()
+            .map(|request| request.provider.clone())
+            .collect::<Vec<_>>(),
+        [example()]
+    );
+}
+
+// REQ-GRANT-87, REQ-WFEXEC-71
+#[tokio::test]
+async fn a_workflow_that_passes_no_configured_providers_name_receives_nothing() {
+    let fixture = SettingUp::running(
+        &workflow_checking(
+            "OTHER_NAME",
+            &unset(&["EXAMPLE_ACCESS_TOKEN", "EXAMPLE_ACCESS_TOKEN_FILE"]),
+        ),
+        cloud_listing_example(),
+    );
+
+    assert_succeeded(&fixture.run(&offer("bg")).await);
+    assert_eq!(fixture.cloud.grant_requests().len(), 1);
+}
+
+/// The providers the fake Cloud was asked for grant tokens of, in the
+/// document's order.
+fn asked_for(cloud: &FakeAgentLoginCloud) -> Vec<AgentLoginProvider> {
+    let asked: Vec<AgentLoginProvider> = cloud
+        .grant_requests()
+        .iter()
+        .filter_map(|request| request.provider.agent_login_provider())
+        .collect();
+    GRANT_NAMES
+        .iter()
+        .map(|(provider, _, _)| *provider)
+        .filter(|provider| asked.contains(provider))
+        .collect()
+}
+
+// REQ-GRANT-87, REQ-GRANT-86, REQ-WORKSPACE-18
+#[tokio::test]
+async fn a_gh_token_the_service_sets_reaches_the_step_and_a_grant_fills_only_its_absence() {
+    let issuing_every_grant = || {
+        let cloud = FakeAgentLoginCloud::new(Ok(Vec::new()));
+        for (provider, _, _) in GRANT_NAMES {
+            cloud.answer_grant_token(provider, FakeGrantToken::Issue(1));
+        }
+        cloud
+    };
+    let offered = offer("bg");
+
+    // The host provides `github`: its value reaches the step, no file is
+    // added, and Cloud is asked for no GitHub token, only the other two.
+    let fixture = SettingUp::running_serving(
+        &workflow_checking(
+            "GH_TOKEN, GH_TOKEN_FILE",
+            &format!(
+                r#"test "$GH_TOKEN" = service-gh-token && {}"#,
+                unset(&["GH_TOKEN_FILE"])
+            ),
+        ),
+        issuing_every_grant(),
+        &[("GH_TOKEN", "service-gh-token")],
+    );
+    assert_succeeded(&fixture.run(&offered).await);
+    assert_eq!(
+        asked_for(&fixture.cloud),
+        [AgentLoginProvider::Gitlab, AgentLoginProvider::Linear]
+    );
+    let github = fixture.grant(AgentLoginProvider::Github);
+    assert_eq!(
+        (
+            github.state,
+            github.issued,
+            github.checked_at.is_some(),
+            github.run_id.as_deref()
+        ),
+        (
+            AgentLoginState::NotDelivered,
+            None,
+            true,
+            Some(offered.run_id.as_str())
+        )
+    );
+
+    // The host sets none of the six names: the token issued, and its file,
+    // reach the step.
+    let token = fake_grant_token(AgentLoginProvider::Github, 1);
+    let fixture = SettingUp::running(
+        &workflow_checking(
+            "GH_TOKEN, GH_TOKEN_FILE",
+            &format!(r#"test "$GH_TOKEN" = {token} && test "$(cat "$GH_TOKEN_FILE")" = {token}"#),
+        ),
+        issuing_every_grant(),
+    );
+    assert_succeeded(&fixture.run(&offered).await);
+    assert_eq!(
+        asked_for(&fixture.cloud),
+        GRANT_NAMES.map(|(provider, _, _)| provider)
+    );
+}
+
+// REQ-GRANT-87, REQ-GRANT-86, REQ-WORKSPACE-18
+#[tokio::test]
+async fn every_provider_the_host_provides_keeps_the_services_names_whatever_cloud_holds() {
+    let check = SERVICE_GRANT_VALUES
+        .iter()
+        .map(|(name, value)| format!(r#"test "${name}" = {value}"#))
+        .collect::<Vec<_>>()
+        .join(" && ");
+    let fixture = SettingUp::running_serving(
         &workflow_checking(&every_grant_name().join(", "), &check),
         FakeAgentLoginCloud::new(Ok(Vec::new())),
+        &SERVICE_GRANT_VALUES,
     );
-    fixture.serve_with(&SERVICE_GRANT_VALUES);
     for (provider, _, _) in GRANT_NAMES {
         fixture
             .cloud
-            .answer_grant_token(provider, refused(GrantTokenRefusal::Unauthorized));
+            .answer_grant_token(provider, FakeGrantToken::Issue(1));
     }
 
     assert_succeeded(&fixture.run(&offer("bg")).await);
-    assert!(!fixture.grant(AgentLoginProvider::Gitlab).selected);
+    assert!(fixture.cloud.grant_requests().is_empty());
+    for (provider, _, _) in GRANT_NAMES {
+        assert_eq!(
+            fixture.grant(provider).state,
+            AgentLoginState::NotDelivered,
+            "{provider:?}"
+        );
+    }
 }
 
-// REQ-GRANT-87, REQ-GRANT-10
+// REQ-GRANT-87, REQ-GRANT-86, REQ-WORKSPACE-18
 #[tokio::test]
-async fn a_selected_provider_without_a_token_withholds_the_services_gitlab_token() {
-    let workflow = workflow_checking(
-        "GITLAB_TOKEN, GITLAB_TOKEN_FILE",
-        &unset(&["GITLAB_TOKEN", "GITLAB_TOKEN_FILE"]),
+async fn a_provider_an_earlier_release_recorded_as_selected_with_no_token_leaves_its_names_unset() {
+    let fixture = SettingUp::running(
+        &workflow_checking(
+            "GH_TOKEN, GH_TOKEN_FILE",
+            &unset(&["GH_TOKEN", "GH_TOKEN_FILE"]),
+        ),
+        FakeAgentLoginCloud::new(Ok(Vec::new())),
     );
-    let serving = || {
-        let fixture = SettingUp::running(&workflow, FakeAgentLoginCloud::new(Ok(Vec::new())));
-        fixture.serve_with(&SERVICE_GRANT_VALUES);
-        fixture
-    };
-
-    // Cloud names a grant in force that cannot issue a token.
-    let fixture = serving();
+    // An earlier release recorded `github` as selected: Cloud named a grant
+    // in force that could not issue a token.
+    let document = readiness_path(&fixture.temporary.path().join("runner-state.json"));
+    fs::write(
+        &document,
+        serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1,
+            "updatedAt": "2026-11-12T01:00:00Z",
+            "providers": [{
+                "provider": "github",
+                "state": "reconnect_required",
+                "checkedAt": "2026-11-12T01:00:00Z",
+                "selected": true,
+                "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abz",
+            }],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&document, fs::Permissions::from_mode(0o600)).unwrap();
     fixture.cloud.answer_grant_token(
-        AgentLoginProvider::Gitlab,
+        AgentLoginProvider::Github,
         refused(GrantTokenRefusal::ReconnectRequired),
     );
-    assert_succeeded(&fixture.run(&offer("bg")).await);
-    assert!(fixture.grant(AgentLoginProvider::Gitlab).selected);
 
-    // Cloud does not answer for a provider an earlier admission was issued
-    // a token of.
-    let fixture = serving();
-    fixture
-        .cloud
-        .answer_grant_token(AgentLoginProvider::Gitlab, FakeGrantToken::Issue(1));
-    let first = offer("bg");
-    fixture.admit(&first).await;
-    fixture.release(&first).await;
-    fixture.cloud.answer_grant_token(
-        AgentLoginProvider::Gitlab,
-        FakeGrantToken::Fail(GrantTokenFailure::Cloud(CloudFailure::Transport)),
+    assert_succeeded(&fixture.run(&offer("bg")).await);
+    assert_eq!(
+        fixture.grant(AgentLoginProvider::Github).state,
+        AgentLoginState::ReconnectRequired
     );
-    assert_succeeded(&fixture.run(&offer("bh")).await);
-    let gitlab = fixture.grant(AgentLoginProvider::Gitlab);
-    assert_eq!(gitlab.state, AgentLoginState::CloudUnavailable);
-    assert!(gitlab.selected);
 }
 
 // REQ-GRANT-87, REQ-GRANT-51
 #[tokio::test]
-async fn an_agent_step_is_not_refused_over_a_withheld_grant_name() {
+async fn an_agent_step_starts_with_a_grant_name_unset() {
     // The names the Codex fixture reads, and the GitLab grant's.
     let workflow = CODEX_ONLY_WORKFLOW.replacen(
         "schemaVersion: 1\n",
@@ -1157,8 +1273,12 @@ async fn an_agent_step_is_not_refused_over_a_withheld_grant_name() {
     manager.agent_login_directory = Some(LoginDirectory::beside(
         &temporary.path().join("runner-state.json"),
     ));
-    let fixture = SettingUp::serving(temporary, manager, FakeAgentLoginCloud::new(Ok(Vec::new())));
-    fixture.serve_with(&SERVICE_GRANT_VALUES);
+    let fixture = SettingUp::serving(
+        temporary,
+        manager,
+        FakeAgentLoginCloud::new(Ok(Vec::new())),
+        &[],
+    );
     fixture.cloud.answer_grant_token(
         AgentLoginProvider::Gitlab,
         refused(GrantTokenRefusal::ReconnectRequired),
@@ -1249,5 +1369,213 @@ async fn a_running_assignment_has_its_token_file_replaced_and_an_ended_one_does_
             .unwrap()
             .generation,
         1
+    );
+}
+
+// REQ-GRANT-89, SC-GRANT-13
+#[tokio::test]
+async fn a_running_assignment_has_its_configured_providers_token_file_replaced() {
+    let wait = Duration::from_secs(60);
+    let one = fake_grant_token(example(), 1);
+    let two = fake_grant_token(example(), 2);
+    let marker = tempfile::tempdir().unwrap();
+    let started = marker.path().join("started");
+    // The step says it has started, then waits for the file to hold
+    // generation 2; its variable is still generation 1's.
+    let workflow = workflow_checking(
+        "EXAMPLE_ACCESS_TOKEN, EXAMPLE_ACCESS_TOKEN_FILE",
+        &format!(
+            r#": > {started} && i=0 && until test "$(cat "$EXAMPLE_ACCESS_TOKEN_FILE")" = {two}; do i=$((i+1)); test $i -lt 600 || exit 1; sleep 0.1; done && test "$EXAMPLE_ACCESS_TOKEN" = {one}"#,
+            started = started.display(),
+        ),
+    );
+    let fixture = SettingUp::running(&workflow, cloud_listing_example());
+    let mut sleeps = fixture.refreshing();
+    fixture
+        .cloud
+        .issue_grant_tokens_with(wait, fake_grant_expiry());
+    fixture
+        .cloud
+        .answer_grant_token(example(), FakeGrantToken::Issue(1));
+
+    let refresh = async {
+        let (asked, release) = sleeps.recv().await.unwrap();
+        assert_eq!(asked, wait);
+        wait_for_fixture_path(&started).await;
+        fixture
+            .cloud
+            .answer_grant_token(example(), FakeGrantToken::Issue(2));
+        release.release();
+    };
+    let running = offer("bg");
+    let (reports, ()) = tokio::join!(fixture.run(&running), refresh);
+
+    assert_succeeded(&reports);
+    assert_eq!(
+        fixture
+            .cloud
+            .grant_requests()
+            .iter()
+            .map(|request| request.provider.clone())
+            .collect::<Vec<_>>(),
+        [example(), example()]
+    );
+}
+
+/// The boot `SettingUp`'s live status serves as.
+const SETTING_UP_BOOT: &str = "rbt_01k0z6r1w8f4jy2m7q9v3x5abc";
+
+/// The entry of `provider` reported as `source`, with `grant_id` or
+/// `agent_login_id` where it names one.
+fn reported(
+    provider: AgentLoginProvider,
+    source: CredentialSource,
+    grant_id: Option<&str>,
+    agent_login_id: Option<&str>,
+) -> ReportedSource {
+    ReportedSource {
+        provider,
+        source,
+        grant_id: grant_id.map(str::to_owned),
+        agent_login_id: agent_login_id.map(str::to_owned),
+    }
+}
+
+// REQ-GRANT-93, REQ-GRANT-92
+#[tokio::test]
+async fn an_admission_reports_each_providers_source_once_before_it_is_accepted() {
+    // The host provides GitHub, Cloud issues a Linear token, and the runner
+    // keeps a Claude Code login its readiness records as installed; it has
+    // no source of GitLab or Codex.
+    let cloud = FakeAgentLoginCloud::new(Ok(vec![ProviderLogin {
+        provider: AgentLoginProvider::ClaudeCode,
+        agent_login_id: FAKE_AGENT_LOGIN_ID.to_owned(),
+        status: LoginStatus::Authorized {
+            generation: 1,
+            record_schema_version: 1,
+        },
+    }]));
+    cloud.answer_grant_token(AgentLoginProvider::Linear, FakeGrantToken::Issue(1));
+    cloud.answer_credential_sources(Ok(()));
+    let fixture = SettingUp::running_serving(
+        &workflow_checking("OTHER_NAME", "true"),
+        cloud,
+        &[("GH_TOKEN", "service-gh-token")],
+    );
+    assert!(matches!(
+        fixture.periodic_pass().await,
+        SetupOutcome::Recorded(_)
+    ));
+    assert!(fixture.cloud.credential_source_reports().is_empty());
+    let offered = offer("bg");
+
+    fixture.admit(&offered).await;
+
+    // The report was made on the admission's preparation, so it is there
+    // once the assignment is accepted, and only once.
+    assert_eq!(
+        fixture.cloud.credential_source_reports(),
+        [CredentialSourcesRequest {
+            boot_id: SETTING_UP_BOOT.to_owned(),
+            assignment_id: offered.assignment_id.clone(),
+            sources: vec![
+                reported(
+                    AgentLoginProvider::ClaudeCode,
+                    CredentialSource::Grant,
+                    None,
+                    Some(FAKE_AGENT_LOGIN_ID),
+                ),
+                reported(
+                    AgentLoginProvider::Github,
+                    CredentialSource::Host,
+                    None,
+                    None,
+                ),
+                reported(
+                    AgentLoginProvider::Linear,
+                    CredentialSource::Grant,
+                    Some(FAKE_GRANT_ID),
+                    None,
+                ),
+            ],
+        }]
+    );
+}
+
+// REQ-GRANT-93
+#[tokio::test]
+async fn an_admission_whose_report_cloud_does_not_take_is_accepted_and_runs_all_the_same() {
+    for answer in [
+        Err(CredentialSourcesFailure::Cloud(CloudFailure::Status(409))),
+        Err(CredentialSourcesFailure::Cloud(CloudFailure::Transport)),
+        Err(CredentialSourcesFailure::NoRoute),
+    ] {
+        let fixture = SettingUp::running_serving(
+            &workflow_checking("GH_TOKEN", r#"test "$GH_TOKEN" = service-gh-token"#),
+            FakeAgentLoginCloud::new(Ok(Vec::new())),
+            &[("GH_TOKEN", "service-gh-token")],
+        );
+        fixture.cloud.answer_credential_sources(answer);
+
+        assert_succeeded(&fixture.run(&offer("bg")).await);
+        assert_eq!(
+            fixture
+                .cloud
+                .credential_source_reports()
+                .iter()
+                .map(|report| report.sources.clone())
+                .collect::<Vec<_>>(),
+            [vec![reported(
+                AgentLoginProvider::Github,
+                CredentialSource::Host,
+                None,
+                None,
+            )]],
+            "{answer:?}"
+        );
+    }
+}
+
+// REQ-GRANT-93
+#[tokio::test]
+#[expect(
+    clippy::await_holding_lock,
+    reason = "the admission's setup must not take the manager's lock"
+)]
+async fn a_continuations_admission_reports_its_own_sources() {
+    let (temporary, manager, initial, workspace, _baseline) =
+        super::git_continuation_tests::retained_initial_attempt(false).await;
+    let fixture = SettingUp::serving(
+        temporary,
+        manager,
+        FakeAgentLoginCloud::new(Ok(Vec::new())),
+        &[("GH_TOKEN", "service-gh-token")],
+    );
+    let mut manager = fixture.manager.lock().unwrap();
+    let successor =
+        super::git_continuation_tests::continuation_successor(&manager, &initial, &workspace);
+    manager.handle_offer(successor.clone()).unwrap();
+
+    super::git_continuation_tests::prepare_retained_continuation(&mut manager, &successor).await;
+
+    assert!(matches!(manager.slot, Some(LocalSlot::Accepted(_))));
+    // The fixture's own coding-agent logins may add host entries; the
+    // continuation's one report is its own assignment's.
+    let reports = fixture.cloud.credential_source_reports();
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| (report.boot_id.as_str(), report.assignment_id.as_str()))
+            .collect::<Vec<_>>(),
+        [(SETTING_UP_BOOT, successor.assignment_id.as_str())]
+    );
+    assert!(
+        reports[0].sources.contains(&reported(
+            AgentLoginProvider::Github,
+            CredentialSource::Host,
+            None,
+            None,
+        )),
+        "{reports:?}"
     );
 }

@@ -1,7 +1,10 @@
 use clap::Args;
 
 use crate::exit_code::ExitCode;
-use useful_api::{AgentLogin, AgentLoginApi, AgentLoginFailure, Grant, GrantApi, GrantFailure};
+use useful_api::{
+    AgentLogin, AgentLoginApi, AgentLoginFailure, Grant, GrantApi, GrantFailure, MemberGrantApi,
+    MemberGrantFailure,
+};
 use useful_human_auth::Deployment;
 
 use super::super::super::grant::every_page;
@@ -25,6 +28,10 @@ pub(super) struct Command {
 }
 
 impl Command {
+    /// Reads the member's agent logins, then their grants, then the providers the deployment
+    /// serves, to name the other OAuth providers they hold nothing of (REQ-GRANT-55,
+    /// REQ-GRANT-96). A deployment that predates the served read names none; a read that fails
+    /// otherwise is reported as a failed grant read is.
     pub(super) fn run(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let policy = self.options.http.transport_policy();
         let json = self.options.json;
@@ -34,10 +41,16 @@ impl Command {
             Ok(logins) => logins,
             Err(failure) => return agent_logins::failure(api_url, &failure, json),
         };
-        let grants = with_human_session_api(deployment, policy, read_grants)?;
-        match grants {
-            Ok(grants) => output::write_status(api_url, &grants, &logins, json),
-            Err(failure) => grants::failure(api_url, &failure, json),
+        let grants = match with_human_session_api(deployment, policy, read_grants)? {
+            Ok(grants) => grants,
+            Err(failure) => return grants::failure(api_url, &failure, json),
+        };
+        let served = with_human_session_api(deployment, policy, MemberGrantApi::served_providers)?;
+        match served {
+            Ok(served) => {
+                output::write_status(api_url, &grants, &logins, &served.unwrap_or_default(), json)
+            }
+            Err(failure) => grants::failure(api_url, &grant_failure(failure), json),
         }
     }
 
@@ -59,6 +72,39 @@ impl Command {
             logins.retain(|login| login.organization_id == organization_id);
         }
         Ok(logins)
+    }
+}
+
+/// A failed read of the providers the deployment serves as the failure of a grant read, which
+/// the command reports it as.
+fn grant_failure(failure: MemberGrantFailure) -> GrantFailure {
+    match failure {
+        MemberGrantFailure::Unauthenticated => GrantFailure::Unauthenticated,
+        MemberGrantFailure::Forbidden => GrantFailure::Forbidden,
+        MemberGrantFailure::InvalidInput => GrantFailure::InvalidInput,
+        MemberGrantFailure::IdempotencyConflict => GrantFailure::IdempotencyConflict,
+        MemberGrantFailure::ProviderUnavailable => GrantFailure::ProviderUnavailable,
+        MemberGrantFailure::GrantNotFound => GrantFailure::NotFound,
+        MemberGrantFailure::RateLimited { retry_after } => {
+            GrantFailure::RateLimited { retry_after }
+        }
+        MemberGrantFailure::Unreachable { category } => GrantFailure::Unreachable { category },
+        MemberGrantFailure::InvalidResponse {
+            credential_rejected,
+        } => GrantFailure::InvalidResponse {
+            credential_rejected,
+        },
+        // The served read names no organization, material, runner or authorization, so these
+        // answers are not ones it defines.
+        MemberGrantFailure::OrganizationNotFound
+        | MemberGrantFailure::MaterialInvalid
+        | MemberGrantFailure::LimitReached
+        | MemberGrantFailure::RunnerNotFound
+        | MemberGrantFailure::RunnerHoldsLogin
+        | MemberGrantFailure::AlreadyAuthorized
+        | MemberGrantFailure::AuthorizationNotFound => GrantFailure::InvalidResponse {
+            credential_rejected: false,
+        },
     }
 }
 

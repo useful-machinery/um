@@ -8,6 +8,8 @@ use tokio::sync::watch;
 use unicode_width::UnicodeWidthStr;
 
 use super::admission::CancellationReason;
+use super::archived_attempt::presented_step_state;
+use super::evidence::FailedChild;
 use super::observation::{
     CommandOutputSource, ExecutionObservation, ExecutionObserver, ObservedStepTransition,
 };
@@ -104,6 +106,9 @@ pub(crate) enum WorkflowRunOutputUnavailableReason {
     Skipped,
     NotRun,
     Cancelled,
+    /// The step succeeded without committing the output, as a `workflow` step leaves an
+    /// export its child left unavailable (REQ-WFEXEC-60).
+    NotCommitted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,6 +136,16 @@ pub(crate) struct WorkflowRunStepView {
     pub(crate) timing: Option<WorkflowRunElapsed>,
     pub(crate) outputs: BTreeMap<String, WorkflowRunOutputDisposition>,
     pub(crate) log: WorkflowRunStepLog,
+    /// The failed child a `workflow` step succeeded on (REQ-WFEXEC-77); `None` for any
+    /// other step. The step's `state` stays `Succeeded`.
+    pub(crate) failed_child: Option<FailedChild>,
+}
+
+impl WorkflowRunStepView {
+    /// The state the interface presents the step with (REQ-LOCALRUN-221).
+    pub(crate) fn presented_state(&self) -> StepStateKind {
+        presented_step_state(self.state, self.failed_child.as_ref())
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -703,6 +718,7 @@ struct WorkflowRunStepViewState {
     outputs: BTreeMap<String, WorkflowRunOutputDisposition>,
     log: StepLogRing,
     terminal_timing: Option<WorkflowStepTiming>,
+    failed_child: Option<FailedChild>,
 }
 
 impl WorkflowRunStepViewState {
@@ -722,6 +738,7 @@ impl WorkflowRunStepViewState {
             outputs,
             log: StepLogRing::default(),
             terminal_timing: None,
+            failed_child: None,
         }
     }
 
@@ -731,13 +748,24 @@ impl WorkflowRunStepViewState {
             Some(ObservedStepTransition::OutputsCommitted { .. }) | None => None,
             Some(_) => detail.clone(),
         };
+        self.failed_child = match (state, &detail) {
+            (
+                StepStateKind::Succeeded,
+                Some(ObservedStepTransition::OutputsCommitted { failed_child, .. }),
+            ) => failed_child.clone(),
+            _ => None,
+        };
         match state {
             StepStateKind::Succeeded => {
-                if let Some(ObservedStepTransition::OutputsCommitted { outputs }) = detail {
-                    for output in outputs {
-                        if let Some(disposition) = self.outputs.get_mut(&output) {
-                            *disposition = WorkflowRunOutputDisposition::Committed;
-                        }
+                if let Some(ObservedStepTransition::OutputsCommitted { outputs, .. }) = detail {
+                    for (name, disposition) in &mut self.outputs {
+                        *disposition = if outputs.contains(name) {
+                            WorkflowRunOutputDisposition::Committed
+                        } else {
+                            WorkflowRunOutputDisposition::Unavailable(
+                                WorkflowRunOutputUnavailableReason::NotCommitted,
+                            )
+                        };
                     }
                 }
             }
@@ -773,13 +801,19 @@ impl WorkflowRunStepViewState {
             StepState::Inherited { detail, .. } => Some(detail.clone()),
             _ => None,
         };
+        self.failed_child = match &terminal.state {
+            StepState::Succeeded { .. } => terminal.failed_child.clone(),
+            _ => None,
+        };
         match &terminal.state {
             StepState::Succeeded { outputs } => {
                 for (name, disposition) in &mut self.outputs {
                     *disposition = if outputs.contains_key(name) {
                         WorkflowRunOutputDisposition::Committed
                     } else {
-                        WorkflowRunOutputDisposition::Pending
+                        WorkflowRunOutputDisposition::Unavailable(
+                            WorkflowRunOutputUnavailableReason::NotCommitted,
+                        )
                     };
                 }
             }
@@ -860,6 +894,7 @@ impl WorkflowRunStepViewState {
             timing: step_timing,
             outputs: self.outputs.clone(),
             log: self.log.snapshot(include_log_records),
+            failed_child: self.failed_child.clone(),
         }
     }
 }
@@ -1015,7 +1050,16 @@ fn terminal_step_is_valid(
     terminal: &super::publication::WorkflowRunStep,
 ) -> bool {
     match &terminal.state {
-        StepState::Succeeded { outputs } => outputs.keys().eq(view.outputs.keys()),
+        // A `workflow` step commits the exports its child left available, a subset of the
+        // ones it declares (REQ-WFEXEC-60); any other step commits every declared output.
+        StepState::Succeeded { outputs } => match view.definition {
+            WorkflowPresentationStep::Workflow { .. } => outputs
+                .keys()
+                .all(|output| view.outputs.contains_key(output)),
+            WorkflowPresentationStep::Command { .. } | WorkflowPresentationStep::Agent { .. } => {
+                outputs.keys().eq(view.outputs.keys())
+            }
+        },
         StepState::Inherited {
             disposition: super::runtime::InheritedDisposition::Succeeded,
             outputs,

@@ -4,13 +4,16 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
-use clap::{ArgGroup, Args, ValueEnum};
+use clap::{ArgGroup, Args};
 use zeroize::Zeroizing;
 
 use crate::cli::runner::doctor::roots::Roots;
 use crate::cli::{CommandFailure, HttpOptions, NoAuthenticationArgs, OrganizationArg};
 use crate::exit_code::ExitCode;
-use useful_api::{MemberGrant, MemberGrantApi, MemberGrantFailure, MemberGrantProvider};
+use useful_api::{
+    MemberGrant, MemberGrantApi, MemberGrantFailure, MemberGrantKind, MemberGrantProvider,
+    ServedGrantProvider,
+};
 use useful_human_auth::Deployment;
 use useful_runner::{CredentialKind, WorkflowCredentials};
 
@@ -18,7 +21,7 @@ use super::super::secret_file::FileMode;
 use super::consent::{Consent, ConsentProvider, Ended, Front, Options, write_refusal};
 use super::organization::Organization;
 use super::program::Stop;
-use super::projection::PROVIDERS;
+use super::projection::{self, Provider};
 use super::{
     browser, claude_setup_token, codex_login, material, organization, output, replacement, replayed,
 };
@@ -31,10 +34,10 @@ pub(super) const ABOUT: &str = "Create a grant through the provider's own sign-i
 pub(super) struct Command {
     #[arg(
         value_name = "PROVIDER",
-        hide_possible_values = true,
-        help = "Provider to sign in to: github, gitlab.com, linear, claude_code or codex; without one, each provider you hold no grant of"
+        value_parser = parse_provider,
+        help = "Provider to sign in to: github, gitlab.com, linear, claude_code, codex or the id of another OAuth provider your deployment serves; without one, each provider you hold no grant of"
     )]
-    provider: Option<ProviderArg>,
+    provider: Option<ProviderName>,
 
     // Parsed only: `--all` says what no PROVIDER says.
     #[arg(
@@ -112,7 +115,7 @@ pub(super) struct Command {
     #[arg(
         long,
         conflicts_with = "timeout",
-        help = "Return after starting a consent instead of waiting for the callback; github, gitlab.com and linear only"
+        help = "Return after starting a consent instead of waiting for the callback; OAuth providers only"
     )]
     no_wait: bool,
 
@@ -157,29 +160,156 @@ impl Ending {
     }
 }
 
-/// A provider `useful grant create` signs in to.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+/// A provider `useful grant create` has a built-in name for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ProviderArg {
     Github,
-    #[value(name = "gitlab.com")]
     GitlabCom,
     Linear,
-    #[value(name = "claude_code")]
     ClaudeCode,
     Codex,
 }
 
+/// The `PROVIDER` `useful grant create` is given (REQ-GRANT-69): one of the five it has a built-in
+/// name for, or any other provider id, taken for an OAuth provider the deployment serves, which
+/// the command reads before it begins anything.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ProviderName {
+    BuiltIn(ProviderArg),
+    Other(String),
+}
+
+/// Parses `PROVIDER`: one of the five by its wire name, or any other name of the provider id
+/// shape; anything else is a usage error before any request.
+fn parse_provider(value: &str) -> Result<ProviderName, String> {
+    if let Some(provider) = ProviderArg::from_name(value) {
+        return Ok(ProviderName::BuiltIn(provider));
+    }
+    if useful_api::valid_provider_id(value) {
+        return Ok(ProviderName::Other(value.to_owned()));
+    }
+    Err(
+        "provider must be github, gitlab.com, linear, claude_code or codex, or the id of another \
+         OAuth provider your deployment serves, as useful grant list shows it"
+            .to_owned(),
+    )
+}
+
+/// An OAuth provider beyond `github`, `gitlab.com` and `linear` that the deployment serves
+/// (REQ-GRANT-78): its id, and its title, the display name the deployment serves for it or else
+/// its id (REQ-GRANT-96).
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NamedProvider {
+    name: String,
+    title: String,
+}
+
+impl NamedProvider {
+    /// The provider `served` names, when it is an OAuth provider with no built-in name.
+    fn of(served: &ServedGrantProvider) -> Option<Self> {
+        (served.kind == MemberGrantKind::GrantKindOAuth
+            && ProviderArg::from_name(&served.name).is_none())
+        .then(|| Self {
+            name: served.name.clone(),
+            title: served
+                .display_name
+                .clone()
+                .unwrap_or_else(|| served.name.clone()),
+        })
+    }
+
+    /// The consent that makes its grant.
+    fn consent(&self) -> ConsentProvider<'_> {
+        ConsentProvider {
+            name: &self.name,
+            title: &self.title,
+        }
+    }
+}
+
+/// A provider in the order `useful grant create` signs in to several in: one of the five it has
+/// a built-in name for, or another OAuth provider the deployment serves (REQ-GRANT-75).
+enum Ordered {
+    BuiltIn(ProviderArg),
+    Served(NamedProvider),
+}
+
+impl Ordered {
+    /// The consent of an OAuth provider; a coding agent has none.
+    fn consent(&self) -> Option<ConsentProvider<'_>> {
+        match self {
+            Self::BuiltIn(provider) => provider.consent(),
+            Self::Served(provider) => Some(provider.consent()),
+        }
+    }
+
+    /// The provider when it is one of the five.
+    const fn built_in(&self) -> Option<ProviderArg> {
+        match self {
+            Self::BuiltIn(provider) => Some(*provider),
+            Self::Served(_) => None,
+        }
+    }
+}
+
 /// The order `useful grant create` signs in to several providers in (REQ-GRANT-75), that of
-/// [`PROVIDERS`], whose wire names are the values of [`ProviderArg`]: the OAuth providers first,
-/// whose consents need only a browser anywhere, then the coding agents, whose sign-ins run on
-/// this machine.
-fn order() -> impl Iterator<Item = ProviderArg> {
-    PROVIDERS
+/// [`projection::providers`] for the providers `served` names: the OAuth providers first,
+/// whose consents need only a browser anywhere, the deployment's other OAuth providers after
+/// the built-in ones, then the coding agents, whose sign-ins run on this machine.
+fn order(served: &[ServedGrantProvider]) -> Vec<Ordered> {
+    projection::providers(served)
         .into_iter()
-        .filter_map(|provider| <ProviderArg as ValueEnum>::from_str(provider.name(), false).ok())
+        .filter_map(|provider| {
+            let name = provider.name();
+            ProviderArg::from_name(name)
+                .map(Ordered::BuiltIn)
+                .or_else(|| {
+                    served
+                        .iter()
+                        .find(|served| served.name == name)
+                        .and_then(NamedProvider::of)
+                        .map(Ordered::Served)
+                })
+        })
+        .collect()
+}
+
+/// What a selection chooses among.
+#[derive(Clone, Copy)]
+enum Wanted<'a> {
+    /// Every provider of the [`order`], the deployment's other OAuth providers among them
+    /// (REQ-GRANT-75).
+    Every,
+    /// Only these of the five, as workflows call for them (REQ-GRANT-76).
+    Only(&'a [ProviderArg]),
+}
+
+impl Wanted<'_> {
+    fn wants(self, provider: &Ordered) -> bool {
+        match (self, provider) {
+            (Self::Every, _) => true,
+            (Self::Only(wanted), Ordered::BuiltIn(provider)) => wanted.contains(provider),
+            (Self::Only(_), Ordered::Served(_)) => false,
+        }
+    }
 }
 
 impl ProviderArg {
+    const ALL: [Self; 5] = [
+        Self::Github,
+        Self::GitlabCom,
+        Self::Linear,
+        Self::ClaudeCode,
+        Self::Codex,
+    ];
+
+    /// The provider whose wire name is `name`, when it is one of the five.
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|provider| provider.grant().as_str() == name)
+    }
+
     const fn grant(self) -> MemberGrantProvider {
         match self {
             Self::Github => MemberGrantProvider::GrantProviderGithub,
@@ -191,7 +321,7 @@ impl ProviderArg {
     }
 
     /// The consent of an OAuth provider; a coding agent has none.
-    const fn consent(self) -> Option<ConsentProvider> {
+    const fn consent(self) -> Option<ConsentProvider<'static>> {
         match self {
             Self::Github => Some(ConsentProvider::GITHUB),
             Self::GitlabCom => Some(ConsentProvider::GITLAB_COM),
@@ -218,11 +348,14 @@ impl ProviderArg {
 }
 
 /// How this invocation makes the grant.
-enum SignIn {
-    /// An OAuth provider's consent.
-    Consent(ConsentProvider),
+enum SignIn<'a> {
+    /// The consent of `github`, `gitlab.com` or `linear`.
+    Consent(ConsentProvider<'static>),
+    /// The consent of another OAuth provider, by its id, once the deployment is found to serve
+    /// it (REQ-GRANT-69).
+    Served(&'a str),
     /// A coding agent's login, imported for one organization.
-    Native(Login),
+    Native(ProviderArg, Login),
 }
 
 /// A coding agent's login: read from a file or stream the member names, before any network
@@ -240,7 +373,10 @@ enum Login {
 /// the coding agents', among them those the deployment does not serve, which are passed over,
 /// and with `--workflow` the providers whose every held grant needs reconnecting.
 struct Selection {
-    consents: Vec<ConsentProvider>,
+    /// The providers wanted, in [`order`].
+    order: Vec<Ordered>,
+    /// The OAuth providers consented to, by name.
+    consents: Vec<String>,
     natives: Option<Natives>,
     /// The coding agents passed over without a sign-in because the deployment does not serve
     /// them (REQ-GRANT-75, REQ-GRANT-78).
@@ -278,7 +414,7 @@ struct Reconnect {
 enum Held {
     /// The grants of an OAuth provider, of which the account the member consents as decides
     /// which, if any, gets the next generation (REQ-GRANT-73, REQ-GRANT-2).
-    Consent(ConsentProvider, Vec<MemberGrant>),
+    Consent(ConsentProvider<'static>, Vec<MemberGrant>),
     /// The one grant of a coding agent, which the sign-in's next generation is stored for, in
     /// its own organization.
     Native(Box<MemberGrant>, Organization),
@@ -326,6 +462,7 @@ impl Reconnect {
 
 impl Selection {
     const NONE: Self = Self {
+        order: Vec::new(),
         consents: Vec::new(),
         natives: None,
         unavailable: Vec::new(),
@@ -334,7 +471,16 @@ impl Selection {
 
     /// The step that signs in to or passes over `provider`, or none when it is held and not
     /// asked about.
-    fn step(&self, provider: ProviderArg) -> Option<Step<'_>> {
+    fn step<'a>(&'a self, provider: &'a Ordered) -> Option<Step<'a>> {
+        let provider = match provider {
+            Ordered::BuiltIn(provider) => *provider,
+            Ordered::Served(provider) => {
+                return self
+                    .consents
+                    .contains(&provider.name)
+                    .then(|| Step::Consent(provider.consent()));
+            }
+        };
         if let Some(reconnect) = self
             .reconnects
             .iter()
@@ -351,7 +497,7 @@ impl Selection {
             return self
                 .consents
                 .iter()
-                .any(|selected| selected.name == consent.name)
+                .any(|selected| selected == consent.name)
                 .then_some(Step::Consent(consent));
         }
         if self.unavailable.contains(&provider) {
@@ -369,7 +515,7 @@ impl Selection {
 
     /// What the plan says the run does about `provider` (REQ-GRANT-76, REQ-GRANT-79).
     fn planned(&self, provider: ProviderArg) -> workflow::State {
-        match self.step(provider) {
+        match self.step(&Ordered::BuiltIn(provider)) {
             None | Some(Step::Kept(_)) => workflow::State::Held,
             Some(Step::Reconsent(_) | Step::Renew(..)) => workflow::State::Reconnect,
             Some(_) => workflow::State::SignIn,
@@ -380,10 +526,10 @@ impl Selection {
 /// One provider's sign-in in a [`Selection`].
 #[derive(Clone, Copy)]
 enum Step<'a> {
-    Consent(ConsentProvider),
+    Consent(ConsentProvider<'a>),
     Native(ProviderArg, &'a Organization),
     /// The consent that replaces a held OAuth grant that needs reconnecting (REQ-GRANT-79).
-    Reconsent(ConsentProvider),
+    Reconsent(ConsentProvider<'a>),
     /// A coding agent's sign-in stored as the next generation of the held grant that needs
     /// reconnecting, in that grant's organization (REQ-GRANT-79).
     Renew(ProviderArg, &'a MemberGrant, &'a Organization),
@@ -395,8 +541,8 @@ enum Step<'a> {
     Kept(ProviderArg),
 }
 
-impl Step<'_> {
-    const fn provider(self) -> &'static str {
+impl<'a> Step<'a> {
+    const fn provider(self) -> &'a str {
         match self {
             Self::Consent(consent) | Self::Reconsent(consent) => consent.name,
             Self::Native(provider, _)
@@ -500,25 +646,27 @@ fn summary_code(outcomes: impl Iterator<Item = Outcome> + Clone) -> ExitCode {
 
 impl Command {
     /// With `PROVIDER`, checks which options suit it before anything is run, read or sent
-    /// (REQ-GRANT-70 to REQ-GRANT-72), then makes its grant: by the provider's consent
-    /// (REQ-GRANT-69) or by importing a coding agent's login (REQ-GRANT-70, REQ-GRANT-71).
+    /// (REQ-GRANT-70 to REQ-GRANT-72), then makes its grant: by the provider's consent, for a
+    /// provider outside the five once the deployment is found to serve it (REQ-GRANT-69), or by
+    /// importing a coding agent's login (REQ-GRANT-70, REQ-GRANT-71).
     /// Without it, makes a grant of each provider the member lacks (REQ-GRANT-75), or with
     /// `--workflow` of each the workflows call for (REQ-GRANT-76).
     pub(super) fn run(self, deployment: &Deployment) -> super::super::CommandResult {
         let flow = self.flow();
-        let Some(provider) = self.provider else {
+        let Some(provider) = &self.provider else {
             if !self.workflows.is_empty() {
                 return self.run_workflows(deployment);
             }
             let scope = output::Scope::Every;
-            return match flow.select(deployment, &order().collect::<Vec<_>>(), scope, false)? {
+            return match flow.select(deployment, Wanted::Every, scope, false)? {
                 Ok(selection) => flow.run_selection(deployment, selection, scope),
                 Err(refused) => Ok(refused),
             };
         };
         match self.sign_in(provider)? {
-            SignIn::Consent(consent) => flow.replace_by_consent(deployment, provider, consent),
-            SignIn::Native(login) => {
+            SignIn::Consent(consent) => flow.replace_by_consent(deployment, consent),
+            SignIn::Served(name) => flow.consent_served(deployment, name),
+            SignIn::Native(provider, login) => {
                 // A Claude Code sign-in the member could not answer is refused before the first
                 // request (REQ-GRANT-71).
                 if matches!(login, Login::ClaudeCode)
@@ -557,16 +705,20 @@ impl Command {
     /// The sign-in the provider and options name; a file or stream is read here, so that an
     /// insecurely held or malformed one is refused with exit 2 before any network use, as is an
     /// option that does not suit the provider: a source of another provider, or for a coding
-    /// agent, whose sign-in has no consent, `--no-wait` or `--timeout` (REQ-GRANT-71).
-    fn sign_in(&self, provider: ProviderArg) -> Result<SignIn, CommandFailure> {
-        let name = provider.grant().as_str();
+    /// agent, whose sign-in has no consent, `--no-wait` or `--timeout` (REQ-GRANT-71). A provider
+    /// outside the five is an OAuth provider's, and takes the options `github` takes.
+    fn sign_in<'a>(&self, provider: &'a ProviderName) -> Result<SignIn<'a>, CommandFailure> {
+        let (name, provider) = match provider {
+            ProviderName::BuiltIn(provider) => (provider.grant().as_str(), Some(*provider)),
+            ProviderName::Other(name) => (name.as_str(), None),
+        };
         let usage = |message: String| {
             CommandFailure::with_exit_code(anyhow!(message), ExitCode::UsageError)
         };
         let unsuited = |option: &str, remedy: &str| {
             usage(format!("{option} does not apply to {name}\n\n{remedy}"))
         };
-        if provider.native()
+        if provider.is_some_and(ProviderArg::native)
             && let Some(option) = first_given([
                 (self.no_wait, "--no-wait"),
                 (self.wait.timeout.is_some(), "--timeout"),
@@ -581,26 +733,30 @@ impl Command {
             ));
         }
         let consent = match provider {
-            ProviderArg::Github => ConsentProvider::GITHUB,
-            ProviderArg::GitlabCom => ConsentProvider::GITLAB_COM,
-            ProviderArg::Linear => ConsentProvider::LINEAR,
-            ProviderArg::Codex => {
+            Some(ProviderArg::Github) => SignIn::Consent(ConsentProvider::GITHUB),
+            Some(ProviderArg::GitlabCom) => SignIn::Consent(ConsentProvider::GITLAB_COM),
+            Some(ProviderArg::Linear) => SignIn::Consent(ConsentProvider::LINEAR),
+            None => SignIn::Served(name),
+            Some(ProviderArg::Codex) => {
                 if self.token_file.is_some() {
                     return Err(unsuited(
                         "--token-file",
                         "Import a Codex auth.json with --from-file PATH, or sign in with --login or --device.",
                     ));
                 }
-                return Ok(SignIn::Native(match &self.from_file {
-                    Some(path) => {
-                        Login::Read(material::read_codex_login(path, FileMode::Private).map_err(
-                            |error| CommandFailure::with_exit_code(error, ExitCode::UsageError),
-                        )?)
-                    }
-                    None => self.flow().codex_sign_in(),
-                }));
+                return Ok(SignIn::Native(
+                    ProviderArg::Codex,
+                    match &self.from_file {
+                        Some(path) => Login::Read(
+                            material::read_codex_login(path, FileMode::Private).map_err(
+                                |error| CommandFailure::with_exit_code(error, ExitCode::UsageError),
+                            )?,
+                        ),
+                        None => self.flow().codex_sign_in(),
+                    },
+                ));
             }
-            ProviderArg::ClaudeCode => {
+            Some(ProviderArg::ClaudeCode) => {
                 if let Some(option) = first_given([
                     (self.from_file.is_some(), "--from-file"),
                     (self.login, "--login"),
@@ -612,14 +768,15 @@ impl Command {
                          printed with --token-file PATH:\n  useful grant create claude_code",
                     ));
                 }
-                return Ok(SignIn::Native(match &self.token_file {
-                    Some(path) => {
-                        Login::Read(material::read_claude_code_token(path).map_err(|error| {
-                            CommandFailure::with_exit_code(error, ExitCode::UsageError)
-                        })?)
-                    }
-                    None => Login::ClaudeCode,
-                }));
+                return Ok(SignIn::Native(
+                    ProviderArg::ClaudeCode,
+                    match &self.token_file {
+                        Some(path) => Login::Read(material::read_claude_code_token(path).map_err(
+                            |error| CommandFailure::with_exit_code(error, ExitCode::UsageError),
+                        )?),
+                        None => Login::ClaudeCode,
+                    },
+                ));
             }
         };
         if let Some(option) = first_given([
@@ -637,7 +794,7 @@ impl Command {
                 ),
             ));
         }
-        Ok(SignIn::Consent(consent))
+        Ok(consent)
     }
 
     /// Signs in to what the `--workflow` files call for (REQ-GRANT-76) through the flow over
@@ -650,11 +807,12 @@ impl Command {
             self.source_root.as_deref(),
             "useful grant create --workflow FILE --source-root ROOT",
         )?;
-        let Some(credentials) = roots.derive(&roots.origin_remote(), self.options.json)? else {
+        let Some(derived) = roots.derive(&roots.origin_remote(), self.options.json)? else {
             return Ok(ExitCode::GeneralFailure);
         };
+        // The sign-ins select by the inference, not by a declared block (REQ-GRANT-76).
         self.flow()
-            .run_workflows(deployment, &credentials, output::Scope::Workflows)
+            .run_workflows(deployment, &derived.inferred, output::Scope::Workflows)
             .map(|ending| ending.code)
     }
 }
@@ -692,7 +850,7 @@ impl Flow<'_> {
         let mut selection = if wanted.is_empty() {
             Selection::NONE
         } else {
-            match self.select(deployment, &wanted, scope, true)? {
+            match self.select(deployment, Wanted::Only(&wanted), scope, true)? {
                 Ok(selection) => selection,
                 Err(code) => {
                     return Ok(Ending {
@@ -735,10 +893,12 @@ impl Flow<'_> {
     /// Selects, among `wanted` and in [`order`], the providers the member lacks: those it holds
     /// no grant of that is `active` or `reconnect_required`, for a native provider in the
     /// organization a new grant would be for (REQ-GRANT-75). The member's grants of both kinds
-    /// are read once. Where a coding agent might be signed in to, the providers the deployment
-    /// serves are read next (REQ-GRANT-78), and a coding agent it does not serve is selected to
-    /// be passed over without a sign-in; a deployment that predates that read is taken to serve
-    /// each one. The organization is resolved once, and only for the native providers it serves,
+    /// are read once. With every provider wanted, the providers the deployment serves are read
+    /// next, every time, and each other OAuth provider among them is wanted after the built-in
+    /// ones; with only some of the five wanted, they are read next only where a coding agent
+    /// might be signed in to (REQ-GRANT-78). A coding agent the deployment does not serve is
+    /// selected to be passed over without a sign-in; a deployment that predates that read is
+    /// taken to serve each one and no other OAuth provider. The organization is resolved once, and only for the native providers it serves,
     /// when `--organization` names it or one of those in `wanted` is held in no organization
     /// (REQ-GRANT-72), so a member who holds every provider wanted is asked for nothing more.
     /// When the member is an active member of none or of several and names none, each native
@@ -752,27 +912,32 @@ impl Flow<'_> {
     fn select(
         &self,
         deployment: &Deployment,
-        wanted: &[ProviderArg],
+        wanted: Wanted<'_>,
         scope: output::Scope,
         reconnect: bool,
     ) -> Result<Result<Selection, ExitCode>, CommandFailure> {
-        let wanted: Vec<_> = order()
-            .filter(|provider| wanted.contains(provider))
-            .collect();
-        let natives: Vec<_> = wanted
+        let natives: Vec<_> = order(&[])
             .iter()
-            .copied()
+            .filter(|provider| wanted.wants(provider))
+            .filter_map(Ordered::built_in)
             .filter(|provider| provider.native())
             .collect();
         let read = self.with_api(deployment, |api| {
             let grants = super::every_grant(api)?;
-            let held_of = |provider: ProviderArg, organization_id: Option<&str>| {
+            // With every provider wanted, what the deployment serves names the other OAuth
+            // providers too, so it is read every time, right after the grants (REQ-GRANT-75).
+            let every = match wanted {
+                Wanted::Every => Some(api.served_providers()?),
+                Wanted::Only(_) => None,
+            };
+            let held_by_name = |name: &str, organization_id: Option<&str>| {
                 grants
                     .iter()
-                    .filter(move |grant| {
-                        replacement::holds(grant, provider.grant(), organization_id)
-                    })
+                    .filter(|grant| replacement::holds(grant, name, organization_id))
                     .collect::<Vec<_>>()
+            };
+            let held_of = |provider: ProviderArg, organization_id: Option<&str>| {
+                held_by_name(provider.grant().as_str(), organization_id)
             };
             let held = |provider: ProviderArg, organization_id: Option<&str>| {
                 !held_of(provider, organization_id).is_empty()
@@ -794,17 +959,25 @@ impl Flow<'_> {
             let signs_in = |natives: &[ProviderArg], unheld: &[ProviderArg]| {
                 !natives.is_empty() && (self.organization.is_some() || !unheld.is_empty())
             };
-            let served = if signs_in(&natives, &unheld)
-                || natives.iter().any(|provider| reconnects(*provider, None))
-            {
-                api.served_providers()?
-            } else {
-                None
+            let served = match every {
+                Some(served) => served,
+                None if signs_in(&natives, &unheld)
+                    || natives.iter().any(|provider| reconnects(*provider, None)) =>
+                {
+                    api.served_providers()?
+                }
+                None => None,
             };
+            let ordered: Vec<_> = order(served.as_deref().unwrap_or_default())
+                .into_iter()
+                .filter(|provider| wanted.wants(provider))
+                .collect();
             let serves = |provider: &ProviderArg| {
-                served
-                    .as_ref()
-                    .is_none_or(|served| served.contains(&provider.grant()))
+                served.as_ref().is_none_or(|served| {
+                    served
+                        .iter()
+                        .any(|served| served.name == provider.grant().as_str())
+                })
             };
             let (natives, unserved): (Vec<_>, Vec<_>) = natives.iter().copied().partition(serves);
             let unheld: Vec<_> = unheld.into_iter().filter(serves).collect();
@@ -835,13 +1008,14 @@ impl Flow<'_> {
                 .into_iter()
                 .filter(|provider| !held(*provider, organization_id))
                 .collect();
-            let consents = wanted
+            let consents = ordered
                 .iter()
-                .filter(|provider| !held(**provider, None))
-                .filter_map(|provider| provider.consent())
+                .filter_map(Ordered::consent)
+                .filter(|consent| held_by_name(consent.name, None).is_empty())
+                .map(|consent| consent.name.to_owned())
                 .collect();
             let mut selected = Vec::new();
-            for provider in wanted.iter().copied() {
+            for provider in ordered.iter().filter_map(Ordered::built_in) {
                 let held = match provider.consent() {
                     Some(consent) if reconnects(provider, None) => Held::Consent(
                         consent,
@@ -861,6 +1035,7 @@ impl Flow<'_> {
                 });
             }
             Ok(Selection {
+                order: ordered,
                 consents,
                 natives: selected_natives,
                 unavailable,
@@ -898,7 +1073,11 @@ impl Flow<'_> {
         scope: output::Scope,
     ) -> super::super::CommandResult {
         let mut outcomes = Vec::new();
-        for step in order().filter_map(|provider| selection.step(provider)) {
+        for step in selection
+            .order
+            .iter()
+            .filter_map(|provider| selection.step(provider))
+        {
             let name = step.provider();
             if !matches!(step, Step::Kept(_)) {
                 let after = outcomes
@@ -977,24 +1156,65 @@ impl Flow<'_> {
         })
     }
 
+    /// Runs the consent of `name`, an OAuth provider with no built-in name, once the providers
+    /// the deployment serves, read first, list it as one (REQ-GRANT-69): it is named by its id
+    /// and titled by its served display name (REQ-GRANT-96). A name they do not list as an OAuth
+    /// provider, and any such name when the deployment predates the read, is refused with exit 2
+    /// before anything is begun, naming the providers that can be given.
+    fn consent_served(&self, deployment: &Deployment, name: &str) -> super::super::CommandResult {
+        let served = match self.with_api(deployment, MemberGrantApi::served_providers)? {
+            Ok(served) => served.unwrap_or_default(),
+            Err(failure) => return self.write_read_refusal(deployment, &failure),
+        };
+        let Some(provider) = served
+            .iter()
+            .filter_map(NamedProvider::of)
+            .find(|provider| provider.name == name)
+        else {
+            // The built-in OAuth providers, the served ones, then the coding agents.
+            let mut given: Vec<_> = projection::providers(&served)
+                .into_iter()
+                .map(Provider::name)
+                .collect();
+            let last = given.pop().unwrap_or_default();
+            return Err(CommandFailure::with_exit_code(
+                anyhow!(
+                    "this deployment does not serve {name} as an OAuth provider\n\n\
+                     Name {} or {last} instead:\n  useful grant create PROVIDER",
+                    given.join(", ")
+                ),
+                ExitCode::UsageError,
+            ));
+        };
+        self.replace_by_consent(deployment, provider.consent())
+    }
+
     /// Settles the replacement in the member's session (REQ-GRANT-73), then runs the consent.
     fn replace_by_consent(
         &self,
         deployment: &Deployment,
-        provider: ProviderArg,
-        consent: ConsentProvider,
+        consent: ConsentProvider<'_>,
     ) -> super::super::CommandResult {
-        let provider = provider.grant();
-        let held = match self.with_api(deployment, |api| replacement::held(api, provider, None))? {
+        let read = self.with_api(deployment, |api| {
+            replacement::held(api, consent.name, MemberGrantKind::GrantKindOAuth, None)
+        })?;
+        let held = match read {
             Ok(held) => held,
-            Err(failure) => {
-                let api_url = deployment.fingerprint().api_url();
-                return write_refusal(api_url, None, &output::report(api_url, &failure), self.json)
-                    .map_err(Into::into);
-            }
+            Err(failure) => return self.write_read_refusal(deployment, &failure),
         };
-        replacement::settle(provider, &held, self.replace)?;
+        replacement::settle(consent.name, &held, self.replace)?;
         self.consent(deployment, consent).map(|ended| ended.code)
+    }
+
+    /// Reports a read that failed before a consent began, as the consent's result.
+    fn write_read_refusal(
+        &self,
+        deployment: &Deployment,
+        failure: &MemberGrantFailure,
+    ) -> super::super::CommandResult {
+        let api_url = deployment.fingerprint().api_url();
+        write_refusal(api_url, None, &output::report(api_url, failure), self.json)
+            .map_err(Into::into)
     }
 
     /// Runs the consent with no identity named, opening its URL when this machine has a
@@ -1002,7 +1222,7 @@ impl Flow<'_> {
     fn consent(
         &self,
         deployment: &Deployment,
-        consent: ConsentProvider,
+        consent: ConsentProvider<'_>,
     ) -> Result<Ended, CommandFailure> {
         Consent {
             front: Front::GRANT,
@@ -1109,7 +1329,7 @@ impl Flow<'_> {
             if signs_in
                 && api
                     .served_providers()?
-                    .is_some_and(|served| !served.contains(&provider))
+                    .is_some_and(|served| !served.iter().any(|served| served.name == name))
             {
                 return Err(MemberGrantFailure::ProviderUnavailable);
             }
@@ -1122,7 +1342,7 @@ impl Flow<'_> {
                 Ok(organization) => organization,
                 Err(refusal) => return Ok(Err(refusal)),
             };
-            let held = replacement::held(api, provider, Some(&organization.id))?;
+            let held = replacement::held(api, name, provider.kind(), Some(&organization.id))?;
             Ok(Ok((organization, held)))
         })?;
         match read {

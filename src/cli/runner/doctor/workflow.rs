@@ -1,7 +1,8 @@
-//! The workflow mode of `useful runner doctor` (REQ-CREDREADY-1 to REQ-CREDREADY-26): the
+//! The workflow mode of `useful runner doctor` (REQ-CREDREADY-1 to REQ-CREDREADY-28): the
 //! credentials a workflow tree declares, with what Cloud holds for the organization and a named
 //! project when `--readiness` asks and what the member holds of each provider when `--grants`
-//! asks, printed as a checklist or a JSON document. `--connect` first runs the grant flow of
+//! asks, and where a declaring file's integrations and the inference differ, printed as a
+//! checklist or a JSON document. `--connect` first runs the grant flow of
 //! `useful grant create --workflow` over the same derivation (INV-CLI-15).
 
 use std::io::{self, Write};
@@ -14,9 +15,9 @@ use crate::cli::CommandFailure;
 use crate::exit_code::ExitCode;
 use useful_human_auth::Deployment;
 use useful_runner::{
-    CredentialRequirement, CredentialSummary, Declaration, DeclarationKind, Node, NodeKind,
-    OriginDeclaration, RepositorySource, UnknownDeclaration, WorkflowCredentials,
-    read_workflow_credentials,
+    CredentialRequirement, CredentialSummary, Declaration, DeclarationKind, DerivedCredentials,
+    Difference, IntegrationDifference, Node, NodeKind, OriginDeclaration, RepositorySource,
+    UnknownDeclaration, WorkflowCredentials, read_workflow_credentials,
 };
 
 use super::super::super::grant::{Flow, output};
@@ -61,10 +62,10 @@ pub(super) fn execute(
                 };
                 let source =
                     RepositorySource::Project(repository.map(|repository| repository.kind));
-                let Some(credentials) = roots.derive(&source, json)? else {
+                let Some(derived) = roots.derive(&source, json)? else {
                     return Ok(ExitCode::GeneralFailure);
                 };
-                let flowed = match connected(connect, deployment, &credentials)? {
+                let flowed = match connected(connect, deployment, &derived.inferred)? {
                     Ok(flowed) => flowed,
                     Err(ended) => return Ok(ended),
                 };
@@ -72,7 +73,8 @@ pub(super) fn execute(
                     deployment,
                     Some((&session, readiness)),
                     grants,
-                    credentials,
+                    derived.reported,
+                    derived.differences,
                     repository,
                     format,
                 )?;
@@ -80,7 +82,7 @@ pub(super) fn execute(
             },
         );
     }
-    let Some(credentials) = roots.derive(&roots.origin_remote(), json)? else {
+    let Some(derived) = roots.derive(&roots.origin_remote(), json)? else {
         return Ok(ExitCode::GeneralFailure);
     };
     // Nothing is loaded and Cloud is not contacted unless a requirement has a read: a
@@ -88,20 +90,25 @@ pub(super) fn execute(
     // the grant flow, which takes a tree that calls for no kind to Cloud for nothing
     // (REQ-RUNNERENROLL-45, REQ-CREDREADY-13, REQ-CREDREADY-22, REQ-CREDREADY-24).
     let connections = readiness.is_some()
-        && credentials
+        && derived
+            .reported
             .requirements
             .iter()
             .any(|requirement| readiness::read_for(requirement.kind).is_some());
-    let reads = connections || (grants.is_some() && !credentials.requirements.is_empty());
+    let reads = connections || (grants.is_some() && !derived.reported.requirements.is_empty());
     if connect.is_none() && !reads {
-        return write_report(&unread(credentials, readiness), format).map_err(Into::into);
+        return write_report(
+            &unread(derived.reported, derived.differences, readiness),
+            format,
+        )
+        .map_err(Into::into);
     }
     super::super::super::execute_deployment_command(
-        Some(credentials),
+        Some(derived),
         COMMAND_PATH,
         DEPLOYMENT_CONTEXT,
-        |credentials, deployment| {
-            let flowed = match connected(connect, deployment, &credentials)? {
+        |derived, deployment| {
+            let flowed = match connected(connect, deployment, &derived.inferred)? {
                 Ok(flowed) => flowed,
                 Err(ended) => return Ok(ended),
             };
@@ -110,9 +117,20 @@ pub(super) fn execute(
                     .map(|readiness| readiness::Session::new(deployment, readiness))
                     .transpose()?;
                 let readiness = session.as_ref().zip(readiness);
-                check(deployment, readiness, grants, credentials, None, format)?
+                check(
+                    deployment,
+                    readiness,
+                    grants,
+                    derived.reported,
+                    derived.differences,
+                    None,
+                    format,
+                )?
             } else {
-                write_report(&unread(credentials, readiness), format)?
+                write_report(
+                    &unread(derived.reported, derived.differences, readiness),
+                    format,
+                )?
             };
             Ok(joined(flowed, checked))
         },
@@ -122,10 +140,12 @@ pub(super) fn execute(
 /// The report of a derivation no Cloud read was made for.
 fn unread<'a>(
     credentials: WorkflowCredentials,
+    differences: Option<Vec<IntegrationDifference>>,
     readiness: Option<&'a Readiness<'a>>,
 ) -> Report<'a> {
     Report {
         credentials,
+        differences,
         organization: readiness.map(|readiness| readiness.organization),
         project: None,
         grants: None,
@@ -133,7 +153,9 @@ fn unread<'a>(
     }
 }
 
-/// Runs the grant flow over `credentials` when `--connect` asks for it (REQ-CREDREADY-24): its
+/// Runs the grant flow over `credentials`, the inference, which selects as
+/// `useful grant create --workflow` does whether or not a file declares its integrations, when
+/// `--connect` asks for it (REQ-CREDREADY-24, REQ-GRANT-76): its
 /// status once it reached its summary and no signal stopped it, for the report that follows,
 /// and otherwise, as the error, the status the command ends with at once, with no report
 /// (REQ-CREDREADY-25). Without `--connect` nothing is run and nothing failed.
@@ -201,9 +223,9 @@ pub(super) fn derive(
     workflow_files: &[PathBuf],
     repository: RepositorySource,
     json: bool,
-) -> anyhow::Result<Option<WorkflowCredentials>> {
+) -> anyhow::Result<Option<DerivedCredentials>> {
     match read_workflow_credentials(source_root, workflow_files, repository) {
-        Ok(credentials) => Ok(Some(credentials)),
+        Ok(derived) => Ok(Some(derived)),
         Err(failure) => {
             if json {
                 crate::cli::workflow::validate::write_json_invalid(&failure)
@@ -218,13 +240,15 @@ pub(super) fn derive(
 
 /// With `readiness`, makes the connection read of each requirement that has one, in kind
 /// order, and combines a named project's repository with its kind's code; with `grants`, then
-/// reads the member's grants when a requirement exists; and writes the report. A failure that
-/// ends the command is written instead (REQ-CREDREADY-14, REQ-CREDREADY-22).
+/// reads the member's grants when a requirement exists; and writes the report, with the
+/// differences, of which nothing is asked (REQ-CREDREADY-28). A failure that ends the command is
+/// written instead (REQ-CREDREADY-14, REQ-CREDREADY-22).
 fn check(
     deployment: &Deployment,
     readiness: Option<(&readiness::Session<'_>, &Readiness<'_>)>,
     grants: Option<&grants::Request<'_>>,
     mut credentials: WorkflowCredentials,
+    differences: Option<Vec<IntegrationDifference>>,
     repository: Option<Repository>,
     format: Format,
 ) -> anyhow::Result<ExitCode> {
@@ -257,6 +281,7 @@ fn check(
     let readiness = readiness.map(|(_, readiness)| readiness);
     let report = Report {
         credentials,
+        differences,
         organization: readiness.map(|readiness| readiness.organization),
         project: readiness.and_then(|readiness| readiness.project),
         grants: held,
@@ -268,6 +293,9 @@ fn check(
 /// The derivation's result, after any Cloud reads, and what the report names beside it.
 struct Report<'a> {
     credentials: WorkflowCredentials,
+    /// Where a declaring file's integrations and the inference differ, when a named file
+    /// declares them (REQ-CREDREADY-28); they change no requirement, count or exit status.
+    differences: Option<Vec<IntegrationDifference>>,
     /// The organization `--readiness` named, for the next actions.
     organization: Option<&'a str>,
     /// The project `--project-id` named, for the next actions.
@@ -377,6 +405,25 @@ fn write_human_report_to(output: &mut impl Write, report: &Report<'_>) -> io::Re
         writeln!(output)?;
     }
 
+    if let Some(differences) = report.differences.as_deref()
+        && !differences.is_empty()
+    {
+        writeln!(output, "── differences ──")?;
+        writeln!(
+            output,
+            "The declared integrations differ from what the workflows' other declarations call for."
+        )?;
+        let mut current_workflow = None;
+        for difference in differences {
+            if current_workflow != Some(&difference.workflow) {
+                writeln!(output, "{}", difference.workflow)?;
+                current_workflow = Some(&difference.workflow);
+            }
+            writeln!(output, "  ! {}", describe_difference(difference))?;
+        }
+        writeln!(output)?;
+    }
+
     let summary = report.summary();
     writeln!(output, "── summary ──")?;
     writeln!(output, "missing: {}", summary.missing)?;
@@ -388,7 +435,34 @@ fn write_human_report_to(output: &mut impl Write, report: &Report<'_>) -> io::Re
     )?;
     writeln!(output, "unverified: {}", summary.unverified)?;
     writeln!(output, "unknown: {}", summary.unknown)?;
+    if let Some(differences) = &report.differences {
+        writeln!(output, "differences: {}", differences.len())?;
+    }
     Ok(())
+}
+
+/// `<provider id> · not declared · needed by: <origins>`, or `<provider id> · declared · not
+/// otherwise called for`, without the workflow file. The provider id is the key of
+/// `requires.integrations` to declare or the one declared, `gitlab.com` for the kind `gitlab`
+/// (REQ-CREDREADY-28).
+fn describe_difference(difference: &IntegrationDifference) -> String {
+    let provider = difference.integration.as_str();
+    match difference.difference {
+        Difference::InferredNotDeclared => {
+            let origins = difference
+                .origins
+                .iter()
+                .map(|origin| format!("{} · {}", group_label(origin), describe(origin)))
+                .collect::<Vec<_>>();
+            format!(
+                "{provider} · not declared · needed by: {}",
+                origins.join("; ")
+            )
+        }
+        Difference::DeclaredNotInferred => {
+            format!("{provider} · declared · not otherwise called for")
+        }
+    }
 }
 
 fn write_requirement(
@@ -461,6 +535,7 @@ pub(in crate::cli) trait HumanLabel {
 impl HumanLabel for OriginDeclaration {
     fn label(self) -> &'static str {
         match self {
+            Self::Integration => "declared integration",
             Self::AgentProfile => "agent profile",
             Self::ForwardedVariable => "forwarded variable",
             Self::Binding => "binding",
@@ -522,6 +597,9 @@ struct JsonReport<'a> {
     workflows: &'a [String],
     requirements: Vec<JsonRequirement<'a>>,
     unknown: Vec<JsonDeclaration<'a>>,
+    /// Present when a named file declares its integrations (REQ-CREDREADY-28).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    differences: Option<Vec<JsonDifference<'a>>>,
     summary: JsonSummary,
 }
 
@@ -545,12 +623,19 @@ impl<'a> JsonReport<'a> {
                 .iter()
                 .map(JsonDeclaration::from_declaration)
                 .collect(),
+            differences: report.differences.as_ref().map(|differences| {
+                differences
+                    .iter()
+                    .map(JsonDifference::from_difference)
+                    .collect()
+            }),
             summary: JsonSummary {
                 missing: summary.missing,
                 reconnect_required: summary.reconnect_required,
                 insufficient_permission: summary.insufficient_permission,
                 unverified: summary.unverified,
                 unknown: summary.unknown,
+                differences: report.differences.as_ref().map(Vec::len),
             },
         }
     }
@@ -587,6 +672,38 @@ impl<'a> JsonRequirement<'a> {
                 .map(JsonDeclaration::from_declaration)
                 .collect(),
             grant: report.grants.as_ref().map(|held| held.of(requirement.kind)),
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct JsonDifference<'a> {
+    difference: &'static str,
+    workflow: &'a str,
+    kind: &'static str,
+    integration: &'static str,
+    /// The declarations that call for the kind, on `inferred_not_declared`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    origins: Option<Vec<JsonDeclaration<'a>>>,
+}
+
+impl<'a> JsonDifference<'a> {
+    fn from_difference(difference: &'a IntegrationDifference) -> Self {
+        Self {
+            difference: difference.difference.as_str(),
+            workflow: &difference.workflow,
+            kind: difference.kind.as_str(),
+            integration: difference.integration.as_str(),
+            origins: match difference.difference {
+                Difference::InferredNotDeclared => Some(
+                    difference
+                        .origins
+                        .iter()
+                        .map(JsonDeclaration::from_declaration)
+                        .collect(),
+                ),
+                Difference::DeclaredNotInferred => None,
+            },
         }
     }
 }
@@ -636,4 +753,7 @@ struct JsonSummary {
     insufficient_permission: usize,
     unverified: usize,
     unknown: usize,
+    /// Present when a named file declares its integrations (REQ-CREDREADY-28).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    differences: Option<usize>,
 }

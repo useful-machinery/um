@@ -48,6 +48,11 @@ pub(crate) mod attribute {
     pub(crate) const GRANT_TOKEN_FAILURE_STAGE: &str = "um.grant_token.failure_stage";
     pub(crate) const GRANT_TOKEN_FAILURE_CAUSE: &str = "um.grant_token.failure_cause";
     pub(crate) const GRANT_TOKEN_HTTP_STATUS: &str = "um.grant_token.http_status";
+    /// A `runner.credential_sources` record names the assignment whose
+    /// credential-source report Cloud did not take, the closed cause, and
+    /// Cloud's HTTP status when the cause is one (REQ-TELEMETRY-48).
+    pub(crate) const CREDENTIAL_SOURCES_FAILURE_CAUSE: &str = "um.credential_sources.failure_cause";
+    pub(crate) const CREDENTIAL_SOURCES_HTTP_STATUS: &str = "um.credential_sources.http_status";
     pub(crate) const BACKOFF_MS: &str = "um.connection.backoff_ms";
     pub(crate) const CONNECTION_ATTEMPT: &str = "um.connection.attempt";
     pub(crate) const EFFECT_ACKNOWLEDGEMENTS_CONFIRMED: &str =

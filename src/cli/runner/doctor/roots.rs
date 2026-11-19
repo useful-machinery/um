@@ -10,7 +10,10 @@ use anyhow::anyhow;
 use crate::cli::CommandFailure;
 use crate::exit_code::ExitCode;
 use useful_execution::{CommandProbeError, CommandRunner, SystemCommandRunner};
-use useful_runner::{Declaration, RepositoryRootError, RepositorySource, WorkflowCredentials};
+use useful_runner::{
+    Declaration, DerivedCredentials, IntegrationDifference, RepositoryRootError, RepositorySource,
+    WorkflowCredentials,
+};
 
 /// The named workflow files grouped by the root that bounds them, in the order first named.
 pub(in crate::cli) struct Roots {
@@ -47,28 +50,41 @@ impl Roots {
     /// or `None` once the first file that does not resolve was rejected as
     /// `useful workflow validate` rejects it. The files of one root are derived together under it,
     /// each reading its repository's provider from `source`, and the derivations are merged by
-    /// kind.
+    /// kind, the roots' inferences and reports each into their own (REQ-CREDREADY-27). The roots'
+    /// differences are concatenated, present when any root's are (REQ-CREDREADY-28).
     pub(in crate::cli) fn derive(
         &self,
         source: &RepositorySource,
         json: bool,
-    ) -> anyhow::Result<Option<WorkflowCredentials>> {
-        let mut merged: Option<WorkflowCredentials> = None;
+    ) -> anyhow::Result<Option<DerivedCredentials>> {
+        let mut merged: Option<DerivedCredentials> = None;
         for (root, files) in &self.groups {
-            let Some(credentials) = super::workflow::derive(root, files, again(source), json)?
-            else {
+            let Some(derived) = super::workflow::derive(root, files, again(source), json)? else {
                 return Ok(None);
             };
             match &mut merged {
-                Some(into) => merge(into, credentials),
-                None => merged = Some(credentials),
+                Some(into) => {
+                    merge(&mut into.inferred, derived.inferred);
+                    merge(&mut into.reported, derived.reported);
+                    concatenate(&mut into.differences, derived.differences);
+                }
+                None => merged = Some(derived),
             }
         }
-        Ok(Some(merged.unwrap_or(WorkflowCredentials {
-            workflows: Vec::new(),
-            requirements: Vec::new(),
-            unknown: Vec::new(),
+        Ok(Some(merged.unwrap_or_else(|| DerivedCredentials {
+            inferred: nothing(),
+            reported: nothing(),
+            differences: None,
         })))
+    }
+}
+
+/// The derivation of no file.
+const fn nothing() -> WorkflowCredentials {
+    WorkflowCredentials {
+        workflows: Vec::new(),
+        requirements: Vec::new(),
+        unknown: Vec::new(),
     }
 }
 
@@ -172,6 +188,16 @@ fn merge(into: &mut WorkflowCredentials, from: WorkflowCredentials) {
     into.requirements
         .sort_by_key(|requirement| requirement.kind);
     add(&mut into.unknown, from.unknown);
+}
+
+/// Appends one root's differences to the others', present when either is.
+fn concatenate(
+    into: &mut Option<Vec<IntegrationDifference>>,
+    from: Option<Vec<IntegrationDifference>>,
+) {
+    if let Some(from) = from {
+        into.get_or_insert_with(Vec::new).extend(from);
+    }
 }
 
 /// Adds the declarations `into` lacks, keeping those of no workflow file last, as a report

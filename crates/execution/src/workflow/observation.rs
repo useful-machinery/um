@@ -4,7 +4,8 @@ use std::sync::Arc;
 use super::admission::CancellationReason;
 use super::agent::AgentObservationEnvelope;
 use super::evidence::{
-    BlockedDetail, CancellationDetail, ConditionFalseDetail, FailureDetail, NonExecutionDetail,
+    BlockedDetail, CancellationDetail, ConditionFalseDetail, FailedChild, FailureDetail,
+    NonExecutionDetail,
 };
 use super::runtime::{
     ActionId, ActiveStepInvocation, RecoveryDecisionKind, RecoveryHandlerActivity,
@@ -65,6 +66,9 @@ pub enum ObservedStepTransition {
     },
     OutputsCommitted {
         outputs: Vec<String>,
+        /// The failure of the child a `workflow` step succeeded on (REQ-WFEXEC-77), committed
+        /// with its outputs.
+        failed_child: Option<FailedChild>,
     },
     Failed {
         detail: FailureDetail,

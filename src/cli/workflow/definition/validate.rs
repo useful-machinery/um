@@ -9,7 +9,8 @@ use serde::Serialize;
 use super::report::{JsonTree, display, display_members, display_path, write_invalid, write_json};
 use crate::exit_code::ExitCode;
 use useful_execution::{
-    BindingValue, OwnerDeclaration, OwnerSource, StopBefore, ValidatedTree, validate_workflow_tree,
+    BindingValue, BusyBehavior, IntegrationAs, IntegrationProvider, OwnerDeclaration, OwnerSource,
+    StopBefore, ValidatedTree, validate_workflow_tree,
 };
 
 pub(super) const ABOUT: &str = "Validate a local workflow tree and print its digest";
@@ -92,6 +93,13 @@ fn write_human_valid(tree: &ValidatedTree) -> anyhow::Result<()> {
         "required tools: {}",
         display_list(&tree.required_tools)
     )?;
+    if !tree.required_integrations.is_empty() {
+        writeln!(
+            stdout,
+            "integrations: {}",
+            display_integrations(&tree.required_integrations)
+        )?;
+    }
     writeln!(
         stdout,
         "triggers:{}",
@@ -148,6 +156,9 @@ fn write_human_valid(tree: &ValidatedTree) -> anyhow::Result<()> {
         if let Some(owner) = &trigger.owner {
             writeln!(stdout, "    owner: {}", display_owner(owner))?;
         }
+        if let Some(busy_behavior) = trigger.busy_behavior {
+            writeln!(stdout, "    busy behavior: {}", busy_behavior.as_str())?;
+        }
     }
     writeln!(
         stdout,
@@ -174,6 +185,21 @@ fn write_human_valid(tree: &ValidatedTree) -> anyhow::Result<()> {
         )?;
     }
     Ok(())
+}
+
+/// Each provider id with the `as` that applies to it: `github as member, linear as org`.
+fn display_integrations(
+    integrations: &BTreeMap<IntegrationProvider, Option<IntegrationAs>>,
+) -> String {
+    integrations
+        .iter()
+        .map(|(provider, acting_as)| match acting_as {
+            Some(IntegrationAs::Member) => format!("{} as member", display(provider.as_str())),
+            Some(IntegrationAs::Org) => format!("{} as org", display(provider.as_str())),
+            None => display(provider.as_str()),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// `from` and any filters: `event.issue.assignee, event.issue.creator only $included`.
@@ -206,6 +232,18 @@ fn valid_report(tree: &ValidatedTree) -> JsonReport<'_> {
         workflow_files: &tree.workflow_files,
         programs: &tree.programs,
         requires_tools: &tree.required_tools,
+        requires_integrations: tree
+            .required_integrations
+            .iter()
+            .map(|(provider, acting_as)| {
+                (
+                    provider.as_str(),
+                    JsonIntegration {
+                        acting_as: *acting_as,
+                    },
+                )
+            })
+            .collect(),
         triggers: tree
             .triggers
             .iter()
@@ -223,6 +261,7 @@ fn valid_report(tree: &ValidatedTree) -> JsonReport<'_> {
                         inputs: &trigger.inputs,
                         stop_before: trigger.stop_before.as_ref(),
                         owner: trigger.owner.as_ref(),
+                        busy_behavior: trigger.busy_behavior.map(BusyBehavior::as_str),
                     },
                 )
             })
@@ -262,8 +301,18 @@ struct JsonReport<'a> {
     workflow_files: &'a [String],
     programs: &'a [String],
     requires_tools: &'a [String],
+    /// Provider id to `{as?}`, in bytewise order; absent when the root declares none.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    requires_integrations: BTreeMap<&'a str, JsonIntegration>,
     triggers: BTreeMap<&'a str, JsonTrigger<'a>>,
     bindings: BTreeMap<&'a str, JsonBinding<'a>>,
+}
+
+/// The `as` that applies to a declared integration, absent where none does.
+#[derive(Serialize)]
+struct JsonIntegration {
+    #[serde(rename = "as", skip_serializing_if = "Option::is_none")]
+    acting_as: Option<IntegrationAs>,
 }
 
 #[derive(Serialize)]
@@ -274,7 +323,8 @@ struct JsonDigest<'a> {
 
 /// A provider trigger's `source`, `event` and `where`, or a schedule's `schedule` and
 /// `timezone`, then a start trigger's `subject`, `inputs` (input name to the value as
-/// written), `stopBefore` and `owner` as `{from, only?, except?}`.
+/// written), `stopBefore`, `owner` as `{from, only?, except?}` and `busyBehavior` as written,
+/// absent when undeclared.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JsonTrigger<'a> {
@@ -297,6 +347,8 @@ struct JsonTrigger<'a> {
     stop_before: Option<&'a StopBefore>,
     #[serde(skip_serializing_if = "Option::is_none")]
     owner: Option<&'a OwnerDeclaration>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    busy_behavior: Option<&'static str>,
 }
 
 #[derive(Serialize)]

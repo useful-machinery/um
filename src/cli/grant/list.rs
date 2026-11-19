@@ -7,11 +7,12 @@ use crate::exit_code::ExitCode;
 use useful_api::{
     CommonIdentityFailure, GrantApi, GrantFailure, GrantUseList, HttpTransportPolicy,
     IdentityApiError, ListIdentitiesOutcome, MemberGrant, MemberGrantApi, MemberGrantFailure,
-    MemberGrantKind, list_identities,
+    MemberGrantKind, ServedGrantProvider, list_identities,
 };
 use useful_human_auth::Deployment;
 
 use super::output::{self, Accounts};
+use super::projection;
 use super::{GRANT_HELP, GrantArg, Options, Resolved, every_grant, every_page, resolve, unrevoked};
 
 pub(super) const ABOUT: &str = "List your grants with where each may run, or show one";
@@ -41,16 +42,17 @@ pub(super) struct Command {
     options: Options,
 }
 
-/// What the leaf read: every grant of the member, or the one `GRANT` names.
+/// What the leaf read: every grant of the member with the providers the deployment serves, or
+/// the one `GRANT` names.
 enum Read {
-    Every(Vec<MemberGrant>),
+    Every(Vec<MemberGrant>, Vec<ServedGrantProvider>),
     One(Resolved),
 }
 
 impl Read {
     fn grants(&self) -> &[MemberGrant] {
         match self {
-            Self::Every(grants) => grants,
+            Self::Every(grants, _) => grants,
             Self::One(Resolved::Grant(grant)) => std::slice::from_ref(grant),
             Self::One(Resolved::Ambiguous { .. }) => &[],
         }
@@ -58,6 +60,11 @@ impl Read {
 }
 
 impl Command {
+    /// Reads every grant of the member and then the providers the deployment serves, to name
+    /// the other OAuth providers they hold nothing of (REQ-GRANT-64, REQ-GRANT-96), or with
+    /// `GRANT` the one grant it names, with no such read (REQ-GRANT-65). A deployment that
+    /// predates the served read names none, and a read that fails otherwise fails the command
+    /// as a failed grant read does.
     pub(super) fn run(self, deployment: &Deployment) -> anyhow::Result<ExitCode> {
         let json = self.options.json;
         let read = super::with_api(deployment, &self.options, |api| {
@@ -67,7 +74,7 @@ impl Command {
                         every_grant(api)?.into_iter().filter(unrevoked).collect();
                     // Cloud lists OAuth grants first; the order is kept whatever it sends.
                     grants.sort_by_key(|grant| grant.kind != MemberGrantKind::GrantKindOAuth);
-                    Read::Every(grants)
+                    Read::Every(grants, api.served_providers()?.unwrap_or_default())
                 }
                 Some(grant) => Read::One(resolve(api, grant)?),
             };
@@ -104,7 +111,13 @@ impl Command {
             organizations,
         };
         match &read {
-            Read::Every(grants) => output::write_list(api_url, grants, &accounts, json),
+            Read::Every(grants, served) => output::write_list(
+                api_url,
+                grants,
+                &projection::providers(served),
+                &accounts,
+                json,
+            ),
             Read::One(Resolved::Grant(grant)) => output::write_grant(
                 api_url,
                 grant,

@@ -507,6 +507,7 @@ fn retained_manifest_rejects_source_files_out_of_canonical_order() {
         inputs: BTreeMap::new(),
         agent_profile_replacement: None,
         tree: None,
+        source_revision: None,
     };
 
     assert_eq!(
@@ -4772,6 +4773,7 @@ fn a_nodes_start_is_recorded_once_when_it_becomes_active() {
                         recovery: None,
                         condition_passed: false,
                         failure_kind: None,
+                        failed_child: None,
                     },
                 )
             }),
@@ -5034,6 +5036,7 @@ async fn cloud_continuation_recovers_unexported_output_across_three_attempts() {
             content_digest: fixture.admitted.workflow().content_digest.clone(),
             withdrawn: false,
             exit_outcome: None,
+            failed_children: BTreeMap::new(),
         };
     retain_cloud_completed_steps(
         &private1,
@@ -5102,6 +5105,7 @@ async fn cloud_continuation_recovers_unexported_output_across_three_attempts() {
             content_digest: fixture.admitted.workflow().content_digest.clone(),
             withdrawn: false,
             exit_outcome: None,
+            failed_children: BTreeMap::new(),
         };
     retain_cloud_completed_steps(
         &private2,

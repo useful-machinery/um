@@ -26,7 +26,7 @@ pub struct ProviderGrant {
     pub identity_id: String,
     /// The provider the grant authorizes.
     #[serde(rename = "provider")]
-    pub provider: Provider,
+    pub provider: String,
     /// The scopes the provider reported granting.
     #[serde(rename = "scopes")]
     pub scopes: Vec<String>,
@@ -52,7 +52,7 @@ impl ProviderGrant {
     pub fn new(
         id: String,
         identity_id: String,
-        provider: Provider,
+        provider: String,
         scopes: Vec<String>,
         state: State,
         created_at: String,
@@ -68,22 +68,6 @@ impl ProviderGrant {
             refresh_expires_at: None,
             created_at,
         }
-    }
-}
-/// The provider the grant authorizes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Provider {
-    #[serde(rename = "github")]
-    ProviderGrantProviderGithub,
-    #[serde(rename = "gitlab.com")]
-    ProviderGrantProviderGitlabCom,
-    #[serde(rename = "linear")]
-    ProviderGrantProviderLinear,
-}
-
-impl Default for Provider {
-    fn default() -> Provider {
-        Self::ProviderGrantProviderGithub
     }
 }
 /// The grant's lifecycle state.

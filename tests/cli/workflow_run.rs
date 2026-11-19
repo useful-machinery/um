@@ -4132,6 +4132,42 @@ fn local_run_forwards_only_declared_host_environment() {
     }
 }
 
+// REQ-WFEXEC-78, SC-WFEXEC-8, REQ-WFEXEC-71
+#[test]
+fn local_run_delivers_a_declared_integrations_names_to_every_step() {
+    let observe = |name: &str, declaration: &str| {
+        format!(
+            "  {name}:\n    kind: cmd\n{declaration}    command:\n      argv: [sh, -c, 'printf \"%s %s %s %s\" \"${{GH_TOKEN-absent}}\" \"${{GH_TOKEN_FILE-absent}}\" \"${{GITLAB_TOKEN-absent}}\" \"${{GITHUB_TOKEN-absent}}\" > {name}.txt']\n"
+        )
+    };
+    for passthrough in ["", "environmentPassthrough: [GH_TOKEN]\n"] {
+        let bundle = RunBundle::new(&format!(
+            "schemaVersion: 1\n{passthrough}requires:\n  integrations:\n    github: {{}}\nsteps:\n{}{}",
+            observe("plain", ""),
+            observe("narrowed", "    environmentPassthrough: []\n"),
+        ));
+        let output = isolated_command(&bundle.args(&bundle.result("declared")))
+            .env("GH_TOKEN", "local-gh-token")
+            .env("GH_TOKEN_FILE", "/local/gh-token")
+            .env("GITLAB_TOKEN", "local-gitlab-token")
+            .env("GITHUB_TOKEN", "local-github-token")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for step in ["plain", "narrowed"] {
+            assert_eq!(
+                fs::read_to_string(bundle.execution_root().join(format!("{step}.txt"))).unwrap(),
+                "local-gh-token /local/gh-token absent absent",
+                "{passthrough:?} {step}"
+            );
+        }
+    }
+}
+
 // SC-WFEXEC-5, REQ-WFEXEC-71
 #[test]
 fn local_run_scopes_declared_host_environment_to_each_step() {
@@ -6986,6 +7022,156 @@ fn a_tree_run_executes_the_copys_programs_under_useful_workflow_root() {
     assert_eq!(mode & 0o777, 0o555);
 }
 
+/// The workspace and workflow commits `source_revision_options` names.
+const SOURCE_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+const SOURCE_WORKFLOW_COMMIT: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+/// The `--source-revision` options of a run whose steps see `GIVEN_SOURCE_REVISION`.
+pub(super) fn source_revision_options() -> Vec<String> {
+    [
+        format!("commit={SOURCE_COMMIT}"),
+        "branch=feature/x".to_owned(),
+        "workflowBranch=main".to_owned(),
+        format!("workflowCommit={SOURCE_WORKFLOW_COMMIT}"),
+    ]
+    .into_iter()
+    .flat_map(|value| ["--source-revision".to_owned(), value])
+    .collect()
+}
+
+/// What `SOURCE_REVISION_PROGRAM` writes for a step of a run given `source_revision_options`.
+pub(super) fn given_source_revision() -> String {
+    format!("{SOURCE_COMMIT}\nfeature/x\nmain\n{SOURCE_WORKFLOW_COMMIT}\n")
+}
+
+/// The value of `USEFUL_SOURCE_COMMIT_OID` the tests launch with, which no step sees.
+pub(super) const INHERITED_SOURCE_COMMIT: &str = "inherited";
+
+/// A tree whose step `report` runs `SOURCE_REVISION_PROGRAM` and admits `SOURCE_EXIT`.
+pub(super) const SOURCE_REVISION_WORKFLOW: &str = "schemaVersion: 1\nenvironmentPassthrough: [SOURCE_EXIT]\nprograms: [bin]\nsteps:\n  report:\n    kind: cmd\n    command:\n      argv: [\"source-report\"]\n";
+
+/// Appends the four source variables it sees, `unset` for one it lacks, to
+/// `source-revision` in the execution root, one per line, and exits `SOURCE_EXIT` (0 unset).
+pub(super) const SOURCE_REVISION_PROGRAM: &str = "#!/bin/sh\nset -eu\nprintf '%s\\n' \"${USEFUL_SOURCE_COMMIT_OID-unset}\" \"${USEFUL_SOURCE_BRANCH-unset}\" \"${USEFUL_WORKFLOW_SOURCE_BRANCH-unset}\" \"${USEFUL_WORKFLOW_SOURCE_COMMIT_OID-unset}\" >> source-revision\nexit \"${SOURCE_EXIT-0}\"\n";
+
+/// A tree of `SOURCE_REVISION_WORKFLOW` with its program.
+pub(super) fn source_revision_tree() -> TreeBundle {
+    let bundle = TreeBundle::new(SOURCE_REVISION_WORKFLOW);
+    bundle.write_program("bin/source-report", SOURCE_REVISION_PROGRAM);
+    bundle
+}
+
+/// A run of `source_revision_tree` created into `name` with `source_revision_options`,
+/// whose one attempt failed with `source-revision` removed after it, for a later attempt
+/// to write again: the tree, the run directory and that file.
+pub(super) fn failed_source_revision_run(name: &str) -> (TreeBundle, PathBuf, PathBuf) {
+    let bundle = source_revision_tree();
+    let destination = bundle.result(name);
+    let output = isolated_command(&tree_args_with(
+        &bundle,
+        &destination,
+        &source_revision_options(),
+    ))
+    .env("SOURCE_EXIT", "1")
+    .output()
+    .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let observed = bundle.execution_root().join("source-revision");
+    assert_eq!(
+        fs::read_to_string(&observed).unwrap(),
+        given_source_revision()
+    );
+    fs::remove_file(&observed).unwrap();
+    let run_directory = fs::canonicalize(&destination).unwrap();
+    (bundle, run_directory, observed)
+}
+
+/// Asserts that a later attempt of `failed_source_revision_run`, launched with an inherited
+/// `USEFUL_SOURCE_COMMIT_OID`, succeeded as attempt 2 and its step saw the given revision.
+pub(super) fn assert_second_attempt_saw_the_source_revision(output: &Output, observed: &Path) {
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(terminal["attemptNumber"], 2);
+    assert_eq!(
+        fs::read_to_string(observed).unwrap(),
+        given_source_revision()
+    );
+}
+
+/// `TreeBundle::args` with `options` before `--json`.
+pub(super) fn tree_args_with(
+    bundle: &TreeBundle,
+    result: &Path,
+    options: &[String],
+) -> Vec<String> {
+    let mut args = bundle.args(result);
+    let at = args.len() - 2;
+    args.splice(at..at, options.iter().cloned());
+    args
+}
+
+// REQ-LOCALRUN-217, REQ-WFEXEC-22
+#[test]
+fn a_run_given_a_source_revision_sets_the_source_variables_and_one_given_none_sets_none() {
+    let recorded = serde_json::json!({
+        "commit": SOURCE_COMMIT,
+        "branch": "feature/x",
+        "workflowBranch": "main",
+        "workflowCommit": SOURCE_WORKFLOW_COMMIT,
+    });
+    for (name, options, expected, manifest_member) in [
+        (
+            "given",
+            source_revision_options(),
+            given_source_revision(),
+            Some(recorded),
+        ),
+        ("none", Vec::new(), "unset\n".repeat(4), None),
+    ] {
+        let bundle = source_revision_tree();
+        let destination = bundle.result(name);
+        let output = isolated_command(&tree_args_with(&bundle, &destination, &options))
+            .env("USEFUL_SOURCE_COMMIT_OID", INHERITED_SOURCE_COMMIT)
+            .env("USEFUL_SOURCE_BRANCH", "inherited")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{name}: stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(bundle.execution_root().join("source-revision")).unwrap(),
+            expected,
+            "{name}"
+        );
+        // The run's manifest records the revision later attempts read back, and names none
+        // when the option was not given.
+        let manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(normalized_run_directory(&destination).join("workflow/manifest.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.get("sourceRevision"),
+            manifest_member.as_ref(),
+            "{name}"
+        );
+    }
+}
+
 // REQ-WFEXEC-54, REQ-LOCALRUN-169, REQ-LOCALRUN-128
 #[test]
 fn a_path_argv_under_a_tree_root_is_rejected_at_phase_tree() {
@@ -7674,6 +7860,29 @@ fn workflow_steps_run_child_runs_and_route_on_their_outcomes() {
     assert_eq!(carrier_names(&destination, "design"), ["outcome", "plan"]);
     assert_eq!(run_record(&destination)["outcome"], "failed");
     assert!(!destination.join("children/build").exists());
+}
+
+// REQ-WFEXEC-77: a child whose run succeeded and chose the outcome `failed` is no failed
+// child; the step's entries in `result.json` and `state.json` record none.
+#[test]
+fn a_child_that_chose_the_outcome_failed_records_no_failed_child() {
+    let (_bundle, destination, output) = run_child_tree("failed");
+    let terminal = succeeded(&output);
+    let child = run_record(&destination.join("children/design/000001"));
+    assert_eq!(child["outcome"], "failed", "{child}");
+    let design = result_step(&terminal, "design");
+    assert_eq!(design["state"], "succeeded", "{terminal}");
+    assert!(design.get("failedChild").is_none(), "{terminal}");
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(destination.join("state.json")).unwrap()).unwrap();
+    let progress = state["attempts"][0]["progress"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|step| step["id"] == "design")
+        .unwrap_or_else(|| panic!("{state}"));
+    assert_eq!(progress["state"], "succeeded", "{progress}");
+    assert!(progress.get("failedChild").is_none(), "{progress}");
 }
 
 /// One progress stream record (REQ-LOCALRUN-106) split on whitespace: its scope, its token

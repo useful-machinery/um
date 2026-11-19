@@ -1,8 +1,8 @@
 //! Keeping a delivered Codex login as `auth.json` in a Codex home of the
 //! runner's own (REQ-GRANT-36) and offering that home to each
-//! assignment as `CODEX_HOME`, while standing back when the service sets
-//! `CODEX_HOME` itself (REQ-GRANT-37). The service's own Codex home is
-//! never written.
+//! assignment as `CODEX_HOME`, while standing back when the service has a
+//! Codex login of its own (REQ-GRANT-37, REQ-GRANT-51). The service's own
+//! Codex home is never written.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -13,7 +13,7 @@ use useful_execution::CODEX_LOGIN_VARIABLE;
 use super::cloud::Delivery;
 use super::directory::{self, LoginDirectory};
 use super::readiness::Installation;
-use super::{FailureStage, InstallRefusal, ServiceEnvironment};
+use super::{FailureStage, InstallRefusal, ServiceEnvironment, login_file_present};
 
 const AUTH_FILE: &str = "auth.json";
 const CONFIG_FILE: &str = "config.toml";
@@ -32,10 +32,18 @@ pub(crate) fn auth_path(directory: &LoginDirectory) -> PathBuf {
     directory.codex_home().join(AUTH_FILE)
 }
 
-/// Whether the service sets a Codex home of its own, which the runner never
-/// replaces: it then neither keeps nor offers a Codex login.
-pub(crate) const fn foreign_login(environment: &ServiceEnvironment) -> bool {
+/// Whether the service already has a Codex login of its own, which the
+/// runner never replaces: it carries `CODEX_HOME`, or `auth.json` is present
+/// in Codex's default home, `.codex` under `HOME`. The file is only looked
+/// at, never opened; one the runner cannot tell is absent counts as present,
+/// and a `HOME` that is unset or not absolute names none. The runner then
+/// neither keeps nor offers a Codex login. Its own Codex home is in its
+/// agent-login directory, never under the service's `HOME`.
+pub(crate) fn foreign_login(environment: &ServiceEnvironment) -> bool {
     environment.codex_home
+        || environment
+            .under_home(".codex")
+            .is_some_and(|home| login_file_present(&home.join(AUTH_FILE)))
 }
 
 /// Keeps `delivery` as `auth.json` in the runner's Codex home, creating the
@@ -76,7 +84,7 @@ pub(crate) fn install_codex(
 }
 
 /// `CODEX_HOME` naming the runner's Codex home, when the runner keeps a
-/// Codex login there and the service sets no `CODEX_HOME` of its own.
+/// Codex login there and the service has no Codex login of its own.
 pub(crate) fn offered_home(
     service: &ServiceEnvironment,
     directory: &LoginDirectory,

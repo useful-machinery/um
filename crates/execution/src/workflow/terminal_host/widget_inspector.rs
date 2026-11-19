@@ -42,7 +42,12 @@ impl InspectorOutput {
 
 impl StepProjection for WorkflowRunStepView {
     fn header(&self) -> StepHeader<'_> {
-        StepHeader::new(&self.id, &self.definition, self.state, self.timing.as_ref())
+        StepHeader::new(
+            &self.id,
+            &self.definition,
+            self.presented_state(),
+            self.timing.as_ref(),
+        )
     }
 
     fn dag_detail(&self) -> Option<String> {
@@ -68,6 +73,9 @@ impl StepProjection for WorkflowRunStepView {
     }
 
     fn inspector_fact(&self) -> Option<InspectorField> {
+        if let Some(detail) = live_failed_stage_detail(self) {
+            return Some(InspectorField::new("failure", detail, Tone::Failure));
+        }
         self.inherited.as_ref().map_or_else(
             || live_inspector_fact(self.fact.as_ref()),
             |detail| {
@@ -551,6 +559,7 @@ pub(super) fn output_disposition(
                 WorkflowRunOutputUnavailableReason::Skipped => "skipped",
                 WorkflowRunOutputUnavailableReason::NotRun => "not-run",
                 WorkflowRunOutputUnavailableReason::Cancelled => "cancelled",
+                WorkflowRunOutputUnavailableReason::NotCommitted => "absent",
             };
             (
                 format!("unavailable ({reason})"),

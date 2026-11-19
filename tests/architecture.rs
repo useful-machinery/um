@@ -264,7 +264,7 @@ fn moved_sources_have_one_final_owner_and_private_generated_api() {
         "pub use control_client::{RequestFailure, request};",
         "pub use service::{Config, ConfigError};",
         "pub struct ServiceError",
-        "pub fn run(config: Config, service_version: &str)",
+        "pub fn run(\n    config: Config,\n    service_version: &str,\n    join_key: JoinKeyMode,\n) -> Result<ServiceEnd, ServiceError>",
     ] {
         assert!(
             runner_facade.contains(consumed),

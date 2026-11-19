@@ -33,7 +33,7 @@ use clap::{Args, Subcommand};
 use crate::exit_code::ExitCode;
 use useful_api::{
     MEMBER_GRANT_PAGE, MemberGrant, MemberGrantApi, MemberGrantFailure, MemberGrantKind,
-    MemberGrantState,
+    MemberGrantProvider, MemberGrantState,
 };
 use useful_human_auth::Deployment;
 
@@ -136,11 +136,12 @@ pub(super) fn parse_runner_id(value: &str) -> Result<String, String> {
 }
 
 /// A grant as a command names it (REQ-GRANT-65): its ID, `pgr_` for an OAuth grant and `agl_`
-/// for a native one, or the wire name of a provider the member holds one grant of.
+/// for a native one, or the wire name of a provider the member holds one grant of, which is
+/// any provider id or `claude_code` (REQ-GRANT-96).
 #[derive(Clone, Debug)]
 enum GrantArg {
     Id(String),
-    Provider(&'static str),
+    Provider(String),
 }
 
 fn parse_grant(value: &str) -> Result<GrantArg, String> {
@@ -149,26 +150,24 @@ fn parse_grant(value: &str) -> Result<GrantArg, String> {
     {
         return Ok(GrantArg::Id(value.to_owned()));
     }
-    projection::PROVIDERS
-        .iter()
-        .map(|provider| provider.name())
-        .find(|name| *name == value)
-        .map(GrantArg::Provider)
-        .ok_or_else(|| {
-            "grant must be an exact pgr_ or agl_ identifier, as useful grant list prints it, or one of \
-             github, gitlab.com, linear, claude_code and codex"
-                .to_owned()
-        })
+    if useful_api::valid_provider_id(value)
+        || value == MemberGrantProvider::GrantProviderClaudeCode.as_str()
+    {
+        return Ok(GrantArg::Provider(value.to_owned()));
+    }
+    Err(
+        "grant must be an exact pgr_ or agl_ identifier, as useful grant list prints it, or a \
+         provider name: claude_code, or a lowercase letter followed by at most 62 lowercase \
+         letters, digits, dots and hyphens, such as github"
+            .to_owned(),
+    )
 }
 
 /// The grant a `GrantArg` names, or the IDs of the several unrevoked grants of the provider it
 /// names, which a command refuses to choose between.
 enum Resolved {
     Grant(Box<MemberGrant>),
-    Ambiguous {
-        provider: &'static str,
-        ids: Vec<String>,
-    },
+    Ambiguous { provider: String, ids: Vec<String> },
 }
 
 /// Reads the grant `grant` names: by its ID, or among the member's unrevoked grants of the
@@ -176,7 +175,7 @@ enum Resolved {
 fn resolve(api: &MemberGrantApi, grant: &GrantArg) -> Result<Resolved, MemberGrantFailure> {
     let provider = match grant {
         GrantArg::Id(id) => return api.get(id).map(|grant| Resolved::Grant(Box::new(grant))),
-        GrantArg::Provider(provider) => *provider,
+        GrantArg::Provider(provider) => provider.as_str(),
     };
     let mut held: Vec<_> = every_grant(api)?
         .into_iter()
@@ -186,7 +185,7 @@ fn resolve(api: &MemberGrantApi, grant: &GrantArg) -> Result<Resolved, MemberGra
         0 => Err(MemberGrantFailure::GrantNotFound),
         1 => Ok(Resolved::Grant(Box::new(held.remove(0)))),
         _ => Ok(Resolved::Ambiguous {
-            provider,
+            provider: provider.to_owned(),
             ids: held.into_iter().map(|grant| grant.id).collect(),
         }),
     }
@@ -282,7 +281,7 @@ fn read_grant(
         match with_api(deployment, options, |api| resolve(api, grant))? {
             Ok(Resolved::Grant(grant)) => Ok(grant),
             Ok(Resolved::Ambiguous { provider, ids }) => Err(output::write_ambiguous(
-                api_url, provider, &ids, example, json,
+                api_url, &provider, &ids, example, json,
             )?),
             Err(failure) => Err(output::failure(api_url, &failure, json)?),
         },

@@ -4,14 +4,14 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use super::document::{
-    Agent, AgentMessage, AgentNode, AgentProfile, Binding, BindingKind, BindingValue, CommandNode,
-    CommonNode, ConditionOperand, ConditionPredicate, ConditionSelector, EdgeTarget,
+    Agent, AgentMessage, AgentNode, AgentProfile, Binding, BindingKind, BindingValue, BusyBehavior,
+    CommandNode, CommonNode, ConditionOperand, ConditionPredicate, ConditionSelector, EdgeTarget,
     ExportDefinition, ExportPresentation, FailurePolicy, FinalizationTrigger, FinalizerDefinition,
-    ForEach, InputDeclaration, JsonDefault, MessageSource, NodeBody, OutcomeDeclaration, Output,
-    OutputReference, OwnerDeclaration, OwnerSource, PresentationSource, RecoveryHandler,
-    RootBlocks, RootRequires, StartRule, StepDefinition, StepRecovery, StopBefore, Trigger,
-    TriggerControlAction, TriggerRule, ValueReference, WaitKind, WaitRule, WorkflowDocument,
-    WorkflowNode,
+    ForEach, InputDeclaration, Integration, IntegrationAs, IntegrationBinding, IntegrationProvider,
+    JsonDefault, MessageSource, NodeBody, OutcomeDeclaration, Output, OutputReference,
+    OwnerDeclaration, OwnerSource, PresentationSource, RecoveryHandler, RootBlocks, RootRequires,
+    StartRule, StepDefinition, StepRecovery, StopBefore, Trigger, TriggerControlAction,
+    TriggerRule, ValueReference, WaitKind, WaitRule, WorkflowDocument, WorkflowNode,
 };
 use super::mirror::{MirrorBlock, MirrorState};
 use super::validated::ValidatedHarness;
@@ -87,7 +87,27 @@ where
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RequiresDto {
+    #[serde(default)]
     tools: Vec<String>,
+    #[serde(rename = "as")]
+    acting_as: Option<IntegrationAs>,
+    #[serde(default)]
+    integrations: BTreeMap<IntegrationProvider, IntegrationDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntegrationDto {
+    #[serde(rename = "as")]
+    acting_as: Option<IntegrationAs>,
+    #[serde(default)]
+    bindings: BTreeMap<String, IntegrationBindingDto>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntegrationBindingDto {
+    kind: String,
 }
 
 #[derive(Deserialize)]
@@ -175,6 +195,16 @@ struct StartTriggerDto {
     #[serde(rename = "stopBefore")]
     stop_before: Option<StopBeforeDto>,
     owner: Option<OwnerDto>,
+    #[serde(rename = "busyBehavior")]
+    busy_behavior: Option<BusyBehaviorDto>,
+}
+
+#[derive(Deserialize)]
+enum BusyBehaviorDto {
+    #[serde(rename = "skip")]
+    Skip,
+    #[serde(rename = "queueLatest")]
+    QueueLatest,
 }
 
 #[derive(Deserialize)]
@@ -317,6 +347,10 @@ impl TriggerDto {
                     prefix: stop_before.prefix,
                 }),
                 owner: start.owner.map(OwnerDto::into_declaration),
+                busy_behavior: start.busy_behavior.map(|behavior| match behavior {
+                    BusyBehaviorDto::Skip => BusyBehavior::Skip,
+                    BusyBehaviorDto::QueueLatest => BusyBehavior::QueueLatest,
+                }),
             },
             Self::Control(control) => Trigger::Control {
                 on: control.on.into_rule(),
@@ -798,11 +832,7 @@ where
     let names = Vec::<String>::deserialize(deserializer)?;
     let mut allowed = BTreeSet::new();
     for name in names {
-        let mut bytes = name.bytes();
-        if !bytes
-            .next()
-            .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
-            || !bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        if !super::admission::is_environment_passthrough_name(&name)
             || super::admission::is_managed_runner_private_environment_name(std::ffi::OsStr::new(
                 &name,
             ))
@@ -896,6 +926,26 @@ impl WorkflowDto {
             exclude: self.exclude.unwrap_or_default(),
             requires: self.requires.map(|requires| RootRequires {
                 tools: requires.tools,
+                acting_as: requires.acting_as,
+                integrations: requires
+                    .integrations
+                    .into_iter()
+                    .map(|(provider, integration)| {
+                        (
+                            provider,
+                            Integration {
+                                acting_as: integration.acting_as,
+                                bindings: integration
+                                    .bindings
+                                    .into_iter()
+                                    .map(|(name, binding)| {
+                                        (name, IntegrationBinding { kind: binding.kind })
+                                    })
+                                    .collect(),
+                            },
+                        )
+                    })
+                    .collect(),
             }),
             bindings: self
                 .bindings

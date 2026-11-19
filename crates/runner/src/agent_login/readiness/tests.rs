@@ -62,8 +62,8 @@ fn the_document_records_an_install_without_its_material() {
             state: AgentLoginState::Ready,
             checked_at: Some(time(1_794_445_200)),
             login: Some(RecordedLogin::Installed(installation.clone())),
-            selected: true,
             last_use: None,
+            source: None,
         }],
         unknown: Vec::new(),
     };
@@ -86,7 +86,6 @@ fn the_document_records_an_install_without_its_material() {
                 "checkedAt": "2026-11-12T01:00:00Z",
                 "installedAt": "2026-11-12T00:55:00Z",
                 "installedPath": installation.installed_path.to_str().unwrap(),
-                "selected": true,
             },
             {"provider": "github", "state": "not_delivered"},
             {"provider": "gitlab", "state": "not_delivered"},
@@ -139,26 +138,22 @@ fn every_readiness_state_round_trips_and_a_missing_document_is_none() {
         (AgentLoginState::CloudUnavailable, None),
         (AgentLoginState::InstallFailed, None),
     ] {
-        for selected in [true, false] {
-            let document = ReadinessDocument {
-                updated_at: time(1_794_445_200),
-                logins: vec![LoginReadiness {
-                    provider: AgentLoginProvider::Codex,
-                    state,
-                    checked_at: None,
-                    login: login.clone(),
-                    selected,
-                    last_use: None,
-                }],
-                unknown: Vec::new(),
-            };
-            document.write(&path).unwrap();
-            let value: serde_json::Value =
-                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            assert!(validator.is_valid(&value), "{value}");
-            assert_eq!(value["providers"][0]["selected"], selected, "{value}");
-            assert_eq!(ReadinessDocument::load(&path), Ok(Some(document)));
-        }
+        let document = ReadinessDocument {
+            updated_at: time(1_794_445_200),
+            logins: vec![LoginReadiness {
+                provider: AgentLoginProvider::Codex,
+                state,
+                checked_at: None,
+                login,
+                last_use: None,
+                source: None,
+            }],
+            unknown: Vec::new(),
+        };
+        document.write(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(validator.is_valid(&value), "{value}");
+        assert_eq!(ReadinessDocument::load(&path), Ok(Some(document)));
     }
     let entries = fs::read_dir(state.path())
         .unwrap()
@@ -187,11 +182,11 @@ fn the_last_use_of_an_install_round_trips_beside_it_and_only_there() {
                 state: AgentLoginState::Ready,
                 checked_at: Some(time(1_794_445_200)),
                 login: Some(RecordedLogin::Installed(installation.clone())),
-                selected: true,
                 last_use: Some(LastUse {
                     outcome,
                     at: time(1_794_445_080),
                 }),
+                source: None,
             }],
             unknown: Vec::new(),
         };
@@ -205,9 +200,9 @@ fn the_last_use_of_an_install_round_trips_beside_it_and_only_there() {
         );
         assert_eq!(value["providers"][0]["lastUseAt"], "2026-11-12T00:58:00Z");
         assert_eq!(ReadinessDocument::load(&path), Ok(Some(document.clone())));
-        // The control socket reports the last use with its time and the
-        // selection, but not where the install is (REQ-GRANT-41,
-        // REQ-GRANT-53, REQ-RUNNERENROLL-63).
+        // The control socket reports the last use with its time, but not
+        // where the install is (REQ-GRANT-41, REQ-GRANT-53,
+        // REQ-RUNNERENROLL-63).
         let reported = serde_json::to_value(document.reported().unwrap()).unwrap();
         let entry = &reported["providers"][0];
         assert_eq!(
@@ -215,7 +210,6 @@ fn the_last_use_of_an_install_round_trips_beside_it_and_only_there() {
             serde_json::to_value(outcome).unwrap(),
             "{reported}"
         );
-        assert_eq!(entry["selected"], true, "{reported}");
         assert_eq!(entry["lastUseAt"], "2026-11-12T00:58:00Z", "{reported}");
         assert!(entry.get("installedPath").is_none(), "{reported}");
     }
@@ -310,8 +304,8 @@ fn an_entry_for_a_provider_this_build_does_not_know_survives_a_rewrite_verbatim(
             state: AgentLoginState::Revoked,
             checked_at: None,
             login: None,
-            selected: false,
             last_use: None,
+            source: None,
         }]
     );
     document.updated_at = time(1_794_445_200);
@@ -334,32 +328,55 @@ fn an_entry_for_a_provider_this_build_does_not_know_survives_a_rewrite_verbatim(
     assert_eq!(reported.providers.len(), entries.len() - 1);
 }
 
-// REQ-GRANT-38
+// REQ-GRANT-38, REQ-GRANT-51
 #[test]
-fn an_entry_written_before_selection_was_recorded_is_selected_by_its_state() {
+fn an_agent_login_entry_an_earlier_release_wrote_as_selected_loads_and_is_written_without_it() {
     let state = state_directory();
     let path = readiness_path(&state.path().join("state.json"));
-    for (state, selected) in [
-        (AgentLoginState::Ready, true),
-        (AgentLoginState::ForeignLogin, true),
-        (AgentLoginState::UnsupportedTarget, true),
-        (AgentLoginState::StaleGeneration, true),
-        (AgentLoginState::CloudUnavailable, true),
-        (AgentLoginState::InstallFailed, true),
-        (AgentLoginState::NotAuthorized, false),
-        (AgentLoginState::Revoked, false),
-    ] {
-        let _ = fs::remove_file(&path);
-        let written = serde_json::json!({
+    write_raw(
+        &path,
+        &serde_json::json!({
             "schemaVersion": 1,
             "updatedAt": "2026-11-12T01:00:00Z",
-            "providers": [{"provider": "codex", "state": state.as_str()}],
-        });
-        fs::write(&path, serde_json::to_vec(&written).unwrap()).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        let document = ReadinessDocument::load(&path).unwrap().unwrap();
-        let codex = document.login(AgentLoginProvider::Codex).unwrap();
-        assert_eq!(codex.selected, selected, "{state:?}");
+            "providers": [
+                {
+                    "provider": "codex", "state": "not_authorized",
+                    "agentLoginId": AGENT_LOGIN_ID,
+                    "checkedAt": "2026-11-12T01:00:00Z", "selected": true,
+                },
+                {
+                    "provider": "claude_code", "state": "foreign_login",
+                    "checkedAt": "2026-11-12T01:00:00Z", "selected": false,
+                },
+            ],
+        }),
+    );
+
+    let document = ReadinessDocument::load(&path).unwrap().unwrap();
+
+    let codex = document.login(AgentLoginProvider::Codex).unwrap();
+    assert_eq!(codex.state, AgentLoginState::NotAuthorized);
+    assert_eq!(
+        codex.login,
+        Some(RecordedLogin::Named(AGENT_LOGIN_ID.to_owned()))
+    );
+    assert_eq!(
+        document
+            .login(AgentLoginProvider::ClaudeCode)
+            .unwrap()
+            .state,
+        AgentLoginState::ForeignLogin
+    );
+    document.write(&path).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(validator().is_valid(&value), "{value}");
+    for entry in value["providers"].as_array().unwrap() {
+        assert!(entry.get("selected").is_none(), "{value}");
+    }
+    assert_eq!(ReadinessDocument::load(&path), Ok(Some(document.clone())));
+    let reported = serde_json::to_value(document.reported().unwrap()).unwrap();
+    for entry in reported["providers"].as_array().unwrap() {
+        assert!(entry.get("selected").is_none(), "{reported}");
     }
 }
 
@@ -518,9 +535,9 @@ fn an_oauth_providers_ready_entry_survives_a_write_and_a_load_unchanged() {
             generation: 4,
             expires_at: time(1_794_474_000),
         }),
-        selected: true,
         run_id: None,
         ended_at: None,
+        source: None,
     };
     let document = with_grants([github.clone()]);
 
@@ -540,7 +557,6 @@ fn an_oauth_providers_ready_entry_survives_a_write_and_a_load_unchanged() {
                 "generation": 4,
                 "expiresAt": "2026-11-12T09:00:00Z",
                 "checkedAt": "2026-11-12T01:00:00Z",
-                "selected": true,
             },
             {"provider": "gitlab", "state": "not_delivered"},
             {"provider": "linear", "state": "not_delivered"},
@@ -563,7 +579,6 @@ fn an_oauth_providers_ready_entry_survives_a_write_and_a_load_unchanged() {
             "generation": 4,
             "expiresAt": "2026-11-12T09:00:00Z",
             "checkedAt": "2026-11-12T01:00:00Z",
-            "selected": true,
         })
     );
 }
@@ -582,9 +597,9 @@ fn ended_github() -> GrantReadiness {
             generation: 4,
             expires_at: time(1_794_474_000),
         }),
-        selected: true,
         run_id: Some(RUN_ID.to_owned()),
         ended_at: Some(time(1_794_445_500)),
+        source: None,
     }
 }
 
@@ -616,6 +631,62 @@ fn an_oauth_entry_with_its_run_and_end_survives_a_write_and_a_load_unchanged() {
     let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     assert!(value["providers"][0].get("endedAt").is_none(), "{value}");
     assert_eq!(ReadinessDocument::load(&path), Ok(Some(running)));
+}
+
+// REQ-GRANT-92, REQ-GRANT-38, REQ-GRANT-88
+#[test]
+fn each_entrys_source_survives_a_write_and_a_load_and_an_oauth_ones_only_beside_its_run() {
+    let state = state_directory();
+    let path = readiness_path(&state.path().join("state.json"));
+    let mut document = with_grants([GrantReadiness {
+        source: Some(CredentialSource::Grant),
+        ..ended_github()
+    }]);
+    document.logins.push(LoginReadiness {
+        provider: AgentLoginProvider::ClaudeCode,
+        state: AgentLoginState::ForeignLogin,
+        checked_at: Some(time(1_794_445_200)),
+        login: None,
+        last_use: None,
+        source: Some(CredentialSource::Host),
+    });
+
+    document.write(&path).unwrap();
+
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(validator().is_valid(&value), "{value}");
+    assert_eq!(value["providers"][0]["source"], "host", "{value}");
+    assert_eq!(value["providers"][1]["source"], "grant", "{value}");
+    assert!(value["providers"][2].get("source").is_none(), "{value}");
+    assert_eq!(ReadinessDocument::load(&path), Ok(Some(document.clone())));
+    // The control socket reports each beside its state.
+    let reported = serde_json::to_value(document.reported().unwrap()).unwrap();
+    assert_eq!(reported["providers"][0]["source"], "host", "{reported}");
+    assert_eq!(reported["providers"][1]["source"], "grant", "{reported}");
+
+    // An OAuth entry's source is its run's: without the run it is neither
+    // read nor written.
+    let unrun = serde_json::json!({
+        "schemaVersion": 1,
+        "updatedAt": "2026-11-12T01:00:00Z",
+        "providers": [{
+            "provider": "linear", "state": "not_delivered",
+            "checkedAt": "2026-11-12T01:00:00Z", "source": "host",
+        }],
+    });
+    assert!(!validator().is_valid(&unrun));
+    write_raw(&path, &unrun);
+    assert_eq!(ReadinessDocument::load(&path), Err(ReadinessError::Invalid));
+    let entry = GrantReadiness {
+        run_id: None,
+        ended_at: None,
+        source: Some(CredentialSource::Host),
+        ..ended_github()
+    };
+    assert_eq!(
+        with_grants([entry]).write(&path),
+        Err(ReadinessError::WriteFailed(io::ErrorKind::InvalidData))
+    );
 }
 
 // REQ-GRANT-88
@@ -716,7 +787,10 @@ fn each_state_of_an_oauth_entry_round_trips() {
     let state = state_directory();
     let path = readiness_path(&state.path().join("state.json"));
     let validator = validator();
+    // A provider the host provides is recorded `not_delivered` for the run
+    // (REQ-GRANT-87).
     for state in [
+        AgentLoginState::NotDelivered,
         AgentLoginState::NotAuthorized,
         AgentLoginState::Revoked,
         AgentLoginState::ReconnectRequired,
@@ -724,35 +798,79 @@ fn each_state_of_an_oauth_entry_round_trips() {
         AgentLoginState::CloudUnavailable,
         AgentLoginState::InstallFailed,
     ] {
-        for selected in [true, false] {
-            let entries = [
-                AgentLoginProvider::Github,
-                AgentLoginProvider::Gitlab,
-                AgentLoginProvider::Linear,
-            ]
-            .map(|provider| GrantReadiness {
-                provider,
-                state,
-                checked_at: Some(time(1_794_445_200)),
-                issued: None,
-                selected,
-                run_id: None,
-                ended_at: None,
-            });
-            let document = with_grants(entries);
-            document.write(&path).unwrap();
-            let value: serde_json::Value =
-                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-            assert!(validator.is_valid(&value), "{value}");
-            assert_eq!(value["providers"][1]["state"], state.as_str(), "{value}");
-            assert_eq!(value["providers"][1]["selected"], selected, "{value}");
-            assert_eq!(
-                ReadinessDocument::load(&path),
-                Ok(Some(document)),
-                "{state:?}"
-            );
-        }
+        let entries = [
+            AgentLoginProvider::Github,
+            AgentLoginProvider::Gitlab,
+            AgentLoginProvider::Linear,
+        ]
+        .map(|provider| GrantReadiness {
+            provider,
+            state,
+            checked_at: Some(time(1_794_445_200)),
+            issued: None,
+            run_id: Some(RUN_ID.to_owned()),
+            ended_at: None,
+            source: None,
+        });
+        let document = with_grants(entries);
+        document.write(&path).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert!(validator.is_valid(&value), "{value}");
+        assert_eq!(value["providers"][1]["state"], state.as_str(), "{value}");
+        assert_eq!(
+            ReadinessDocument::load(&path),
+            Ok(Some(document)),
+            "{state:?}"
+        );
     }
+}
+
+// REQ-GRANT-88, REQ-GRANT-87
+#[test]
+fn an_oauth_entry_an_earlier_release_wrote_as_selected_loads_and_is_written_without_it() {
+    let state = state_directory();
+    let path = readiness_path(&state.path().join("state.json"));
+    write_raw(
+        &path,
+        &serde_json::json!({
+            "schemaVersion": 1,
+            "updatedAt": "2026-11-12T01:00:00Z",
+            "providers": [
+                {
+                    "provider": "github", "state": "reconnect_required",
+                    "checkedAt": "2026-11-12T01:00:00Z", "selected": true, "runId": RUN_ID,
+                },
+                {"provider": "gitlab", "state": "not_delivered", "selected": false},
+            ],
+        }),
+    );
+
+    let document = ReadinessDocument::load(&path).unwrap().unwrap();
+
+    assert_eq!(
+        document.grant(AgentLoginProvider::Github),
+        Some(&GrantReadiness {
+            provider: AgentLoginProvider::Github,
+            state: AgentLoginState::ReconnectRequired,
+            checked_at: Some(time(1_794_445_200)),
+            issued: None,
+            run_id: Some(RUN_ID.to_owned()),
+            ended_at: None,
+            source: None,
+        })
+    );
+    assert_eq!(document.grant(AgentLoginProvider::Gitlab), None);
+    document.write(&path).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(validator().is_valid(&value), "{value}");
+    for entry in value["providers"].as_array().unwrap() {
+        assert!(entry.get("selected").is_none(), "{value}");
+    }
+    let reported = serde_json::to_value(document.reported().unwrap()).unwrap();
+    assert!(
+        reported["providers"][0].get("selected").is_none(),
+        "{reported}"
+    );
 }
 
 // REQ-GRANT-88, REQ-GRANT-38
@@ -799,9 +917,9 @@ fn recording_an_oauth_entry_replaces_the_providers_last_and_keeps_the_rest() {
         state,
         checked_at: Some(time(1_794_445_200)),
         issued: None,
-        selected: false,
         run_id: None,
         ended_at: None,
+        source: None,
     };
     let gemini = serde_json::json!({"provider": "gemini", "state": "awaiting_consent"});
     let state = state_directory();

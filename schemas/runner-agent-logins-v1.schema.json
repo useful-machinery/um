@@ -25,14 +25,18 @@
         "installedAt": { "type": "string", "format": "date-time" },
         "installedPath": { "type": "string", "pattern": "^/" },
         "selected": {
-          "description": "Whether Cloud's last answer named an authorization in force for the provider: authorized, unauthorized or unsupported_target. An entry without it, written before it was recorded, is selected exactly when its state is ready, foreign_login, unsupported_target, stale_generation, cloud_unavailable or install_failed.",
+          "description": "Whether the provider was selected, which an earlier release wrote; nothing reads it, and the runner writes it on no entry.",
           "type": "boolean"
         },
         "lastUse": {
           "description": "How the provider answered the last use of the login installed: accepted when an agent step that received its variable finished successfully, refused when one failed with the harness error unauthorized. Recorded only beside an install, with when.",
           "enum": ["accepted", "refused"]
         },
-        "lastUseAt": { "type": "string", "format": "date-time" }
+        "lastUseAt": { "type": "string", "format": "date-time" },
+        "source": {
+          "description": "Where the coding agent's login comes from, as the setup pass that wrote the entry settled it: host while the service has a login of its own, grant while the runner keeps one it offers. Absent while neither provides one.",
+          "enum": ["host", "grant"]
+        }
       },
       "dependentRequired": {
         "generation": ["agentLoginId", "installedAt", "installedPath"],
@@ -60,7 +64,7 @@
       }
     },
     "brokered": {
-      "description": "An OAuth provider whose token Cloud issues for each assignment: what the last assignment the runner admitted was issued, its run and, once it has ended, when, never the token or the path of its file. A provider the runner has asked for no token of is not_delivered.",
+      "description": "An OAuth provider whose token Cloud issues for each assignment: what the last assignment the runner admitted was issued, its run and, once it has ended, when, never the token or the path of its file. A provider the runner has asked for no token of, one the host provides included, is not_delivered.",
       "type": "object",
       "additionalProperties": false,
       "required": ["provider", "state"],
@@ -83,7 +87,7 @@
         "expiresAt": { "type": "string", "format": "date-time" },
         "checkedAt": { "type": "string", "format": "date-time" },
         "selected": {
-          "description": "Whether Cloud's last answer for the provider named a grant in force: an issued token or reconnect_required. An entry without it is not selected.",
+          "description": "Whether the provider was selected, which an earlier release wrote; nothing reads it, and the runner writes it on no entry.",
           "type": "boolean"
         },
         "runId": {
@@ -95,11 +99,16 @@
           "description": "When that assignment ended on this runner; absent while it runs.",
           "type": "string",
           "format": "date-time"
+        },
+        "source": {
+          "description": "Where the provider's credential came from for that assignment, as its admission settled it: host while the service environment carries the provider's names, grant while the admission holds a token it can read back. Absent while neither provides one.",
+          "enum": ["host", "grant"]
         }
       },
       "dependentRequired": {
         "runId": ["checkedAt"],
-        "endedAt": ["checkedAt"]
+        "endedAt": ["checkedAt"],
+        "source": ["runId"]
       },
       "if": { "properties": { "state": { "const": "ready" } } },
       "then": { "required": ["grantId", "generation", "expiresAt"] },

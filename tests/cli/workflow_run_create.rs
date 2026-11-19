@@ -523,6 +523,55 @@ fn a_created_run_records_the_owner_and_external_references_it_is_given() {
     }
 }
 
+// REQ-LOCALRUN-217, REQ-LOCALRUN-80
+#[test]
+fn a_malformed_source_revision_is_a_usage_error_that_creates_no_run() {
+    const COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+    let commit = format!("commit={COMMIT}");
+    let workflow_commit = format!("workflowCommit={COMMIT}");
+    let bundle = super::workflow_run::RunBundle::new(CLOSURE_WORKFLOW);
+    for options in [
+        vec!["ref=main", commit.as_str()],
+        vec![commit.as_str(), commit.as_str()],
+        vec![commit.as_str(), "branch=a", "branch=b"],
+        vec!["commit"],
+        vec![commit.as_str(), "branch="],
+        vec!["commit=0123456789abcdef"],
+        vec!["commit=0123456789ABCDEF0123456789ABCDEF01234567"],
+        vec!["branch=main"],
+        vec![commit.as_str(), "workflowBranch=main"],
+        vec![commit.as_str(), workflow_commit.as_str()],
+        vec![
+            commit.as_str(),
+            "workflowBranch=main",
+            "workflowCommit=main",
+        ],
+    ] {
+        let destination = bundle.result("refused");
+        let mut args = bundle.args(&destination);
+        let at = args.len() - 1;
+        args.splice(
+            at..at,
+            options
+                .iter()
+                .flat_map(|option| ["--source-revision", option])
+                .map(str::to_owned),
+        );
+        assert_usage_error(&args);
+        assert!(!destination.exists(), "{options:?}");
+    }
+
+    // A run of a workflow file's closure takes it, with a 64-character commit.
+    let destination = bundle.result("closure");
+    let mut args = bundle.args(&destination);
+    args.extend([
+        "--source-revision".to_owned(),
+        format!("commit={COMMIT}{}", &COMMIT[..24]),
+    ]);
+    let output = super::workflow_run::run(&args);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+}
+
 /// `useful workflow run create ID --cloud ORGANIZATION --project PROJECT` against a scripted Cloud
 /// (REQ-RUN-94).
 mod cloud {
@@ -730,7 +779,7 @@ mod cloud {
         }
     }
 
-    // REQ-RUN-94, REQ-LOCALRUN-80
+    // REQ-RUN-94, REQ-LOCALRUN-80, REQ-LOCALRUN-217
     #[test]
     fn a_local_option_beside_cloud_or_a_cloud_option_without_it_is_a_usage_error() {
         let scratch = tempfile::tempdir().unwrap();
@@ -751,6 +800,10 @@ mod cloud {
             &["--owner", "alice"],
             &["--no-owner", "--owner", "alice"],
             &["--external", "url=a"],
+            &[
+                "--source-revision",
+                "commit=0123456789abcdef0123456789abcdef01234567",
+            ],
             &["--max-parallel", "65"],
             &["--max-parallel", "0"],
             &["--workflow", "../review.yaml"],

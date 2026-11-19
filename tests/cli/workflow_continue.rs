@@ -4,7 +4,8 @@ use std::path::Path;
 
 use super::poll_until;
 use super::workflow_run::{
-    RunBundle, TreeBundle, git, initialize_git_repository, isolated_command, run_record,
+    INHERITED_SOURCE_COMMIT, RunBundle, TreeBundle, assert_second_attempt_saw_the_source_revision,
+    failed_source_revision_run, git, initialize_git_repository, isolated_command, run_record,
     workflow_run_schema,
 };
 use super::workflow_run_control::{
@@ -1886,6 +1887,20 @@ fn a_continuation_of_a_tree_run_verifies_and_rebinds_the_copy() {
     assert_eq!(resumed["state"], "exited");
     assert_eq!(resumed["attempts"], 2);
     assert_eq!(resumed["id"], record["id"]);
+}
+
+// REQ-LOCALRUN-217: a continuation attempt's step sees the revision the run was created with,
+// whatever the launching environment holds.
+#[test]
+fn a_continuation_sees_the_source_revision_the_run_was_created_with() {
+    let (_bundle, run_directory, observed) = failed_source_revision_run("source-continuation");
+
+    let output = isolated_command(&continue_args(&run_directory, &["report"]))
+        .env("USEFUL_SOURCE_COMMIT_OID", INHERITED_SOURCE_COMMIT)
+        .output()
+        .unwrap();
+
+    assert_second_attempt_saw_the_source_revision(&output, &observed);
 }
 
 /// A root whose `design` waits for answers when blocked and for a repair when it fails,

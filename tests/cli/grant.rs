@@ -284,12 +284,14 @@ fn two_pages() -> [Vec<u8>; 2] {
     ]
 }
 
-pub(super) const LIST_FIRST_PAGE: &str = "GET /api/v1/me/grants?kind=all&limit=200 HTTP/1.1";
-const LIST_SECOND_PAGE: &str = "GET /api/v1/me/grants?kind=all&limit=200&cursor=grants-2 HTTP/1.1";
-const READ_IDENTITIES: &str = "GET /api/v1/me/identities?limit=200 HTTP/1.1";
+pub(super) const LIST_FIRST_PAGE: &str =
+    "GET /api/v1/me/grants?kind=all&limit=200&vocabulary=2 HTTP/1.1";
+const LIST_SECOND_PAGE: &str =
+    "GET /api/v1/me/grants?kind=all&limit=200&cursor=grants-2&vocabulary=2 HTTP/1.1";
+const READ_IDENTITIES: &str = "GET /api/v1/me/identities?limit=200&vocabulary=2 HTTP/1.1";
 const READ_ORGANIZATION: &str = "GET /api/v1/organizations/org_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
 const READ_USES: &str =
-    "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc/uses?limit=20 HTTP/1.1";
+    "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc/uses?limit=20&vocabulary=2 HTTP/1.1";
 
 // REQ-GRANT-64
 // REQ-GRANT-77
@@ -298,6 +300,7 @@ fn list_prints_every_grant_with_its_account_runners_and_status_and_names_the_res
     let mut responses = Vec::new();
     for _ in 0..2 {
         responses.extend(two_pages());
+        responses.push(predating_served());
         responses.push(organization());
         responses.push(identities(ada()));
     }
@@ -399,11 +402,12 @@ fn list_prints_every_grant_with_its_account_runners_and_status_and_names_the_res
     let expected = [
         LIST_FIRST_PAGE,
         LIST_SECOND_PAGE,
+        READ_SERVED,
         READ_ORGANIZATION,
         READ_IDENTITIES,
     ];
-    assert_eq!(request_lines(&requests[..4]), expected);
-    assert_eq!(request_lines(&requests[4..]), expected);
+    assert_eq!(request_lines(&requests[..5]), expected);
+    assert_eq!(request_lines(&requests[5..]), expected);
 }
 
 // REQ-GRANT-64
@@ -417,6 +421,7 @@ fn an_account_the_member_cannot_name_is_printed_by_its_id() {
             ],
             None,
         ),
+        predating_served(),
         problem("404 Not Found", 404, "not-found"),
         identities(serde_json::json!([])),
     ]);
@@ -436,7 +441,12 @@ fn an_account_the_member_cannot_name_is_printed_by_its_id() {
     assert_member_requests(&requests);
     assert_eq!(
         request_lines(&requests),
-        [LIST_FIRST_PAGE, READ_ORGANIZATION, READ_IDENTITIES]
+        [
+            LIST_FIRST_PAGE,
+            READ_SERVED,
+            READ_ORGANIZATION,
+            READ_IDENTITIES
+        ]
     );
 }
 
@@ -446,8 +456,10 @@ fn an_account_the_member_cannot_name_is_printed_by_its_id() {
 fn list_names_the_command_that_authorizes_a_runner_for_an_oauth_grant_with_none() {
     let responses = vec![
         page(&[oauth_grant_unauthorized(OAUTH_GRANT_ID)], None),
+        predating_served(),
         identities(ada()),
         page(&[oauth_grant_unauthorized(OAUTH_GRANT_ID)], None),
+        predating_served(),
         identities(ada()),
     ];
     let (server, _directory, credential) = prepared(responses);
@@ -559,7 +571,7 @@ fn list_grant_shows_a_native_grants_exchange_and_ended_authorizations() {
 
     let requests = server.finish();
     assert_member_requests(&requests);
-    let read = "GET /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
+    let read = "GET /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc?vocabulary=2 HTTP/1.1";
     assert_eq!(
         request_lines(&requests),
         [read, READ_ORGANIZATION, read, READ_ORGANIZATION]
@@ -639,8 +651,10 @@ fn list_prints_a_native_authorizations_last_use_and_when() {
             one(grant),
             organization(),
             page(std::slice::from_ref(grant), None),
+            predating_served(),
             organization(),
             page(std::slice::from_ref(grant), None),
+            predating_served(),
             organization(),
         ]);
         let detail_json = run_grant(&server, &credential, &["list", NATIVE_GRANT_ID, "--json"]);
@@ -739,7 +753,7 @@ fn list_grant_shows_an_oauth_grants_scopes_last_use_and_expiries() {
 
     let requests = server.finish();
     assert_member_requests(&requests);
-    let read = "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
+    let read = "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc?vocabulary=2 HTTP/1.1";
     assert_eq!(
         request_lines(&requests),
         [
@@ -788,7 +802,7 @@ fn list_grant_whose_identity_read_fails_prints_the_grant_and_a_diagnostic() {
 
     let requests = server.finish();
     assert_member_requests(&requests);
-    let read = "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
+    let read = "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc?vocabulary=2 HTTP/1.1";
     assert_eq!(
         request_lines(&requests),
         [
@@ -901,7 +915,7 @@ fn list_grant_lists_the_tokens_issued_from_an_oauth_grant_newest_first() {
 
     let requests = server.finish();
     assert_member_requests(&requests);
-    let read = "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
+    let read = "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc?vocabulary=2 HTTP/1.1";
     assert_eq!(
         request_lines(&requests),
         [
@@ -909,7 +923,7 @@ fn list_grant_lists_the_tokens_issued_from_an_oauth_grant_newest_first() {
             READ_USES,
             READ_IDENTITIES,
             read,
-            "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc/uses?limit=50 HTTP/1.1",
+            "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc/uses?limit=50&vocabulary=2 HTTP/1.1",
             READ_IDENTITIES
         ]
     );
@@ -1046,21 +1060,205 @@ fn a_provider_name_with_no_grant_is_not_found_and_one_with_several_is_refused_na
 }
 
 // REQ-GRANT-65
+// REQ-GRANT-96
 #[test]
 fn a_grant_that_is_no_grant_id_nor_provider_is_refused_before_anything_is_sent() {
     let (server, _directory, credential) = prepared(vec![]);
+    let too_long = "a".repeat(64);
     for grant in [
         "grt_01k0z6r1w8f4jy2m7q9v3x5abc",
         "pgr_",
         "agl_not-an-id",
-        "bitbucket",
         "GitHub",
+        "bit_bucket",
+        "1password",
+        too_long.as_str(),
     ] {
         let output = run_grant(&server, &credential, &["list", grant, "--json"]);
         assert_eq!(output.status.code(), Some(2), "{grant}");
         assert!(output.stdout.is_empty(), "{grant}");
     }
     assert!(server.finish().is_empty());
+}
+
+// REQ-GRANT-65
+// REQ-GRANT-96: any name of the provider id shape may name a provider, so one the member holds
+// no grant of is read for and not found.
+#[test]
+fn a_provider_the_member_holds_no_grant_of_is_not_found_after_the_grants_are_read() {
+    let (server, _directory, credential) = prepared(vec![page(
+        &[oauth_grant(OAUTH_GRANT_ID, "github", "active")],
+        None,
+    )]);
+    let output = run_grant(&server, &credential, &["list", "bitbucket", "--json"]);
+
+    assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+    assert_eq!(json_output(&output)["outcome"], "grant_not_found");
+    let requests = server.finish();
+    assert_member_requests(&requests);
+    assert_eq!(request_lines(&requests), [LIST_FIRST_PAGE]);
+}
+
+const EXAMPLE_GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abg";
+
+// REQ-GRANT-96
+#[test]
+fn a_grant_of_any_provider_is_listed_shown_and_revoked_by_its_provider() {
+    let github = oauth_grant(OAUTH_GRANT_ID, "github", "active");
+    let mut example = oauth_grant(EXAMPLE_GRANT_ID, "example", "active");
+    example["authorizations"][0]["id"] = "pga_01k0z6r1w8f4jy2m7q9v3x5abg".into();
+    let grants = || page(&[github.clone(), example.clone()], None);
+    let example_use = serde_json::json!({
+        "id": "pgu_01k0z6r1w8f4jy2m7q9v3x5abg",
+        "grantId": EXAMPLE_GRANT_ID,
+        "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abg",
+        "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abg",
+        "organizationId": ORGANIZATION_ID,
+        "provider": "example",
+        "issuedAt": "2026-11-04T08:00:00Z"
+    });
+    let (server, _directory, credential) = prepared(vec![
+        grants(),
+        predating_served(),
+        identities(ada()),
+        grants(),
+        uses(&[example_use]),
+        identities(ada()),
+        grants(),
+        deleted(),
+    ]);
+    let listed = run_grant(&server, &credential, &["list", "--json"]);
+    let shown = run_grant(&server, &credential, &["list", "example", "--json"]);
+    let revoked = run_grant(
+        &server,
+        &credential,
+        &["revoke", "example", "--yes", "--json"],
+    );
+
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
+    let document = json_output(&listed);
+    let grants = document["grants"].as_array().unwrap();
+    assert_eq!(
+        grants
+            .iter()
+            .map(|grant| (
+                grant["id"].as_str().unwrap(),
+                grant["provider"].as_str().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        [(OAUTH_GRANT_ID, "github"), (EXAMPLE_GRANT_ID, "example")]
+    );
+    assert_eq!(grants[1]["account"]["name"], EMAIL);
+
+    assert_eq!(shown.status.code(), Some(0), "{}", stderr(&shown));
+    let document = json_output(&shown);
+    assert_eq!(document["outcome"], "shown");
+    assert_eq!(document["grant"]["id"], EXAMPLE_GRANT_ID);
+    assert_eq!(document["grant"]["provider"], "example");
+    assert_eq!(
+        document["grant"]["uses"][0]["id"],
+        "pgu_01k0z6r1w8f4jy2m7q9v3x5abg"
+    );
+
+    assert_eq!(revoked.status.code(), Some(0), "{}", stderr(&revoked));
+    let document = json_output(&revoked);
+    assert_eq!(document["outcome"], "revoked");
+    assert_eq!(document["grantId"], EXAMPLE_GRANT_ID);
+    assert_eq!(document["provider"], "example");
+
+    let requests = server.finish();
+    assert_member_requests(&requests);
+    assert_eq!(
+        request_lines(&requests),
+        [
+            "GET /api/v1/me/grants?kind=all&limit=200&vocabulary=2 HTTP/1.1",
+            READ_SERVED,
+            "GET /api/v1/me/identities?limit=200&vocabulary=2 HTTP/1.1",
+            LIST_FIRST_PAGE,
+            "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abg/uses?limit=20&vocabulary=2 HTTP/1.1",
+            READ_IDENTITIES,
+            LIST_FIRST_PAGE,
+            "DELETE /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abg HTTP/1.1",
+        ]
+    );
+}
+
+// REQ-GRANT-64
+// REQ-GRANT-96
+#[test]
+fn list_names_each_other_oauth_provider_served_that_the_member_holds_nothing_of() {
+    let github = || page(&[oauth_grant(OAUTH_GRANT_ID, "github", "active")], None);
+    let (server, _directory, credential) = prepared(vec![
+        github(),
+        serving_example_early(),
+        identities(ada()),
+        github(),
+        serving_example_early(),
+        identities(ada()),
+        github(),
+        uses(&[]),
+        identities(ada()),
+    ]);
+    let json = run_grant(&server, &credential, &["list", "--json"]);
+    let human = run_grant(&server, &credential, &["list"]);
+    let shown = run_grant(&server, &credential, &["list", "github", "--json"]);
+
+    assert_eq!(json.status.code(), Some(0), "{}", stderr(&json));
+    assert_eq!(
+        json_output(&json)["notConnected"],
+        serde_json::json!([
+            not_connected("gitlab.com"),
+            not_connected("linear"),
+            not_connected("example"),
+            not_connected("claude_code"),
+            not_connected("codex")
+        ])
+    );
+    assert_eq!(human.status.code(), Some(0), "{}", stderr(&human));
+    let text = stdout(&human);
+    let (_, rest) = text.split_once("── not connected ──").unwrap();
+    let lines: Vec<_> = rest.lines().collect();
+    let at = |provider: &str| lines.iter().position(|line| *line == provider).unwrap();
+    assert!(
+        at("linear") < at("example") && at("example") < at("claude_code"),
+        "{text}"
+    );
+    let next_action = lines[at("example") + 2];
+    assert!(
+        next_action.contains("`useful grant create example`"),
+        "{text}"
+    );
+    assert_eq!(shown.status.code(), Some(0), "{}", stderr(&shown));
+    assert_eq!(json_output(&shown)["outcome"], "shown");
+    let requests = server.finish();
+    assert_member_requests(&requests);
+    assert_eq!(
+        request_lines(&requests),
+        [
+            LIST_FIRST_PAGE,
+            READ_SERVED,
+            READ_IDENTITIES,
+            LIST_FIRST_PAGE,
+            READ_SERVED,
+            READ_IDENTITIES,
+            LIST_FIRST_PAGE,
+            READ_USES,
+            READ_IDENTITIES,
+        ]
+    );
+
+    // A served read that fails fails the list as a failed grant list does.
+    let failed = || problem("500 Internal Server Error", 500, "internal-error");
+    let (server, _directory, credential) = prepared(vec![github(), failed(), failed()]);
+    let served_failed = run_grant(&server, &credential, &["list", "--json"]);
+    let list_failed = run_grant(&server, &credential, &["list", "--json"]);
+    assert_ne!(served_failed.status.code(), Some(0));
+    assert_eq!(served_failed.status.code(), list_failed.status.code());
+    assert_eq!(json_output(&served_failed), json_output(&list_failed));
+    assert_eq!(
+        request_lines(&server.finish()),
+        [LIST_FIRST_PAGE, READ_SERVED, LIST_FIRST_PAGE]
+    );
 }
 
 // REQ-GRANT-64
@@ -1250,10 +1448,10 @@ fn authorize_states_who_can_use_the_grant_then_authorizes_the_runner_with_one_ke
     assert_eq!(
         request_lines(&requests),
         [
-            "GET /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1",
+            "GET /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc?vocabulary=2 HTTP/1.1",
             "POST /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc/authorizations HTTP/1.1",
             "POST /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc/authorizations HTTP/1.1",
-            "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1",
+            "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc?vocabulary=2 HTTP/1.1",
             "POST /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc/authorizations HTTP/1.1",
         ]
     );
@@ -1302,7 +1500,7 @@ fn authorize_without_yes_states_the_runs_issued_oauth_tokens_and_the_steps_readi
     assert_eq!(
         request_lines(&server.finish()),
         [
-            "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1",
+            "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc?vocabulary=2 HTTP/1.1",
             "POST /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc/authorizations HTTP/1.1",
         ]
     );
@@ -1346,7 +1544,7 @@ fn a_missing_confirmation_or_a_malformed_target_exits_2_before_anything_is_sent(
     refused(&["deauthorize", "codex", "builder"]);
     refused(&["authorize", "--yes"]);
     refused(&["authorize", RUNNER_ID, "--yes"]);
-    refused(&["revoke", "bitbucket", "--yes"]);
+    refused(&["revoke", "bit_bucket", "--yes"]);
 
     assert!(server.finish().is_empty());
 }
@@ -1759,7 +1957,7 @@ const DEAUTHORIZE_NATIVE: &str = "DELETE /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7
 // REQ-GRANT-67
 #[test]
 fn deauthorize_ends_a_native_grants_authorization_and_reports_its_removal_and_stop() {
-    let read = "GET /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
+    let read = "GET /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc?vocabulary=2 HTTP/1.1";
     let (server, _directory, credential) = prepared(vec![
         one(&native_grant_in_use()),
         Vec::new(),
@@ -1892,7 +2090,7 @@ fn native_grant_revoked() -> serde_json::Value {
 #[test]
 fn revoke_erases_a_native_grant_and_reports_each_runners_removal_and_stop() {
     let delete = "DELETE /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
-    let read = "GET /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
+    let read = "GET /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc?vocabulary=2 HTTP/1.1";
     let after = native_grant_revoked();
     let (server, _directory, credential) = prepared(vec![
         page(&[native_grant_in_use()], None),
@@ -2008,7 +2206,7 @@ fn revoke_revokes_an_oauth_grant_without_reading_it_after() {
     assert_eq!(
         request_lines(&requests),
         [
-            "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1",
+            "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc?vocabulary=2 HTTP/1.1",
             "DELETE /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1"
         ]
     );
@@ -2326,9 +2524,9 @@ fn deauthorize_without_a_runner_names_only_the_runners_the_grant_is_authorized_f
     assert_eq!(
         request_lines(&requests),
         [
-            "GET /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1",
+            "GET /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc?vocabulary=2 HTTP/1.1",
             LIST_ACME_RUNNERS,
-            "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1",
+            "GET /api/v1/me/grants/pgr_01k0z6r1w8f4jy2m7q9v3x5abc?vocabulary=2 HTTP/1.1",
             LIST_ACME_RUNNERS,
         ]
     );
@@ -2631,10 +2829,10 @@ fn deauthorize_on_a_terminal_without_a_runner_offers_only_the_authorized_runner(
     assert_eq!(
         request_lines(&requests),
         [
-            "GET /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1",
+            "GET /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc?vocabulary=2 HTTP/1.1",
             LIST_ACME_RUNNERS,
             DEAUTHORIZE_NATIVE,
-            "GET /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1",
+            "GET /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc?vocabulary=2 HTTP/1.1",
         ]
     );
 }
@@ -2810,7 +3008,7 @@ fn deauthorize_with_all_runners_chosen_ends_each_authorization() {
     let (shown, output) = on_terminal(command, &[(NEW_RUNNER_ID, &format!("{}\r", down(2)))]);
 
     assert_eq!(output.status.code(), Some(0), "{shown}");
-    let read = "GET /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
+    let read = "GET /api/v1/me/grants/agl_01k0z6r1w8f4jy2m7q9v3x5abc?vocabulary=2 HTTP/1.1";
     let requests = server.finish();
     assert_member_requests(&requests);
     assert_eq!(
@@ -2884,8 +3082,8 @@ const BROWSER_VARIABLES: [&str; 5] = [
     "DISPLAY",
     "WAYLAND_DISPLAY",
 ];
-const LIST_OAUTH: &str = "GET /api/v1/me/grants?kind=oauth&limit=200 HTTP/1.1";
-const START_CONSENT: &str = "POST /api/v1/me/grants HTTP/1.1";
+const LIST_OAUTH: &str = "GET /api/v1/me/grants?kind=oauth&limit=200&vocabulary=2 HTTP/1.1";
+const START_CONSENT: &str = "POST /api/v1/me/grants?vocabulary=2 HTTP/1.1";
 
 /// Where `useful grant create` runs.
 #[derive(Clone, Copy, Debug)]
@@ -3090,7 +3288,7 @@ fn events(output: &Output) -> Vec<serde_json::Value> {
 }
 
 fn poll_line() -> String {
-    format!("GET /api/v1/me/grant-sessions/{SESSION_ID} HTTP/1.1")
+    format!("GET /api/v1/me/grant-sessions/{SESSION_ID}?vocabulary=2 HTTP/1.1")
 }
 
 // REQ-GRANT-69
@@ -3389,6 +3587,195 @@ fn create_does_not_hold_a_revoked_grant_or_one_of_another_provider_against_a_con
     assert_eq!(request_lines(&server.finish()), [LIST_OAUTH, START_CONSENT]);
 }
 
+/// The five providers `useful grant create` has a built-in name for.
+const BUILT_IN: [&str; 5] = ["github", "gitlab.com", "linear", "claude_code", "codex"];
+
+/// The answer of a deployment that serves the five and `example`, an OAuth provider titled
+/// `title` when one is given (REQ-GRANT-78).
+fn serving_example(title: Option<&str>) -> Vec<u8> {
+    serving_titled(
+        &[
+            "github",
+            "gitlab.com",
+            "linear",
+            "example",
+            "claude_code",
+            "codex",
+        ],
+        &title
+            .map(|title| ("example", title))
+            .into_iter()
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The line that says where to approve a consent at `url`: the one before the URL's.
+fn approval_line(text: &str, url: &str) -> String {
+    let lines: Vec<_> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.trim() == url)
+        .unwrap_or_else(|| panic!("no consent URL in {text}"));
+    lines[at - 1].to_owned()
+}
+
+// REQ-GRANT-69
+// REQ-GRANT-96
+#[test]
+fn create_connects_any_oauth_provider_the_deployment_serves_titled_as_it_serves_it() {
+    for (title, json) in [
+        (Some("Example Cloud"), false),
+        (Some("Example Cloud"), true),
+        (None, false),
+    ] {
+        let mut responses = vec![serving_example(title), nothing_held()];
+        responses.extend(approved("example"));
+        let (server, _directory, credential) = prepared(responses);
+        let opener = Opener::new(0);
+        let mut args = vec!["example"];
+        if json {
+            args.push("--json");
+        }
+        let output = run_create(&server, &credential, &opener, Place::Desktop, &args);
+
+        assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+        let url = consent_url("example");
+        assert_eq!(opener.opened(1), [format!("1 {url}")]);
+        if json {
+            let events = events(&output);
+            assert_eq!(events.len(), 2);
+            assert_eq!(events[0]["event"], "consent_required");
+            assert_eq!(events[0]["provider"], "example");
+            assert_eq!(events[1]["outcome"], "completed");
+            assert_eq!(events[1]["grant"]["id"], OAUTH_GRANT_ID);
+            assert_eq!(events[1]["grant"]["provider"], "example");
+        } else {
+            let text = stdout(&output);
+            let approval = approval_line(&text, &url);
+            match title {
+                Some(title) => assert!(approval.contains(title), "{approval}"),
+                None => assert!(
+                    approval.contains(" example ") && !approval.contains("Example Cloud"),
+                    "{approval}"
+                ),
+            }
+            assert!(text.contains(&format!("grant: {OAUTH_GRANT_ID}")), "{text}");
+        }
+        let requests = server.finish();
+        assert_member_requests(&requests);
+        let poll = poll_line();
+        assert_eq!(
+            request_lines(&requests),
+            [READ_SERVED, LIST_OAUTH, START_CONSENT, poll.as_str()]
+        );
+        assert_eq!(
+            request_body(&requests[2]),
+            serde_json::json!({"provider": "example"})
+        );
+    }
+}
+
+// REQ-GRANT-69
+#[test]
+fn a_provider_the_deployment_does_not_serve_as_oauth_is_refused_naming_those_that_can_be_given() {
+    let mut with_example = BUILT_IN.to_vec();
+    with_example.push("example");
+    let serving_aider = json_http_response(
+        "200 OK",
+        serde_json::json!({"items": [
+            {"provider": "github", "kind": "oauth"},
+            {"provider": "aider", "kind": "native"},
+        ]}),
+    );
+    for (provider, answer, named) in [
+        (
+            "bitbucket",
+            serving_example(Some("Example Cloud")),
+            with_example.as_slice(),
+        ),
+        ("bitbucket", predating_served(), BUILT_IN.as_slice()),
+        ("aider", serving_aider, BUILT_IN.as_slice()),
+    ] {
+        let (server, _directory, credential) = prepared(vec![answer.clone(), answer]);
+        let opener = Opener::new(0);
+        for args in [vec![provider], vec![provider, "--json"]] {
+            let output = run_create(&server, &credential, &opener, Place::Desktop, &args);
+
+            assert_eq!(output.status.code(), Some(2), "{args:?}");
+            assert!(output.stdout.is_empty(), "{args:?}");
+            let diagnostic = stderr(&output);
+            for name in named {
+                assert!(diagnostic.contains(name), "{args:?}: {diagnostic}");
+            }
+        }
+        assert_eq!(
+            request_lines(&server.finish()),
+            [READ_SERVED, READ_SERVED],
+            "{provider}"
+        );
+    }
+
+    // A name that is no provider id, or an option an OAuth provider does not take, is refused
+    // before anything is sent.
+    let (server, _directory, credential) = prepared(vec![]);
+    let opener = Opener::new(0);
+    let too_long = "a".repeat(64);
+    for args in [
+        vec!["Example"],
+        vec!["exa_mple"],
+        vec![too_long.as_str()],
+        vec!["example", "--organization", "acme"],
+    ] {
+        let output = run_create(&server, &credential, &opener, Place::Desktop, &args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty(), "{args:?}");
+    }
+    assert!(server.finish().is_empty());
+}
+
+// REQ-GRANT-69
+// REQ-GRANT-73
+#[test]
+fn create_replaces_a_held_grant_of_a_served_provider_only_with_replace() {
+    let held = page(&[oauth_grant(EXAMPLE_GRANT_ID, "example", "active")], None);
+    let (server, _directory, credential) = prepared(vec![
+        serving_example(None),
+        held.clone(),
+        serving_example(None),
+        held,
+        json_http_response("201 Created", consent_of("example", "pending")),
+    ]);
+    let opener = Opener::new(0);
+    let refused = run_create(&server, &credential, &opener, Place::Remote, &["example"]);
+    let replaced = run_create(
+        &server,
+        &credential,
+        &opener,
+        Place::Remote,
+        &["example", "--replace", "--no-wait", "--json"],
+    );
+
+    assert_eq!(refused.status.code(), Some(2));
+    assert!(refused.stdout.is_empty());
+    let text = stderr(&refused);
+    assert!(text.contains(EXAMPLE_GRANT_ID), "{text}");
+    assert!(text.contains("--replace"), "{text}");
+    assert_eq!(replaced.status.code(), Some(0), "{}", stderr(&replaced));
+    let events = events(&replaced);
+    assert_eq!(events[0]["sessionId"], SESSION_ID);
+    assert_eq!(events[0]["provider"], "example");
+    assert_eq!(
+        request_lines(&server.finish()),
+        [
+            READ_SERVED,
+            LIST_OAUTH,
+            READ_SERVED,
+            LIST_OAUTH,
+            START_CONSENT
+        ]
+    );
+}
+
 /// Runs `command` with a pseudo-terminal as its standard input and standard error, waits for
 /// its `[y/N]` question, answers it with `answer`, and returns what the terminal showed up to
 /// the question and the command's output.
@@ -3513,7 +3900,7 @@ fn create_on_a_terminal_asks_before_it_replaces_a_held_grant() {
 const GLOBEX_ORGANIZATION_ID: &str = "org_01k0z6r1w8f4jy2m7q9v3x5abe";
 const THIRD_NATIVE_GRANT_ID: &str = "agl_01k0z6r1w8f4jy2m7q9v3x5abe";
 const LIST_MEMBERSHIPS: &str = "GET /api/v1/me/memberships?limit=200 HTTP/1.1";
-const LIST_NATIVE: &str = "GET /api/v1/me/grants?kind=native&limit=200 HTTP/1.1";
+const LIST_NATIVE: &str = "GET /api/v1/me/grants?kind=native&limit=200&vocabulary=2 HTTP/1.1";
 const IMPORT_GRANT: &str = "POST /api/v1/me/grant-imports HTTP/1.1";
 const READ_ACME: &str = "GET /api/v1/organizations/acme HTTP/1.1";
 
@@ -5149,6 +5536,7 @@ fn a_provider_the_deployment_does_not_serve_is_reported_and_passed_over_without_
         [
             vec![
                 holding(&["github"], true),
+                predating_served(),
                 problem("503 Service Unavailable", 503, "provider-unavailable"),
             ],
             approved("linear").to_vec(),
@@ -5177,16 +5565,28 @@ fn a_provider_the_deployment_does_not_serve_is_reported_and_passed_over_without_
     let poll = poll_line();
     assert_eq!(
         request_lines(&requests),
-        [LIST_EVERY_KIND, START_CONSENT, START_CONSENT, poll.as_str()]
+        [
+            LIST_EVERY_KIND,
+            READ_SERVED,
+            START_CONSENT,
+            START_CONSENT,
+            poll.as_str()
+        ]
     );
-    assert_eq!(start_body(&requests[1]), "gitlab.com");
-    assert_eq!(start_body(&requests[2]), "linear");
+    assert_eq!(start_body(&requests[2]), "gitlab.com");
+    assert_eq!(start_body(&requests[3]), "linear");
 }
 
 const READ_SERVED: &str = "GET /api/v1/me/grant-providers HTTP/1.1";
 
 /// The deployment's answer naming the providers it serves, each with its kind (REQ-GRANT-78).
 fn serving(providers: &[&str]) -> Vec<u8> {
+    serving_titled(providers, &[])
+}
+
+/// The deployment's answer naming `providers` in order, each with its kind, and each provider
+/// `titles` names with that display name (REQ-GRANT-78).
+fn serving_titled(providers: &[&str], titles: &[(&str, &str)]) -> Vec<u8> {
     let items: Vec<_> = providers
         .iter()
         .map(|provider| {
@@ -5195,7 +5595,11 @@ fn serving(providers: &[&str]) -> Vec<u8> {
             } else {
                 "oauth"
             };
-            serde_json::json!({"provider": provider, "kind": kind})
+            let mut item = serde_json::json!({"provider": provider, "kind": kind});
+            if let Some((_, title)) = titles.iter().find(|(named, _)| named == provider) {
+                item["displayName"] = (*title).into();
+            }
+            item
         })
         .collect();
     json_http_response("200 OK", serde_json::json!({"items": items}))
@@ -5354,6 +5758,96 @@ fn a_deployment_that_predates_the_served_providers_read_is_signed_in_to_as_befor
     );
 }
 
+/// The answer of a deployment that serves `example`, titled `Example Cloud`, between `github`
+/// and `gitlab.com`: a command names the providers in its own order, not the deployment's
+/// (REQ-GRANT-75).
+fn serving_example_early() -> Vec<u8> {
+    serving_titled(
+        &[
+            "github",
+            "example",
+            "gitlab.com",
+            "linear",
+            "claude_code",
+            "codex",
+        ],
+        &[("example", "Example Cloud")],
+    )
+}
+
+// REQ-GRANT-75
+// REQ-GRANT-96
+#[test]
+fn create_without_a_provider_consents_to_each_other_oauth_provider_served_after_the_built_in_ones()
+{
+    for (held, served, consents) in [
+        (
+            &["github"][..],
+            serving_example_early(),
+            &["gitlab.com", "linear", "example"][..],
+        ),
+        (
+            &["github", "example"],
+            serving_example_early(),
+            &["gitlab.com", "linear"],
+        ),
+        (&["github"], predating_served(), &["gitlab.com", "linear"]),
+    ] {
+        let mut responses = vec![holding(held, true), served];
+        for provider in consents {
+            responses.extend(approved(provider));
+        }
+        let (server, _directory, credential) = prepared(responses);
+        let opener = Opener::new(0);
+        let output = run_every(&server, &credential, &opener, &[], &["--json"]);
+
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{held:?}: {}",
+            stderr(&output)
+        );
+        let created: Vec<_> = consents
+            .iter()
+            .map(|provider| (*provider, "created"))
+            .collect();
+        assert_eq!(
+            summary(&events(&output)),
+            ("completed".to_owned(), outcomes(&created)),
+            "{held:?}"
+        );
+        let requests = server.finish();
+        assert_member_requests(&requests);
+        let poll = poll_line();
+        let mut expected = vec![LIST_EVERY_KIND, READ_SERVED];
+        for _ in consents {
+            expected.extend([START_CONSENT, poll.as_str()]);
+        }
+        assert_eq!(request_lines(&requests), expected, "{held:?}");
+        let started: Vec<_> = requests
+            .iter()
+            .filter(|request| request.starts_with("POST "))
+            .map(|request| start_body(request))
+            .collect();
+        assert_eq!(started, consents, "{held:?}");
+    }
+
+    // The consent of a served provider is titled by its served display name (REQ-GRANT-96).
+    let mut responses = vec![
+        holding(&["github", "gitlab.com", "linear"], true),
+        serving_example_early(),
+    ];
+    responses.extend(approved("example"));
+    let (server, _directory, credential) = prepared(responses);
+    let opener = Opener::new(0);
+    let output = run_every(&server, &credential, &opener, &[], &[]);
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let approval = approval_line(&stdout(&output), &consent_url("example"));
+    assert!(approval.contains("Example Cloud"), "{approval}");
+    assert_eq!(server.finish().len(), 4);
+}
+
 /// The report that ends the human output of `useful grant create` without a provider, whose first
 /// outcome line names `first`: its verdict line, then the lines after it.
 fn summary_report<'a>(text: &'a str, first: &str) -> Vec<&'a str> {
@@ -5381,6 +5875,7 @@ fn a_summary_with_a_provider_passed_over_is_no_success_verdict_and_names_it() {
         [
             vec![
                 holding(&["github"], true),
+                predating_served(),
                 problem("503 Service Unavailable", 503, "provider-unavailable"),
             ],
             approved("linear").to_vec(),
@@ -5407,7 +5902,13 @@ fn a_summary_with_a_provider_passed_over_is_no_success_verdict_and_names_it() {
     let poll = poll_line();
     assert_eq!(
         request_lines(&server.finish()),
-        [LIST_EVERY_KIND, START_CONSENT, START_CONSENT, poll.as_str()]
+        [
+            LIST_EVERY_KIND,
+            READ_SERVED,
+            START_CONSENT,
+            START_CONSENT,
+            poll.as_str()
+        ]
     );
 }
 
@@ -5416,6 +5917,7 @@ fn a_summary_with_a_provider_passed_over_is_no_success_verdict_and_names_it() {
 fn a_summary_of_consents_only_started_is_no_success_verdict_and_names_where_to_see_them() {
     let (server, _directory, credential) = prepared(vec![
         holding(&["github", "gitlab.com"], true),
+        predating_served(),
         json_http_response("201 Created", consent_of("linear", "pending")),
     ]);
     let opener = Opener::new(0);
@@ -5434,7 +5936,7 @@ fn a_summary_of_consents_only_started_is_no_success_verdict_and_names_where_to_s
     );
     assert_eq!(
         request_lines(&server.finish()),
-        [LIST_EVERY_KIND, START_CONSENT]
+        [LIST_EVERY_KIND, READ_SERVED, START_CONSENT]
     );
 }
 
@@ -5483,10 +5985,12 @@ fn a_summary_with_codex_missing_names_installing_it_before_running_the_command_a
 
 // REQ-GRANT-75
 #[test]
-fn a_member_who_holds_every_provider_is_told_so_after_only_the_list() {
+fn a_member_who_holds_every_provider_is_told_so_after_the_list_and_the_served_read() {
     for json in [false, true] {
-        let (server, _directory, credential) =
-            prepared(vec![holding(&["github", "gitlab.com", "linear"], true)]);
+        let (server, _directory, credential) = prepared(vec![
+            holding(&["github", "gitlab.com", "linear"], true),
+            predating_served(),
+        ]);
         let opener = Opener::new(0);
         let args: &[&str] = if json { &["--json"] } else { &[] };
         let output = run_every(&server, &credential, &opener, &[], args);
@@ -5500,7 +6004,10 @@ fn a_member_who_holds_every_provider_is_told_so_after_only_the_list() {
             assert!(!output.stdout.is_empty());
         }
         assert!(opener.opened(0).is_empty());
-        assert_eq!(request_lines(&server.finish()), [LIST_EVERY_KIND]);
+        assert_eq!(
+            request_lines(&server.finish()),
+            [LIST_EVERY_KIND, READ_SERVED]
+        );
     }
 }
 
@@ -5749,6 +6256,7 @@ fn a_coding_agent_refuses_the_options_that_wait_for_a_consent_which_still_apply_
     // Without a provider, both still apply to the consents.
     let (server, _directory, credential) = prepared(vec![
         holding(&["github", "gitlab.com"], true),
+        predating_served(),
         json_http_response("201 Created", consent_of("linear", "pending")),
     ]);
     let output = run_every(
@@ -5765,12 +6273,12 @@ fn a_coding_agent_refuses_the_options_that_wait_for_a_consent_which_still_apply_
     );
     assert_eq!(
         request_lines(&server.finish()),
-        [LIST_EVERY_KIND, START_CONSENT]
+        [LIST_EVERY_KIND, READ_SERVED, START_CONSENT]
     );
 
     let (server, _directory, credential) = prepared(
         [
-            vec![holding(&["github", "gitlab.com"], true)],
+            vec![holding(&["github", "gitlab.com"], true), predating_served()],
             approved("linear").to_vec(),
         ]
         .concat(),
@@ -6375,16 +6883,19 @@ fn create_workflow_never_replaces_a_provider_held_healthy_beside_one_that_needs_
 // REQ-GRANT-79
 #[test]
 fn create_all_selects_nothing_for_a_grant_that_needs_reconnecting() {
-    let (server, _directory, credential) = prepared(vec![page(
-        &[
-            oauth_grant(OAUTH_GRANT_ID, "github", "active"),
-            oauth_grant(OAUTH_GRANT_ID, "gitlab.com", "active"),
-            oauth_grant(LINEAR_GRANT_ID, "linear", "reconnect_required"),
-            native_grant(OTHER_NATIVE_GRANT_ID, "active"),
-            claude_grant_refused(NATIVE_GRANT_ID),
-        ],
-        None,
-    )]);
+    let (server, _directory, credential) = prepared(vec![
+        page(
+            &[
+                oauth_grant(OAUTH_GRANT_ID, "github", "active"),
+                oauth_grant(OAUTH_GRANT_ID, "gitlab.com", "active"),
+                oauth_grant(LINEAR_GRANT_ID, "linear", "reconnect_required"),
+                native_grant(OTHER_NATIVE_GRANT_ID, "active"),
+                claude_grant_refused(NATIVE_GRANT_ID),
+            ],
+            None,
+        ),
+        predating_served(),
+    ]);
     let opener = Opener::new(0);
     let claude = FakeProgram::claude(SetupToken::Prints);
     let output = run_every(
@@ -6401,7 +6912,10 @@ fn create_all_selects_nothing_for_a_grant_that_needs_reconnecting() {
         ("nothing_to_create".to_owned(), Vec::new())
     );
     assert_eq!(claude.recorded("arguments"), None);
-    assert_eq!(request_lines(&server.finish()), [LIST_EVERY_KIND]);
+    assert_eq!(
+        request_lines(&server.finish()),
+        [LIST_EVERY_KIND, READ_SERVED]
+    );
 }
 
 // `useful runner doctor --workflow FILE --connect`: the flow of `useful grant create --workflow` over the
@@ -7046,6 +7560,7 @@ fn connecting_what_a_workflow_needs_leaves_grants_one_command_authorizes_a_runne
         stored(CLAUDE_CODE, "201 Created", 1),
         // useful grant list
         page(&held, None),
+        predating_served(),
         organization(),
         identities(ada()),
         // useful grant authorize --all RUNNER --yes
@@ -7055,6 +7570,7 @@ fn connecting_what_a_workflow_needs_leaves_grants_one_command_authorizes_a_runne
         authorized(NATIVE_GRANT_ID, RUNNER_ID),
         // useful grant list
         page(&after, None),
+        predating_served(),
         organization(),
         identities(ada()),
     ]);
@@ -7164,7 +7680,12 @@ fn connecting_what_a_workflow_needs_leaves_grants_one_command_authorizes_a_runne
     let requests = server.finish();
     assert_member_requests(&requests);
     let poll = poll_line();
-    let list = [LIST_FIRST_PAGE, READ_ORGANIZATION, READ_IDENTITIES];
+    let list = [
+        LIST_FIRST_PAGE,
+        READ_SERVED,
+        READ_ORGANIZATION,
+        READ_IDENTITIES,
+    ];
     let authorizations = grant_ids.map(authorize_line);
     let expected: Vec<&str> = [
         LIST_EVERY_KIND,
@@ -7184,7 +7705,7 @@ fn connecting_what_a_workflow_needs_leaves_grants_one_command_authorizes_a_runne
     assert_eq!(start_body(&requests[3]), "linear");
     // The Claude Code grant is made for Acme, which Ada did not name (REQ-GRANT-72).
     assert_imported(&requests[5], ORGANIZATION_ID, CLAUDE_CODE);
-    for request in &requests[10..13] {
+    for request in &requests[11..14] {
         assert_eq!(
             request_body(request),
             serde_json::json!({"runnerId": RUNNER_ID})
@@ -7437,6 +7958,58 @@ fn a_tree_that_calls_for_gitlab_selects_gitlab_com() {
             "completed".to_owned(),
             outcomes(&[("gitlab.com", "created")])
         )
+    );
+    let requests = server.finish();
+    let poll = poll_line();
+    assert_eq!(
+        request_lines(&requests),
+        [LIST_EVERY_KIND, START_CONSENT, poll.as_str()]
+    );
+    assert_eq!(start_body(&requests[1]), "gitlab.com");
+}
+
+// REQ-GRANT-76
+#[test]
+fn a_declared_integration_changes_nothing_the_grant_flow_selects() {
+    let tree = Tree::new(
+        &[(
+            "gitlab.yaml",
+            &GITLAB_WORKFLOW.replace(
+                "  tools: [glab]\n",
+                "  tools: [glab]\n  integrations:\n    linear: {}\n",
+            ),
+        )],
+        true,
+    );
+    let git = Git::new();
+    let (server, _directory, credential) =
+        prepared([vec![nothing_held()], approved("gitlab.com").to_vec()].concat());
+    let opener = Opener::new(0);
+    let output = run_in(
+        &server,
+        &credential,
+        &opener,
+        &[],
+        git.in_tree(&tree),
+        &["--workflow", "gitlab.yaml", "--json"],
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    let events = events(&output);
+    assert_eq!(
+        planned(&events[0], "selected"),
+        [(
+            "gitlab.com".to_owned(),
+            serde_json::json!([{"declaration": "required_tool", "workflow": "gitlab.yaml", "name": "glab"}])
+        )]
+    );
+    let command = serde_json::json!(
+        {"declaration": "command", "workflow": "gitlab.yaml", "node": {"kind": "step", "id": "build"}}
+    );
+    assert!(
+        events[0]["unknown"].as_array().unwrap().contains(&command),
+        "{}",
+        events[0]
     );
     let requests = server.finish();
     let poll = poll_line();

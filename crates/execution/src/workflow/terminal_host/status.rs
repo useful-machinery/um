@@ -79,7 +79,7 @@ pub(super) struct StepCounts {
 pub(super) fn step_counts(snapshot: &WorkflowRunViewSnapshot) -> StepCounts {
     let mut counts = StepCounts::default();
     for step in &snapshot.steps {
-        match step.state {
+        match step.presented_state() {
             StepStateKind::Pending => counts.pending += 1,
             StepStateKind::Starting
             | StepStateKind::Running

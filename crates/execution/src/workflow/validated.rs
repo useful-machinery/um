@@ -75,7 +75,8 @@ pub struct ValidatedWorkflow {
     pub version: Option<String>,
     /// The declared `text` root input whose value is a run's subject (REQ-WFFORMAT-100).
     pub subject: Option<String>,
-    /// The root-only blocks (REQ-WFFORMAT-82); no run reads them.
+    /// The root-only blocks (REQ-WFFORMAT-82); a run acts on none of them but `mirror`
+    /// (REQ-WFFORMAT-86) and, through admission, `requires` (REQ-WFEXEC-55, REQ-WFEXEC-78).
     pub root: Option<RootBlocks>,
     /// How the ordinary steps are started (REQ-WFFORMAT-93).
     pub scheduling: Scheduling,

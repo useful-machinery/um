@@ -1183,6 +1183,7 @@ fn invalid_result_publication_retains_the_original_command_failure() {
         command_output: Some(diagnostic),
         recovery: None,
         invocations: Vec::new(),
+        failed_child: None,
     };
     retain_result_publication_failure(
         private_root.path(),

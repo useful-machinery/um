@@ -112,9 +112,9 @@ impl Held<'_> {
             Availability::ReconnectRequired => {
                 ("grant_reconnect_required", Failing::ReconnectRequired)
             }
-            Availability::DeliveryFailed
-            | Availability::InsufficientPermission
-            | Availability::NotDelivered => ("grant_not_ready", Failing::Missing),
+            Availability::DeliveryFailed | Availability::NotDelivered => {
+                ("grant_not_ready", Failing::Missing)
+            }
         };
         Some(Shortfall::new(
             code,

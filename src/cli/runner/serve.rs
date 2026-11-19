@@ -26,10 +26,11 @@ use useful_execution::{
 };
 use useful_human_auth::Deployment;
 use useful_runner::{
-    ActivationArtifact, AmbiguousCause, Config, EnrollmentError, EnrollmentResponse,
-    JoinKeyArtifact, JoinOutcome, JoinRefusal, JoinRetry, RecordedOptions, RegisteredRunner,
-    RegistrationAuthority, RegistrationConflict, RegistrationConflictKind, RegistrationError,
-    RegistrationOutcome, RegistrationStage, RegistrationTarget,
+    ActivationArtifact, AmbiguousCause, Config, EnrollmentError, EnrollmentResponse, HeldJoinKey,
+    JoinKeyArtifact, JoinKeyHold, JoinKeyMode, JoinOutcome, JoinRefusal, JoinRetry,
+    RecordedOptions, RegisteredRunner, RegistrationAuthority, RegistrationConflict,
+    RegistrationConflictKind, RegistrationError, RegistrationOutcome, RegistrationStage,
+    RegistrationTarget, Rejoin, RejoinAnswer, RejoinOutcome, ServiceEnd,
 };
 use useful_support::generate_idempotency_key;
 
@@ -62,7 +63,8 @@ pub(super) struct Command {
     config: Option<PathBuf>,
 
     /// Join the key's pool from a protected file or explicit stdin when the
-    /// host holds no enrolled state; USEFUL_RUNNER_JOIN_KEY may hold the key instead.
+    /// host holds no enrolled state, or rejoin it when Cloud deleted the runner
+    /// of a host that joined with a key; USEFUL_RUNNER_JOIN_KEY may hold the key instead.
     #[arg(long, value_name = "PATH|-")]
     join_key_file: Option<PathBuf>,
 
@@ -122,18 +124,20 @@ impl Command {
             }
         };
         // A host whose state file is present holds enrolled state: it serves
-        // with it and never reads its join key or a sign-in, so a key that is
-        // gone or unreadable does not stop it, and a configuration or state
-        // that does not load is the start's failure. A signed-in mode is then
-        // confirmed against the host's registration record, sending nothing.
-        // The journal its own completed join left is removed before it
-        // serves, as the second copy of the credential secret it is.
+        // with it and never reads a sign-in, and a configuration or state
+        // that does not load is the start's failure. It reads a join key given
+        // by file or variable only when its credential came from a join key,
+        // to rejoin if Cloud refuses that credential, and a key it cannot use
+        // does not stop it. A signed-in mode is then confirmed against the
+        // host's registration record, sending nothing. The journal its own
+        // completed join left is removed before it serves, as the second copy
+        // of the credential secret it is.
         let configuration_failure = |error| {
             discover();
             config_load_error(&config_path, error)
         };
         let enrolled = Config::holds_enrolled_state(&config_path);
-        let (config, (pi_installation, claude_code_installation, codex_installation)) =
+        let (config, (pi_installation, claude_code_installation, codex_installation), join_key) =
             match (enrolled, join_key, registration) {
                 (Err(error), _, _) => return Err(configuration_failure(error).into()),
                 // A host with no state file, no key and no registration mode
@@ -151,20 +155,27 @@ impl Command {
                 // mode it is given, if any, is the one its registration record
                 // holds.
                 (Ok(true), join_key, registration) => {
-                    match (Config::load(&config_path), join_key) {
-                        (Err(error), _) => return Err(configuration_failure(error).into()),
-                        (Ok(_), Some(JoinKeySource::Variable(_))) => {
-                            return Err(restart_without_join_key_variable().into());
-                        }
-                        (Ok(config), _) => {
-                            if let Some(registration) = registration {
-                                registration.confirm(&config_path)?;
-                            }
-                            useful_runner::remove_completed_join_journal(&config_path)
-                                .context("remove the journal of the runner's completed join")?;
-                            (config, discover())
-                        }
+                    let config = match Config::load(&config_path) {
+                        Ok(config) => config,
+                        Err(error) => return Err(configuration_failure(error).into()),
+                    };
+                    // The origin query and the hold read the state under
+                    // its lock, and fail the start as the load does.
+                    let state_failure = |error| {
+                        discover();
+                        anyhow::Error::new(error).context(format!(
+                            "load runner operator configuration {}",
+                            config_path.display()
+                        ))
+                    };
+                    let join_key =
+                        enrolled_join_key_mode(&config_path, &config, join_key, state_failure)?;
+                    if let Some(registration) = registration {
+                        registration.confirm(&config_path)?;
                     }
+                    useful_runner::remove_completed_join_journal(&config_path)
+                        .context("remove the journal of the runner's completed join")?;
+                    (config, discover(), join_key)
                 }
                 // A host with no state file checks what it can of its
                 // configuration before it reads the key, in both images of a
@@ -177,7 +188,7 @@ impl Command {
                     let key = join_key.read()?;
                     let installations = discover();
                     join_unless_enrolled(&config_path, key)?;
-                    (load_config(&config_path)?, installations)
+                    (load_config(&config_path)?, installations, JoinKeyMode::None)
                 }
                 // A signed-in registration checks the host the same way before
                 // it reads the sign-in, so a host that cannot serve registers
@@ -196,25 +207,75 @@ impl Command {
                         ExitCode::Success => {}
                         exit_code => return Ok(exit_code),
                     }
-                    (load_config(&config_path)?, installations)
+                    (load_config(&config_path)?, installations, JoinKeyMode::None)
                 }
             };
-        let config = configure_harness_installations(
+        let installations = (
+            pi_installation,
+            claude_code_installation,
+            codex_installation,
+        );
+        serve(&config_path, config, &installations, join_key)
+    }
+}
+
+type HarnessInstallations = (
+    Option<ValidatedPiInstallation>,
+    Option<ValidatedClaudeCodeInstallation>,
+    Option<ValidatedCodexInstallation>,
+);
+
+/// Runs the service until it ends. A rejoined host is served again in the
+/// same process, as the new runner its reloaded state names, with the
+/// harness installations the start discovered and no join key.
+fn serve(
+    config_path: &Path,
+    mut config: Config,
+    installations: &HarnessInstallations,
+    mut join_key: JoinKeyMode,
+) -> super::super::CommandResult {
+    loop {
+        let (pi_installation, claude_code_installation, codex_installation) = installations.clone();
+        let config_with_installations = configure_harness_installations(
             config,
             pi_installation,
             claude_code_installation,
             codex_installation,
         );
-        match useful_runner::run(config, crate::build_info::VERSION) {
-            Ok(()) => Ok(ExitCode::Success),
-            Err(error) => {
-                let exit_code = service_exit_code(error.requires_operator_recovery());
-                Err(super::super::CommandFailure::with_exit_code(
-                    anyhow::Error::new(error).context("serve enrolled runner assignments"),
-                    exit_code,
-                ))
-            }
+        let end = useful_runner::run(
+            config_with_installations,
+            crate::build_info::VERSION,
+            join_key,
+        )
+        .map_err(|error| {
+            let exit_code = service_exit_code(error.requires_operator_recovery());
+            super::super::CommandFailure::with_exit_code(
+                anyhow::Error::new(error).context("serve enrolled runner assignments"),
+                exit_code,
+            )
+        })?;
+        if let Some(result) = finished_service(end) {
+            return result;
         }
+        config = load_config(config_path)?;
+        join_key = JoinKeyMode::Spent;
+    }
+}
+
+/// The command's result for a service that ended, or none for a rejoined
+/// host, which is served again.
+fn finished_service(end: ServiceEnd) -> Option<super::super::CommandResult> {
+    match end {
+        ServiceEnd::Stopped => Some(Ok(ExitCode::Success)),
+        ServiceEnd::Rejoined => None,
+        // Exit status 1, which a service manager restarts; the restart's
+        // join key can then rejoin the host.
+        ServiceEnd::CredentialRefused => Some(Err(super::super::CommandFailure::with_exit_code(
+            anyhow::anyhow!(
+                "serve enrolled runner assignments: Cloud refused the runner's credential\n\nStart the runner again with the join key the host joined with to rejoin its pool; a service manager's restart does this."
+            ),
+            ExitCode::GeneralFailure,
+        ))),
     }
 }
 
@@ -245,7 +306,8 @@ fn config_load_error(config_path: &Path, error: useful_runner::ConfigError) -> a
 }
 
 /// Where the join key would be read from; nothing is read until the host is
-/// found to hold no enrolled state.
+/// found to hold no enrolled state, or enrolled state whose credential came
+/// from a join key.
 enum JoinKeySource {
     File(PathBuf),
     Variable(OsString),
@@ -620,8 +682,11 @@ impl JoinKeySource {
     }
 }
 
+/// A join key artifact's bound, in bytes.
+const JOIN_KEY_ARTIFACT_LIMIT: usize = 4096;
+
 /// The longest line the prompt reads, a join key artifact's bound.
-const PROMPTED_LINE_LIMIT: usize = 4096;
+const PROMPTED_LINE_LIMIT: usize = JOIN_KEY_ARTIFACT_LIMIT;
 
 // A prompted key is read from the terminal on standard input with echo off and
 // held only in memory; it was never in the environment, so no `exec` follows.
@@ -778,16 +843,38 @@ fn restore_terminal_on_signal(signals: SigSet, saved: &Termios, done: &AtomicBoo
 //
 // Returns only when the handoff fails: a successful `exec` does not return.
 fn hand_join_key_to_new_image(text: &OsStr) -> anyhow::Error {
-    match stage_join_key_handoff(text) {
+    let key = text.as_bytes();
+    if let Err(error) = JoinKeyArtifact::parse(key) {
+        return anyhow::Error::new(error)
+            .context(format!("read join key from {JOIN_KEY_VARIABLE}"));
+    }
+    pipe_join_key_to_new_image(key)
+}
+
+// A host whose credential came from a join key hands the variable's text to the
+// new image the same way, without judging it: the new image reads it as any
+// key on standard input and finds a text that is not a join key unusable, which
+// never stops an enrolled host's start. At most the artifact's bound is handed
+// on, so a longer text is not one either.
+//
+// Returns only when the handoff fails: a successful `exec` does not return.
+fn hand_unjudged_join_key_to_new_image(text: &OsStr) -> anyhow::Error {
+    let key = text.as_bytes();
+    pipe_join_key_to_new_image(&key[..key.len().min(JOIN_KEY_ARTIFACT_LIMIT)])
+}
+
+fn pipe_join_key_to_new_image(key: &[u8]) -> anyhow::Error {
+    match stage_join_key_handoff(key) {
         Ok(mut command) => anyhow::Error::new(command.exec())
             .context("start useful runner serve with the join key on standard input"),
         Err(error) => error,
     }
 }
 
-// An enrolled host does not read USEFUL_RUNNER_JOIN_KEY, but the variable still
-// leaves its environment block: the command replaces itself with the same
-// `useful runner serve` started without it. Returns only when the restart fails.
+// A host whose credential did not come from a join key does not read
+// USEFUL_RUNNER_JOIN_KEY, but the variable still leaves its environment block:
+// the command replaces itself with the same `useful runner serve` started
+// without it. Returns only when the restart fails.
 fn restart_without_join_key_variable() -> anyhow::Error {
     match std::env::current_exe().context("locate the useful executable") {
         Ok(executable) => anyhow::Error::new(
@@ -800,12 +887,9 @@ fn restart_without_join_key_variable() -> anyhow::Error {
     }
 }
 
-fn stage_join_key_handoff(text: &OsStr) -> anyhow::Result<process::Command> {
-    let key = text.as_bytes();
-    JoinKeyArtifact::parse(key)
-        .with_context(|| format!("read join key from {JOIN_KEY_VARIABLE}"))?;
-    // The parsed key is at most 4096 bytes, within any pipe's capacity, so the
-    // write completes before the new image starts reading.
+fn stage_join_key_handoff(key: &[u8]) -> anyhow::Result<process::Command> {
+    // The key is at most 4096 bytes, within any pipe's capacity, so the write
+    // completes before the new image starts reading.
     let (reader, mut writer) = io::pipe().context("open the join key pipe")?;
     writer
         .write_all(key)
@@ -861,28 +945,39 @@ fn join_unless_enrolled(
 /// Cloud: a resent join may have registered a runner Cloud has since deleted.
 const NO_RUNNER_REGISTERED: &str = "No runner was registered.";
 
+/// What a refused join or rejoin says of the runner it may have registered.
+const fn refused_join_registration(resent: bool) -> &'static str {
+    if resent {
+        "Cloud holds no runner for this host's join: none was registered, or the one registered was deleted."
+    } else {
+        NO_RUNNER_REGISTERED
+    }
+}
+
+// Cloud rejected the token a start gave for a staged join or rejoin, so
+// starting again with the same key, however it is given, resends a request it
+// rejects again.
+fn staged_join_unauthorized_remedy(join_key_id: &str, journal: &Path, join: &str) -> String {
+    format!(
+        "Cloud rejected the token this start gave for join key {join_key_id}, so the same join key will be rejected again however it is given. Start useful runner serve with join key {join_key_id} as it was issued, which completes the staged {join}. Otherwise look in the pool for a runner that joined from this host and delete it if there is one, then remove {} and start the runner with a join key Cloud accepts.",
+        journal.display()
+    )
+}
+
 fn join_failure(join_key_id: &str, error: EnrollmentError) -> anyhow::Error {
     match error {
-        error @ EnrollmentError::JoinRefused { refusal, resent } => {
-            let registration = if resent {
-                "Cloud holds no runner for this host's join: none was registered, or the one registered was deleted."
-            } else {
-                NO_RUNNER_REGISTERED
-            };
-            anyhow::anyhow!(
-                "join runner pool with join key {join_key_id}: {error}\ncode: {}\n\n{registration} Start the runner with a join key Cloud accepts.",
-                refusal.code()
-            )
-        }
-        // Cloud rejected the token this start gave, so starting again with the
-        // same key, however it is given, resends a join it rejects again.
+        error @ EnrollmentError::JoinRefused { refusal, resent } => anyhow::anyhow!(
+            "join runner pool with join key {join_key_id}: {error}\ncode: {}\n\n{} Start the runner with a join key Cloud accepts.",
+            refusal.code(),
+            refused_join_registration(resent)
+        ),
         EnrollmentError::StagedJoinUnauthorized {
             ref journal,
             ref join_key_id,
         } => anyhow::anyhow!(
-            "join runner pool with join key {join_key_id}: {error}\ncode: {}\n\nCloud rejected the token this start gave for join key {join_key_id}, so the same join key will be rejected again however it is given. Start useful runner serve with join key {join_key_id} as it was issued, which completes the staged join. Otherwise look in the pool for a runner that joined from this host and delete it if there is one, then remove {} and start the runner with a join key Cloud accepts.",
+            "join runner pool with join key {join_key_id}: {error}\ncode: {}\n\n{}",
             JoinRefusal::Unauthorized.code(),
-            journal.display()
+            staged_join_unauthorized_remedy(join_key_id, journal, "join")
         ),
         EnrollmentError::RegistrationConflict(conflict) => registration_conflict(
             &format!("join runner pool with join key {join_key_id}"),
@@ -890,6 +985,183 @@ fn join_failure(join_key_id: &str, error: EnrollmentError) -> anyhow::Error {
         ),
         error => anyhow::Error::new(error)
             .context(format!("join runner pool with join key {join_key_id}")),
+    }
+}
+
+/// The join key mode of an enrolled host's start (REQ-RUNNERENROLL-127). A key
+/// given by file or variable is read only when the host's credential came from
+/// a join key, which is asked under the state lock; the prompt is never asked
+/// for. A key in the variable is then handed unjudged to a new image on a pipe,
+/// a key in a file is read and held, and a key that does not read, does not
+/// parse, or has expired with no rejoin staged for it is unusable: it never
+/// stops the start. A failure to read the state fails the start through
+/// `state_failure`; a successful `exec` does not return.
+fn enrolled_join_key_mode(
+    config_path: &Path,
+    config: &Config,
+    source: Option<JoinKeySource>,
+    state_failure: impl Fn(EnrollmentError) -> anyhow::Error,
+) -> anyhow::Result<JoinKeyMode> {
+    let joined_with_key =
+        || useful_runner::enrolled_with_join_key(config_path).map_err(&state_failure);
+    let path = match source {
+        None | Some(JoinKeySource::Prompt) => return Ok(JoinKeyMode::None),
+        Some(JoinKeySource::Variable(text)) => {
+            return Err(if joined_with_key()? {
+                hand_unjudged_join_key_to_new_image(&text)
+            } else {
+                restart_without_join_key_variable()
+            });
+        }
+        Some(JoinKeySource::File(path)) => path,
+    };
+    if !joined_with_key()? {
+        return Ok(JoinKeyMode::None);
+    }
+    let key = match JoinKeyArtifact::read_file(&path) {
+        Ok(key) => key,
+        Err(error) => return Ok(unusable_join_key(&path, &error)),
+    };
+    let join_key_id = key.join_key_id().to_owned();
+    match HeldJoinKey::hold(config_path, key).map_err(&state_failure)? {
+        JoinKeyHold::Expired => Ok(unusable_join_key(&path, &EnrollmentError::ExpiredJoinKey)),
+        JoinKeyHold::Held(key) => Ok(JoinKeyMode::Held(Box::new(HostRejoin {
+            key,
+            join_key_id,
+            runner_id: config.runner_id().to_owned(),
+            journal: config.enrollment_journal_path(),
+        }))),
+    }
+}
+
+/// The mode of a key the start could not use, whose report says, once Cloud
+/// has refused the credential, where the key came from and why it was not
+/// used. It names no part of the key.
+fn unusable_join_key(path: &Path, error: &EnrollmentError) -> JoinKeyMode {
+    let source = if path == Path::new("-") {
+        "from standard input".to_owned()
+    } else {
+        path.display().to_string()
+    };
+    let report = format!(
+        "error: rejoin runner pool: read join key {source}: {error}\n\nCloud refused the runner's credential, and the join key this start was given cannot be used, so the host does not rejoin its pool. Start the runner with a current join key for its pool to rejoin it.\n"
+    );
+    JoinKeyMode::Unusable(Box::new(move || {
+        // The report is commentary: a failed write to stderr changes nothing.
+        let _ = io::stderr().lock().write_all(report.as_bytes());
+    }))
+}
+
+/// The rejoin of a host whose credential came from a join key, once Cloud has
+/// refused that credential (REQ-RUNNERENROLL-127). Each attempt and retry is
+/// reported on standard error, which never carries the key's token.
+struct HostRejoin {
+    key: HeldJoinKey,
+    join_key_id: String,
+    /// The runner the host's state names, which the rejoin replaces.
+    runner_id: String,
+    journal: Option<PathBuf>,
+}
+
+impl Rejoin for HostRejoin {
+    fn attempt(&mut self) -> RejoinAnswer {
+        let outcome = self.key.rejoin_once();
+        // The reports are commentary: a failed write to stderr changes nothing.
+        let mut stderr = io::stderr().lock();
+        match outcome {
+            Ok(RejoinOutcome::Rejoined(response)) => {
+                let _ = write_enrolled(&mut stderr, "✓ Runner rejoined.", &response);
+                RejoinAnswer::Rejoined
+            }
+            Ok(RejoinOutcome::Unanswered(cause)) => RejoinAnswer::Unanswered(cause),
+            Err(error) => {
+                let _ = stderr.write_all(self.failure(error).as_bytes());
+                RejoinAnswer::Refused
+            }
+        }
+    }
+
+    fn retrying(&mut self, retry: JoinRetry) {
+        let _ = write_join_retry(&mut io::stderr().lock(), &self.join_key_id, retry);
+    }
+}
+
+impl HostRejoin {
+    /// The report of a rejoin that Cloud refused or that could not be sent:
+    /// the diagnostic, the refusal's `code:` line when Cloud refused it, and
+    /// what the operator can do.
+    fn failure(&self, error: EnrollmentError) -> String {
+        let Self {
+            join_key_id,
+            runner_id,
+            journal,
+            ..
+        } = self;
+        let kept = format!(
+            "The host keeps the state of runner {runner_id}, whose credential Cloud refused."
+        );
+        let (code, remedy) = match &error {
+            EnrollmentError::JoinRefused {
+                refusal:
+                    refusal @ (JoinRefusal::Unauthorized | JoinRefusal::Gone | JoinRefusal::Conflict),
+                resent,
+            } => (
+                Some(refusal.code()),
+                format!(
+                    "{} {kept} Start the runner with a join key Cloud accepts to rejoin its pool.",
+                    refused_join_registration(*resent)
+                ),
+            ),
+            EnrollmentError::JoinRefused {
+                refusal: refusal @ JoinRefusal::RejoinUnavailable,
+                ..
+            } => (
+                Some(refusal.code()),
+                format!(
+                    "Cloud still holds runner {runner_id}: it is disabled or its credential was revoked, and a join key does not replace a runner Cloud still holds. Enable the runner or enroll it with a new credential to serve as it again, or delete it and start the runner again to rejoin its pool as a new runner."
+                ),
+            ),
+            EnrollmentError::JoinRefused {
+                refusal: refusal @ JoinRefusal::RejoinUnsupported,
+                ..
+            } => (
+                Some(refusal.code()),
+                format!(
+                    "{NO_RUNNER_REGISTERED} {kept} To join the pool as a new runner, stop the runner, remove the host's state file and start it again with the join key."
+                ),
+            ),
+            EnrollmentError::StagedJoinUnauthorized {
+                journal,
+                join_key_id,
+            } => (
+                Some(JoinRefusal::Unauthorized.code()),
+                staged_join_unauthorized_remedy(join_key_id, journal, "rejoin"),
+            ),
+            EnrollmentError::InvalidResponse => (
+                None,
+                match journal {
+                    Some(journal) => format!(
+                        "The rejoin stays staged in {}. Start the runner again with join key {join_key_id}, which sends the same rejoin.",
+                        journal.display()
+                    ),
+                    None => format!(
+                        "The rejoin stays staged. Start the runner again with join key {join_key_id}, which sends the same rejoin."
+                    ),
+                },
+            ),
+            _ => (
+                None,
+                format!(
+                    "{kept} Correct the cause and start the runner again with join key {join_key_id} to rejoin its pool."
+                ),
+            ),
+        };
+        let code = code
+            .map(|code| format!("code: {code}\n"))
+            .unwrap_or_default();
+        format!(
+            "error: rejoin runner pool with join key {join_key_id}: {error}\n{code}\n{remedy}\n"
+        )
     }
 }
 
@@ -1057,6 +1329,21 @@ mod tests {
     fn recovery_requirement_selects_the_supervisor_stopping_exit_code() {
         assert_eq!(service_exit_code(true), ExitCode::RunnerRecoveryRequired);
         assert_eq!(service_exit_code(false), ExitCode::GeneralFailure);
+    }
+
+    // INV-RUNNER-35, REQ-RUNNERENROLL-128
+    #[test]
+    fn a_refused_credential_exits_one_and_a_stop_succeeds() {
+        let Some(Err(refused)) = finished_service(ServiceEnd::CredentialRefused) else {
+            panic!("a refused credential did not end the command as a failure");
+        };
+        assert_eq!(refused.exit_code(), ExitCode::GeneralFailure);
+        assert_eq!(refused.exit_code().as_u8(), 1);
+        assert!(matches!(
+            finished_service(ServiceEnd::Stopped),
+            Some(Ok(ExitCode::Success))
+        ));
+        assert!(finished_service(ServiceEnd::Rejoined).is_none());
     }
 
     // REQ-RUNNERENROLL-32
@@ -1244,7 +1531,8 @@ mod tests {
         );
     }
 
-    // REQ-RUNNERENROLL-97
+    // REQ-RUNNERENROLL-97, REQ-RUNNERENROLL-127: a host whose credential came
+    // from an activation restarts without the variable and hands on no key.
     #[test]
     fn an_enrolled_host_restarts_without_the_join_key_variable_and_hands_on_no_key() {
         let command = join_key_handoff_command(

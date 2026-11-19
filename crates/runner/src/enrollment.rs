@@ -35,9 +35,13 @@ const STATE_LIMIT: u64 = 64 * 1024;
 const RESPONSE_LIMIT: u64 = 64 * 1024;
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
-const JOURNAL_FILE: &str = ".runner-enrollment.json";
+pub(crate) const JOURNAL_FILE: &str = ".runner-enrollment.json";
 const LOCK_FILE: &str = ".runner-state.lock";
 const REGISTRATION_FILE: &str = ".runner-registration.json";
+/// The host's record of the runners its rejoins replaced (INV-RUNNER-37).
+const REPLACED_RUNNERS_FILE: &str = ".runner-replaced.json";
+/// The most runners the replaced-runner record lists.
+const REPLACED_RUNNERS_LIMIT: usize = 16;
 /// The temporary files of the runner's protected host documents.
 const STATE_TEMPORARY_PREFIX: &str = ".runner-state.tmp";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -169,22 +173,32 @@ impl JoinKeyArtifact {
 
 // StagedJoinKey is what a join journal keeps of its key: enough to resend the
 // staged request, never the token, which the next start re-reads from the
-// still-supplied key.
+// still-supplied key. A rejoin's journal also names the runner it replaces,
+// which a first join's journal omits, so its bytes are those an older
+// release wrote and reads.
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct StagedJoinKey {
     join_url: String,
     join_key_id: String,
     expires_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    previous_runner_id: Option<String>,
 }
 
-impl From<&JoinKeyArtifact> for StagedJoinKey {
-    fn from(key: &JoinKeyArtifact) -> Self {
+impl StagedJoinKey {
+    fn new(key: &JoinKeyArtifact, previous_runner_id: Option<&str>) -> Self {
         Self {
             join_url: key.join_url.clone(),
             join_key_id: key.join_key_id.clone(),
             expires_at: key.expires_at.clone(),
+            previous_runner_id: previous_runner_id.map(str::to_owned),
         }
+    }
+
+    // A rejoin journal of this host's runner, staged for this key.
+    fn rejoins(&self, join_key_id: &str, runner_id: &str) -> bool {
+        self.join_key_id == join_key_id && self.previous_runner_id.as_deref() == Some(runner_id)
     }
 }
 
@@ -443,6 +457,15 @@ impl StoredRunnerCredential {
 
     fn activated_by(&self, activation_id: &str) -> bool {
         self.activation_id.as_deref() == Some(activation_id)
+    }
+}
+
+impl RunnerState {
+    fn joined_with_key(&self) -> bool {
+        matches!(
+            self.current_credential.origin(),
+            Some(CredentialOrigin::JoinKey(_))
+        )
     }
 }
 
@@ -872,6 +895,12 @@ pub enum JoinRefusal {
     /// 409: the pool's member is not active, the organization is at its
     /// registration limit, or the idempotency key names another verifier.
     Conflict,
+    /// 409 `runner-rejoin-unavailable`, only to a rejoin: Cloud still holds
+    /// the runner the host names as its previous runner.
+    RejoinUnavailable,
+    /// 400, only to a rejoin: a Cloud release that does not read the
+    /// previous runner registered nothing from the request.
+    RejoinUnsupported,
 }
 
 impl JoinRefusal {
@@ -880,6 +909,8 @@ impl JoinRefusal {
             Self::Unauthorized => "join_key_unauthorized",
             Self::Gone => "join_key_gone",
             Self::Conflict => "join_conflict",
+            Self::RejoinUnavailable => "runner_rejoin_unavailable",
+            Self::RejoinUnsupported => "rejoin_unsupported",
         }
     }
 }
@@ -947,58 +978,176 @@ pub fn join_unless_enrolled(
         )));
     }
 
-    let (journal, mut resent) = match read_private_file_if_present(journal_path, STATE_LIMIT)? {
-        Some(bytes) => match serde_json::from_slice::<EnrollmentJournal>(&bytes) {
-            Ok(journal) => (journal, true),
-            Err(_) => {
-                require_terminal_receipt(&bytes)?;
-                (stage_join(journal_path, &key, mode)?, false)
-            }
-        },
-        None => (stage_join(journal_path, &key, mode)?, false),
-    };
+    let (journal, mut resent) = staged_or_new_join(journal_path, &key, None, mode)?;
     let EnrollmentTarget::Join(staged) = &journal.target else {
         return Err(EnrollmentError::UnresolvedJournal);
     };
     if staged.join_key_id != key.join_key_id {
-        return Err(EnrollmentError::JoinJournalForAnotherKey {
-            journal: journal_path.clone(),
-            join_key_id: staged.join_key_id.clone(),
-        });
+        return Err(join_journal_for_another_key(journal_path, staged));
     }
     validate_journal(&journal, mode)?;
 
-    let refusal = match send_until_answered(
+    let outcome = send_until_answered(
         &journal,
         &staged.join_url,
         &key.join_token,
         &mut resent,
         observe_retry,
-    ) {
-        Ok(EnrollmentHTTPOutcome::Success(response)) => {
-            drop(key);
-            validate_enrollment_response(&response, None, mode)?;
-            persist_enrollment_state(&host.state_path, &journal, &response, mode)?;
-            remove_and_sync(journal_path)?;
-            drop(host);
-            return Ok(JoinOutcome::Joined(Box::new(response)));
-        }
+    );
+    drop(key);
+    let response = settle_join_answer(outcome, journal_path, staged, resent)?;
+    validate_enrollment_response(&response, None, mode)?;
+    persist_enrollment_state(&host.state_path, &journal, &response, mode)?;
+    remove_and_sync(journal_path)?;
+    drop(host);
+    Ok(JoinOutcome::Joined(Box::new(response)))
+}
+
+fn join_journal_for_another_key(journal_path: &Path, staged: &StagedJoinKey) -> EnrollmentError {
+    EnrollmentError::JoinJournalForAnotherKey {
+        journal: journal_path.to_owned(),
+        join_key_id: staged.join_key_id.clone(),
+    }
+}
+
+// Settles Cloud's definite answer to a sent join or rejoin: a 201's response,
+// or a refusal that removes the journal. A resent journal whose token Cloud
+// rejects is kept, since an earlier send of it may have registered a runner,
+// for the join to be completed or cleaned up deliberately. Any other outcome
+// is returned as it is and keeps the journal.
+fn settle_join_answer(
+    outcome: Result<EnrollmentHTTPOutcome, EnrollmentError>,
+    journal_path: &Path,
+    staged: &StagedJoinKey,
+    resent: bool,
+) -> Result<EnrollmentResponse, EnrollmentError> {
+    let refusal = match outcome {
+        Ok(EnrollmentHTTPOutcome::Success(response)) => return Ok(response),
         Ok(EnrollmentHTTPOutcome::Gone) => JoinRefusal::Gone,
-        // An earlier send of this journal may have registered a runner, so
-        // the journal stays for the join to be completed or cleaned up
-        // deliberately.
         Err(EnrollmentError::Unauthorized) if resent => {
             return Err(EnrollmentError::StagedJoinUnauthorized {
-                journal: journal_path.clone(),
+                journal: journal_path.to_owned(),
                 join_key_id: staged.join_key_id.clone(),
             });
         }
         Err(EnrollmentError::Unauthorized) => JoinRefusal::Unauthorized,
         Err(EnrollmentError::Conflict) => JoinRefusal::Conflict,
+        Err(EnrollmentError::RejoinUnavailable) => JoinRefusal::RejoinUnavailable,
+        Err(EnrollmentError::RejoinUnsupported) => JoinRefusal::RejoinUnsupported,
         Err(error) => return Err(error),
     };
     remove_and_sync(journal_path)?;
     Err(EnrollmentError::JoinRefused { refusal, resent })
+}
+
+/// Whether the host's enrolled credential came from a join key, asked under
+/// the state lock. A pending credential does not count, and a host without
+/// enrolled state answers false.
+pub fn enrolled_with_join_key(config_path: &Path) -> Result<bool, EnrollmentError> {
+    let host = LockedStateDirectory::lock(config_path)?;
+    Ok(read_runner_state_if_present(&host.state_path, host.mode)?
+        .is_some_and(|state| state.joined_with_key()))
+}
+
+/// A join key held in memory for the rejoin of an enrolled host. Its token is
+/// never serialized, so neither the state, a journal nor a diagnostic can
+/// carry it, and it is dropped with this.
+pub struct HeldJoinKey {
+    config_path: PathBuf,
+    key: JoinKeyArtifact,
+}
+
+/// Whether a supplied join key can be held for a rejoin.
+pub enum JoinKeyHold {
+    Held(HeldJoinKey),
+    /// The key is past its `expiresAt`, and no unanswered rejoin of the
+    /// host's runner is staged with it. It is dropped.
+    Expired,
+}
+
+/// The end of one rejoin attempt that Cloud did not refuse.
+#[derive(Debug)]
+pub enum RejoinOutcome {
+    /// Cloud registered the host as a new runner, whose state replaced the
+    /// host's.
+    Rejoined(Box<EnrollmentResponse>),
+    /// Cloud gave no definite answer. The staged rejoin is kept, and the next
+    /// attempt resends it as the same request.
+    Unanswered(AmbiguousCause),
+}
+
+impl HeldJoinKey {
+    /// Holds `key` for the host of `config_path`, under the state lock. A key
+    /// past its `expiresAt` is held only when the host's journal is a rejoin
+    /// of its runner staged with this key, which only that key resends.
+    pub fn hold(config_path: &Path, key: JoinKeyArtifact) -> Result<JoinKeyHold, EnrollmentError> {
+        let host = LockedStateDirectory::lock(config_path)?;
+        if require_unexpired(&key.expires_at, EnrollmentError::ExpiredJoinKey).is_err() {
+            let Some(state) = read_runner_state_if_present(&host.state_path, host.mode)? else {
+                return Ok(JoinKeyHold::Expired);
+            };
+            let staged = read_private_file_if_present(&host.journal_path, STATE_LIMIT)
+                .ok()
+                .flatten()
+                .and_then(|bytes| serde_json::from_slice::<EnrollmentJournal>(&bytes).ok())
+                .is_some_and(|journal| {
+                    matches!(&journal.target, EnrollmentTarget::Join(staged)
+                        if staged.rejoins(&key.join_key_id, &state.runner_id))
+                });
+            if !staged {
+                return Ok(JoinKeyHold::Expired);
+            }
+        }
+        drop(host);
+        Ok(JoinKeyHold::Held(Self {
+            config_path: config_path.to_owned(),
+            key,
+        }))
+    }
+
+    /// One attempt of the rejoin, blocking and under the state lock: the host's
+    /// rejoin of its runner staged with this key is resent, or else a new one
+    /// is staged, and it is sent once, without a retry. A 201 records the
+    /// runner it replaces, replaces the enrolled state with the answer's and
+    /// then removes the journal; a definite refusal removes the journal
+    /// except as `settle_join_answer` keeps it; any other journal stops the
+    /// attempt before a send.
+    pub fn rejoin_once(&self) -> Result<RejoinOutcome, EnrollmentError> {
+        let host = LockedStateDirectory::lock(&self.config_path)?;
+        let mode = host.mode;
+        let journal_path = &host.journal_path;
+        let state = read_runner_state_if_present(&host.state_path, mode)?
+            .ok_or(EnrollmentError::InvalidState)?;
+        if !state.joined_with_key() {
+            return Err(EnrollmentError::CredentialNotFromJoinKey);
+        }
+        let runner_id = state.runner_id.as_str();
+
+        let (journal, resent) = staged_or_new_join(journal_path, &self.key, Some(runner_id), mode)?;
+        let EnrollmentTarget::Join(staged) = &journal.target else {
+            return Err(EnrollmentError::UnresolvedJournal);
+        };
+        if staged.join_key_id != self.key.join_key_id {
+            return Err(join_journal_for_another_key(journal_path, staged));
+        }
+        if staged.previous_runner_id.as_deref() != Some(runner_id) {
+            return Err(EnrollmentError::UnresolvedJournal);
+        }
+        validate_journal(&journal, mode)?;
+
+        let outcome = match send_enrollment(&journal, &staged.join_url, &self.key.join_token) {
+            Err(EnrollmentError::NetworkAmbiguous(cause)) => {
+                return Ok(RejoinOutcome::Unanswered(cause));
+            }
+            outcome => outcome,
+        };
+        let response = settle_join_answer(outcome, journal_path, staged, resent)?;
+        validate_enrollment_response(&response, None, mode)?;
+        persist_rejoined_state(&host.state_path, &journal, &response, runner_id, mode)?;
+        remove_and_sync(journal_path)?;
+        drop(host);
+        Ok(RejoinOutcome::Rejoined(Box::new(response)))
+    }
 }
 
 /// Removes the journal of the host's own completed join, the one whose
@@ -1042,16 +1191,39 @@ impl LockedStateDirectory {
     }
 }
 
+// The host's journal and whether it was already staged, so that a send of it
+// is a resend; a terminal receipt or no journal stages a new join. The caller
+// checks that a found journal is the join it would stage.
+fn staged_or_new_join(
+    journal_path: &Path,
+    key: &JoinKeyArtifact,
+    previous_runner_id: Option<&str>,
+    mode: DeploymentMode,
+) -> Result<(EnrollmentJournal, bool), EnrollmentError> {
+    if let Some(bytes) = read_private_file_if_present(journal_path, STATE_LIMIT)? {
+        if let Ok(journal) = serde_json::from_slice::<EnrollmentJournal>(&bytes) {
+            return Ok((journal, true));
+        }
+        require_terminal_receipt(&bytes)?;
+    }
+    Ok((
+        stage_join(journal_path, key, previous_runner_id, mode)?,
+        false,
+    ))
+}
+
+// A rejoin stages the runner it replaces as `previous_runner_id`.
 fn stage_join(
     journal_path: &Path,
     key: &JoinKeyArtifact,
+    previous_runner_id: Option<&str>,
     mode: DeploymentMode,
 ) -> Result<EnrollmentJournal, EnrollmentError> {
     validate_join_url(&key.join_url, &key.join_key_id, mode)?;
     require_unexpired(&key.expires_at, EnrollmentError::ExpiredJoinKey)?;
     stage_journal(
         journal_path,
-        EnrollmentTarget::Join(StagedJoinKey::from(key)),
+        EnrollmentTarget::Join(StagedJoinKey::new(key, previous_runner_id)),
         false,
     )
 }
@@ -1101,6 +1273,10 @@ fn enrollment_deployment(request_url: &str) -> Result<String, EnrollmentError> {
 struct EnrollmentRequest<'a> {
     schema_version: u8,
     credential_secret_verifier: &'a str,
+    // Only a rejoin's body carries it, so an activation's and a first join's
+    // keep their bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    previous_runner_id: Option<&'a str>,
 }
 
 enum EnrollmentHTTPOutcome {
@@ -1153,7 +1329,10 @@ fn write_terminal_receipt(
 }
 
 // send_enrollment posts the journal's staged request, the same body for an
-// activation and a join, to `url` with the capability `token` as bearer.
+// activation and a join, with a rejoin's previous runner, to `url` with the
+// capability `token` as bearer. Two answers are a rejoin's own: a 409 whose
+// problem names the previous runner unavailable, and a 400, which only a
+// Cloud release that does not read the previous runner gives a valid rejoin.
 fn send_enrollment(
     journal: &EnrollmentJournal,
     url: &str,
@@ -1165,9 +1344,14 @@ fn send_enrollment(
         .timeout(REQUEST_TIMEOUT)
         .build()
         .map_err(|_| EnrollmentError::NetworkAmbiguous(AmbiguousCause::Network))?;
+    let previous_runner_id = match &journal.target {
+        EnrollmentTarget::Activation(_) => None,
+        EnrollmentTarget::Join(staged) => staged.previous_runner_id.as_deref(),
+    };
     let request = EnrollmentRequest {
         schema_version: 1,
         credential_secret_verifier: &journal.credential_secret_verifier,
+        previous_runner_id,
     };
     let body = serde_json::to_vec(&request).map_err(|_| EnrollmentError::InvalidJournal)?;
     let mut response = client
@@ -1186,7 +1370,13 @@ fn send_enrollment(
         return Err(EnrollmentError::Unauthorized);
     }
     if status == StatusCode::CONFLICT {
+        if previous_runner_id.is_some() && rejoin_unavailable(&mut response) {
+            return Err(EnrollmentError::RejoinUnavailable);
+        }
         return Err(EnrollmentError::Conflict);
+    }
+    if status == StatusCode::BAD_REQUEST && previous_runner_id.is_some() {
+        return Err(EnrollmentError::RejoinUnsupported);
     }
     if status == StatusCode::TOO_MANY_REQUESTS {
         return Err(EnrollmentError::NetworkAmbiguous(
@@ -1201,16 +1391,43 @@ fn send_enrollment(
     if status != StatusCode::CREATED {
         return Err(EnrollmentError::InvalidResponse);
     }
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut response)
-        .take(RESPONSE_LIMIT + 1)
-        .read_to_end(&mut bytes)
+    let bytes = read_response_body(&mut response)
         .map_err(|_| EnrollmentError::NetworkAmbiguous(AmbiguousCause::Network))?;
     if bytes.len() as u64 > RESPONSE_LIMIT {
         return Err(EnrollmentError::InvalidResponse);
     }
     let decoded = serde_json::from_slice(&bytes).map_err(|_| EnrollmentError::InvalidResponse)?;
     Ok(EnrollmentHTTPOutcome::Success(decoded))
+}
+
+// Reads at most one byte past `RESPONSE_LIMIT`, so the caller can tell an
+// oversized body.
+fn read_response_body(response: &mut reqwest::blocking::Response) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    Read::by_ref(response)
+        .take(RESPONSE_LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[derive(Deserialize)]
+struct ProblemType {
+    #[serde(rename = "type")]
+    problem_type: String,
+}
+
+// Whether a 409's problem is `runner-rejoin-unavailable`. A body that does not
+// read, is too large or names no problem type is a plain conflict.
+fn rejoin_unavailable(response: &mut reqwest::blocking::Response) -> bool {
+    read_response_body(response)
+        .ok()
+        .filter(|bytes| bytes.len() as u64 <= RESPONSE_LIMIT)
+        .and_then(|bytes| serde_json::from_slice::<ProblemType>(&bytes).ok())
+        .is_some_and(|problem| {
+            problem
+                .problem_type
+                .ends_with("/problems/runner-rejoin-unavailable")
+        })
 }
 
 pub(crate) fn load_runner_service_configuration(
@@ -1354,6 +1571,74 @@ impl RunnerStateAccess {
             .map_err(|_| ReloadStateError::StateUpdate)?;
         drop(lock);
         Ok(())
+    }
+
+    /// The runners this host's rejoins replaced, oldest first, read under the
+    /// state lock (INV-RUNNER-37): empty when no rejoin has written the record.
+    pub(crate) fn replaced_runners(&self) -> Result<Vec<String>, ReplacedRunnersError> {
+        let lock =
+            StateLock::acquire_beside(&self.path).map_err(ReplacedRunnersError::StateLock)?;
+        let path = replaced_runners_path(&self.path).map_err(ReplacedRunnersError::StateLock)?;
+        let bytes =
+            read_private_document(&path, STATE_LIMIT).map_err(ReplacedRunnersError::Unreadable)?;
+        drop(lock);
+        let Some(bytes) = bytes else {
+            return Ok(Vec::new());
+        };
+        ReplacedRunnersRecord::parse(&bytes)
+            .map(|record| record.replaced_runner_ids)
+            .ok_or(ReplacedRunnersError::Invalid)
+    }
+}
+
+/// Why the host's replaced-runner record could not be read.
+#[derive(Debug)]
+pub(crate) enum ReplacedRunnersError {
+    /// The state lock beside the record could not be taken.
+    StateLock(EnrollmentError),
+    /// The record is not a private regular file the runner could read.
+    Unreadable(PrivateFileFailure),
+    /// The record does not parse or fails its checks.
+    Invalid,
+}
+
+impl ReplacedRunnersError {
+    /// The closed name of the cause, for telemetry.
+    pub(crate) const fn cause(&self) -> &'static str {
+        match self {
+            Self::StateLock(_) => "state_lock",
+            Self::Unreadable(_) => "unreadable",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+impl fmt::Display for ReplacedRunnersError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::StateLock(error) => {
+                write!(
+                    formatter,
+                    "the replaced-runner record cannot be locked: {error}"
+                )
+            }
+            Self::Unreadable(failure) => write!(
+                formatter,
+                "the replaced-runner record cannot be read: {}: {}",
+                failure.requirement, failure.error
+            ),
+            Self::Invalid => formatter.write_str("the replaced-runner record is invalid"),
+        }
+    }
+}
+
+impl Error for ReplacedRunnersError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::StateLock(error) => Some(error),
+            Self::Unreadable(failure) => Some(&failure.error),
+            Self::Invalid => None,
+        }
     }
 }
 
@@ -1671,6 +1956,10 @@ fn validate_journal(
             if journal.replace_credential
                 || !valid_typed_id(&join_key.join_key_id, "rjk_")
                 || parse_rfc3339(&join_key.expires_at).is_none()
+                || join_key
+                    .previous_runner_id
+                    .as_deref()
+                    .is_some_and(|runner_id| !valid_typed_id(runner_id, "rnr_"))
             {
                 return Err(EnrollmentError::InvalidJournal);
             }
@@ -1765,6 +2054,108 @@ fn persist_enrollment_state(
         }
     };
     atomic_write_json(path, &PersistedRunnerState::from(&state))
+}
+
+// Replaces the enrolled state of `replaced_runner_id` with the answer to its
+// rejoin: a fresh state holding the journal's secret as the answer's
+// credential, without a pending credential or a promotion, after recording
+// `replaced_runner_id` in the host's replaced-runner record. State that already
+// holds this enrollment is done; state that names neither runner is refused.
+fn persist_rejoined_state(
+    path: &Path,
+    journal: &EnrollmentJournal,
+    response: &EnrollmentResponse,
+    replaced_runner_id: &str,
+    mode: DeploymentMode,
+) -> Result<(), EnrollmentError> {
+    let origin = journal.credential_origin()?;
+    let existing =
+        read_runner_state_if_present(path, mode)?.ok_or(EnrollmentError::InvalidState)?;
+    if enrollment_already_persisted(&existing, journal, response, &origin) {
+        return Ok(());
+    }
+    if existing.runner_id != replaced_runner_id {
+        return Err(EnrollmentError::RunnerMismatch);
+    }
+    record_replaced_runner(path, replaced_runner_id)?;
+    let enrolled_at = now_rfc3339()?;
+    let state = RunnerState {
+        schema_version: 1,
+        runner_id: response.runner_id.clone(),
+        connection_url: response.connection_url.clone(),
+        current_credential: StoredRunnerCredential::new(
+            response.credential_id.clone(),
+            journal.credential_secret.clone(),
+            origin,
+            enrolled_at.clone(),
+        ),
+        pending_credential: None,
+        last_promotion: None,
+        updated_at: enrolled_at,
+    };
+    atomic_write_json(path, &PersistedRunnerState::from(&state))
+}
+
+/// The runners this host's rejoins replaced, oldest first, kept in
+/// `REPLACED_RUNNERS_FILE` beside the state.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct ReplacedRunnersRecord {
+    schema_version: u8,
+    replaced_runner_ids: Vec<String>,
+}
+
+impl ReplacedRunnersRecord {
+    /// The record in `bytes`, or `None` when it does not parse or fails its
+    /// checks: schema version 1 and at most `REPLACED_RUNNERS_LIMIT` runner
+    /// IDs.
+    fn parse(bytes: &[u8]) -> Option<Self> {
+        let record: Self = serde_json::from_slice(bytes).ok()?;
+        (record.schema_version == 1
+            && record.replaced_runner_ids.len() <= REPLACED_RUNNERS_LIMIT
+            && record
+                .replaced_runner_ids
+                .iter()
+                .all(|id| valid_typed_id(id, "rnr_")))
+        .then_some(record)
+    }
+}
+
+/// The host's replaced-runner record, beside the state file.
+fn replaced_runners_path(state_path: &Path) -> Result<PathBuf, EnrollmentError> {
+    Ok(state_directory(state_path)?.join(REPLACED_RUNNERS_FILE))
+}
+
+// Adds `replaced_runner_id` to the host's replaced-runner record before a
+// rejoin replaces the state, under the caller's state lock. A record that does
+// not parse or check starts a new list; one that cannot be read or written is
+// the rejoin's error, so the state is not replaced.
+fn record_replaced_runner(
+    state_path: &Path,
+    replaced_runner_id: &str,
+) -> Result<(), EnrollmentError> {
+    let path = replaced_runners_path(state_path)?;
+    let mut replaced_runner_ids = read_private_file_if_present(&path, STATE_LIMIT)?
+        .and_then(|bytes| ReplacedRunnersRecord::parse(&bytes))
+        .map(|record| record.replaced_runner_ids)
+        .unwrap_or_default();
+    if !replaced_runner_ids
+        .iter()
+        .any(|id| id == replaced_runner_id)
+    {
+        replaced_runner_ids.push(replaced_runner_id.to_owned());
+    }
+    let excess = replaced_runner_ids
+        .len()
+        .saturating_sub(REPLACED_RUNNERS_LIMIT);
+    replaced_runner_ids.drain(..excess);
+    atomic_write_json(
+        &path,
+        &ReplacedRunnersRecord {
+            schema_version: 1,
+            replaced_runner_ids,
+        },
+    )
 }
 
 fn enrollment_already_persisted(
@@ -2325,6 +2716,10 @@ pub enum EnrollmentError {
     NetworkAmbiguous(AmbiguousCause),
     Unauthorized,
     Conflict,
+    /// A rejoin's 409 `runner-rejoin-unavailable`.
+    RejoinUnavailable,
+    /// A rejoin's 400.
+    RejoinUnsupported,
     InvalidResponse,
     InvalidJoinKey,
     JoinKeyFile,
@@ -2373,6 +2768,9 @@ pub enum EnrollmentError {
     /// A join met a signed-in registration the host holds without enrolled
     /// state (REQ-RUNNERENROLL-118).
     RegistrationConflict(Box<RegistrationConflict>),
+    /// A rejoin found enrolled state whose credential did not come from a
+    /// join key, so it sent nothing.
+    CredentialNotFromJoinKey,
 }
 
 impl fmt::Display for EnrollmentError {
@@ -2420,6 +2818,18 @@ impl fmt::Display for EnrollmentError {
             Self::Conflict => {
                 "enrollment request conflicts with Cloud state; the journal remains unresolved"
             }
+            Self::RejoinUnavailable
+            | Self::JoinRefused {
+                refusal: JoinRefusal::RejoinUnavailable,
+                ..
+            } => {
+                "Cloud still holds the runner this host was, so the host cannot join as another runner"
+            }
+            Self::RejoinUnsupported
+            | Self::JoinRefused {
+                refusal: JoinRefusal::RejoinUnsupported,
+                ..
+            } => "Cloud does not accept a join that names the runner this host was",
             Self::InvalidResponse => {
                 "enrollment response is invalid; the journal remains unresolved"
             }
@@ -2490,6 +2900,9 @@ impl fmt::Display for EnrollmentError {
                 "Cloud reports the newly issued activation revoked, expired or already used"
             }
             Self::RegistrationConflict(conflict) => return conflict.fmt(formatter),
+            Self::CredentialNotFromJoinKey => {
+                "the host's runner credential did not come from a join key, so a join key cannot rejoin it"
+            }
         };
         formatter.write_str(message)
     }

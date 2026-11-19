@@ -73,6 +73,13 @@ fn write_list(list: &RunList, json: bool) -> anyhow::Result<ExitCode> {
         writeln!(out, "  project: {}", item.project_id)?;
         writeln!(out, "  workflow: {}", visible_text(&item.workflow_path))?;
         writeln!(out, "  updated: {}", item.updated_at)?;
+        if let Some(Some(wait)) = &item.workflow_wait {
+            writeln!(
+                out,
+                "  workflow wait: {}",
+                output::typed_wait_phrase(wait.as_ref())?
+            )?;
+        }
         if let Some(place) = &item.placement {
             writeln!(
                 out,

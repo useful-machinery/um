@@ -95,11 +95,7 @@ impl<Clock: CoordinatorClock> ProgramLoginCheck<Clock> {
     }
 
     fn service(&self) -> ServiceEnvironment {
-        ServiceEnvironment::from_lookup(|name| {
-            self.process
-                .variable(OsStr::new(name))
-                .map(OsStr::to_os_string)
-        })
+        ServiceEnvironment::of(&self.process)
     }
 }
 

@@ -9,7 +9,7 @@ use crate::exit_code::ExitCode;
 use useful_execution::{
     ArchivedAttemptLoadError, ColorChoice, LocalRecoveryStatus, LocalRetryEligibility,
     LocalRunStatusSnapshot, LocalStatusError, LocalStatusResult, PresentationConfig,
-    RequestedPresentationMode, RetryIneligibilityReason, TerminalCapabilities,
+    RequestedPresentationMode, RetryIneligibilityReason, TerminalCapabilities, failed_child_detail,
     load_local_archived_attempt, normalize_terminal_path, normalize_terminal_scalar,
     operational_error_code, read_local_run_status, reconcile_current_result_publication,
     styled_terminal_text as styled,
@@ -335,6 +335,17 @@ fn write_plain_snapshot(
             normalize_terminal_scalar(wait.step_path().as_bytes()),
             normalize_terminal_scalar(wait.since.as_bytes())
         )?;
+        // REQ-LOCALRUN-221: the failed stage the run waits at, by the wait's full path.
+        if let Some(failed_child) = wait.failed_child() {
+            let stage = wait.step_path();
+            writeln!(
+                writer,
+                "{} {} · {}",
+                styled("failed stage:", STYLE_FAILURE, color),
+                normalize_terminal_scalar(stage.as_bytes()),
+                failed_child_detail(&stage, &failed_child)
+            )?;
+        }
     }
     writeln!(
         writer,

@@ -4388,11 +4388,12 @@ async fn command_workflows_do_not_require_an_agent_runtime() {
     assert_eq!(active_step_count(&manager), Some(1));
 }
 
-// REQ-WORKSPACE-18
+// REQ-WORKSPACE-18, REQ-GRANT-87: the clone's credentials and the host's Git helpers never
+// reach a step, and the host's `GH_TOKEN` reaches one that lists it.
 #[tokio::test]
 async fn managed_workflow_environment_excludes_runner_credentials_and_helpers() {
     let workflow = r#"schemaVersion: 1
-environmentPassthrough: [RUNNER_VISIBLE]
+environmentPassthrough: [RUNNER_VISIBLE, GH_TOKEN]
 steps:
   check:
     kind: cmd
@@ -4400,7 +4401,7 @@ steps:
       argv:
         - sh
         - -c
-        - 'test "$RUNNER_VISIBLE" = retained && test -z "${RUNNER_HIDDEN+x}" && test -z "${GH_TOKEN+x}" && test -z "${GITHUB_TOKEN+x}" && test -z "${GIT_ASKPASS+x}" && test -z "${GIT_CONFIG_KEY_0+x}" && test -z "${GIT_CONFIG_VALUE_0+x}" && test -z "${GIT_SSH_COMMAND+x}" && test -z "${SSH_AUTH_SOCK+x}" && test -z "${SSH_AGENT_PID+x}" && test -z "${USEFUL_SOURCE_TOKEN_FD+x}"'
+        - 'test "$RUNNER_VISIBLE" = retained && test -z "${RUNNER_HIDDEN+x}" && test "$GH_TOKEN" = runner-host-token && test -z "${GITHUB_TOKEN+x}" && test -z "${GIT_ASKPASS+x}" && test -z "${GIT_CONFIG_KEY_0+x}" && test -z "${GIT_CONFIG_VALUE_0+x}" && test -z "${GIT_SSH_COMMAND+x}" && test -z "${SSH_AUTH_SOCK+x}" && test -z "${SSH_AGENT_PID+x}" && test -z "${USEFUL_SOURCE_TOKEN_FD+x}"'
 "#;
     let (_temporary, mut manager) = manager_fixture(workflow);
     let mut variables = manager.environment.variables().clone();
@@ -4424,7 +4425,7 @@ steps:
         ("SSH_ASKPASS_REQUIRE", "force"),
         ("SSH_AUTH_SOCK", "/runner/private/agent.sock"),
         ("SSH_AGENT_PID", "4242"),
-        ("GH_TOKEN", "runner-private"),
+        ("GH_TOKEN", "runner-host-token"),
         ("GITHUB_TOKEN", "runner-private"),
         ("USEFUL_SOURCE_TOKEN_FD", "9"),
     ] {
@@ -4444,6 +4445,10 @@ steps:
     assert_eq!(
         environment.variable(OsStr::new("RUNNER_VISIBLE")),
         Some(OsStr::new("retained"))
+    );
+    assert_eq!(
+        environment.variable(OsStr::new("GH_TOKEN")),
+        Some(OsStr::new("runner-host-token"))
     );
     assert_eq!(
         environment.variable(OsStr::new("USEFUL_SOURCE_BRANCH")),
@@ -4473,7 +4478,6 @@ steps:
         "SSH_ASKPASS_REQUIRE",
         "SSH_AUTH_SOCK",
         "SSH_AGENT_PID",
-        "GH_TOKEN",
         "GITHUB_TOKEN",
         "USEFUL_SOURCE_TOKEN_FD",
     ] {
@@ -4483,10 +4487,10 @@ steps:
     assert_succeeded(&execute_to_terminal(&mut manager, &offered).await);
 }
 
-// REQ-WORKSPACE-18: the grant token names may be declared, but a runner's service
-// environment never supplies them to a step.
+// REQ-WORKSPACE-18, REQ-GRANT-87, REQ-GRANT-86: a step that declares a grant token name the
+// runner's service environment sets receives the service's value of it.
 #[tokio::test]
-async fn declared_grant_token_names_never_carry_the_runner_service_values() {
+async fn declared_grant_token_names_carry_the_runner_service_values() {
     const GRANT_TOKEN_NAMES: [&str; 3] = [
         "GH_TOKEN",
         "USEFUL_LINEAR_ACCESS_TOKEN",
@@ -4501,12 +4505,12 @@ steps:
       argv:
         - sh
         - -c
-        - 'test -z "${GH_TOKEN+x}" && test -z "${USEFUL_LINEAR_ACCESS_TOKEN+x}" && test -z "${USEFUL_LINEAR_ACCESS_TOKEN_FILE+x}"'
+        - 'test "$GH_TOKEN" = runner-host && test "$USEFUL_LINEAR_ACCESS_TOKEN" = runner-host && test "$USEFUL_LINEAR_ACCESS_TOKEN_FILE" = runner-host'
 "#;
     let (_temporary, mut manager) = manager_fixture(workflow);
     let mut variables = manager.environment.variables().clone();
     for name in GRANT_TOKEN_NAMES {
-        variables.insert(OsString::from(name), OsString::from("runner-private"));
+        variables.insert(OsString::from(name), OsString::from("runner-host"));
     }
     manager.environment = EnvironmentSnapshot::new(variables);
     let offered = offer("bg");
@@ -4518,8 +4522,9 @@ steps:
         _ => panic!("assignment should be accepted"),
     };
     for name in GRANT_TOKEN_NAMES {
-        assert!(
-            execution.environment().variable(OsStr::new(name)).is_none(),
+        assert_eq!(
+            execution.environment().variable(OsStr::new(name)),
+            Some(OsStr::new("runner-host")),
             "{name}"
         );
     }

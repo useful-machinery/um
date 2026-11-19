@@ -19,7 +19,7 @@ use super::claude_code::ClaudeCodeConfig;
 use super::claude_code::ClaudeCodeStreamJsonV1ProtocolLimits;
 use super::codex::CodexAppServerV1ProtocolLimits;
 use super::codex::CodexConfig;
-use super::document::WaitRule;
+use super::document::{IntegrationProvider, WaitRule};
 use super::execution_root::{AdmittedExecutionRoot, ExecutionRootAdmissionFailure};
 use super::git_capture::{
     CloudGitCaptureProjection, GitCaptureContext, GitWorkspaceAdmissionFailure, LocalGitBaseline,
@@ -825,23 +825,38 @@ impl EnvironmentSnapshot {
         }
     }
 
-    fn for_workflow_children(&self, passthrough: &BTreeSet<String>) -> Self {
+    /// Keeps the fixed inherited names, the root's `environmentPassthrough` and the names
+    /// of the run's declared integrations (REQ-WFFORMAT-33, REQ-WFEXEC-78), after dropping
+    /// every runner-private name (INV-ENGINE-43).
+    fn for_workflow_children(
+        &self,
+        passthrough: &BTreeSet<String>,
+        integrations: &BTreeSet<&'static str>,
+    ) -> Self {
         self.without_variables_matching(|name| {
             is_managed_runner_private_environment_name(name)
                 || !(is_base_workflow_environment_name(name)
-                    || name.to_str().is_some_and(|name| passthrough.contains(name)))
+                    || name.to_str().is_some_and(|name| {
+                        passthrough.contains(name) || integrations.contains(name)
+                    }))
         })
     }
 
     /// Removes the root-declared names a node's effective `environmentPassthrough` omits
-    /// (INV-ENGINE-31). A fixed inherited name stays even when the root lists it, and an
-    /// engine variable cannot be a passthrough name, so neither is ever removed.
-    fn narrowed_for_node(&self, root: &BTreeSet<String>, kept: &BTreeSet<String>) -> Self {
+    /// (INV-ENGINE-31). A fixed inherited name stays even when the root lists it, a name of
+    /// the run's declared integrations stays whatever the node lists (INV-ENGINE-43), and an
+    /// engine variable cannot be a passthrough name, so none of them is ever removed.
+    fn narrowed_for_node(
+        &self,
+        root: &BTreeSet<String>,
+        kept: &BTreeSet<String>,
+        integrations: &BTreeSet<&'static str>,
+    ) -> Self {
         self.without_variables_matching(|name| {
             !is_base_workflow_environment_name(name)
-                && name
-                    .to_str()
-                    .is_some_and(|name| root.contains(name) && !kept.contains(name))
+                && name.to_str().is_some_and(|name| {
+                    root.contains(name) && !kept.contains(name) && !integrations.contains(name)
+                })
         })
     }
 
@@ -879,14 +894,36 @@ fn is_base_workflow_environment_name(name: &OsStr) -> bool {
 
 /// The grant token names (REQ-WFFORMAT-32): a workflow may declare them in
 /// `environmentPassthrough` although `GH_TOKEN` is a GitHub credential name and the
-/// Linear names start with `USEFUL_`. On a runner they are set only from a grant, never
-/// from the service's own environment (REQ-WORKSPACE-18).
+/// Linear names start with `USEFUL_`. On a runner a step that declares one receives the
+/// service's own value where the service environment sets the provider's names, and
+/// otherwise the run's grant token (REQ-GRANT-87, REQ-WORKSPACE-18).
 pub fn grant_token_environment_names() -> [&'static str; 3] {
     [
         "GH_TOKEN",
         "USEFUL_LINEAR_ACCESS_TOKEN",
         "USEFUL_LINEAR_ACCESS_TOKEN_FILE",
     ]
+}
+
+/// The names a step receives only because its workflow lists them in
+/// `environmentPassthrough`: a name of the passthrough grammar that is neither reserved
+/// (REQ-WFFORMAT-32) nor one every step inherits (REQ-WFFORMAT-33). A workflow may still
+/// list an inherited name; this predicate refuses it because declaring it adds nothing.
+pub fn is_declared_only_environment_name(name: &str) -> bool {
+    let name_os = OsStr::new(name);
+    is_environment_passthrough_name(name)
+        && !is_managed_runner_private_environment_name(name_os)
+        && !is_base_workflow_environment_name(name_os)
+}
+
+/// The `environmentPassthrough` name grammar (REQ-WFFORMAT-32): an ASCII letter or `_`,
+/// then ASCII letters, digits and `_`.
+pub(super) fn is_environment_passthrough_name(name: &str) -> bool {
+    let mut bytes = name.bytes();
+    bytes
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+        && bytes.all(|c| c.is_ascii_alphanumeric() || c == b'_')
 }
 
 fn is_grant_token_environment_name(name: &OsStr) -> bool {
@@ -1107,26 +1144,38 @@ pub struct SourceRevisionProvenance {
 }
 
 impl SourceRevisionProvenance {
-    pub fn new(branch: impl Into<Arc<str>>, commit_oid: impl Into<Arc<str>>) -> Self {
+    /// A source revision: the commit the execution root is checked out at, its branch when
+    /// one applies, and the branch and commit the workflow was pinned at when they are
+    /// known. A Cloud run's comes from its execution spec (REQ-WORKSPACE-16) and a local
+    /// run's from `--source-revision` and its manifest (REQ-LOCALRUN-217).
+    pub fn from_parts(
+        commit_oid: impl Into<Arc<str>>,
+        branch: Option<impl Into<Arc<str>>>,
+        definition: Option<(impl Into<Arc<str>>, impl Into<Arc<str>>)>,
+    ) -> Self {
         Self {
-            branch: Some(branch.into()),
+            branch: branch.map(Into::into),
             commit_oid: commit_oid.into(),
-            definition: None,
+            definition: definition.map(|(branch, commit_oid)| (branch.into(), commit_oid.into())),
         }
     }
 
-    pub fn with_definition(
-        mut self,
-        branch: impl Into<Arc<str>>,
-        commit_oid: impl Into<Arc<str>>,
-    ) -> Self {
-        self.definition = Some((branch.into(), commit_oid.into()));
-        self
+    /// The commit the execution root is checked out at (`USEFUL_SOURCE_COMMIT_OID`).
+    pub fn commit_oid(&self) -> &str {
+        &self.commit_oid
     }
 
-    pub fn without_workspace_branch(mut self) -> Self {
-        self.branch = None;
-        self
+    /// The workspace branch (`USEFUL_SOURCE_BRANCH`), when one applies.
+    pub fn branch(&self) -> Option<&str> {
+        self.branch.as_deref()
+    }
+
+    /// The branch and commit the workflow was pinned at (`USEFUL_WORKFLOW_SOURCE_BRANCH`
+    /// and `USEFUL_WORKFLOW_SOURCE_COMMIT_OID`), when given.
+    pub fn definition(&self) -> Option<(&str, &str)> {
+        self.definition
+            .as_ref()
+            .map(|(branch, commit_oid)| (branch.as_ref(), commit_oid.as_ref()))
     }
 }
 
@@ -1171,7 +1220,6 @@ pub struct ExecutionContext {
     root: PathBuf,
     limits: ExecutionPolicyLimits,
     environment: EnvironmentSnapshot,
-    withheld_agent_logins: BTreeSet<String>,
     harness_login_observer: Option<SharedHarnessLoginObserver>,
     cancellation: CancellationPolicy,
     source_revision: Option<SourceRevisionProvenance>,
@@ -1196,7 +1244,6 @@ impl ExecutionContext {
             root,
             limits,
             environment,
-            withheld_agent_logins: BTreeSet::new(),
             harness_login_observer: None,
             cancellation,
             source_revision: None,
@@ -1209,17 +1256,6 @@ impl ExecutionContext {
             tree: None,
             conditions: BTreeSet::new(),
         }
-    }
-
-    /// The login variables the admitting runner withheld beside `environment`: a coding
-    /// agent's login it was selected to offer and could not, which fails an agent step that
-    /// would have received it (INV-ENGINE-35). None unless given; a local run gives none.
-    pub fn with_withheld_agent_logins<Name: Into<String>>(
-        mut self,
-        variables: impl IntoIterator<Item = Name>,
-    ) -> Self {
-        self.withheld_agent_logins = variables.into_iter().map(Into::into).collect();
-        self
     }
 
     /// The observer the step runtime tells how a harness that received its login variable
@@ -1404,9 +1440,12 @@ pub struct AdmittedExecutionContext {
     root: AdmittedExecutionRoot,
     limits: ExecutionLimits,
     environment: EnvironmentSnapshot,
-    withheld_agent_logins: BTreeSet<String>,
+    /// The environment names of the run's declared integrations, which no node's own
+    /// `environmentPassthrough` removes (REQ-WFEXEC-78, INV-ENGINE-43).
+    integration_environment_names: BTreeSet<&'static str>,
     harness_login_observer: Option<SharedHarnessLoginObserver>,
     cancellation: CancellationPolicy,
+    source_revision: Option<SourceRevisionProvenance>,
 }
 
 impl AdmittedExecutionContext {
@@ -1428,6 +1467,12 @@ impl AdmittedExecutionContext {
 
     pub fn cancellation(&self) -> &CancellationPolicy {
         &self.cancellation
+    }
+
+    /// The source revision whose variables the admission set, which a local run records
+    /// in its manifest and hands to its child runs (REQ-LOCALRUN-217).
+    pub fn source_revision(&self) -> Option<&SourceRevisionProvenance> {
+        self.source_revision.as_ref()
     }
 
     pub(crate) fn harness_login_observer(&self) -> Option<&dyn HarnessLoginObserver> {
@@ -1659,43 +1704,6 @@ impl AdmittedWorkflow {
         self.environment_narrowed_to(self.node_passthrough(node))
     }
 
-    /// Whether the admission withheld the login variable of `step`'s harness and the step's
-    /// effective `environmentPassthrough` keeps it: the root names it and the step's own
-    /// list, when it declares one, keeps it (INV-ENGINE-31). Such a step would have received
-    /// the withheld login, so it must not start (INV-ENGINE-35). Only names are compared; no
-    /// credential is read.
-    pub(crate) fn withholds_agent_login(&self, step: &str) -> bool {
-        self.withholds_login_kept_by(self.agent_step(step), self.node_passthrough(step))
-    }
-
-    /// The same check for the agent recovery handler of `step`, whose effective list is the
-    /// one `recovery_handler_environment` narrows by (REQ-WFRECOVERY-64, INV-ENGINE-35).
-    pub(crate) fn withholds_recovery_handler_login(&self, step: &str) -> bool {
-        self.withholds_login_kept_by(
-            self.recovery_handler(step),
-            self.recovery_handler_passthrough(step),
-        )
-    }
-
-    /// Whether `harness`'s login variable is withheld and an environment narrowed to `kept`
-    /// would carry it, as `environment_narrowed_to` decides.
-    fn withholds_login_kept_by(
-        &self,
-        harness: Option<&AdmittedHarness>,
-        kept: Option<&BTreeSet<String>>,
-    ) -> bool {
-        let Some(variable) = harness.and_then(AdmittedHarness::login_variable) else {
-            return false;
-        };
-        self.execution.withheld_agent_logins.contains(variable)
-            && self
-                .workflow
-                .definition
-                .environment_passthrough
-                .contains(variable)
-            && kept.is_none_or(|kept| kept.contains(variable))
-    }
-
     /// The admitted environment the recovery handler of `step` starts from: narrowed by
     /// the handler's own `environmentPassthrough`, or its step's when it declares none
     /// (REQ-WFRECOVERY-64).
@@ -1735,10 +1743,11 @@ impl AdmittedWorkflow {
 
     fn environment_narrowed_to(&self, kept: Option<&BTreeSet<String>>) -> EnvironmentSnapshot {
         match kept {
-            Some(kept) => self
-                .execution
-                .environment
-                .narrowed_for_node(&self.workflow.definition.environment_passthrough, kept),
+            Some(kept) => self.execution.environment.narrowed_for_node(
+                &self.workflow.definition.environment_passthrough,
+                kept,
+                &self.execution.integration_environment_names,
+            ),
             None => self.execution.environment.clone(),
         }
     }
@@ -2174,6 +2183,30 @@ pub fn admit_workflow(
     admit_local_workflow_for(workflow, inputs, context)
 }
 
+/// The environment names of the run's declared integrations (REQ-WFEXEC-78): the tree
+/// root's declaration in a run admitted from a tree, for the root and every child run
+/// alike, and otherwise the admitted file's own `requires.integrations`. A stage file's
+/// override names a subset of the root's (REQ-WFDEF-35), so it is never read alone.
+fn declared_integration_environment_names(
+    tree: Option<&ValidatedTree>,
+    workflow: &ResolvedWorkflow,
+) -> BTreeSet<&'static str> {
+    let providers: Vec<IntegrationProvider> = match tree {
+        Some(tree) => tree.required_integrations.keys().copied().collect(),
+        None => workflow
+            .definition
+            .root
+            .as_ref()
+            .and_then(|root| root.requires.as_ref())
+            .map(|requires| requires.integrations.keys().copied().collect())
+            .unwrap_or_default(),
+    };
+    providers
+        .into_iter()
+        .flat_map(|provider| provider.environment_names().iter().copied())
+        .collect()
+}
+
 fn collect_input_admission_failures(
     workflow: &ResolvedWorkflow,
     inputs: &ResolvedInputs,
@@ -2442,29 +2475,32 @@ fn admit_workflow_for(
     }
 
     let root = canonical_execution_root(&context.root)?;
-    let mut environment = context
-        .environment
-        .for_workflow_children(&workflow.definition.environment_passthrough);
-    if let Some(source_revision) = context.source_revision {
+    let integration_environment_names =
+        declared_integration_environment_names(context.tree.as_ref(), &workflow);
+    let mut environment = context.environment.for_workflow_children(
+        &workflow.definition.environment_passthrough,
+        &integration_environment_names,
+    );
+    if let Some(source_revision) = &context.source_revision {
         environment = environment.with_variable(
             OsString::from("USEFUL_SOURCE_COMMIT_OID"),
-            OsString::from(source_revision.commit_oid.as_ref()),
+            OsString::from(source_revision.commit_oid()),
         );
-        if let Some(branch) = source_revision.branch {
+        if let Some(branch) = source_revision.branch() {
             environment = environment.with_variable(
                 OsString::from("USEFUL_SOURCE_BRANCH"),
-                OsString::from(branch.as_ref()),
+                OsString::from(branch),
             );
         }
-        if let Some((branch, commit_oid)) = source_revision.definition {
+        if let Some((branch, commit_oid)) = source_revision.definition() {
             environment = environment
                 .with_variable(
                     OsString::from("USEFUL_WORKFLOW_SOURCE_BRANCH"),
-                    OsString::from(branch.as_ref()),
+                    OsString::from(branch),
                 )
                 .with_variable(
                     OsString::from("USEFUL_WORKFLOW_SOURCE_COMMIT_OID"),
-                    OsString::from(commit_oid.as_ref()),
+                    OsString::from(commit_oid),
                 );
         }
     }
@@ -2489,9 +2525,10 @@ fn admit_workflow_for(
             maximum_step_log_bytes,
         },
         environment,
-        withheld_agent_logins: context.withheld_agent_logins,
+        integration_environment_names,
         harness_login_observer: context.harness_login_observer,
         cancellation: context.cancellation,
+        source_revision: context.source_revision,
     };
     let needs_git_capture = context.continuation_reexecuted.as_ref().map_or_else(
         || workflow.requires_git_capture(),

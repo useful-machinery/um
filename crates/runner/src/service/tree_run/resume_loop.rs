@@ -52,8 +52,12 @@
 //! `lift` when it names one) is applied while the run waits and no process holds it, only when
 //! the run's current wait is that wait, and is otherwise skipped `wait_not_current` with
 //! nothing run; an applied one is followed by `resume`, except `retry`, which continues the run
-//! itself under the loop's supervision. One that names none (`stop`, and `lift` without a
-//! wait) is applied as soon as it arrives, beside a running process as a delivery is.
+//! itself under the loop's supervision. One that names none (`stop`, `withdraw`, and `lift`
+//! without a wait) is applied as soon as it arrives, beside a running process as a delivery
+//! is. An applied `withdraw` is followed by no `resume` (REQ-RUNNERENROLL-123): the loop reads
+//! the record, which ends it on an `exited` record the command left; a withdrawal recorded for
+//! a process that then left the run waiting, as an evaluation of a held wait does, is finished
+//! with one more `withdraw`, reported no further.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
@@ -274,7 +278,8 @@ enum Pause {
 enum Woken {
     /// The pause elapsed, or a control was applied for `resume` to act on.
     Due,
-    /// A delivery's application ended the run or moved it off the wait.
+    /// A delivery's application ended the run or moved it off the wait, or a withdrawal was
+    /// applied: the record is read again, and no `resume` runs on the control's account.
     Changed,
     /// A `retry` control ran the run's next command, which exited so.
     Ran(CommandExit),
@@ -322,6 +327,7 @@ impl Progress<'_> {
                     since: wait.since.clone(),
                     step: wait.step.clone(),
                     questions: wait.questions.clone(),
+                    failed_child: wait.failed_child.clone(),
                 }),
             )),
         };
@@ -414,6 +420,9 @@ struct Driver<'a> {
     applied: BTreeSet<String>,
     /// The controls taken and not yet applied, in arrival order.
     controls: VecDeque<RunControl>,
+    /// Whether a withdrawal was applied `recorded`, left for the process holding the run to
+    /// honor, and the record has not been seen waiting since (REQ-RUNNERENROLL-123).
+    withdrawal_recorded: bool,
 }
 
 /// Whether a command's document is the runtime's refusal, and its first diagnostic's
@@ -443,6 +452,7 @@ pub(super) async fn drive(run: &TreeRun, sink: ReportSink<'_>) -> Result<TreeEnd
         steps: Arc::default(),
         applied: BTreeSet::new(),
         controls: VecDeque::new(),
+        withdrawal_recorded: false,
     };
     let end = drive_to_end(&mut driver).await?;
     Ok(match driver.directory {
@@ -617,6 +627,14 @@ async fn drive_to_end(driver: &mut Driver<'_>) -> Result<TreeEnd, DriveFailure> 
                 Pause::Now
             }
             RecordState::Waiting => {
+                // A withdrawal recorded for a process that ended without honoring it, as an
+                // evaluation of a held wait does (REQ-LOCALRUN-212), is finished on the waiting
+                // run, unreported, and the record read again (REQ-RUNNERENROLL-123).
+                if std::mem::take(&mut driver.withdrawal_recorded) {
+                    command::finish_withdrawal(&run.useful, &directory, run.cancellation.source())
+                        .await;
+                    continue;
+                }
                 let Some(wait) = wait else {
                     return Err(DriveFailure::Cause("tree_run_wait_unavailable"));
                 };
@@ -695,13 +713,13 @@ impl Driver<'_> {
                 biased;
                 exit = &mut supervised => {
                     if !applying.is_terminated() {
-                        let reports = (&mut applying).await;
-                        self.report(reports)?;
+                        let applied = (&mut applying).await;
+                        self.report_beside(applied)?;
                     }
                     return exit.map_err(|failure| DriveFailure::Cause(failure.cause()));
                 }
-                reports = &mut applying, if !applying.is_terminated() => {
-                    self.report(reports)?;
+                applied = &mut applying, if !applying.is_terminated() => {
+                    self.report_beside(applied)?;
                 }
                 () = run.deliveries.arrived(), if applying.is_terminated() => {}
                 () = run.controls.arrived(), if applying.is_terminated() => {}
@@ -738,8 +756,9 @@ impl Driver<'_> {
 
     /// Waits as `pause` says, applying each delivery and control that arrives meanwhile to
     /// the run at `directory`: `Changed` once a delivery's application leaves the run off
-    /// `wait`, the identity of the wait it holds, `Due` or `Ran` once a control is applied
-    /// (`apply_control`), and `Cancelled` when the assignment's cancellation comes first.
+    /// `wait`, the identity of the wait it holds, `Due`, `Ran` or, for a `withdraw`, `Changed`
+    /// once a control is applied (`apply_control`), and `Cancelled` when the assignment's
+    /// cancellation comes first.
     /// `Control` waits for a control alone. `Now` waits for nothing; the command it precedes
     /// applies any delivery, and any control that names no wait.
     async fn pause(
@@ -925,10 +944,11 @@ impl Driver<'_> {
     /// Applies `control` to the run at `directory`, which no process holds, and reports its
     /// application (REQ-RUNNERENROLL-90). A control naming a wait the run does not currently
     /// wait on is skipped `wait_not_current` and runs nothing. A `retry` runs as the loop's
-    /// next command, `Ran` with its exit once it applied or was cancelled; any other control
-    /// that applied is `Due`, for `resume` to act on it; and one that did not, or that the
-    /// assignment's cancellation abandoned unreported, leaves the run waiting as it was,
-    /// `None`.
+    /// next command, `Ran` with its exit once it applied or was cancelled; a `withdraw` that
+    /// applied is `Changed`, for the loop to read the record it left, and is followed by no
+    /// `resume` (REQ-RUNNERENROLL-123); any other control that applied is `Due`, for `resume`
+    /// to act on it; and one that did not, or that the assignment's cancellation abandoned
+    /// unreported, leaves the run waiting as it was, `None`.
     async fn apply_control(
         &mut self,
         control: RunControl,
@@ -969,8 +989,19 @@ impl Driver<'_> {
             return Ok(None);
         };
         let applied = matches!(outcome, RunControlOutcome::Applied { .. });
+        self.withdrawal_recorded |= recorded_withdrawal(&control.action, &outcome);
         self.report_control(control.control_id, outcome)?;
-        Ok(applied.then_some(Woken::Due))
+        Ok(applied.then_some(match control.action {
+            RunControlAction::Withdraw => Woken::Changed,
+            _ => Woken::Due,
+        }))
+    }
+
+    /// Queues the applications made beside a running process, noting a withdrawal applied
+    /// `recorded` among them.
+    fn report_beside(&mut self, applied: AppliedBeside) -> Result<(), DriveFailure> {
+        self.withdrawal_recorded |= applied.withdrawal_recorded;
+        self.report(applied.reports)
     }
 
     fn report_control(
@@ -1079,8 +1110,25 @@ fn named_wait(action: &RunControlAction) -> Option<&RunControlWait> {
         | RunControlAction::HandBack { wait, .. }
         | RunControlAction::Retry { wait } => Some(wait),
         RunControlAction::Lift { wait, .. } => wait.as_ref(),
-        RunControlAction::Stop { .. } => None,
+        RunControlAction::Stop { .. } | RunControlAction::Withdraw => None,
     }
+}
+
+/// Whether `outcome` applied a withdrawal `action` by recording it for the process that holds
+/// the run, which ends the run `withdrawn` only if that process honors it.
+fn recorded_withdrawal(action: &RunControlAction, outcome: &RunControlOutcome) -> bool {
+    matches!(action, RunControlAction::Withdraw)
+        && matches!(
+            outcome,
+            RunControlOutcome::Applied { action_outcome } if action_outcome == command::RECORDED
+        )
+}
+
+/// The applications `apply_beside` made, in order, and whether a withdrawal among them was
+/// applied `recorded`.
+struct AppliedBeside {
+    reports: Vec<ExecutionReport>,
+    withdrawal_recorded: bool,
 }
 
 /// Applies `deliveries`, then `controls`, which name no wait, to the run at `directory`
@@ -1092,19 +1140,21 @@ async fn apply_beside(
     directory: PathBuf,
     deliveries: Vec<TriggerDelivery>,
     controls: Vec<RunControl>,
-) -> Vec<ExecutionReport> {
+) -> AppliedBeside {
     let mut reports =
         command::apply_deliveries(useful, directory.clone(), deliveries, cancellation)
             .await
             .into_iter()
             .map(|application| ExecutionReport::TriggerDeliveryApplied { application })
             .collect::<Vec<_>>();
+    let mut withdrawal_recorded = false;
     for control in controls {
         let Some(outcome) =
             command::apply_control(useful, &directory, &control.action, cancellation).await
         else {
             break;
         };
+        withdrawal_recorded |= recorded_withdrawal(&control.action, &outcome);
         reports.push(ExecutionReport::RunControlApplied {
             application: RunControlApplication {
                 control_id: control.control_id,
@@ -1112,7 +1162,10 @@ async fn apply_beside(
             },
         });
     }
-    reports
+    AppliedBeside {
+        reports,
+        withdrawal_recorded,
+    }
 }
 
 /// The home's only run directory, once `create` has made it.

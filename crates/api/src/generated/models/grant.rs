@@ -21,12 +21,12 @@ pub struct Grant {
     /// The grant's opaque, stable identifier, `pgr_` for an OAuth grant and `agl_` for a native grant.
     #[serde(rename = "id")]
     pub id: String,
-    /// `oauth` for a consent at GitHub, GitLab.com or Linear, from which Cloud issues tokens; `native` for a coding agent's own login, which Cloud delivers whole.
+    /// `oauth` for a consent at a provider of the deployment's provider table, from which Cloud issues tokens; `native` for a coding agent's own login, which Cloud delivers whole.
     #[serde(rename = "kind")]
     pub kind: Kind,
     /// The provider the grant authorizes.
     #[serde(rename = "provider")]
-    pub provider: Provider,
+    pub provider: String,
     /// The grant's lifecycle state; a native grant is never `reconnect_required`.
     #[serde(rename = "state")]
     pub state: State,
@@ -88,7 +88,7 @@ impl Grant {
     pub fn new(
         id: String,
         kind: Kind,
-        provider: Provider,
+        provider: String,
         state: State,
         generation: i64,
         created_at: String,
@@ -117,7 +117,7 @@ impl Grant {
         }
     }
 }
-/// `oauth` for a consent at GitHub, GitLab.com or Linear, from which Cloud issues tokens; `native` for a coding agent's own login, which Cloud delivers whole.
+/// `oauth` for a consent at a provider of the deployment's provider table, from which Cloud issues tokens; `native` for a coding agent's own login, which Cloud delivers whole.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum Kind {
     #[serde(rename = "oauth")]
@@ -129,26 +129,6 @@ pub enum Kind {
 impl Default for Kind {
     fn default() -> Kind {
         Self::GrantKindOAuth
-    }
-}
-/// The provider the grant authorizes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Provider {
-    #[serde(rename = "github")]
-    GrantProviderGithub,
-    #[serde(rename = "gitlab.com")]
-    GrantProviderGitlabCom,
-    #[serde(rename = "linear")]
-    GrantProviderLinear,
-    #[serde(rename = "claude_code")]
-    GrantProviderClaudeCode,
-    #[serde(rename = "codex")]
-    GrantProviderCodex,
-}
-
-impl Default for Provider {
-    fn default() -> Provider {
-        Self::GrantProviderGithub
     }
 }
 /// The grant's lifecycle state; a native grant is never `reconnect_required`.

@@ -1,6 +1,8 @@
 //! The credentials a workflow tree declares it needs, read offline from its definitions and
 //! the source root's `origin` remote or, when the command names a project, the provider of the
-//! project's repository (REQ-CREDREADY-1 to REQ-CREDREADY-12, REQ-CREDREADY-21). Nothing here
+//! project's repository (REQ-CREDREADY-1 to REQ-CREDREADY-12, REQ-CREDREADY-21), and the report
+//! that follows a named file's declared integrations in their place (REQ-CREDREADY-27), with
+//! where those integrations and the inference disagree (REQ-CREDREADY-28). Nothing here
 //! runs a node, starts a harness or reads the process environment; the one process started is
 //! the bounded `git remote get-url origin` (INV-HARNESS-17). The derivation gives every requirement
 //! its offline code; the command, which alone may ask Cloud, replaces a provider's code with
@@ -12,8 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use useful_execution::{
-    BindingKind, CommandRunner, ResolutionFailure, ResolvedWorkflow, RootBlocks, ValidatedHarness,
-    ValidatedRecoveryHandler, ValidatedStep, resolve_workflow_file,
+    BindingKind, CommandRunner, IntegrationProvider, ResolutionFailure, ResolvedWorkflow,
+    RootBlocks, ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep, resolve_workflow_file,
 };
 
 use super::git::origin_remote_host;
@@ -56,6 +58,29 @@ impl CredentialKind {
         match self {
             Self::Github | Self::Gitlab | Self::Linear => true,
             Self::ClaudeCode | Self::Codex => false,
+        }
+    }
+
+    /// The kind a declared integration's provider id names (REQ-CREDREADY-27).
+    const fn of_integration(provider: IntegrationProvider) -> Self {
+        match provider {
+            IntegrationProvider::Github => Self::Github,
+            IntegrationProvider::GitlabCom => Self::Gitlab,
+            IntegrationProvider::Linear => Self::Linear,
+            IntegrationProvider::ClaudeCode => Self::ClaudeCode,
+            IntegrationProvider::Codex => Self::Codex,
+        }
+    }
+
+    /// The provider id that declares this kind, the inverse of `of_integration`
+    /// (REQ-CREDREADY-28).
+    const fn integration(self) -> IntegrationProvider {
+        match self {
+            Self::Github => IntegrationProvider::Github,
+            Self::Gitlab => IntegrationProvider::GitlabCom,
+            Self::Linear => IntegrationProvider::Linear,
+            Self::ClaudeCode => IntegrationProvider::ClaudeCode,
+            Self::Codex => IntegrationProvider::Codex,
         }
     }
 
@@ -162,6 +187,9 @@ pub struct Node {
 /// A declaration that calls for a requirement.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum OriginDeclaration {
+    /// A named file's `requires.integrations` entry; `name` is the provider id as written
+    /// (REQ-CREDREADY-27). First, so a file's declared integration sorts before its other origins.
+    Integration,
     /// An agent node's profile selects a harness; `name` is the profile.
     AgentProfile,
     /// A root `environmentPassthrough` name; `name` is the variable.
@@ -202,6 +230,7 @@ pub trait DeclarationKind: Copy + Ord {
 impl DeclarationKind for OriginDeclaration {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Integration => "integration",
             Self::AgentProfile => "agent_profile",
             Self::ForwardedVariable => "forwarded_variable",
             Self::Binding => "binding",
@@ -486,41 +515,242 @@ pub enum RepositorySource {
     Project(Option<CredentialKind>),
 }
 
+/// What the derivation yields for the named files. `inferred` reads every covered file's
+/// declarations and the repository's (REQ-CREDREADY-3 to REQ-CREDREADY-12), as the grant flow
+/// selects by them (REQ-GRANT-76); `reported` is what the doctor reports and asks Cloud about,
+/// in which a named file that declares its integrations is reported by them (REQ-CREDREADY-27).
+/// The two are equal when no named file carries the block. `differences` is present, and empty
+/// when every declaration agrees, exactly when a named file declares its integrations
+/// (REQ-CREDREADY-28).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DerivedCredentials {
+    pub inferred: WorkflowCredentials,
+    pub reported: WorkflowCredentials,
+    pub differences: Option<Vec<IntegrationDifference>>,
+}
+
+/// How a declaring file's integrations and the inference over its files disagree on a kind.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Difference {
+    /// The inference calls for a kind the file does not declare.
+    InferredNotDeclared,
+    /// The file declares an integration nothing else in it calls for.
+    DeclaredNotInferred,
+}
+
+impl Difference {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InferredNotDeclared => "inferred_not_declared",
+            Self::DeclaredNotInferred => "declared_not_inferred",
+        }
+    }
+}
+
+/// One kind on which a named file's `requires.integrations` and the inference over the files it
+/// covers and the repository disagree (REQ-CREDREADY-28). `integration` is the provider id to
+/// declare or the one declared; `origins` are the inferred declarations that call for the kind,
+/// and empty for `DeclaredNotInferred`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IntegrationDifference {
+    pub difference: Difference,
+    pub workflow: String,
+    pub kind: CredentialKind,
+    pub integration: IntegrationProvider,
+    pub origins: Vec<CredentialOrigin>,
+}
+
+/// A named workflow file and the files it covers: itself and the files its `workflow` steps
+/// name, by source-root-relative path.
+struct Named {
+    path: String,
+    /// The provider ids of its `requires.integrations`, a root's declaration or a stage file's
+    /// override alike; empty when it carries no block.
+    integrations: BTreeSet<IntegrationProvider>,
+    covers: BTreeSet<String>,
+}
+
+impl Named {
+    fn declares(&self) -> bool {
+        !self.integrations.is_empty()
+    }
+
+    /// Where its integrations and a reading of the files it covers and the repository disagree,
+    /// in kind order. The reading's unknown entries are not differences.
+    fn differences(
+        &self,
+        resolved: &BTreeMap<String, ResolvedWorkflow>,
+        repository: &Repository,
+    ) -> Vec<IntegrationDifference> {
+        let mut reading = Reading::default();
+        for (path, workflow) in resolved {
+            if self.covers.contains(path) {
+                reading.read_workflow(path, workflow);
+            }
+        }
+        reading.read_repository(repository);
+        let mut inferred = reading.origins;
+        let mut differences = Vec::new();
+        for provider in &self.integrations {
+            let kind = CredentialKind::of_integration(*provider);
+            if inferred.remove(&kind).is_none() {
+                differences.push(self.difference(
+                    Difference::DeclaredNotInferred,
+                    kind,
+                    Vec::new(),
+                ));
+            }
+        }
+        for (kind, origins) in inferred {
+            differences.push(self.difference(
+                Difference::InferredNotDeclared,
+                kind,
+                in_report_order(origins),
+            ));
+        }
+        differences.sort_by_key(|difference| difference.kind);
+        differences
+    }
+
+    fn difference(
+        &self,
+        difference: Difference,
+        kind: CredentialKind,
+        origins: Vec<CredentialOrigin>,
+    ) -> IntegrationDifference {
+        IntegrationDifference {
+            difference,
+            workflow: self.path.clone(),
+            kind,
+            integration: kind.integration(),
+            origins,
+        }
+    }
+}
+
+/// The source root's repository provider, asked once per derivation and given to each reading
+/// (INV-HARNESS-17); `name` is `origin` or `project`.
+struct Repository {
+    kind: Option<CredentialKind>,
+    name: &'static str,
+}
+
+impl RepositorySource {
+    fn read(self, source_root: &Path) -> Repository {
+        match self {
+            Self::OriginRemote(runner) => Repository {
+                kind: remote_host_kind(origin_remote_host(runner.as_ref(), source_root).as_deref()),
+                name: ORIGIN_REMOTE,
+            },
+            Self::Project(kind) => Repository {
+                kind,
+                name: PROJECT,
+            },
+        }
+    }
+}
+
 /// Resolves each named workflow file and every file its `workflow` steps name, one level
 /// deep, each once, and reads the credentials they declare, then names the repository's
-/// provider from `repository`. The first file that does not resolve ends the read with its
-/// resolution failure (REQ-CREDREADY-2), before Git is asked.
+/// provider from `repository`, asking it once. The first file that does not resolve ends the
+/// read with its resolution failure (REQ-CREDREADY-2), before Git is asked.
 pub fn read_workflow_credentials(
     source_root: &Path,
     workflow_files: &[PathBuf],
     repository: RepositorySource,
-) -> Result<WorkflowCredentials, ResolutionFailure> {
+) -> Result<DerivedCredentials, ResolutionFailure> {
     let mut resolved = BTreeMap::new();
+    let mut named = Vec::new();
     for workflow_file in workflow_files {
         let workflow = resolve_workflow_file(source_root, workflow_file)?;
+        let path = workflow.source.workflow_path.clone();
+        let integrations = declared_integrations(&workflow);
         let children = child_workflow_paths(&workflow);
-        resolved.insert(workflow.source.workflow_path.clone(), workflow);
+        resolved.insert(path.clone(), workflow);
+        let mut covers = BTreeSet::from([path.clone()]);
         for child in children {
             if resolved.contains_key(&child) {
+                covers.insert(child);
                 continue;
             }
             let child_workflow = resolve_workflow_file(source_root, &source_root.join(&child))?;
+            covers.insert(child_workflow.source.workflow_path.clone());
             resolved.insert(child_workflow.source.workflow_path.clone(), child_workflow);
+        }
+        named.push(Named {
+            path,
+            integrations,
+            covers,
+        });
+    }
+    let repository = repository.read(source_root);
+
+    let mut inference = Reading::default();
+    for (path, workflow) in &resolved {
+        inference.read_workflow(path, workflow);
+    }
+    inference.read_repository(&repository);
+
+    // The report reads the declarations of a file, and of the repository, only where a named
+    // file without the block covers them, and each declaring file's integrations beside them.
+    let mut report = Reading::default();
+    let inferred_files = named
+        .iter()
+        .filter(|named| !named.declares())
+        .flat_map(|named| &named.covers)
+        .collect::<BTreeSet<_>>();
+    for (path, workflow) in &resolved {
+        if inferred_files.contains(path) {
+            report.read_workflow(path, workflow);
+        }
+    }
+    if named.is_empty() || named.iter().any(|named| !named.declares()) {
+        report.read_repository(&repository);
+    }
+    for named in &named {
+        for provider in &named.integrations {
+            report.add_origin(
+                CredentialKind::of_integration(*provider),
+                &named.path,
+                OriginDeclaration::Integration,
+                None,
+                Some(provider.as_str()),
+            );
         }
     }
 
-    let mut reading = Reading::default();
-    for (path, workflow) in &resolved {
-        reading.read_workflow(path, workflow);
-    }
-    match repository {
-        RepositorySource::OriginRemote(runner) => {
-            let host = origin_remote_host(runner.as_ref(), source_root);
-            reading.read_repository(remote_host_kind(host.as_deref()), ORIGIN_REMOTE);
-        }
-        RepositorySource::Project(kind) => reading.read_repository(kind, PROJECT),
-    }
-    Ok(reading.finish(resolved.into_keys().collect()))
+    // Each declaring file is compared with a reading of its own files, by path then kind; a file
+    // named twice is compared once.
+    let differences = named.iter().any(Named::declares).then(|| {
+        let mut differences = named
+            .iter()
+            .filter(|named| named.declares())
+            .flat_map(|named| named.differences(&resolved, &repository))
+            .collect::<Vec<_>>();
+        differences
+            .sort_by(|left, right| (&left.workflow, left.kind).cmp(&(&right.workflow, right.kind)));
+        differences.dedup();
+        differences
+    });
+
+    let workflows = resolved.into_keys().collect::<Vec<_>>();
+    Ok(DerivedCredentials {
+        inferred: inference.finish(workflows.clone()),
+        reported: report.finish(workflows),
+        differences,
+    })
+}
+
+/// The provider ids a file's `requires.integrations` names; the override of a stage file is
+/// held in its root blocks as a root's declaration is.
+fn declared_integrations(workflow: &ResolvedWorkflow) -> BTreeSet<IntegrationProvider> {
+    workflow
+        .definition
+        .root
+        .as_ref()
+        .and_then(|root| root.requires.as_ref())
+        .map(|requires| requires.integrations.keys().copied().collect())
+        .unwrap_or_default()
 }
 
 fn child_workflow_paths(workflow: &ResolvedWorkflow) -> BTreeSet<String> {
@@ -637,17 +867,19 @@ impl Reading {
 
     /// The repository's provider as `name`, the remote or the project, names it; no provider
     /// is an unknown repository (REQ-CREDREADY-12, REQ-CREDREADY-21).
-    fn read_repository(&mut self, kind: Option<CredentialKind>, name: &str) {
-        match kind {
+    fn read_repository(&mut self, repository: &Repository) {
+        match repository.kind {
             Some(kind) => {
-                self.origins
-                    .entry(kind)
-                    .or_default()
-                    .insert(of_repository(OriginDeclaration::Repository, name));
+                self.origins.entry(kind).or_default().insert(of_repository(
+                    OriginDeclaration::Repository,
+                    repository.name,
+                ));
             }
             None => {
-                self.unknown
-                    .insert(of_repository(UnknownDeclaration::Repository, name));
+                self.unknown.insert(of_repository(
+                    UnknownDeclaration::Repository,
+                    repository.name,
+                ));
             }
         }
     }
@@ -788,12 +1020,16 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
-    use useful_execution::{CommandOutput, CommandProbeError, CommandRequest, CommandRunner};
+    use useful_execution::{
+        CommandOutput, CommandProbeError, CommandRequest, CommandRunner, IntegrationProvider,
+    };
 
     use super::super::git::{MAXIMUM_STDOUT_BYTES, SYSTEM_TIMEOUT};
     use super::{
-        CredentialKind, Declaration, ForwardedVariable, OriginDeclaration, RepositorySource,
-        UnknownDeclaration, classify_forwarded_variable, read_workflow_credentials,
+        CredentialKind, Declaration, DerivedCredentials, Difference, ForwardedVariable,
+        IntegrationDifference, Node, NodeKind, OriginDeclaration, RepositorySource,
+        UnknownDeclaration, WorkflowCredentials, classify_forwarded_variable,
+        read_workflow_credentials,
     };
 
     /// The parts of a probe request a test compares.
@@ -917,7 +1153,8 @@ steps:
             ],
             no_git(),
         )
-        .unwrap();
+        .unwrap()
+        .reported;
 
         assert_eq!(
             credentials.workflows,
@@ -972,8 +1209,9 @@ steps:
         let root = temporary.path().canonicalize().unwrap();
         fs::write(root.join("root.yaml"), ROOT).unwrap();
 
-        let credentials =
-            read_workflow_credentials(&root, &[root.join("root.yaml")], no_git()).unwrap();
+        let credentials = read_workflow_credentials(&root, &[root.join("root.yaml")], no_git())
+            .unwrap()
+            .reported;
 
         let requirements = credentials
             .requirements
@@ -1100,7 +1338,8 @@ steps:
                 &[root.join("main.yaml")],
                 RepositorySource::OriginRemote(git.clone()),
             )
-            .unwrap();
+            .unwrap()
+            .reported;
 
             assert_eq!(
                 *git.requests.lock().unwrap(),
@@ -1158,6 +1397,319 @@ steps:
             assert!(!debug.contains(address), "{debug}");
             assert!(!debug.contains("/o/r"), "{debug}");
         }
+    }
+
+    /// The files at their source-root-relative paths, derived with `named` given as `--workflow`.
+    fn derive_files(files: &[(&str, &str)], named: &[&str]) -> DerivedCredentials {
+        derive_files_from(files, named, no_git())
+    }
+
+    /// As `derive_files`, with the repository's provider read from `repository`.
+    fn derive_files_from(
+        files: &[(&str, &str)],
+        named: &[&str],
+        repository: RepositorySource,
+    ) -> DerivedCredentials {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        for &(path, contents) in files {
+            fs::write(root.join(path), contents).unwrap();
+        }
+        let named = named.iter().map(|path| root.join(path)).collect::<Vec<_>>();
+        read_workflow_credentials(&root, &named, repository).unwrap()
+    }
+
+    const INTEGRATIONS: &str =
+        "  integrations:\n    linear: {}\n    gitlab.com: {}\n    claude_code: {}\n";
+
+    /// A root that declares Linear, GitLab.com and Claude Code, and whose other declarations call
+    /// for GitHub and Linear and list a connection binding, a forwarded variable of no known kind
+    /// and, through `child.yaml`, Codex and a command step.
+    fn declaring() -> String {
+        format!(
+            r#"schemaVersion: 1
+requires:
+  tools: [git, gh]
+{INTEGRATIONS}bindings:
+  connection: {{kind: connection}}
+environmentPassthrough: [LINEAR_API_KEY, BUILDKITE_API_TOKEN]
+steps:
+  build:
+    kind: workflow
+    workflow: child.yaml
+    on:
+      succeeded: exit.succeeded
+      failed: exit.failed
+"#
+        )
+    }
+
+    const PLAIN: &str = r#"schemaVersion: 1
+environmentPassthrough: [LINEAR_API_KEY]
+steps:
+  build:
+    kind: cmd
+    command:
+      argv: ["./build"]
+"#;
+
+    /// `workflow` with a stage file's override declaring Codex.
+    fn with_override(workflow: &str) -> String {
+        workflow.replacen(
+            "schemaVersion: 1\n",
+            "schemaVersion: 1\nrequires:\n  integrations:\n    codex: {}\n",
+            1,
+        )
+    }
+
+    fn integration(workflow: &str, provider: &str) -> Declaration<OriginDeclaration> {
+        Declaration {
+            workflow: Some(workflow.to_owned()),
+            declaration: OriginDeclaration::Integration,
+            node: None,
+            name: Some(provider.to_owned()),
+        }
+    }
+
+    fn kinds_and_origins(
+        credentials: &WorkflowCredentials,
+    ) -> Vec<(CredentialKind, Vec<Declaration<OriginDeclaration>>)> {
+        credentials
+            .requirements
+            .iter()
+            .map(|requirement| (requirement.kind, requirement.origins.clone()))
+            .collect()
+    }
+
+    // REQ-CREDREADY-27
+    #[test]
+    fn a_declaring_workflow_is_reported_by_its_integrations_beside_the_inference() {
+        let declaring = declaring();
+
+        let derived = derive_files(
+            &[("declaring.yaml", &declaring), ("child.yaml", CHILD)],
+            &["declaring.yaml"],
+        );
+
+        assert_eq!(
+            kinds_and_origins(&derived.reported),
+            [
+                (
+                    CredentialKind::Gitlab,
+                    vec![integration("declaring.yaml", "gitlab.com")]
+                ),
+                (
+                    CredentialKind::Linear,
+                    vec![integration("declaring.yaml", "linear")]
+                ),
+                (
+                    CredentialKind::ClaudeCode,
+                    vec![integration("declaring.yaml", "claude_code")]
+                ),
+            ]
+        );
+        // Git is absent, yet the repository is not unknown either.
+        assert!(
+            derived.reported.unknown.is_empty(),
+            "{:?}",
+            derived.reported.unknown
+        );
+        assert_eq!(derived.reported.workflows, ["child.yaml", "declaring.yaml"]);
+        let undeclared = derive_files(
+            &[
+                ("declaring.yaml", &declaring.replace(INTEGRATIONS, "")),
+                ("child.yaml", CHILD),
+            ],
+            &["declaring.yaml"],
+        );
+        assert_eq!(undeclared.inferred, undeclared.reported);
+        assert_eq!(derived.inferred, undeclared.reported);
+    }
+
+    // REQ-CREDREADY-27
+    #[test]
+    fn a_workflow_without_the_block_keeps_its_inferred_origins_and_unknown_entries() {
+        let derived = derive_files(
+            &[
+                ("declaring.yaml", &declaring()),
+                ("child.yaml", CHILD),
+                ("plain.yaml", PLAIN),
+            ],
+            &["declaring.yaml", "plain.yaml"],
+        );
+
+        let linear = derived
+            .reported
+            .requirements
+            .iter()
+            .filter(|requirement| requirement.kind == CredentialKind::Linear)
+            .map(|requirement| requirement.origins.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            linear,
+            [vec![
+                integration("declaring.yaml", "linear"),
+                Declaration {
+                    workflow: Some("plain.yaml".to_owned()),
+                    declaration: OriginDeclaration::ForwardedVariable,
+                    node: None,
+                    name: Some("LINEAR_API_KEY".to_owned()),
+                },
+            ]]
+        );
+        assert_eq!(
+            derived.reported.unknown,
+            [
+                Declaration {
+                    workflow: Some("plain.yaml".to_owned()),
+                    declaration: UnknownDeclaration::Command,
+                    node: Some(Node {
+                        kind: NodeKind::Step,
+                        id: "build".to_owned(),
+                    }),
+                    name: None,
+                },
+                repository(UnknownDeclaration::Repository),
+            ]
+        );
+        assert!(
+            derived
+                .reported
+                .requirements
+                .iter()
+                .all(|requirement| requirement.kind != CredentialKind::Codex),
+            "{:?}",
+            derived.reported.requirements
+        );
+    }
+
+    // REQ-CREDREADY-27
+    #[test]
+    fn a_named_stage_file_is_reported_by_its_override() {
+        let derived = derive_files(
+            &[("stage.yaml", &with_override(COMMAND_ONLY))],
+            &["stage.yaml"],
+        );
+
+        assert_eq!(
+            kinds_and_origins(&derived.reported),
+            [(
+                CredentialKind::Codex,
+                vec![integration("stage.yaml", "codex")]
+            )]
+        );
+        assert!(
+            derived.reported.unknown.is_empty(),
+            "{:?}",
+            derived.reported.unknown
+        );
+    }
+
+    // REQ-CREDREADY-27
+    #[test]
+    fn the_override_of_a_file_a_workflow_step_names_is_not_read() {
+        let parent = parent("LINEAR_API_KEY");
+
+        let derived = derive_files(
+            &[
+                ("parent.yaml", &parent),
+                ("child.yaml", &with_override(CHILD)),
+            ],
+            &["parent.yaml"],
+        );
+
+        let without = derive_files(
+            &[("parent.yaml", &parent), ("child.yaml", CHILD)],
+            &["parent.yaml"],
+        );
+        assert_eq!(derived, without);
+        assert_eq!(derived.reported, derived.inferred);
+    }
+
+    /// A Git whose `origin` remote is at `github.com`.
+    fn github_origin() -> RepositorySource {
+        RepositorySource::OriginRemote(FakeGit::answering(Ok(printed(
+            true,
+            "https://github.com/o/r.git\n",
+            false,
+        ))))
+    }
+
+    /// A root declaring `integrations` whose `requires.tools` lists `gh` and which forwards
+    /// `LINEAR_API_KEY`.
+    fn declaring_tools(integrations: &[&str]) -> String {
+        let mut declared =
+            "schemaVersion: 1\nrequires:\n  tools: [gh]\n  integrations:\n".to_owned();
+        for integration in integrations {
+            declared.push_str(&format!("    {integration}: {{}}\n"));
+        }
+        declared.push_str(PLAIN.trim_start_matches("schemaVersion: 1\n"));
+        declared
+    }
+
+    // REQ-CREDREADY-28
+    #[test]
+    fn a_declaring_workflow_differs_where_its_integrations_and_the_inference_disagree() {
+        let derived = derive_files_from(
+            &[("main.yaml", &declaring_tools(&["linear", "codex"]))],
+            &["main.yaml"],
+            github_origin(),
+        );
+
+        assert_eq!(
+            derived.differences,
+            Some(vec![
+                IntegrationDifference {
+                    difference: Difference::InferredNotDeclared,
+                    workflow: "main.yaml".to_owned(),
+                    kind: CredentialKind::Github,
+                    integration: IntegrationProvider::Github,
+                    origins: vec![
+                        Declaration {
+                            workflow: Some("main.yaml".to_owned()),
+                            declaration: OriginDeclaration::RequiredTool,
+                            node: None,
+                            name: Some("gh".to_owned()),
+                        },
+                        repository(OriginDeclaration::Repository),
+                    ],
+                },
+                IntegrationDifference {
+                    difference: Difference::DeclaredNotInferred,
+                    workflow: "main.yaml".to_owned(),
+                    kind: CredentialKind::Codex,
+                    integration: IntegrationProvider::Codex,
+                    origins: Vec::new(),
+                },
+            ])
+        );
+    }
+
+    // REQ-CREDREADY-28
+    #[test]
+    fn a_declaration_that_agrees_differs_in_nothing_and_no_declaration_is_not_compared() {
+        let agreeing = declaring_tools(&["linear", "github"]);
+
+        let agrees =
+            derive_files_from(&[("main.yaml", &agreeing)], &["main.yaml"], github_origin());
+        let undeclared =
+            derive_files_from(&[("main.yaml", PLAIN)], &["main.yaml"], github_origin());
+        // A plain file's kinds are not compared with another file's declaration.
+        let beside = derive_files_from(
+            &[
+                ("main.yaml", &agreeing),
+                (
+                    "plain.yaml",
+                    &PLAIN.replace("LINEAR_API_KEY", "GITLAB_TOKEN"),
+                ),
+            ],
+            &["main.yaml", "plain.yaml"],
+            github_origin(),
+        );
+
+        assert_eq!(agrees.differences, Some(Vec::new()));
+        assert_eq!(undeclared.differences, None);
+        assert_eq!(beside.differences, Some(Vec::new()));
     }
 
     // REQ-CREDREADY-5

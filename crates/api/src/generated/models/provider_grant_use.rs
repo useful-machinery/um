@@ -35,7 +35,7 @@ pub struct ProviderGrantUse {
     pub organization_id: String,
     /// The provider the token is for.
     #[serde(rename = "provider")]
-    pub provider: Provider,
+    pub provider: String,
     /// The RFC 3339 time at which the token was issued.
     #[serde(rename = "issuedAt")]
     pub issued_at: String,
@@ -49,7 +49,7 @@ impl ProviderGrantUse {
         run_id: String,
         assignment_id: String,
         organization_id: String,
-        provider: Provider,
+        provider: String,
         issued_at: String,
     ) -> ProviderGrantUse {
         ProviderGrantUse {
@@ -61,21 +61,5 @@ impl ProviderGrantUse {
             provider,
             issued_at,
         }
-    }
-}
-/// The provider the token is for.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Provider {
-    #[serde(rename = "github")]
-    ProviderGrantUseProviderGithub,
-    #[serde(rename = "gitlab.com")]
-    ProviderGrantUseProviderGitlabCom,
-    #[serde(rename = "linear")]
-    ProviderGrantUseProviderLinear,
-}
-
-impl Default for Provider {
-    fn default() -> Provider {
-        Self::ProviderGrantUseProviderGithub
     }
 }

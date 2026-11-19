@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::sync::Arc;
 
@@ -46,11 +46,11 @@ fn state_directory() -> tempfile::TempDir {
 }
 
 fn environment(variables: &[(&str, &OsStr)]) -> ServiceEnvironment {
-    let variables = variables
-        .iter()
-        .map(|(name, value)| ((*name).to_owned(), value.to_os_string()))
-        .collect::<BTreeMap<_, _>>();
-    ServiceEnvironment::from_lookup(|name| variables.get(name).cloned())
+    ServiceEnvironment::from_variables(
+        variables
+            .iter()
+            .map(|(name, value)| (OsString::from(name), value.to_os_string())),
+    )
 }
 
 fn claude_code(status: LoginStatus) -> Result<Vec<ProviderLogin>, CloudFailure> {

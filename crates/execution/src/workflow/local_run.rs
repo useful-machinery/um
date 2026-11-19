@@ -33,7 +33,7 @@ use time::format_description::well_known::Rfc3339;
 
 use super::admission::{
     AdmittedTree, AdmittedWorkflow, CancellationReason, ResolvedAttachment, ResolvedInput,
-    ResolvedInputs, ResolvedJsonInput,
+    ResolvedInputs, ResolvedJsonInput, SourceRevisionProvenance,
 };
 use super::agent::AgentCompatibilityProfile;
 use super::agent_diagnostics::AgentDiagnosticSessionStore;
@@ -541,6 +541,64 @@ struct WorkflowManifestV1 {
     agent_profile_replacement: Option<ManifestFileV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tree: Option<ManifestTreeV1>,
+    /// Written only for a run created with `--source-revision` (REQ-LOCALRUN-217), so the
+    /// manifest of a run given none keeps its bytes and digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_revision: Option<ManifestSourceRevisionV1>,
+}
+
+/// The source revision a run was created with (REQ-LOCALRUN-217), whose variables every
+/// admission of the run and of its child runs sets: `commit`, and `branch` and the workflow
+/// pair `workflowBranch` and `workflowCommit` when given.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ManifestSourceRevisionV1 {
+    commit: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    workflow_commit: Option<String>,
+}
+
+impl ManifestSourceRevisionV1 {
+    fn recorded(revision: &SourceRevisionProvenance) -> Self {
+        let (workflow_branch, workflow_commit) = revision
+            .definition()
+            .map(|(branch, commit)| (branch.to_owned(), commit.to_owned()))
+            .unzip();
+        Self {
+            commit: revision.commit_oid().to_owned(),
+            branch: revision.branch().map(str::to_owned),
+            workflow_branch,
+            workflow_commit,
+        }
+    }
+
+    fn provenance(&self) -> SourceRevisionProvenance {
+        SourceRevisionProvenance::from_parts(
+            self.commit.as_str(),
+            self.branch.as_deref(),
+            self.workflow_branch
+                .as_deref()
+                .zip(self.workflow_commit.as_deref()),
+        )
+    }
+
+    fn is_valid(&self) -> bool {
+        let is_commit = |value: &str| is_lowercase_hex(value, 40) || is_lowercase_hex(value, 64);
+        is_commit(&self.commit)
+            && self
+                .branch
+                .as_deref()
+                .is_none_or(|branch| !branch.is_empty())
+            && match (&self.workflow_branch, &self.workflow_commit) {
+                (Some(branch), Some(commit)) => !branch.is_empty() && is_commit(commit),
+                (None, None) => true,
+                _ => false,
+            }
+    }
 }
 
 /// The run's read-only copy of the tree it was admitted from (REQ-LOCALRUN-170): the
@@ -862,6 +920,13 @@ pub(super) struct AttemptStepV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub(super) diagnostic: Option<FailureDiagnosticV1>,
+    /// The failed child of a `succeeded` `workflow` step (REQ-WFEXEC-77, REQ-LOCALRUN-219).
+    #[serde(
+        default,
+        deserialize_with = "super::evidence::deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(super) failed_child: Option<super::evidence::FailedChild>,
     /// The time of the commit that first moved the node out of `pending` in this attempt,
     /// kept through recovery executions and after the node ends (REQ-LOCALRUN-201).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1567,6 +1632,7 @@ pub struct PendingLocalRetry {
     definition: AttemptDefinitionV1,
     git_baseline: Option<LocalGitBaseline>,
     tree: Option<ManifestTreeV1>,
+    source_revision: Option<SourceRevisionProvenance>,
 }
 
 impl PendingLocalRetry {
@@ -1600,6 +1666,12 @@ impl PendingLocalRetry {
 
     pub fn execution_specification(&self) -> (&ResolvedWorkflow, &ResolvedInputs, usize) {
         (&self.workflow, &self.inputs, self.maximum_parallel_steps)
+    }
+
+    /// The source revision the run was created with, which the retry's admission sets
+    /// (REQ-LOCALRUN-217); none for a run created without one.
+    pub fn source_revision(&self) -> Option<&SourceRevisionProvenance> {
+        self.source_revision.as_ref()
     }
 
     pub fn git_baseline(&self) -> Option<&LocalGitBaseline> {
@@ -1740,6 +1812,7 @@ pub struct PendingLocalContinuation {
     maximum_parallel_steps: usize,
     quiescence: super::publication::ContinuationQuiescenceV1,
     tree: Option<ManifestTreeV1>,
+    source_revision: Option<SourceRevisionProvenance>,
     /// Whether `begin` keeps the root wait record it removes (`keep_resolved_wait`).
     keep_resolved_wait: bool,
 }
@@ -2216,6 +2289,12 @@ impl PendingLocalContinuation {
 
     pub fn maximum_parallel_steps(&self) -> usize {
         self.maximum_parallel_steps
+    }
+
+    /// The source revision the run was created with, which every attempt's admission sets
+    /// (REQ-LOCALRUN-217); none for a run created without one.
+    pub fn source_revision(&self) -> Option<&SourceRevisionProvenance> {
+        self.source_revision.as_ref()
     }
 
     pub fn git_baseline(&self) -> Option<LocalGitBaseline> {
@@ -4849,6 +4928,10 @@ fn retain_execution_specification(
         inputs,
         agent_profile_replacement,
         tree: None,
+        source_revision: admitted
+            .execution()
+            .source_revision()
+            .map(ManifestSourceRevisionV1::recorded),
     };
     validate_manifest(&manifest)?;
     Ok(manifest)
@@ -5987,6 +6070,11 @@ fn update_progress_nodes<Cause, Output>(
         }
         node.detail = attempt_step_detail(&runtime.state);
         node.diagnostic = attempt_step_diagnostic(&runtime.state)?;
+        // REQ-LOCALRUN-219: only a `succeeded` entry carries its failed child.
+        node.failed_child = match &runtime.state {
+            StepState::Succeeded { .. } => runtime.failed_child.clone(),
+            _ => None,
+        };
     }
     Ok(())
 }
@@ -8243,7 +8331,7 @@ pub fn acquire_local_continuation_bridged(
             prior,
             &mut retained_read_budget,
         )?;
-        let (initial_workflow, inputs, maximum_parallel_steps, tree) =
+        let (initial_workflow, inputs, maximum_parallel_steps, tree, source_revision) =
             load_retained_execution_with_budget(&root, &run, &mut retained_read_budget)?;
         validate_retained_outputs_against_definition(prior, &prior_workflow)?;
         verify_retained_output_evidence(&root, &state, prior.attempt_number)?;
@@ -8261,15 +8349,17 @@ pub fn acquire_local_continuation_bridged(
             inputs,
             maximum_parallel_steps,
             tree,
+            source_revision,
         ))
     })();
-    let (prior_workflow, initial_workflow, inputs, maximum_parallel_steps, tree) = match retained {
-        Ok(retained) => retained,
-        Err(error) => {
-            settle_abandoned_snapshot(&normalized, &root, &state)?;
-            return Err(error);
-        }
-    };
+    let (prior_workflow, initial_workflow, inputs, maximum_parallel_steps, tree, source_revision) =
+        match retained {
+            Ok(retained) => retained,
+            Err(error) => {
+                settle_abandoned_snapshot(&normalized, &root, &state)?;
+                return Err(error);
+            }
+        };
     Ok(LocalContinuationOpen::Acquired(Box::new(
         PendingLocalContinuation {
             normalized,
@@ -8284,6 +8374,7 @@ pub fn acquire_local_continuation_bridged(
             maximum_parallel_steps,
             quiescence,
             tree,
+            source_revision,
             keep_resolved_wait: false,
         },
     )))
@@ -8352,7 +8443,7 @@ fn open_locked_retry(
         &mut retained_read_budget,
     )?;
     validate_retained_outputs_against_definition(current, &current_workflow)?;
-    let (workflow, inputs, maximum_parallel_steps, tree) =
+    let (workflow, inputs, maximum_parallel_steps, tree, source_revision) =
         load_retained_execution_with_budget(&root, &run, &mut retained_read_budget)?;
     verify_retained_output_evidence(&root, &state, current.attempt_number)?;
     cleanup_unreferenced_retained_values(&root, &state, current.attempt_number)?;
@@ -8375,6 +8466,7 @@ fn open_locked_retry(
         definition: attempt_definition_for_run(&run),
         git_baseline: run.git_baseline.as_ref().and_then(local_git_baseline),
         tree,
+        source_revision,
     })))
 }
 
@@ -9396,21 +9488,23 @@ fn run_root_entries() -> BTreeSet<Vec<u8>> {
     ])
 }
 
-/// The run's retained definition, inputs and parallelism, and its tree record when
-/// the run was admitted from a tree (REQ-LOCALRUN-170).
+/// A run's retained definition, inputs and parallelism, its tree record when the run was
+/// admitted from a tree (REQ-LOCALRUN-170) and its source revision when it was created with
+/// one (REQ-LOCALRUN-217).
+type RetainedExecution = (
+    ResolvedWorkflow,
+    ResolvedInputs,
+    usize,
+    Option<ManifestTreeV1>,
+    Option<SourceRevisionProvenance>,
+);
+
+/// The run's `RetainedExecution`, read from its manifest.
 pub(super) fn load_retained_execution_with_budget(
     root: &OwnedFd,
     run: &LocalRunV1,
     budget: &mut RetainedReadBudget,
-) -> Result<
-    (
-        ResolvedWorkflow,
-        ResolvedInputs,
-        usize,
-        Option<ManifestTreeV1>,
-    ),
-    LocalRunDirectoryError,
-> {
+) -> Result<RetainedExecution, LocalRunDirectoryError> {
     let workflow_directory = open_directory_at(root, WORKFLOW_DIRECTORY)?;
     load_retained_execution_directory(
         workflow_directory,
@@ -9447,7 +9541,9 @@ pub(super) fn load_attempt_retained_execution_with_budget(
         &definition.manifest_digest,
         budget,
     )
-    .map(|(workflow, inputs, maximum_parallel_steps, _)| (workflow, inputs, maximum_parallel_steps))
+    .map(|(workflow, inputs, maximum_parallel_steps, _, _)| {
+        (workflow, inputs, maximum_parallel_steps)
+    })
 }
 
 fn resolved_attempt_definition(
@@ -9497,15 +9593,7 @@ fn load_retained_execution_directory(
     expected_workflow_digest: &DigestV1,
     expected_manifest_digest: &DigestV1,
     budget: &mut RetainedReadBudget,
-) -> Result<
-    (
-        ResolvedWorkflow,
-        ResolvedInputs,
-        usize,
-        Option<ManifestTreeV1>,
-    ),
-    LocalRunDirectoryError,
-> {
+) -> Result<RetainedExecution, LocalRunDirectoryError> {
     let manifest_bytes = read_regular_file(&workflow_directory, WORKFLOW_MANIFEST_FILE)?;
     budget.account(&manifest_bytes)?;
     if DigestV1::sha256(&manifest_bytes) != *expected_manifest_digest {
@@ -9684,6 +9772,10 @@ fn load_retained_execution_directory(
         ResolvedInputs::new(inputs),
         manifest.maximum_parallel_steps,
         manifest.tree,
+        manifest
+            .source_revision
+            .as_ref()
+            .map(ManifestSourceRevisionV1::provenance),
     ))
 }
 
@@ -10333,6 +10425,7 @@ fn fresh_progress_node(
         outputs: Some(Vec::new()),
         detail: None,
         diagnostic: None,
+        failed_child: None,
         started_at: None,
         recovery: None,
     })
@@ -11033,6 +11126,13 @@ fn validate_manifest(manifest: &WorkflowManifestV1) -> Result<(), LocalRunDirect
     }
     if let Some(tree) = &manifest.tree {
         validate_manifest_tree(tree)?;
+    }
+    if manifest
+        .source_revision
+        .as_ref()
+        .is_some_and(|revision| !revision.is_valid())
+    {
+        return Err(LocalRunDirectoryError::SerializationUnavailable);
     }
     let mut expected_ordinal = 1_u64;
     for file in retained_files {

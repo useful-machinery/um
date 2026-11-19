@@ -59,6 +59,22 @@ pub struct RunListItem {
         skip_serializing_if = "Option::is_none"
     )]
     pub owner: Option<Option<String>>,
+    /// The run's workflow state, derived as the run read's `workflowState` is, distinct from `state`, which stays `running` while the run waits; null for a run by `workflowPath`.
+    #[serde(
+        rename = "workflowState",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workflow_state: Option<Option<WorkflowState>>,
+    /// While `workflowState` is `waiting`, the wait of the runner's latest root progress report for the current attempt, without its questions, which the run read alone answers; null otherwise and for a run by `workflowPath`. A null wait says none was reported, never that the run cannot be waiting.
+    #[serde(
+        rename = "workflowWait",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub workflow_wait: Option<Option<Box<models::RunListItemWorkflowWait>>>,
 }
 
 impl RunListItem {
@@ -86,6 +102,8 @@ impl RunListItem {
             definition: None,
             subject_claim: None,
             owner: None,
+            workflow_state: None,
+            workflow_wait: None,
         }
     }
 }
@@ -118,5 +136,21 @@ pub enum State {
 impl Default for State {
     fn default() -> State {
         Self::Queued
+    }
+}
+/// The run's workflow state, derived as the run read's `workflowState` is, distinct from `state`, which stays `running` while the run waits; null for a run by `workflowPath`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum WorkflowState {
+    #[serde(rename = "running")]
+    RunListItemWorkflowStateRunning,
+    #[serde(rename = "waiting")]
+    RunListItemWorkflowStateWaiting,
+    #[serde(rename = "exited")]
+    RunListItemWorkflowStateExited,
+}
+
+impl Default for WorkflowState {
+    fn default() -> WorkflowState {
+        Self::RunListItemWorkflowStateRunning
     }
 }

@@ -815,6 +815,17 @@ pub(super) struct MaterializedCheckout {
     origin_cleanup: Option<PreparationOriginCleanup>,
 }
 
+impl MaterializedCheckout {
+    /// The origin a workflow-Git relay installed in this checkout serves: its `origin` when
+    /// it has no canonical origin, as a GitHub checkout has none. A GitLab checkout's origin
+    /// is the Cloud relay, which dropping the checkout restores to the canonical URL.
+    pub(super) fn relay_origin(&self) -> Option<Arc<str>> {
+        self.canonical_origin
+            .is_none()
+            .then(|| Arc::clone(&self.origin))
+    }
+}
+
 pub(super) fn checkout(
     broker: Arc<dyn SourceCredentialBroker>,
     environment: &EnvironmentSnapshot,
@@ -3215,6 +3226,7 @@ mod tests {
                     )),
                     recovery: None,
                     invocations: Vec::new(),
+                    failed_child: None,
                 }],
                 finalization: None,
                 exports,

@@ -115,8 +115,8 @@ pub use gitlab::{
 };
 pub use google_docs_actions::{ActionApi, ActionFailure, ActionRead, Lifecycle as ActionLifecycle};
 pub use grants::{
-    Grant, GrantApi, GrantApiError, GrantFailure, GrantList, GrantProvider, GrantSession,
-    GrantSessionReason, GrantSessionStatus, GrantState, GrantUse, GrantUseList,
+    Grant, GrantApi, GrantApiError, GrantFailure, GrantList, GrantSession, GrantSessionReason,
+    GrantSessionStatus, GrantState, GrantUse, GrantUseList,
 };
 pub use http_client::{
     HttpCancellation, HttpClient, HttpClientError, HttpEndpointError, HttpTransportPolicy,
@@ -144,7 +144,7 @@ pub use linear::{
 pub use member_grants::{
     GrantEndedAuthorization, GrantReport, MEMBER_GRANT_PAGE, MemberGrant, MemberGrantApi,
     MemberGrantApiError, MemberGrantAuthorization, MemberGrantFailure, MemberGrantKind,
-    MemberGrantList, MemberGrantProvider, MemberGrantState,
+    MemberGrantList, MemberGrantProvider, MemberGrantState, ServedGrantProvider, valid_provider_id,
 };
 pub use organizations::{
     AcceptInvitationOutcome, AcceptedInvitationMembership, AuditActor, AuditProjectionWarning,

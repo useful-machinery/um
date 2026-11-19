@@ -445,6 +445,45 @@ fn edge_diagnostics_name_the_step_and_the_outcome() {
     assert_eq!(location["outcome"], "planned");
 }
 
+// REQ-WFFORMAT-89: a child may carry a `requires` override without `tools`, whatever its
+// parent declares, and still no `requires` holding `tools`.
+#[test]
+fn a_child_may_carry_a_requires_override_without_tools() {
+    const CHILD: &str =
+        "schemaVersion: 1\nsteps:\n  decide:\n    kind: cmd\n    command: { argv: [\"true\"] }\n";
+    const PARENT: &str = "schemaVersion: 1\noutcomes: [landed, failed]\nsteps:\n  design:\n    kind: workflow\n    workflow: design.yaml\n    on:\n      succeeded: exit.landed\n      failed: exit.failed\n";
+    let bundle = WorkflowBundle::valid();
+    let write_child = |requires: &str| {
+        fs::write(
+            bundle.root.join("design.yaml"),
+            format!("{CHILD}requires:\n{requires}"),
+        )
+        .expect("child workflow should be written");
+    };
+
+    write_child("  integrations: {linear: {as: org}}\n");
+    for parent in [
+        PARENT.to_owned(),
+        format!("{PARENT}requires:\n  integrations: {{github: {{}}}}\n"),
+    ] {
+        bundle.replace_workflow(&parent);
+        let output = validate(&bundle, true);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+    }
+
+    write_child("  tools: [git]\n");
+    bundle.replace_workflow(PARENT);
+    let output = validate(&bundle, true);
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let diagnostics = report["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "{report}");
+    assert_eq!(diagnostics[0]["code"], "child_workflow_root_blocks");
+    let location = &diagnostics[0]["location"];
+    assert_eq!(location["kind"], "step_workflow");
+    assert_eq!(location["step"], "design");
+}
+
 // REQ-WFFORMAT-69, REQ-WFFORMAT-72, REQ-WFFORMAT-103
 #[test]
 fn structural_diagnostics_name_the_field_and_the_rule_without_the_value() {
@@ -489,6 +528,54 @@ fn structural_diagnostics_name_the_field_and_the_rule_without_the_value() {
         assert!(!String::from_utf8_lossy(&output.stdout).contains("grant-e2e"));
         assert_static_contents_absent(output);
     }
+}
+
+// REQ-WFDEF-34, REQ-WFFORMAT-82
+#[test]
+fn a_requires_integrations_declaration_validates_and_reports_nothing_more() {
+    const BLOCK: &str = "requires:\n  as: member\n  integrations:\n    linear:\n      as: org\n      bindings:\n        team: {kind: team}\n    github: {}\n    claude_code: {}\n";
+    let without_digest = |output: &std::process::Output| {
+        let mut report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        report.as_object_mut().unwrap().remove("digest");
+        report
+    };
+    let bundle = WorkflowBundle::valid();
+    let plain = validate(&bundle, true);
+    assert_eq!(plain.status.code(), Some(0));
+    let source = fs::read_to_string(bundle.workflow_path()).expect("workflow should be readable");
+
+    bundle.replace_workflow(&format!("{source}{BLOCK}"));
+    let declared = validate(&bundle, true);
+    assert_eq!(declared.status.code(), Some(0), "{declared:?}");
+    assert_eq!(without_digest(&declared), without_digest(&plain));
+
+    bundle.replace_workflow(&format!(
+        "{source}{}",
+        BLOCK.replace("github: {}", "jira: {}")
+    ));
+    let json = validate(&bundle, true);
+    assert_eq!(json.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    let diagnostics = report["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "invalid_workflow_structure");
+    assert_eq!(
+        diagnostics[0]["location"],
+        serde_json::json!({
+            "kind": "workflow",
+            "field": "requires.integrations.jira",
+            "rule": "enum",
+            "expected": ["github", "gitlab.com", "linear", "claude_code", "codex"],
+        })
+    );
+
+    let human = validate(&bundle, false);
+    assert_eq!(human.status.code(), Some(1));
+    let human_text = String::from_utf8(human.stdout).unwrap();
+    let (_, remedy) = human_text
+        .split_once("No workflow steps were executed.\n\n")
+        .unwrap_or_else(|| panic!("{human_text:?}"));
+    assert!(remedy.contains("requires.integrations.jira"), "{remedy}");
 }
 
 // REQ-WFFORMAT-80, REQ-WFFORMAT-102

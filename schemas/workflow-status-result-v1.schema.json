@@ -621,6 +621,28 @@
       "type": "string",
       "pattern": "^[a-z][a-z0-9_]{0,63}$"
     },
+    "FailedChild": {
+      "description": "The failure of the child a succeeded workflow step ran (REQ-WFEXEC-77): the outcome the child recorded, the one-based fan-out element whose child ended the step, omitted for a plain step, and the primaryIssue of the child's failed result.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "outcome",
+        "primaryIssue"
+      ],
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "minLength": 1
+        },
+        "item": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "primaryIssue": {
+          "$ref": "#/$defs/PrimaryIssue"
+        }
+      }
+    },
     "AttemptStep": {
       "type": "object",
       "additionalProperties": false,
@@ -696,11 +718,28 @@
         "diagnostic": {
           "$ref": "#/$defs/FailureDiagnostic"
         },
+        "failedChild": {
+          "$ref": "#/$defs/FailedChild"
+        },
         "startedAt": {
           "$ref": "#/$defs/Timestamp"
         }
       },
       "allOf": [
+        {
+          "if": {
+            "required": [
+              "failedChild"
+            ]
+          },
+          "then": {
+            "properties": {
+              "state": {
+                "const": "succeeded"
+              }
+            }
+          }
+        },
         {
           "if": {
             "required": [

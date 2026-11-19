@@ -2508,3 +2508,222 @@ fn runner_doctor_workflow_names_the_grant_commands_for_each_coding_agent() {
         );
     }
 }
+
+/// `workflow` declaring `integrations` under `requires`, which is the one root block it adds.
+fn declaring(workflow: &str, integrations: &[&str]) -> String {
+    let mut declared = format!("{workflow}requires:\n  integrations:\n");
+    for integration in integrations {
+        declared.push_str(&format!("    {integration}: {{}}\n"));
+    }
+    declared
+}
+
+// REQ-CREDREADY-27, REQ-CREDREADY-6, REQ-CREDREADY-8
+#[test]
+fn runner_doctor_workflow_reports_a_declaring_workflow_by_its_integrations() {
+    let tree = single_file_tree(&declaring(LINEAR_WORKFLOW, &["linear", "gitlab.com"]));
+
+    let output = doctor(&tree, true);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let report = json_report(&output);
+    let kinds = report["requirements"]
+        .as_array()
+        .expect("requirements should be an array")
+        .iter()
+        .map(|requirement| requirement["kind"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, [json!("gitlab"), json!("linear")]);
+    for kind in ["gitlab", "linear"] {
+        let declared = requirement(&report, kind);
+        assert_eq!(declared["state"], "unverified", "{declared}");
+        assert_eq!(declared["code"], "not_checked", "{declared}");
+        assert_eq!(declared["cloud"], "not_checked", "{declared}");
+        assert!(next_action(declared).contains("--readiness"), "{declared}");
+    }
+    assert_eq!(
+        requirement(&report, "gitlab")["origins"],
+        json!([{"declaration": "integration", "workflow": "main.yaml", "name": "gitlab.com"}])
+    );
+    assert_eq!(report["unknown"], json!([]));
+    assert_eq!(report["summary"]["unknown"], 0);
+    assert_eq!(report["summary"]["unverified"], 2);
+
+    let output = doctor(&tree, false);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("report should be UTF-8");
+    let lines = stdout.lines().map(str::trim).collect::<Vec<_>>();
+    assert!(!lines.contains(&"── unknown ──"), "{stdout}");
+    assert!(!lines.contains(&"kind: claude_code"), "{stdout}");
+    assert!(lines.contains(&"kind: gitlab"), "{stdout}");
+}
+
+// REQ-CREDREADY-27, REQ-CREDREADY-15, REQ-CREDREADY-17
+#[test]
+fn runner_doctor_readiness_asks_only_about_the_declared_integrations() {
+    let tree = single_file_tree(&declaring(
+        &LINEAR_WORKFLOW.replace("LINEAR_API_KEY", "GITLAB_TOKEN"),
+        &["linear"],
+    ));
+    let deployment = Deployment::signed_in(vec![connection_page(&[], None)]);
+
+    let output = deployment.doctor(&tree, true);
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let report = json_report(&output);
+    let linear = requirement(&report, "linear");
+    assert_eq!(linear["state"], "missing", "{linear}");
+    assert_eq!(linear["code"], "not_connected", "{linear}");
+    assert_eq!(report["requirements"].as_array().map(Vec::len), Some(1));
+    // The Linear list is the one read; the inferred GitLab is not asked about.
+    assert_eq!(deployment.linear_list_requests().len(), 1);
+}
+
+/// `github_tree()`'s workflow, which calls for GitHub by the tool `gh` and for Claude Code by an
+/// agent profile, declaring Linear alone.
+fn github_tree_declaring_linear() -> WorkflowTree {
+    single_file_tree(&LINEAR_WORKFLOW.replace(
+        "environmentPassthrough: [LINEAR_API_KEY]",
+        "requires: {tools: [gh], integrations: {linear: {}}}",
+    ))
+}
+
+// REQ-CREDREADY-28, REQ-CREDREADY-8
+#[test]
+fn runner_doctor_workflow_reports_where_the_declaration_and_the_inference_differ() {
+    let tree = github_tree_declaring_linear();
+
+    let output = doctor(&tree, true);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let report = json_report(&output);
+    let kinds = report["requirements"]
+        .as_array()
+        .expect("requirements should be an array")
+        .iter()
+        .map(|requirement| requirement["kind"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, [json!("linear")]);
+    assert_eq!(
+        report["differences"],
+        json!([
+            {
+                "difference": "inferred_not_declared",
+                "workflow": "main.yaml",
+                "kind": "github",
+                "integration": "github",
+                "origins": [{"declaration": "required_tool", "workflow": "main.yaml", "name": "gh"}],
+            },
+            {
+                "difference": "declared_not_inferred",
+                "workflow": "main.yaml",
+                "kind": "linear",
+                "integration": "linear",
+            },
+            {
+                "difference": "inferred_not_declared",
+                "workflow": "main.yaml",
+                "kind": "claude_code",
+                "integration": "claude_code",
+                "origins": [
+                    {"declaration": "agent_profile", "workflow": "main.yaml", "node": step("review"), "name": "reviewing"},
+                ],
+            },
+        ])
+    );
+    assert_eq!(report["summary"]["differences"], 3);
+    assert_eq!(report["summary"]["unknown"], 0);
+
+    let output = doctor(&tree, false);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).expect("report should be UTF-8");
+    let (_, differences) = stdout
+        .split_once("── differences ──\n")
+        .unwrap_or_else(|| panic!("no differences section in {stdout}"));
+    let (differences, summary) = differences
+        .split_once("── summary ──\n")
+        .unwrap_or_else(|| panic!("no summary after the differences in {stdout}"));
+    let marked = differences
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("! "))
+        .collect::<Vec<_>>();
+    assert_eq!(marked.len(), 3, "{stdout}");
+    for (line, kind) in marked.iter().zip(["github", "linear", "claude_code"]) {
+        assert!(line.contains(kind), "{kind}: {line}");
+    }
+    assert!(marked[0].contains("required tool gh"), "{stdout}");
+    assert_eq!(summary.lines().last(), Some("differences: 3"), "{stdout}");
+}
+
+// REQ-CREDREADY-28, REQ-CREDREADY-15
+#[test]
+fn runner_doctor_readiness_asks_nothing_about_a_kind_only_the_inference_finds() {
+    let tree = github_tree_declaring_linear();
+    let deployment = Deployment::signed_in(vec![connection_page(
+        &[linear_connection("active", &["read"])],
+        None,
+    )]);
+
+    let output = deployment.doctor(&tree, true);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(json_report(&output)["summary"]["differences"], 3);
+    // The Linear list is the one read; the GitHub installations are not asked about.
+    assert_eq!(deployment.linear_list_requests().len(), 1);
+}
+
+// REQ-CREDREADY-28, REQ-CREDREADY-8
+#[test]
+fn runner_doctor_workflow_without_the_block_reports_no_differences() {
+    let tree = github_tree();
+
+    let output = doctor(&tree, true);
+    let human = doctor(&tree, false);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report = json_report(&output);
+    assert!(report.get("differences").is_none(), "{report}");
+    assert!(report["summary"].get("differences").is_none(), "{report}");
+    let stdout = String::from_utf8(human.stdout).expect("report should be UTF-8");
+    assert!(!stdout.contains("── differences ──"), "{stdout}");
+    assert!(!stdout.contains("differences:"), "{stdout}");
+}
+
+// REQ-CREDREADY-28
+#[test]
+fn runner_doctor_workflow_names_the_provider_id_to_declare_for_an_undeclared_kind() {
+    // The tool `glab` calls for the kind `gitlab`, which is declared as `gitlab.com`.
+    let tree = single_file_tree(&LINEAR_WORKFLOW.replace(
+        "environmentPassthrough: [LINEAR_API_KEY]",
+        "requires: {tools: [glab], integrations: {claude_code: {}}}",
+    ));
+
+    let output = doctor(&tree, true);
+    let human = doctor(&tree, false);
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report = json_report(&output);
+    assert_eq!(report["summary"]["differences"], 1, "{report}");
+    let difference = &report["differences"][0];
+    assert_eq!(difference["difference"], "inferred_not_declared");
+    assert_eq!(difference["kind"], "gitlab");
+    assert_eq!(difference["integration"], "gitlab.com");
+    let stdout = String::from_utf8(human.stdout).expect("report should be UTF-8");
+    let (_, differences) = stdout
+        .split_once("── differences ──\n")
+        .unwrap_or_else(|| panic!("no differences section in {stdout}"));
+    let marked = differences
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with("! "))
+        .collect::<Vec<_>>();
+    assert_eq!(marked.len(), 1, "{stdout}");
+    assert!(marked[0].contains("gitlab.com"), "{stdout}");
+}

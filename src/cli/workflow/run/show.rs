@@ -27,7 +27,7 @@ use crate::exit_code::ExitCode;
 
 pub(super) const ABOUT: &str =
     "Show a local workflow run from its records, or a Cloud run with --cloud";
-pub(super) const AFTER_HELP: &str = "With --cloud ORGANIZATION, RUN is a Cloud run ID: the command reads that run with its definition, subject claim, workflow state and outcome, latest progress, exits and newest trigger deliveries. It reads and writes no local run.";
+pub(super) const AFTER_HELP: &str = "With --cloud ORGANIZATION, RUN is a Cloud run ID: the command reads that run with its definition, subject claim, workflow state and outcome, cancellation, latest progress, exits, newest controls and newest trigger deliveries. It reads and writes no local run.";
 const COMMAND: &str = "useful workflow run show";
 
 #[derive(Debug, Args)]

@@ -1832,6 +1832,350 @@ fn run_show_reports_the_run_actor() {
     }
 }
 
+// REQ-RUN-107: `useful run show` prints, after the run's actor, one line for each provider of
+// the run's credential sources, none for a run that records none, and passes the member
+// through in JSON.
+#[test]
+fn run_show_reports_each_providers_credential_source() {
+    let principal = "prn_01k0z6r1w8f4jy2m7q9v3x5abd";
+    let sources = serde_json::json!({
+        "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "recordedAt": "2026-11-17T11:00:00Z",
+        "sources": [
+            {"provider": "github", "source": "host", "principalId": null},
+            {"provider": "linear", "source": "grant", "principalId": principal},
+            {"provider": "codex", "source": "grant", "principalId": null},
+        ],
+    });
+    for (value, expected) in [
+        (
+            sources.clone(),
+            vec![
+                "credential github: host".to_owned(),
+                format!("credential linear: grant of {principal}"),
+                "credential codex: grant".to_owned(),
+            ],
+        ),
+        (serde_json::Value::Null, vec![]),
+    ] {
+        let mut body = run_body();
+        body["actor"] = serde_json::json!({"kind": "app"});
+        body["credentialSources"] = value.clone();
+        let (output, server) = run_show_with_response(run_response(body.clone()));
+        assert!(output.status.success());
+        let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(shown["run"]["credentialSources"], value);
+        server.finish();
+
+        let (server, _directory, credential_path) = prepared_run(vec![run_response(body)]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let output = run_with_env(
+            &["run", "show", ORGANIZATION, RUN_ID, "--allow-insecure-http"],
+            &environment,
+        );
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let after_actor = stdout
+            .lines()
+            .skip_while(|line| *line != "actor: app")
+            .skip(1)
+            .take_while(|line| line.starts_with("credential "))
+            .collect::<Vec<_>>();
+        assert_eq!(after_actor, expected, "in {stdout:?}");
+        assert_eq!(
+            stdout
+                .lines()
+                .filter(|line| line.starts_with("credential "))
+                .count(),
+            expected.len(),
+            "in {stdout:?}"
+        );
+        server.finish();
+    }
+}
+
+// REQ-RUN-109: `useful run show` prints, after the credential lines, one line for each entry
+// of the run's integration sources in the API's order, none for a run without the member,
+// and passes the member through in JSON as received or omitted.
+#[test]
+fn run_show_reports_each_declared_integrations_source() {
+    let principal = "prn_01k0z6r1w8f4jy2m7q9v3x5abd";
+    let integrations = serde_json::json!([
+        {"integration": "github", "actedAs": "member", "connectedBy": principal, "source": "grant", "tokenVersion": null},
+        {"integration": "linear", "actedAs": null, "connectedBy": null, "source": "host", "tokenVersion": null},
+        {"integration": "claude_code", "actedAs": "member", "connectedBy": null, "source": "grant", "tokenVersion": null},
+        {"integration": "codex", "actedAs": null, "connectedBy": null, "source": null, "tokenVersion": null},
+        {"integration": "mergify", "actedAs": "org", "connectedBy": null, "source": "token", "tokenVersion": 2},
+    ]);
+    for (value, expected) in [
+        (
+            Some(integrations),
+            vec![
+                format!("integration github: connected by {principal}"),
+                "integration linear: host".to_owned(),
+                "integration claude_code: connected by a member".to_owned(),
+                "integration codex: not provided".to_owned(),
+                "integration mergify: connected by the organization, token v2".to_owned(),
+            ],
+        ),
+        (None, vec![]),
+    ] {
+        let mut body = run_body();
+        body["actor"] = serde_json::json!({"kind": "app"});
+        body["credentialSources"] = serde_json::json!({
+            "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "recordedAt": "2026-11-17T11:00:00Z",
+            "sources": [{"provider": "github", "source": "grant", "principalId": principal}],
+        });
+        if let Some(value) = &value {
+            body["integrationSources"] = value.clone();
+        }
+        let (output, server) = run_show_with_response(run_response(body.clone()));
+        assert!(output.status.success());
+        let shown: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(shown["run"].get("integrationSources"), value.as_ref());
+        server.finish();
+
+        let (server, _directory, credential_path) = prepared_run(vec![run_response(body)]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let output = run_with_env(
+            &["run", "show", ORGANIZATION, RUN_ID, "--allow-insecure-http"],
+            &environment,
+        );
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let after_credentials = stdout
+            .lines()
+            .skip_while(|line| *line != "actor: app")
+            .skip(1)
+            .skip_while(|line| line.starts_with("credential "))
+            .take_while(|line| line.starts_with("integration "))
+            .collect::<Vec<_>>();
+        assert_eq!(after_credentials, expected, "in {stdout:?}");
+        assert_eq!(
+            stdout
+                .lines()
+                .filter(|line| line.starts_with("integration ") && *line != "integration context:")
+                .count(),
+            expected.len(),
+            "in {stdout:?}"
+        );
+        server.finish();
+    }
+}
+
+const REPAIR_SINCE: &str = "2026-08-10T12:03:00Z";
+
+/// `body` with the workflow state `waiting` and a root progress report whose wait is for
+/// repair at `step` since `REPAIR_SINCE`.
+fn waiting_for_repair(mut body: serde_json::Value, step: serde_json::Value) -> serde_json::Value {
+    body["workflowState"] = serde_json::json!("waiting");
+    body["workflowProgress"] = serde_json::json!({
+        "attempt": 2,
+        "position": step.clone(),
+        "wait": {"kind": "repair", "since": REPAIR_SINCE, "step": step},
+        "reportedAt": "2026-08-10T12:03:01Z",
+    });
+    body
+}
+
+/// The plain `useful run show` report of `body`.
+fn run_show_plain(body: serde_json::Value) -> String {
+    let (server, _directory, credential_path) = prepared_run(vec![run_response(body)]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let output = run_with_env(
+        &["run", "show", ORGANIZATION, RUN_ID, "--allow-insecure-http"],
+        &environment,
+    );
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        !output
+            .stdout
+            .iter()
+            .any(|byte| byte.is_ascii_control() && *byte != b'\n'),
+        "{output:?}"
+    );
+    server.finish();
+    String::from_utf8(output.stdout).unwrap()
+}
+
+/// The report's lines that name a wait: `workflow wait:` lines.
+fn wait_lines(report: &str) -> Vec<&str> {
+    report
+        .lines()
+        .filter(|line| line.trim_start().starts_with("workflow wait:"))
+        .collect()
+}
+
+// REQ-RUN-116: `useful run show` prints the workflow state after the run's state and, while
+// it is waiting, the wait's kind, step and since; a running workflow state prints no wait, a
+// run without the member prints neither line, and a runner-reported step prints escaped.
+#[test]
+fn run_show_names_the_workflow_state_and_the_wait() {
+    let report = run_show_plain(waiting_for_repair(
+        run_body(),
+        serde_json::json!(["design", "read"]),
+    ));
+    let lines = report.lines().collect::<Vec<_>>();
+    let state = lines
+        .iter()
+        .position(|line| *line == "state: running")
+        .unwrap_or_else(|| panic!("{report}"));
+    assert_eq!(lines[state + 1], "workflow state: waiting", "{report}");
+    let waits = wait_lines(&report);
+    assert_eq!(waits.len(), 1, "{report}");
+    assert!(
+        waits[0].contains("repair")
+            && waits[0].contains("design.read")
+            && waits[0].contains(REPAIR_SINCE),
+        "{report}"
+    );
+
+    let mut running = run_body();
+    running["workflowState"] = serde_json::json!("running");
+    running["workflowProgress"] = serde_json::json!({
+        "attempt": 2, "position": ["design", "read"], "wait": null,
+        "reportedAt": "2026-08-10T12:03:01Z",
+    });
+    let report = run_show_plain(running);
+    assert!(
+        report.lines().any(|line| line == "workflow state: running"),
+        "{report}"
+    );
+    assert!(wait_lines(&report).is_empty(), "{report}");
+
+    let report = run_show_plain(run_body());
+    assert!(
+        !report
+            .lines()
+            .any(|line| line.starts_with("workflow state:")),
+        "{report}"
+    );
+    assert!(wait_lines(&report).is_empty(), "{report}");
+
+    let report = run_show_plain(waiting_for_repair(
+        run_body(),
+        serde_json::json!(["design", "re\u{1}ad"]),
+    ));
+    let waits = wait_lines(&report);
+    assert_eq!(waits.len(), 1, "{report}");
+    assert!(
+        waits[0].contains("repair") && waits[0].contains(r"design.re\x01ad"),
+        "{report}"
+    );
+}
+
+// REQ-RUN-116: `useful run list` prints one wait line under a listed run whose item carries
+// `workflowWait`, none under one without, and passes both through under --json.
+#[test]
+fn list_runs_names_a_listed_runs_wait() {
+    let item = |id: &str, wait: serde_json::Value| {
+        serde_json::json!({
+            "id": id, "displayName": "Release checks", "projectId": PROJECT_ID,
+            "workflowPath": WORKFLOW_PATH, "state": "running",
+            "createdAt": "2025-01-03T00:00:00Z", "updatedAt": "2025-01-03T01:00:00Z",
+            "integrationContext": {}, "placement": null,
+            "workflowState": if wait.is_null() { "running" } else { "waiting" },
+            "workflowWait": wait,
+        })
+    };
+    let other = "run_01k0z6r1w8f4jy2m7q9v3x5abd";
+    let body = serde_json::json!({
+        "items": [
+            item(RUN_ID, serde_json::json!({
+                "kind": "repair", "since": REPAIR_SINCE, "step": ["design", "read"],
+            })),
+            item(other, serde_json::Value::Null),
+        ],
+        "nextCursor": null
+    });
+    let reply = http_response_with_headers(
+        "200 OK",
+        Some("application/json"),
+        &[("Cache-Control", "private, no-store")],
+        &serde_json::to_vec(&body).unwrap(),
+    );
+    let (server, _directory, credential_path) = prepared_run(vec![reply.clone(), reply]);
+    let environment = deployment_environment(&server.api_url, &credential_path);
+    let arguments = ["run", "list", ORGANIZATION, "--allow-insecure-http"];
+    let text = run_with_env(&arguments, &environment);
+    assert_eq!(text.status.code(), Some(0), "{text:?}");
+    let report = String::from_utf8(text.stdout).unwrap();
+    let lines = report.lines().collect::<Vec<_>>();
+    let waits = wait_lines(&report);
+    assert_eq!(waits.len(), 1, "{report}");
+    assert!(
+        waits[0].contains("repair")
+            && waits[0].contains("design.read")
+            && waits[0].contains(REPAIR_SINCE),
+        "{report}"
+    );
+    let first = lines.iter().position(|line| line.starts_with(RUN_ID));
+    let wait = lines.iter().position(|line| *line == waits[0]);
+    let second = lines.iter().position(|line| line.starts_with(other));
+    assert!(first < wait && wait < second && first.is_some(), "{report}");
+
+    let structured = run_with_env(&[arguments.as_slice(), &["--json"]].concat(), &environment);
+    assert_eq!(structured.status.code(), Some(0), "{structured:?}");
+    let parsed: serde_json::Value = serde_json::from_slice(&structured.stdout).unwrap();
+    assert_eq!(parsed, body);
+    server.finish();
+}
+
+// REQ-RUN-113: `useful run show --wait` names the wait in the observation line of a waiting
+// run, keeps reading until the run is final, and its result carries the final read's
+// workflow members as the API returned them.
+#[test]
+fn show_wait_names_the_wait_and_follows_to_the_final_state() {
+    let waiting = waiting_for_repair(run_body(), serde_json::json!(["design", "read"]));
+    let mut finished = run_body_with_state("succeeded");
+    finished["workflowState"] = serde_json::json!("exited");
+    finished["workflowProgress"] = serde_json::json!({
+        "attempt": 2, "position": ["land"], "wait": null,
+        "reportedAt": "2026-08-10T12:09:00Z",
+    });
+    let (server, _directory, credential_path) =
+        prepared_run(vec![run_response(waiting), run_response(finished.clone())]);
+    let output = run_with_env(
+        &[
+            "run",
+            "show",
+            ORGANIZATION,
+            RUN_ID,
+            "--wait",
+            "--json",
+            "--timeout",
+            "2m",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let observations = stderr
+        .lines()
+        .filter(|line| line.starts_with("Run observation:"))
+        .collect::<Vec<_>>();
+    assert_eq!(observations.len(), 2, "{stderr}");
+    assert!(
+        observations[0].contains("running")
+            && observations[0].contains("repair")
+            && observations[0].contains("design.read")
+            && observations[0].contains(REPAIR_SINCE),
+        "{stderr}"
+    );
+    assert!(!observations[1].contains("repair"), "{stderr}");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["outcome"], "settled");
+    assert_eq!(result["run"]["state"], "succeeded");
+    assert_eq!(result["run"]["workflowState"], "exited");
+    assert_eq!(
+        result["run"]["workflowProgress"],
+        finished["workflowProgress"]
+    );
+    assert_eq!(server.finish().len(), 2);
+}
+
 // REQ-COMPAT-16
 #[test]
 fn generated_client_requests_name_the_cli_version_in_the_user_agent() {
@@ -6495,6 +6839,33 @@ mod workflow_run_cloud {
         run_response(page)
     }
 
+    /// A control of `kind` in `state` accepted for attempt 2 of the run, with the command's
+    /// `actionOutcome` or the runtime's `code` when it has one.
+    fn run_control(
+        id: &str,
+        kind: &str,
+        state: &str,
+        action_outcome: Option<&str>,
+        code: Option<&str>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "runId": RUN_ID, "attemptNumber": 2, "kind": kind, "wait": null,
+            "answers": null, "notes": null, "before": null, "reason": null, "state": state,
+            "code": code, "actionOutcome": action_outcome,
+            "requestedBy": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "acceptedAt": "2026-08-10T12:05:00Z", "deliveredAt": null, "settledAt": null,
+        })
+    }
+
+    /// A page of the run's controls holding `items`, with a cursor when `more` remain.
+    fn controls_response(items: &[serde_json::Value], more: bool) -> Vec<u8> {
+        let mut page = serde_json::json!({"items": items});
+        if more {
+            page["nextCursor"] = serde_json::json!("older-controls");
+        }
+        run_response(page)
+    }
+
     fn released_claim() -> Vec<u8> {
         http_response_with_headers(
             "200 OK",
@@ -6567,7 +6938,11 @@ mod workflow_run_cloud {
             "show",
             RUN_ID,
             &["--json"],
-            vec![run_response(definition_run()), deliveries_response(true)],
+            vec![
+                run_response(definition_run()),
+                deliveries_response(true),
+                controls_response(&[], false),
+            ],
             home.path(),
         );
         assert_eq!(output.status.code(), Some(0), "{output:?}");
@@ -6580,6 +6955,9 @@ mod workflow_run_cloud {
                 format!("GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}"),
                 format!(
                     "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/trigger-deliveries?limit=100"
+                ),
+                format!(
+                    "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/controls?limit=100"
                 ),
             ]
         );
@@ -6629,7 +7007,11 @@ mod workflow_run_cloud {
             "show",
             RUN_ID,
             &[],
-            vec![run_response(definition_run()), deliveries_response(false)],
+            vec![
+                run_response(definition_run()),
+                deliveries_response(false),
+                controls_response(&[], false),
+            ],
             home.path(),
         );
         assert_eq!(output.status.code(), Some(0), "{output:?}");
@@ -6677,7 +7059,11 @@ mod workflow_run_cloud {
             "show",
             RUN_ID,
             args,
-            vec![run_response(run), deliveries_response(false)],
+            vec![
+                run_response(run),
+                deliveries_response(false),
+                controls_response(&[], false),
+            ],
             home.path(),
         );
         assert_eq!(output.status.code(), Some(0), "{output:?}");
@@ -6687,10 +7073,15 @@ mod workflow_run_cloud {
     /// The value of the human report's `questions:` line and the indented lines after it,
     /// if it printed one.
     fn reported_questions(text: &str) -> Option<(&str, Vec<&str>)> {
-        let mut lines = text
-            .lines()
-            .skip_while(|line| !line.starts_with("questions:"));
-        let value = lines.next()?.strip_prefix("questions:")?.trim_start();
+        reported_list(text, "questions")
+    }
+
+    /// The value of the human report's `LABEL:` line and the indented lines after it, if it
+    /// printed one.
+    fn reported_list<'a>(text: &'a str, label: &str) -> Option<(&'a str, Vec<&'a str>)> {
+        let label = format!("{label}:");
+        let mut lines = text.lines().skip_while(|line| !line.starts_with(&label));
+        let value = lines.next()?.strip_prefix(&label)?.trim_start();
         let questions = lines
             .take_while(|line| line.starts_with("  "))
             .map(str::trim_start)
@@ -6759,6 +7150,119 @@ mod workflow_run_cloud {
         }
     }
 
+    /// `definition_run()` waiting on a wait of `kind` whose `failedChild` is `failed_child`,
+    /// or that omits the member when it is `None`.
+    fn run_failed_at_stage(
+        kind: &str,
+        failed_child: Option<serde_json::Value>,
+    ) -> serde_json::Value {
+        let mut run = run_asking(kind, None);
+        if let Some(failed_child) = failed_child {
+            run["workflowProgress"]["wait"]["failedChild"] = failed_child;
+        }
+        run
+    }
+
+    /// The values of the human report's lines that start with the key `failed stage:`.
+    fn reported_failed_stages(text: &str) -> Vec<&str> {
+        text.lines()
+            .filter_map(|line| line.strip_prefix("failed stage:"))
+            .map(str::trim_start)
+            .collect()
+    }
+
+    // REQ-RUN-112: Cloud show prints a waiting run's failed stage on one line, the stage's
+    // path, the outcome and the failing node by its path with its state, phase and code
+    // when each is reported; a null or absent failed child prints no such line; every value
+    // is escaped so the line stays one line; an answer wait's questions still print whole;
+    // and --json passes the member through as received.
+    #[test]
+    fn cloud_show_prints_the_failed_stage_of_a_waiting_run() {
+        let failed = serde_json::json!({
+            "outcome": "failed",
+            "node": {"id": "draftPr", "role": "step"},
+            "state": "failed",
+            "phase": "execution",
+            "code": "command_exit",
+        });
+        let output = shown(run_failed_at_stage("repair", Some(failed.clone())), &[]);
+        let text = String::from_utf8(output.stdout).unwrap();
+        let stages = reported_failed_stages(&text);
+        assert_eq!(stages.len(), 1, "{text}");
+        for fact in [
+            "design.1.review",
+            "failed",
+            "design.1.review.draftPr",
+            "execution",
+            "command_exit",
+        ] {
+            assert!(stages[0].contains(fact), "{fact} missing from {text}");
+        }
+
+        let blocked = serde_json::json!({
+            "outcome": "blocked",
+            "node": {"id": "draftPr", "role": "step"},
+            "state": "blocked",
+            "phase": null,
+            "code": null,
+        });
+        let output = shown(run_failed_at_stage("repair", Some(blocked)), &[]);
+        let text = String::from_utf8(output.stdout).unwrap();
+        let stages = reported_failed_stages(&text);
+        assert_eq!(stages.len(), 1, "{text}");
+        assert!(
+            stages[0].contains("blocked") && stages[0].contains("design.1.review.draftPr"),
+            "{text}"
+        );
+        assert!(
+            !stages[0].contains("execution") && !stages[0].contains("command_exit"),
+            "{text}"
+        );
+
+        for failed_child in [Some(serde_json::Value::Null), None] {
+            let output = shown(run_failed_at_stage("repair", failed_child), &[]);
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(reported_failed_stages(&text).is_empty(), "{text}");
+        }
+
+        let mut hostile = failed.clone();
+        hostile["outcome"] = serde_json::json!("\u{1b}[2Jcleared\nsecond line");
+        let output = shown(run_failed_at_stage("repair", Some(hostile)), &[]);
+        assert!(!output.stdout.contains(&0x1b), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        let stages = reported_failed_stages(&text);
+        assert_eq!(stages.len(), 1, "{text}");
+        assert!(
+            stages[0].contains("cleared")
+                && stages[0].contains("second line")
+                && stages[0].contains("design.1.review.draftPr"),
+            "{text}"
+        );
+
+        let mut asking = run_failed_at_stage("answer", Some(failed.clone()));
+        asking["workflowProgress"]["wait"]["questions"] =
+            serde_json::json!([{"id": "scope", "text": "Which packages?"}]);
+        let output = shown(asking, &[]);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(reported_failed_stages(&text).len(), 1, "{text}");
+        assert_eq!(
+            reported_questions(&text),
+            Some(("", vec!["scope: Which packages?"])),
+            "{text}"
+        );
+
+        for failed_child in [failed, serde_json::Value::Null] {
+            let output = shown(
+                run_failed_at_stage("repair", Some(failed_child.clone())),
+                &["--json"],
+            );
+            assert_eq!(
+                document(&output)["run"]["workflowProgress"]["wait"]["failedChild"],
+                failed_child
+            );
+        }
+    }
+
     // REQ-RUN-105, REQ-DIAG-29: Cloud show prints a rejected run's reason and validation
     // facts beside its workflow state, passes the rejection through under --json as
     // received, and prints no rejection for a run without one.
@@ -6790,6 +7294,29 @@ mod workflow_run_cloud {
             !text.lines().any(|line| line.starts_with("rejection")),
             "{text}"
         );
+    }
+
+    // REQ-RUN-96: Cloud show of an exited run whose claim is still held names the subject,
+    // the `subject-settled` refusal a start for it reads, and the release command with the
+    // run and organization as given; a released claim or a live run adds no release command.
+    #[test]
+    fn cloud_show_says_how_to_release_an_exited_runs_held_claim() {
+        let release = format!("workflow run release {RUN_ID} --cloud {ORGANIZATION}");
+        let text = String::from_utf8(shown(definition_run(), &[]).stdout).unwrap();
+        for fact in ["AUTO-7", "subject-settled", release.as_str()] {
+            assert!(text.contains(fact), "{fact} missing from {text}");
+        }
+
+        let mut released = definition_run();
+        released["subjectClaim"]["state"] = serde_json::json!("released");
+        released["subjectClaim"]["releaseCause"] = serde_json::json!("exit");
+        let mut running = definition_run();
+        running["workflowState"] = serde_json::json!("running");
+        for run in [released, running] {
+            let text = String::from_utf8(shown(run, &[]).stdout).unwrap();
+            assert!(!text.contains("workflow run release"), "{text}");
+            assert!(!text.contains("subject-settled"), "{text}");
+        }
     }
 
     const OWNER: &str = "prn_01k0z6r1w8f4jy2m7q9v3x5abd";
@@ -6933,8 +7460,9 @@ mod workflow_run_cloud {
         server.finish();
     }
 
-    // REQ-RUN-96, REQ-RUN-87, REQ-RUN-88: a run by `workflowPath` reads no deliveries, and
-    // the observations its read leaves out are null, not absent.
+    // REQ-RUN-96, REQ-RUN-87, REQ-RUN-88, REQ-RUN-110: a run by `workflowPath` reads no
+    // deliveries and no controls, and the observations its read leaves out are null, not
+    // absent.
     #[test]
     fn cloud_show_of_a_path_run_reads_no_deliveries_and_reports_unknown_fields_as_null() {
         let home = tempfile::tempdir().unwrap();
@@ -6961,6 +7489,8 @@ mod workflow_run_cloud {
         }
         assert_eq!(shown["deliveries"], serde_json::Value::Null);
         assert_eq!(shown["moreDeliveries"], false);
+        assert_eq!(shown["controls"], serde_json::Value::Null);
+        assert_eq!(shown["moreControls"], false);
 
         let (output, _) = cloud(
             "show",
@@ -6971,6 +7501,192 @@ mod workflow_run_cloud {
         );
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         assert!(String::from_utf8(output.stdout).unwrap().contains(RUN_ID));
+    }
+
+    /// The definition-backed run its runner withdrew: its attempt exited `withdrawn` with the
+    /// outcome's state write and a confirmed claim release. The runner reports that exit as a
+    /// `cancelled` finish Cloud did not ask for, so until AUTO-665 is fixed the run's `state`
+    /// reads `running` and then, once its lease expires, `interrupted`, never `cancelled`.
+    fn withdrawn_run() -> serde_json::Value {
+        let mut run = definition_run();
+        run["state"] = serde_json::json!("running");
+        run["workflowState"] = serde_json::json!("exited");
+        run["workflowOutcome"] = serde_json::json!("withdrawn");
+        run["exits"] = serde_json::json!([{
+            "attemptNumber": 2,
+            "workflowOutcome": "withdrawn",
+            "mirror": [
+                {"hook": "outcome", "at": "2026-08-10T12:05:02Z", "issue": "AUTO-7",
+                 "action": {"kind": "state", "state": "Backlog", "binding": "withdrawnState"},
+                 "outcome": "written"},
+            ],
+            "claimRelease": true,
+        }]);
+        run
+    }
+
+    fn server_error() -> Vec<u8> {
+        problem_http_response(
+            "500 Internal Server Error",
+            serde_json::json!({
+                "type": "https://api.usefulmachinery.com/problems/internal-server-error",
+                "title": "Internal Server Error", "status": 500,
+            }),
+        )
+    }
+
+    // REQ-RUN-110, REQ-RUN-92, REQ-COMPAT-20, REQ-LOCALRUN-189: Cloud show of a
+    // definition-backed run reads the newest 100 of its controls after its deliveries and
+    // passes them through under --json as Cloud sent them, a kind and state this release does
+    // not name included, saying when older ones remain; it prints each control's id, kind,
+    // state and outcome or code, says when there are none, prints a run's cancellation mode,
+    // and is refused when the controls read fails, as when the deliveries read does.
+    #[test]
+    fn cloud_show_lists_a_runs_controls_and_its_cancellation() {
+        let home = tempfile::tempdir().unwrap();
+        let controls = [
+            run_control(
+                "rct_01k0z6r1w8f4jy2m7q9v3x5abe",
+                "pause",
+                "queued",
+                None,
+                None,
+            ),
+            run_control(
+                "rct_01k0z6r1w8f4jy2m7q9v3x5abd",
+                "stop",
+                "refused",
+                None,
+                Some("run_exited"),
+            ),
+            run_control(
+                "rct_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "withdraw",
+                "applied",
+                Some("withdrawn"),
+                None,
+            ),
+        ];
+        let (output, requests) = cloud(
+            "show",
+            RUN_ID,
+            &["--json"],
+            vec![
+                run_response(withdrawn_run()),
+                deliveries_response(false),
+                controls_response(&controls, true),
+            ],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(
+            requests.last().map(|request| route(request)),
+            Some(
+                format!(
+                    "GET /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/controls?limit=100"
+                )
+                .as_str()
+            )
+        );
+        let listed = document(&output);
+        assert_eq!(listed["run"]["state"], "running");
+        assert_eq!(listed["run"]["workflowOutcome"], "withdrawn");
+        assert_eq!(listed["run"]["exits"][0]["claimRelease"], true);
+        assert_eq!(listed["controls"], serde_json::json!(controls));
+        assert_eq!(listed["moreControls"], true);
+
+        let (output, _) = cloud(
+            "show",
+            RUN_ID,
+            &[],
+            vec![
+                run_response(withdrawn_run()),
+                deliveries_response(false),
+                controls_response(&controls, true),
+            ],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        let (value, listed) = reported_list(&text, "controls").unwrap_or_else(|| panic!("{text}"));
+        assert_eq!(value, "", "{text}");
+        assert_eq!(listed.len(), 3, "{text}");
+        for (line, facts) in listed.iter().zip([
+            ["rct_01k0z6r1w8f4jy2m7q9v3x5abe", "pause", "queued"],
+            [
+                "rct_01k0z6r1w8f4jy2m7q9v3x5abd",
+                "stop",
+                "refused run_exited",
+            ],
+            [
+                "rct_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "withdraw",
+                "applied withdrawn",
+            ],
+        ]) {
+            for fact in facts {
+                assert!(line.contains(fact), "{fact} missing from {line}");
+            }
+        }
+        assert_eq!(
+            reported(&text, "older controls"),
+            Some("not shown"),
+            "{text}"
+        );
+        assert_eq!(reported(&text, "cancellation"), None, "{text}");
+        let position = |label: &str| text.lines().position(|line| line.starts_with(label));
+        assert!(position("exits:") < position("controls:"), "{text}");
+        assert!(position("controls:") < position("deliveries:"), "{text}");
+
+        let mut cancelling = definition_run();
+        cancelling["state"] = serde_json::json!("cancelling");
+        cancelling["cancellation"] = serde_json::json!({
+            "mode": "graceful", "gracefulRequestId": CANCELLATION_ID, "forceRequestId": null,
+        });
+        let text = String::from_utf8(shown(cancelling, &[]).stdout).unwrap();
+        assert_eq!(reported(&text, "cancellation"), Some("graceful"), "{text}");
+        assert_eq!(
+            reported_list(&text, "controls"),
+            Some(("none", vec![])),
+            "{text}"
+        );
+        let none = document(&shown(definition_run(), &["--json"]));
+        assert_eq!(none["controls"], serde_json::json!([]));
+        assert_eq!(none["moreControls"], false);
+
+        let failed_deliveries = cloud(
+            "show",
+            RUN_ID,
+            &["--json"],
+            vec![run_response(withdrawn_run()), server_error()],
+            home.path(),
+        )
+        .0;
+        let (failed_controls, _) = cloud(
+            "show",
+            RUN_ID,
+            &["--json"],
+            vec![
+                run_response(withdrawn_run()),
+                deliveries_response(false),
+                server_error(),
+            ],
+            home.path(),
+        );
+        let refused = document(&failed_controls);
+        assert_eq!(refused["outcome"], "refused", "{refused}");
+        assert!(refused.get("controls").is_none(), "{refused}");
+        assert_eq!(
+            (
+                failed_controls.status.code(),
+                &refused["diagnostics"][0]["code"]
+            ),
+            (
+                failed_deliveries.status.code(),
+                &document(&failed_deliveries)["diagnostics"][0]["code"]
+            )
+        );
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
     }
 
     // REQ-LOCALRUN-189: a run Cloud does not find is refused without reading any local run.
@@ -7215,9 +7931,44 @@ mod workflow_run_cloud {
         );
     }
 
-    // REQ-LOCALRUN-210, REQ-RUN-91: approve, hand-back, retry and a lift name the run's
-    // current wait with their kinds; a lift of a run that does not wait on a stop, and a
-    // stop, name none, and a stop does not read the run.
+    // REQ-LOCALRUN-218, REQ-RUN-91: Cloud withdraw reads no run, sends one `withdraw` control
+    // naming no wait under one fresh key, sent again when the response is lost, and reports
+    // the accepted control; nothing under the `useful` home is read or written.
+    #[test]
+    fn cloud_withdraw_sends_one_control_under_one_key_and_reports_it() {
+        let home = tempfile::tempdir().unwrap();
+        let request = serde_json::json!({"kind": "withdraw"});
+        let (output, requests) = cloud(
+            "withdraw",
+            RUN_ID,
+            &["--json"],
+            vec![Vec::new(), accepted_control("withdraw", &request)],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(requests.len(), 2);
+        for request_sent in &requests {
+            assert_eq!(route(request_sent), controls_route());
+            assert_eq!(body(request_sent), request);
+        }
+        let key = header_value(&requests[0], "idempotency-key");
+        assert!(!key.is_empty());
+        assert_eq!(header_value(&requests[1], "idempotency-key"), key);
+        let accepted = document(&output);
+        assert_eq!(accepted["command"], "useful workflow run withdraw");
+        assert_eq!(accepted["outcome"], "accepted");
+        assert_eq!(accepted["exitStatus"], 0);
+        assert_eq!(accepted["organizationRef"], ORGANIZATION);
+        assert_eq!(accepted["runId"], RUN_ID);
+        assert_eq!(accepted["control"]["id"], CONTROL_ID);
+        assert_eq!(accepted["control"]["kind"], "withdraw");
+        assert_eq!(accepted["control"]["wait"], serde_json::Value::Null);
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+    }
+
+    // REQ-LOCALRUN-210, REQ-LOCALRUN-218, REQ-RUN-91: approve, hand-back, retry and a lift
+    // name the run's current wait with their kinds; a lift of a run that does not wait on a
+    // stop, a stop and a withdraw name none, and a stop and a withdraw do not read the run.
     #[test]
     fn cloud_control_leaves_send_their_kinds() {
         let home = tempfile::tempdir().unwrap();
@@ -7254,10 +8005,17 @@ mod workflow_run_cloud {
                 None,
                 serde_json::json!({"kind": "stop", "before": "review", "reason": "Hold for review"}),
             ),
+            (
+                "withdraw",
+                &[][..],
+                None,
+                serde_json::json!({"kind": "withdraw"}),
+            ),
         ] {
             let kind = request["kind"].as_str().unwrap();
+            let unread = matches!(leaf, "stop" | "withdraw");
             let mut responses = Vec::new();
-            if leaf != "stop" {
+            if !unread {
                 responses.push(run_response(waiting_run(waiting)));
             }
             responses.push(accepted_control(kind, &request));
@@ -7266,7 +8024,7 @@ mod workflow_run_cloud {
             let (output, requests) = cloud(leaf, RUN_ID, &all, responses, home.path());
             assert_eq!(output.status.code(), Some(0), "{leaf}: {output:?}");
             let posted = requests.last().unwrap();
-            assert_eq!(requests.len(), if leaf == "stop" { 1 } else { 2 }, "{leaf}");
+            assert_eq!(requests.len(), if unread { 1 } else { 2 }, "{leaf}");
             assert_eq!(route(posted), controls_route(), "{leaf}");
             assert_eq!(body(posted), request, "{leaf}");
             let accepted = document(&output);
@@ -7309,6 +8067,36 @@ mod workflow_run_cloud {
             assert_eq!(refused["outcome"], "refused", "{refused}");
             assert_eq!(refused["exitStatus"], 1);
             assert_eq!(refused["diagnostics"][0]["code"], code, "{refused}");
+        }
+        // REQ-LOCALRUN-218: a withdrawal Cloud refuses because no runner executes the run or
+        // its runner's `useful` does not apply one names the cancellation that still ends it.
+        for (slug, code, names_cancel) in [
+            ("control-unsupported", "control_unsupported", true),
+            ("run-not-live", "run_not_live", true),
+            ("idempotency-conflict", "idempotency_conflict", false),
+        ] {
+            let (output, requests) = cloud(
+                "withdraw",
+                RUN_ID,
+                &["--json"],
+                vec![conflict(slug)],
+                home.path(),
+            );
+            assert_eq!(output.status.code(), Some(1), "{code}: {output:?}");
+            assert_eq!(requests.len(), 1, "{code}");
+            let refused = document(&output);
+            assert_eq!(refused["outcome"], "refused", "{refused}");
+            assert_eq!(refused["exitStatus"], 1);
+            assert_eq!(refused["diagnostics"][0]["code"], code, "{refused}");
+            if names_cancel {
+                assert!(
+                    refused["diagnostics"][0]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("useful workflow run cancel"),
+                    "{refused}"
+                );
+            }
         }
         for (waiting, code) in [
             (Some("approval"), "wait_kind_mismatch"),
@@ -7353,6 +8141,91 @@ mod workflow_run_cloud {
             document(&output)["diagnostics"][0]["code"],
             "authentication_required"
         );
+        assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
+    }
+
+    // REQ-LOCALRUN-218, REQ-CANCEL-1, REQ-CANCEL-5: Cloud cancel reads no run and sends one
+    // graceful cancellation request under one fresh key; an accepted request and one Cloud
+    // resolved `already_terminal` are each reported with the receipt, a missing run is
+    // refused, and nothing under the `useful` home is read or written.
+    #[test]
+    fn cloud_cancel_sends_one_graceful_request_and_reports_the_receipt() {
+        let home = tempfile::tempdir().unwrap();
+        let echo = api_test_support::REQUEST_IDEMPOTENCY_KEY_ECHO;
+        for (status, envelope) in [
+            (
+                "202 Accepted",
+                cancellation_envelope("pending", "graceful", serde_json::Value::Null),
+            ),
+            (
+                "200 OK",
+                cancellation_envelope("resolved", "graceful", run_body_with_state("succeeded")),
+            ),
+        ] {
+            let (output, requests) = cloud(
+                "cancel",
+                RUN_ID,
+                &["--json"],
+                vec![cancellation_response(status, echo, envelope.clone())],
+                home.path(),
+            );
+            assert_eq!(output.status.code(), Some(0), "{status}: {output:?}");
+            assert_eq!(requests.len(), 1, "{status}");
+            assert_eq!(
+                route(&requests[0]),
+                format!(
+                    "POST /api/v1/organizations/{ORGANIZATION}/runs/{RUN_ID}/cancellation-requests"
+                )
+            );
+            assert_eq!(body(&requests[0]), serde_json::json!({"mode": "graceful"}));
+            assert!(!header_value(&requests[0], "idempotency-key").is_empty());
+            let accepted = document(&output);
+            assert_eq!(accepted["command"], "useful workflow run cancel");
+            assert_eq!(accepted["outcome"], "accepted", "{accepted}");
+            assert_eq!(accepted["exitStatus"], 0);
+            assert_eq!(accepted["organizationRef"], ORGANIZATION);
+            assert_eq!(accepted["runId"], RUN_ID);
+            assert_eq!(accepted["cancellationRequest"]["id"], CANCELLATION_ID);
+            assert_eq!(
+                accepted["cancellationRequest"]["state"],
+                envelope["request"]["state"]
+            );
+        }
+        let (output, requests) = cloud(
+            "cancel",
+            RUN_ID,
+            &[],
+            vec![cancellation_response(
+                "202 Accepted",
+                echo,
+                cancellation_envelope("pending", "graceful", serde_json::Value::Null),
+            )],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(requests.len(), 1);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains(CANCELLATION_ID) && text.contains(RUN_ID),
+            "{text}"
+        );
+
+        let (output, requests) = cloud(
+            "cancel",
+            RUN_ID,
+            &["--json"],
+            vec![problem_http_response(
+                "404 Not Found",
+                serde_json::json!({"type": "https://api.usefulmachinery.com/problems/not-found", "title": "Not Found", "status": 404}),
+            )],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_eq!(requests.len(), 1);
+        let refused = document(&output);
+        assert_eq!(refused["outcome"], "refused", "{refused}");
+        assert_eq!(refused["exitStatus"], 1);
+        assert_eq!(refused["diagnostics"][0]["code"], "not_found");
         assert_eq!(std::fs::read_dir(home.path()).unwrap().count(), 0);
     }
 
@@ -7427,7 +8300,11 @@ mod workflow_run_cloud {
             "show",
             &id,
             &["--json"],
-            vec![run_response(cloud_run), deliveries_response(false)],
+            vec![
+                run_response(cloud_run),
+                deliveries_response(false),
+                controls_response(&[], false),
+            ],
             std::path::Path::new(published.home.path()),
         );
         assert_eq!(output.status.code(), Some(0), "{output:?}");

@@ -45,7 +45,7 @@ enum GrantProviderArg {
 }
 
 impl GrantProviderArg {
-    const fn consent(self) -> ConsentProvider {
+    const fn consent(self) -> ConsentProvider<'static> {
         match self {
             Self::Github => ConsentProvider::GITHUB,
             Self::GitlabCom => ConsentProvider::GITLAB_COM,

@@ -19,11 +19,10 @@ use super::admission::{
 };
 use super::agent::dispatch::production_agent_dispatcher;
 use super::agent::{
-    AGENT_LOGIN_UNAVAILABLE, AdmittedAgentAdapter, AgentAdapter, AgentCompatibilityProfile,
-    AgentFailureCause, AgentHarnessSetupStage, AgentInvocation, AgentInvocationIdentity,
-    AgentInvocationLimits, AgentInvocationStaging, AgentOutcome, AgentProcessContext, AgentPrompt,
-    AgentValueMode, IntoNativeHarness, NoopAgentObservationSink, WorkflowRunId,
-    agent_start_channel,
+    AdmittedAgentAdapter, AgentAdapter, AgentCompatibilityProfile, AgentFailureCause,
+    AgentHarnessSetupStage, AgentInvocation, AgentInvocationIdentity, AgentInvocationLimits,
+    AgentInvocationStaging, AgentOutcome, AgentProcessContext, AgentPrompt, AgentValueMode,
+    IntoNativeHarness, NoopAgentObservationSink, WorkflowRunId, agent_start_channel,
 };
 use super::agent_diagnostics::AgentDiagnosticSessionStore;
 use super::cancellation::MINIMUM_CANCELLATION_GRACE;
@@ -300,9 +299,6 @@ fn failure_cause(cause: &AgentFailureCause) -> HarnessLoginCheckCause {
         AgentFailureCause::HarnessStartFailed { stage, .. } => {
             HarnessLoginCheckCause::StartFailed { stage }
         }
-        AgentFailureCause::AgentLoginUnavailable => HarnessLoginCheckCause::StartFailed {
-            stage: AGENT_LOGIN_UNAVAILABLE,
-        },
         AgentFailureCause::HarnessSetupFailed { stage }
         | AgentFailureCause::HarnessSetupRejected { stage, .. } => {
             HarnessLoginCheckCause::StartFailed {

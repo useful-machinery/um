@@ -126,7 +126,8 @@ pub(super) fn to_authorize(
     options: &Options,
     grant: &MemberGrant,
 ) -> anyhow::Result<Offer> {
-    if grant.provider == MemberGrantProvider::GrantProviderCodex && !grant.authorizations.is_empty()
+    if grant.provider == MemberGrantProvider::GrantProviderCodex.as_str()
+        && !grant.authorizations.is_empty()
     {
         return Ok(Offer::Nothing(Nothing::AuthorizedElsewhere));
     }

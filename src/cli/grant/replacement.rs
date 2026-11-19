@@ -9,26 +9,27 @@ use anyhow::anyhow;
 use crate::cli::CommandFailure;
 use crate::exit_code::ExitCode;
 use useful_api::{
-    MEMBER_GRANT_PAGE, MemberGrant, MemberGrantApi, MemberGrantFailure, MemberGrantProvider,
-    MemberGrantState,
+    MEMBER_GRANT_PAGE, MemberGrant, MemberGrantApi, MemberGrantFailure, MemberGrantKind,
+    MemberGrantProvider, MemberGrantState,
 };
 use useful_support::Availability;
 
 use super::{confirmation, projection};
 
-/// The member's grants of `provider` that a new sign-in would replace: those of its kind that
-/// are `active` or `reconnect_required`, and for a native provider those of the organization
-/// `organization_id` names. A revoked grant is not held.
+/// The member's grants of the provider `provider` names, of `kind`, that a new sign-in would
+/// replace: those that are `active` or `reconnect_required`, and for a native provider those of
+/// the organization `organization_id` names. A revoked grant is not held.
 pub(super) fn held(
     api: &MemberGrantApi,
-    provider: MemberGrantProvider,
+    provider: &str,
+    kind: MemberGrantKind,
     organization_id: Option<&str>,
 ) -> Result<Vec<MemberGrant>, MemberGrantFailure> {
     let invalid = MemberGrantFailure::InvalidResponse {
         credential_rejected: false,
     };
     let grants = super::every_page(invalid, |cursor| {
-        api.list(Some(provider.kind()), Some(MEMBER_GRANT_PAGE), cursor)
+        api.list(Some(kind), Some(MEMBER_GRANT_PAGE), cursor)
             .map(|page| (page.items, page.next_cursor))
     })?;
     Ok(grants
@@ -37,13 +38,10 @@ pub(super) fn held(
         .collect())
 }
 
-/// Whether `grant` is one the member holds of `provider`: `active` or `reconnect_required`,
-/// and for `organization_id` when that is named. A revoked grant is not held.
-pub(super) fn holds(
-    grant: &MemberGrant,
-    provider: MemberGrantProvider,
-    organization_id: Option<&str>,
-) -> bool {
+/// Whether `grant` is one the member holds of the provider `provider` names: `active` or
+/// `reconnect_required`, and for `organization_id` when that is named. A revoked grant is not
+/// held.
+pub(super) fn holds(grant: &MemberGrant, provider: &str, organization_id: Option<&str>) -> bool {
     grant.provider == provider
         && organization_id.is_none_or(|id| grant.organization_id.as_deref() == Some(id))
         && matches!(
@@ -66,16 +64,15 @@ pub(super) fn needs_reconnecting(grant: &MemberGrant) -> bool {
 
 /// Proceeds when nothing is held or `replace` is given; otherwise asks on a terminal, where
 /// standard input and standard error both are one, and refuses with exit 2 without one or on
-/// any answer but yes.
+/// any answer but yes. The question and the refusal name the provider by `provider`.
 pub(super) fn settle(
-    provider: MemberGrantProvider,
+    provider: &str,
     held: &[MemberGrant],
     replace: bool,
 ) -> Result<(), CommandFailure> {
     if held.is_empty() {
         return Ok(());
     }
-    let provider = provider.as_str();
     let ids = ids(held);
     let refusal = match answer(
         || format!("You already hold a {provider} grant: {ids}"),
@@ -152,6 +149,6 @@ pub(super) fn native_target(
             ExitCode::UsageError,
         ));
     }
-    settle(provider, &held, replace)?;
+    settle(provider.as_str(), &held, replace)?;
     Ok(held.pop())
 }

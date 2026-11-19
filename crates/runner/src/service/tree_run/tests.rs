@@ -6,6 +6,7 @@ use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,12 +29,15 @@ use crate::service::assignment::{
     OBSERVATION_RESERVE_BASE,
 };
 use crate::service::config::{AssignmentConfig, Config, RepositoryUrlPolicy};
-use crate::service::source::SourceCredentialBroker;
-use crate::service::source::test_support::fixture_source_broker;
+use crate::service::source::test_support::{fixture_credential, fixture_source_broker};
+use crate::service::source::{
+    CommitAvailability, CredentialBrokerFailure, ProviderCredential, SourceCredentialBroker,
+    WorkflowGitRevocation, WorkflowGitRevocationOutcome,
+};
 use crate::service::test_support::run_fixture_git;
 use useful_execution::{
-    CancellationReason, EnvironmentSnapshot, ResolvedAttachment, ResolvedFile, ResolvedInput,
-    ResolvedInputs, ResolvedJsonInput,
+    CancellationReason, CaptureCancellation, EnvironmentSnapshot, ResolvedAttachment, ResolvedFile,
+    ResolvedInput, ResolvedInputs, ResolvedJsonInput,
 };
 use useful_runner_protocol::{
     AssignmentDecline, CancellationMode, CloudFrame, ContinuationOffer, ExecutionSpecInvalidReason,
@@ -68,7 +72,8 @@ const RUN_URL: &str = "https://usefulmachinery.com/acme/runs/run_01k0z6r1w8f4jy2
 /// Each `run resume` appends its command line to
 /// `resume.args`, leaves its environment in `resume.env` and answers with the next word of
 /// `$TREE_TEST_RESUMES`, or with the word in `$TREE_TEST_LOG/answer` while that file
-/// exists: `held` (the default) reports the wait unchanged, `unavailable`
+/// exists: `held` (the default) reports the wait unchanged, `gated` does so once
+/// `$TREE_TEST_LOG/gate` no longer exists, `unavailable`
 /// refuses with `wait_condition_unavailable`, `refuse` refuses with
 /// `continuation_nodes_unsatisfied`, `stall` starts nothing and prints nothing until `run
 /// cancel` runs, and `continue` starts the record's next attempt at
@@ -97,7 +102,22 @@ const RUN_URL: &str = "https://usefulmachinery.com/acme/runs/run_01k0z6r1w8f4jy2
 /// beside it in its process group, writes the sleep's pid to `$TREE_TEST_LOG/hang.pid` and
 /// waits for it. While `$TREE_TEST_LOG/noise` exists every command first writes that many
 /// bytes to stderr. While `$TREE_TEST_LOG/unlaunchable` exists `run create` removes the
-/// injected `useful` itself, so no later command can be launched.
+/// injected `useful` itself, so no later command can be launched. While the directory
+/// `$TREE_TEST_LOG/git-home` exists `run create` first names its execution root in `git-root`
+/// and writes that root's local `credential.*` configuration to `create.git-config` and, run
+/// there with that directory as `HOME`, the answer of `git credential fill` for the root's
+/// `origin` to `create.credential` and its exit status to `create.credential.status`; and
+/// `run resume`, while `git-root` names a root, does the same to `resume.git-config`,
+/// `resume.credential` and `resume.credential.status` before it answers.
+/// `run withdraw` appends its command line to `withdraw.args` and its name to `order`, leaves
+/// its environment in `withdraw.env` and answers with the next word of
+/// `$TREE_TEST_WITHDRAWS`: `withdrawn` (the default) ends a waiting record `withdrawn`, as
+/// the runtime does, with the outcome write `withdrawn_write` under the run's `mirror/`, and
+/// answers `withdrawn`; `recorded` answers `recorded` and creates
+/// `$TREE_TEST_LOG/withdraw.recorded`, which a `cancellable` process honors by ending its run
+/// `withdrawn` the same way; `refuse` refuses `mirror_credentials_unavailable`;
+/// `withdrawn_hang` ends a waiting record as `withdrawn` does and then hangs until killed,
+/// printing nothing; and `hang` hangs until killed, leaving the record as it is.
 const USEFUL_FIXTURE: &str = r#"#!/bin/sh
 log="$TREE_TEST_LOG"
 position='["merge"]'
@@ -108,8 +128,22 @@ if [ -f "$log/noise" ]; then head -c "$(cat "$log/noise")" /dev/zero >&2; fi
 stage() {
   if [ -d "$log/stages/$1" ]; then cp -R "$log/stages/$1/." "$run/"; fi
 }
+observe_git() {
+  git -C "$1" config --local --get-regexp '^credential\.' > "$log/$2.git-config"
+  printf 'url=%s\n\n' "$(git -C "$1" remote get-url origin)" |
+    HOME="$log/git-home" GIT_TERMINAL_PROMPT=0 git -C "$1" credential fill > "$log/$2.credential" 2> /dev/null
+  echo "$?" > "$log/$2.credential.status"
+}
 recorded() {
   printf '{"schemaVersion":1,"command":"useful workflow run %s","outcome":"recorded","exitStatus":0,"runDirectory":"%s","run":"run_01k0z6r1w8f4jy2m7q9v3x5loc","control":{"ordinal":1,"event":"control.%s","path":"controls/0001-%s.json","wait":null},"wait":null}\n' "$1" "$2" "$1" "$1"
+}
+withdrawn() {
+  rm -f "$1/wait.json"
+  mkdir -p "$1/mirror"
+  printf '{"schemaVersion":1,"hook":"outcome","at":"2026-07-23T00:00:05Z","issue":"AUTO-143","action":{"kind":"state","state":"Todo","binding":"todoState"},"outcome":"written"}\n' > "$1/mirror/0001-outcome.json"
+  # Replaced whole, as the runtime writes it.
+  printf '{"state":"exited","outcome":"withdrawn","attempts":1,"position":[]}\n' > "$1/run.json.next"
+  mv "$1/run.json.next" "$1/run.json"
 }
 retrying=
 if [ "$1 $2 $3" = "workflow run retry" ]; then
@@ -136,6 +170,10 @@ case "$1 $2 $3" in
   printf '%s\n' "$@" > "$log/create.args"
   env > "$log/create.env"
   if [ -e "$log/unlaunchable" ]; then rm -f "$0"; fi
+  if [ -d "$log/git-home" ]; then
+    printf '%s' "$6" > "$log/git-root"
+    observe_git "$6" create
+  fi
   if [ "$TREE_TEST_STATE" = refused ]; then
     printf '{"schemaVersion":1,"command":"useful workflow run create","outcome":"rejected","exitStatus":1,"phase":"admission","workflow":{"path":"workflow.yaml"},"diagnostics":[{"code":"%s","message":"Install the tool the root workflow'"'"'s `requires.tools` names, or put it on the launching `PATH`.","location":{"kind":"required_tool","tool":"useful-test-no-such-tool"}}]}\n' "${TREE_TEST_REFUSAL:-required_tool_unavailable}"
     exit 1
@@ -150,8 +188,12 @@ case "$1 $2 $3" in
   cancellable)
     printf '{"state":"running","outcome":null,"attempts":1,"position":["build"]}\n' > "$run/run.json"
     n=0
-    while [ ! -e "$log/cancelled" ] && [ "$n" -lt 400 ]; do sleep 0.05; n=$((n + 1)); done
-    printf '{"state":"exited","outcome":"canceled","attempts":1,"position":[]}\n' > "$run/run.json"
+    while [ ! -e "$log/cancelled" ] && [ ! -e "$log/withdraw.recorded" ] && [ "$n" -lt 400 ]; do sleep 0.05; n=$((n + 1)); done
+    if [ -e "$log/withdraw.recorded" ]; then
+      withdrawn "$run"
+    else
+      printf '{"state":"exited","outcome":"canceled","attempts":1,"position":[]}\n' > "$run/run.json"
+    fi
     ;;
   waiting)
     if [ -e "$log/running" ]; then
@@ -242,9 +284,14 @@ case "$1 $2 $3" in
   printf '%s\n' "$run" >> "$log/resume.log"
   printf '%s\n' "$*" >> "$log/resume.args"
   env > "$log/resume.env"
+  if [ -f "$log/git-root" ]; then observe_git "$(cat "$log/git-root")" resume; fi
   n=$(wc -l < "$log/resume.log" | tr -d ' ')
   answer=$(printf '%s\n' $TREE_TEST_RESUMES | sed -n "${n}p")
   if [ -f "$log/answer" ]; then answer=$(cat "$log/answer"); fi
+  if [ "$answer" = gated ]; then
+    i=0
+    while [ -e "$log/gate" ] && [ "$i" -lt 400 ]; do sleep 0.05; i=$((i + 1)); done
+  fi
   case "$answer" in
   continue)
     rm -f "$run/wait.json"
@@ -274,6 +321,29 @@ case "$1 $2 $3" in
   *)
     stage "resume$n"
     printf '{"schemaVersion":1,"outcome":"waiting","exitStatus":0,"runDirectory":"%s","attemptNumber":1}\n' "$run"
+    ;;
+  esac
+  ;;
+"workflow run withdraw")
+  printf '%s\n' "$*" >> "$log/withdraw.args"
+  echo withdraw >> "$log/order"
+  env > "$log/withdraw.env"
+  n=$(wc -l < "$log/withdraw.args" | tr -d ' ')
+  answer=$(printf '%s\n' $TREE_TEST_WITHDRAWS | sed -n "${n}p")
+  case "$answer" in
+  recorded)
+    : > "$log/withdraw.recorded"
+    printf '{"schemaVersion":1,"command":"useful workflow run withdraw","outcome":"recorded","exitStatus":0,"runDirectory":"%s","run":"run_01k0z6r1w8f4jy2m7q9v3x5loc"}\n' "$4"
+    ;;
+  refuse)
+    printf '{"schemaVersion":1,"command":"useful workflow run withdraw","outcome":"refused","exitStatus":1,"runDirectory":"%s","diagnostics":[{"code":"mirror_credentials_unavailable","message":"unavailable"}]}\n' "$4"
+    exit 1
+    ;;
+  hang) sleep 60 & wait ;;
+  *)
+    if grep -q '"state":"waiting"' "$4/run.json"; then withdrawn "$4"; fi
+    if [ "$answer" = withdrawn_hang ]; then sleep 60 & wait; fi
+    printf '{"schemaVersion":1,"command":"useful workflow run withdraw","outcome":"withdrawn","exitStatus":0,"runDirectory":"%s","run":"run_01k0z6r1w8f4jy2m7q9v3x5loc"}\n' "$4"
     ;;
   esac
   ;;
@@ -438,6 +508,17 @@ fn tree_offer() -> CloudFrame {
     .unwrap()
 }
 
+/// The built `useful` beside the test binary, which serves the workflow-Git helper's
+/// internal mode the test binary does not; the checks build it before the tests.
+fn built_useful() -> PathBuf {
+    std::env::current_exe()
+        .unwrap()
+        .parent()
+        .and_then(Path::parent)
+        .unwrap()
+        .join(format!("useful{}", std::env::consts::EXE_SUFFIX))
+}
+
 /// Writes the injected `useful` to `directory`.
 fn injected_useful(directory: &Path) -> PathBuf {
     let useful = directory.join("useful");
@@ -584,6 +665,7 @@ fn fixture_sourced(
         source_broker(&source),
         TreeRunDependencies::new(Some(Arc::new(broker)))
             .with_executable(useful)
+            .with_helper_executable(built_useful())
             .with_resume_intervals(TEST_INTERVALS)
             .with_command_bound(bound),
         environment,
@@ -761,6 +843,101 @@ async fn published_tree_runs_once_and_reports_the_chosen_outcome() {
     );
 }
 
+/// The values that follow each `--source-revision` on the fixture's `create`, in order.
+fn source_revision_arguments(log: &Path) -> Vec<String> {
+    let create = logged_lines(log, "create.args");
+    create
+        .windows(2)
+        .filter(|pair| pair[0] == "--source-revision")
+        .map(|pair| pair[1].clone())
+        .collect()
+}
+
+/// A definition commit of the schema-3 offers, distinct from the workspace commit.
+const DEFINITION_COMMIT: &str = "fedcba9876543210fedcba9876543210fedcba98";
+
+/// The fixture's offer as Cloud admits a schema-3 run: the workflow pinned at
+/// `DEFINITION_COMMIT` of the source branch, the workspace at the fixture commit, selected
+/// as `workspace_branch` when one is given.
+fn schema_3_offer(fixture: &mut Fixture, workspace_branch: Option<&str>) {
+    let spec = &mut fixture.offer.execution_spec;
+    spec.schema_version = 3;
+    DEFINITION_COMMIT.clone_into(&mut spec.workflow_definition_source.commit_oid);
+    spec.workspace_branch = workspace_branch.map(str::to_owned);
+    let commit = spec.primary_workspace_source.commit_oid.clone();
+    spec.workspace_membership = Some(useful_runner_protocol::WorkspaceMembership {
+        repository_connection_id: spec
+            .primary_workspace_source
+            .repository_connection_id
+            .clone(),
+        provider_kind: "github".to_owned(),
+        provider_repository_id: "1234".to_owned(),
+        object_format: "sha1".to_owned(),
+        workspace_commit_oid: commit.clone(),
+        witness: useful_runner_protocol::WorkspaceWitness {
+            reference: format!("refs/heads/{}", workspace_branch.unwrap_or("main")),
+            tip_oid: commit,
+            relationship: "equal".to_owned(),
+            observed_at: "2026-10-18T12:00:00Z".to_owned(),
+        },
+        change_request: None,
+    });
+}
+
+// REQ-RUNNERENROLL-120, REQ-WORKSPACE-16: the runtime's `create` names the pinned source as
+// the engine path sets it, each name and value one argument after the option.
+#[tokio::test]
+async fn create_names_the_pinned_source_of_each_spec_schema() {
+    let mut schema_2 = fixture(TREE_DIGEST, "exited", "\"planned\"");
+    let commit = schema_2
+        .offer
+        .execution_spec
+        .primary_workspace_source
+        .commit_oid
+        .clone();
+    assert_eq!(schema_2.offer.execution_spec.source_branch, "main");
+    execute(&mut schema_2).await;
+    assert_eq!(
+        source_revision_arguments(&schema_2.log),
+        [format!("commit={commit}"), "branch=main".to_owned()]
+    );
+
+    let mut on_a_branch = fixture(TREE_DIGEST, "exited", "\"planned\"");
+    schema_3_offer(&mut on_a_branch, Some("feature/x"));
+    execute(&mut on_a_branch).await;
+    let commit = &on_a_branch
+        .offer
+        .execution_spec
+        .primary_workspace_source
+        .commit_oid;
+    assert_eq!(
+        source_revision_arguments(&on_a_branch.log),
+        [
+            format!("commit={commit}"),
+            "branch=feature/x".to_owned(),
+            "workflowBranch=main".to_owned(),
+            format!("workflowCommit={DEFINITION_COMMIT}"),
+        ]
+    );
+
+    let mut without_a_branch = fixture(TREE_DIGEST, "exited", "\"planned\"");
+    schema_3_offer(&mut without_a_branch, None);
+    execute(&mut without_a_branch).await;
+    let commit = &without_a_branch
+        .offer
+        .execution_spec
+        .primary_workspace_source
+        .commit_oid;
+    assert_eq!(
+        source_revision_arguments(&without_a_branch.log),
+        [
+            format!("commit={commit}"),
+            "workflowBranch=main".to_owned(),
+            format!("workflowCommit={DEFINITION_COMMIT}"),
+        ]
+    );
+}
+
 // REQ-RUNNERENROLL-99: a run that succeeded and chose an outcome its workflow names
 // `failed` finishes `succeeded`, that outcome its chosen one.
 #[tokio::test]
@@ -837,6 +1014,180 @@ async fn exited_run_without_a_settled_document_finishes_by_its_recorded_result()
         json!({ "stage": "tree_run_adopted_failure" })
     );
     assert_eq!(payload["chosenOutcome"], "blocked");
+}
+
+/// The execution credential `GitHubSourceBroker` issues.
+const WORKFLOW_GIT_TOKEN: &str = "ghs_fixture-workflow-git";
+
+/// A GitHub project's source broker for the fixture repository: preparation reads it with
+/// the fixture's provider token and no canonical origin, and each execution credential it
+/// issues, which it counts, names the repository as the origin.
+struct GitHubSourceBroker {
+    origin: String,
+    issued_workflow_git: AtomicUsize,
+}
+
+impl SourceCredentialBroker for GitHubSourceBroker {
+    fn issue(
+        &self,
+        _: &str,
+        _: &CaptureCancellation,
+    ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+        Ok(fixture_credential(
+            self.origin.clone(),
+            "fixture-provider-token",
+        ))
+    }
+
+    fn commit_availability(
+        &self,
+        _: &str,
+        _: &CaptureCancellation,
+    ) -> Result<CommitAvailability, CredentialBrokerFailure> {
+        Err(CredentialBrokerFailure::Unavailable)
+    }
+
+    fn issue_workflow_git(
+        &self,
+        _: &str,
+        _: &CaptureCancellation,
+    ) -> Result<ProviderCredential, CredentialBrokerFailure> {
+        self.issued_workflow_git.fetch_add(1, Ordering::SeqCst);
+        let mut credential = fixture_credential(self.origin.clone(), WORKFLOW_GIT_TOKEN);
+        credential.expires_at = useful_support::utc_now() + time::Duration::hours(1);
+        Ok(credential)
+    }
+
+    fn revoke_workflow_git(
+        &self,
+        _: &str,
+        _: &[u8],
+    ) -> Result<WorkflowGitRevocation, CredentialBrokerFailure> {
+        Ok(WorkflowGitRevocation::GitHub {
+            issuance_id: "wgi_fixture".to_owned(),
+            outcome: WorkflowGitRevocationOutcome::Revoked,
+            provider_expires_at: useful_support::utc_now() + time::Duration::hours(1),
+        })
+    }
+}
+
+/// Parses `git config --get-regexp` output into its keys and values.
+fn git_config_entries(output: &str) -> BTreeMap<String, String> {
+    output
+        .lines()
+        .map(|line| {
+            let (key, value) = line.split_once(' ').unwrap_or((line, ""));
+            (key.to_owned(), value.to_owned())
+        })
+        .collect()
+}
+
+/// A tree run on a GitHub project whose run fails in `build`, so its workspace is retained:
+/// its source broker, which counts each execution credential it issues, and the scripted
+/// runtime observing its Git access under a `HOME` whose global configuration names a
+/// helper that writes the returned marker when it runs.
+fn github_tree_fixture() -> (Fixture, Arc<GitHubSourceBroker>, PathBuf) {
+    let mut github = None;
+    let fixture = fixture_sourced(
+        TREE_DIGEST,
+        "exited",
+        "\"failed\"",
+        &[("TREE_TEST_RESULT", BUILD_FAILED)],
+        None,
+        super::command::SHORT_COMMAND_BOUND,
+        |source| -> Arc<dyn SourceCredentialBroker> {
+            let broker = Arc::new(GitHubSourceBroker {
+                origin: Url::from_file_path(source).unwrap().to_string(),
+                issued_workflow_git: AtomicUsize::new(0),
+            });
+            github = Some(Arc::clone(&broker));
+            broker
+        },
+        TREE_FILES,
+    );
+    let home = fixture.log.join("git-home");
+    fs::create_dir(&home).unwrap();
+    let marker = fixture.log.join("global-helper-ran");
+    let global_helper = fixture.log.join("global-helper");
+    fs::write(
+        &global_helper,
+        format!(
+            "#!/bin/sh\n: > '{}'\nprintf 'username=global\\npassword=global-token\\n\\n'\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&global_helper, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        home.join(".gitconfig"),
+        format!("[credential]\n\thelper = {}\n", global_helper.display()),
+    )
+    .unwrap();
+    (fixture, github.unwrap(), marker)
+}
+
+/// Asserts what the scripted runtime's `command` observed of the workspace's Git access:
+/// the runner's relay wiring for `github`'s origin in the workspace's configuration, a
+/// credential request for that origin answered with the credential Cloud issues, and the
+/// host's global helper, which would write `marker`, not consulted.
+fn assert_relay_observed(log: &Path, command: &str, github: &GitHubSourceBroker, marker: &Path) {
+    let configured =
+        git_config_entries(&fs::read_to_string(log.join(format!("{command}.git-config"))).unwrap());
+    let scoped_helper = format!("credential.{}.helper", github.origin);
+    assert_eq!(configured.len(), 3, "{configured:#?}");
+    assert_eq!(
+        configured.get("credential.helper").map(String::as_str),
+        Some("")
+    );
+    assert_eq!(
+        configured.get("credential.usehttppath").map(String::as_str),
+        Some("true")
+    );
+    assert!(
+        configured
+            .get(&scoped_helper)
+            .is_some_and(|helper| !helper.is_empty()),
+        "{configured:#?}"
+    );
+    assert_eq!(
+        fs::read_to_string(log.join(format!("{command}.credential.status"))).unwrap(),
+        "0\n"
+    );
+    assert!(
+        logged_lines(log, &format!("{command}.credential"))
+            .contains(&format!("password={WORKFLOW_GIT_TOKEN}")),
+        "the relay did not answer the credential request"
+    );
+    assert!(
+        !marker.exists(),
+        "the host's global credential helper was consulted"
+    );
+}
+
+// REQ-RUNNERENROLL-121, REQ-WORKSPACE-19, REQ-WORKSPACE-21, REQ-WORKSPACE-22: a tree run on a
+// GitHub project runs with the runner's Git read relay for its origin in the workspace,
+// which answers a credential request for that origin with the credential Cloud issues and
+// resets the host's global helpers, and leaves no wiring in the retained workspace.
+#[tokio::test]
+async fn github_tree_assignment_runs_its_steps_over_the_relay_for_its_origin() {
+    let (mut fixture, github, marker) = github_tree_fixture();
+    assert_eq!(
+        prepare_offered(&mut fixture.manager, &fixture.offer).await,
+        None
+    );
+    let (workspace, private) = accepted_roots(&fixture.manager);
+
+    start_offered(&mut fixture.manager, &fixture.offer).spawn();
+    let reports = finished_reports(&mut fixture.manager).await;
+    assert!(
+        matches!(reports.last(), Some(ExecutionReport::TreeFinished { outcome, .. })
+            if outcome["outcome"] == "failed"),
+        "{reports:#?}"
+    );
+
+    assert_relay_observed(&fixture.log, "create", &github, &marker);
+    assert_eq!(github.issued_workflow_git.load(Ordering::SeqCst), 1);
+    assert_no_runner_git_wiring(&workspace, &private);
 }
 
 /// A tree run offered on a GitLab project as Cloud admits one: schema 2 with both
@@ -954,9 +1305,9 @@ async fn kept_agent_login_reaches_the_runtime_that_creates_the_run() {
     );
 }
 
-// REQ-RUNNERENROLL-91, REQ-GRANT-87: the runtime that creates the run is offered the
-// admission's issued GitHub token and its file, and nothing of the service's GitLab token
-// while Cloud records a GitLab grant in force that issued none.
+// REQ-RUNNERENROLL-91, REQ-GRANT-87, REQ-GRANT-86: the runtime that creates the run is
+// offered the admission's issued GitHub token and its file, and the service's own GitLab token,
+// for which Cloud is asked for none.
 #[tokio::test]
 async fn issued_grant_token_reaches_the_runtime_that_creates_the_run() {
     use crate::agent_login::cloud::{GrantTokenFailure, GrantTokenRefusal};
@@ -965,18 +1316,15 @@ async fn issued_grant_token_reaches_the_runtime_that_creates_the_run() {
     use crate::control_protocol::AgentLoginProvider;
     use crate::service::control::{AdmissionAgentLogins, LiveStatus};
     use crate::service::test_support::{
-        CountedGate, FakeAgentLoginCloud, FakeGrantToken, fake_agent_login_setup, fake_grant_token,
+        CountedGate, FakeAgentLoginCloud, FakeGrantToken, fake_agent_login_setup_serving,
+        fake_grant_token,
     };
 
-    let mut fixture = fixture_with(
-        TREE_DIGEST,
-        "exited",
-        "\"planned\"",
-        &[
-            ("GITLAB_TOKEN", "service-gitlab-token"),
-            ("GITLAB_TOKEN_FILE", "/service/gitlab-token"),
-        ],
-    );
+    let service = [
+        ("GITLAB_TOKEN", "service-gitlab-token"),
+        ("GITLAB_TOKEN_FILE", "/service/gitlab-token"),
+    ];
+    let mut fixture = fixture_with(TREE_DIGEST, "exited", "\"planned\"", &service);
     let state = tempfile::tempdir().unwrap();
     let home = state.path().join("service-home");
     fs::create_dir(&home).unwrap();
@@ -993,7 +1341,7 @@ async fn issued_grant_token_reaches_the_runtime_that_creates_the_run() {
     );
     let (recorder, _capture) = crate::telemetry::test_recorder("rbt_01k0z6r1w8f4jy2m7q9v3x5abe");
     let setup = Arc::new(AgentLoginSetup::new(
-        fake_agent_login_setup(cloud, &home, state.path(), recorder),
+        fake_agent_login_setup_serving(Arc::clone(&cloud), &home, &service, state.path(), recorder),
         Arc::new(CountedGate::idle()),
         || time::OffsetDateTime::from_unix_timestamp(1_794_450_000).unwrap(),
     ));
@@ -1012,26 +1360,32 @@ async fn issued_grant_token_reaches_the_runtime_that_creates_the_run() {
     let token = fake_grant_token(AgentLoginProvider::Github, 3);
     assert!(environment.contains(&format!("GH_TOKEN={token}")));
     assert!(environment.contains(&format!("GH_TOKEN_FILE={}", github_file.display())));
-    for name in ["GITLAB_TOKEN", "GITLAB_TOKEN_FILE"] {
+    for (name, value) in service {
         assert!(
-            !environment
-                .iter()
-                .any(|line| line.starts_with(&format!("{name}="))),
-            "create.env carries {name}"
+            environment.contains(&format!("{name}={value}")),
+            "create.env lacks {name}"
         );
     }
+    assert!(
+        cloud
+            .grant_requests()
+            .iter()
+            .all(|request| request.provider.agent_login_provider()
+                != Some(AgentLoginProvider::Gitlab))
+    );
 }
 
-// REQ-WORKSPACE-18: a tree run's runtime admits its steps itself and would pass a declared
-// grant token name, so the runtime never receives the daemon's own values of them.
+// REQ-WORKSPACE-18, REQ-GRANT-87, REQ-GRANT-86: a tree run's runtime admits its steps
+// itself, so it receives the daemon's own values of the grant token names, which a step that
+// declares one then receives.
 #[tokio::test]
-async fn runtime_never_receives_the_daemon_grant_token_names() {
+async fn runtime_receives_the_daemon_grant_token_names() {
     const GRANT_TOKEN_NAMES: [&str; 3] = [
         "GH_TOKEN",
         "USEFUL_LINEAR_ACCESS_TOKEN",
         "USEFUL_LINEAR_ACCESS_TOKEN_FILE",
     ];
-    let variables = GRANT_TOKEN_NAMES.map(|name| (name, "daemon-private"));
+    let variables = GRANT_TOKEN_NAMES.map(|name| (name, "daemon-host"));
     let mut fixture = fixture_with(TREE_DIGEST, "exited", "\"planned\"", &variables);
 
     execute(&mut fixture).await;
@@ -1041,10 +1395,8 @@ async fn runtime_never_receives_the_daemon_grant_token_names() {
         assert!(environment.contains(&"GITHUB_TOKEN=daemon-github-token".to_owned()));
         for name in GRANT_TOKEN_NAMES {
             assert!(
-                !environment
-                    .iter()
-                    .any(|line| line.starts_with(&format!("{name}="))),
-                "{log} carries {name}"
+                environment.contains(&format!("{name}=daemon-host")),
+                "{log} lacks {name}"
             );
         }
     }
@@ -2159,6 +2511,225 @@ async fn stop_control_while_a_process_runs_is_applied_beside_it() {
         control_applications(&reports),
         [applied(CONTROL_ID, "recorded")]
     );
+    assert_eq!(chosen_outcome(&reports).as_deref(), Some("canceled"));
+}
+
+/// The outcome write the injected `useful`'s `run withdraw` leaves in the run's `mirror/`.
+fn withdrawn_write() -> Value {
+    mirror_write(
+        "outcome",
+        json!({"kind": "state", "state": "Todo", "binding": "todoState"}),
+        "written",
+        json!({}),
+    )
+}
+
+fn refused(id: &str, code: &str) -> RunControlApplication {
+    RunControlApplication {
+        control_id: id.to_owned(),
+        outcome: RunControlOutcome::Refused {
+            code: code.to_owned(),
+        },
+    }
+}
+
+// REQ-RUNNERENROLL-123, REQ-RUNNERENROLL-99: a withdrawal on a run waiting on a wait only a
+// control resolves runs `useful workflow run withdraw` under the run's environment, which
+// ends the run; no resume follows, and the exit reports the withdrawal with the command's
+// outcome write and the release it confirms. Cloud does not yet accept this `cancelled`
+// finish, which it did not request (AUTO-665): the run's `state` reads `interrupted` once its
+// lease expires. This pins what the runner sends.
+#[tokio::test]
+async fn withdraw_control_on_a_waiting_run_ends_it_withdrawn_without_a_resume() {
+    let mut fixture = control_wait_fixture("approval", &[]);
+    start(&mut fixture).await;
+    wait_for_waiting(&mut fixture).await;
+    send_control(&mut fixture, CONTROL_ID, json!({"kind": "withdraw"}));
+    let reports = finished_reports(&mut fixture.manager).await;
+
+    let commands = logged_lines(&fixture.log, "withdraw.args");
+    assert_eq!(commands.len(), 1, "{commands:#?}");
+    assert!(
+        commands[0].starts_with("workflow run withdraw "),
+        "{}",
+        commands[0]
+    );
+    assert!(
+        commands[0].ends_with("/runs/run_01k0z6r1w8f4jy2m7q9v3x5loc --json"),
+        "{}",
+        commands[0]
+    );
+    // The command runs under the run's environment, as the run's other commands do.
+    let environment = logged_lines(&fixture.log, "withdraw.env");
+    assert!(environment.contains(&"GITHUB_TOKEN=daemon-github-token".to_owned()));
+    assert!(
+        environment
+            .iter()
+            .any(|line| line.starts_with("USEFUL_HOME="))
+    );
+    assert_eq!(
+        control_applications(&reports),
+        [applied(CONTROL_ID, "withdrawn")]
+    );
+    assert_eq!(resumes(&fixture.log), 0);
+    assert_eq!(order(&fixture.log), ["withdraw"]);
+    assert_eq!(terminal_count(&reports), 1);
+    let Some(ExecutionReport::TreeFinished { outcome, exit, .. }) = reports.last() else {
+        panic!("expected a tree finish: {reports:#?}");
+    };
+    assert_eq!(outcome["outcome"], "cancelled");
+    assert_eq!(
+        exit,
+        &TreeExit {
+            chosen_outcome: Some("withdrawn".to_owned()),
+            mirror: vec![mirror_result(withdrawn_write())],
+            claim_release: true,
+        }
+    );
+}
+
+// REQ-RUNNERENROLL-123: beside a running process a withdrawal is recorded for it, `applied`
+// `recorded`; nothing cancels the process, and the loop ends on the exit of the process that
+// honored the withdrawal.
+#[tokio::test]
+async fn withdraw_control_while_a_process_runs_is_recorded_and_ends_with_its_exit() {
+    let mut fixture = fixture_with(
+        TREE_DIGEST,
+        "cancellable",
+        "null",
+        &[("TREE_TEST_WITHDRAWS", "recorded")],
+    );
+    start(&mut fixture).await;
+    wait_for_reports(&mut fixture.manager, |reports| {
+        progress(reports)
+            .iter()
+            .any(|(_, _, state, _)| *state == "running")
+    })
+    .await;
+    send_control(&mut fixture, CONTROL_ID, json!({"kind": "withdraw"}));
+    let reports = finished_reports(&mut fixture.manager).await;
+
+    assert_eq!(
+        control_applications(&reports),
+        [applied(CONTROL_ID, "recorded")]
+    );
+    // `create` ended the run itself: nothing cancelled it or the run.
+    assert!(!fixture.log.join("cancelled").exists());
+    assert!(!fixture.log.join("cancel.args").exists());
+    assert_eq!(order(&fixture.log), ["withdraw"]);
+    assert_eq!(terminal_count(&reports), 1);
+    assert_eq!(chosen_outcome(&reports).as_deref(), Some("withdrawn"));
+}
+
+// REQ-RUNNERENROLL-123, REQ-LOCALRUN-212: a withdrawal recorded beside a `resume` that only
+// evaluated a held `external` wait is left pending by it; the runner runs `withdraw` once
+// more on the waiting run, which ends it, reports nothing further and resumes nothing.
+#[tokio::test]
+async fn withdrawal_a_held_wait_evaluation_left_pending_is_finished_without_a_resume() {
+    let mut fixture = fixture_with(
+        TREE_DIGEST,
+        "waiting",
+        "null",
+        &[
+            ("TREE_TEST_WAIT_KIND", "external"),
+            ("TREE_TEST_WAIT_SOURCE", "github"),
+            ("TREE_TEST_RESUMES", "gated"),
+            ("TREE_TEST_WITHDRAWS", "recorded withdrawn"),
+        ],
+    );
+    fs::write(fixture.log.join("gate"), b"").unwrap();
+    start(&mut fixture).await;
+    wait_for_waiting(&mut fixture).await;
+    send_control(&mut fixture, CONTROL_ID, json!({"kind": "withdraw"}));
+    wait_for_reports(&mut fixture.manager, |reports| {
+        !control_applications(reports).is_empty()
+    })
+    .await;
+    // The evaluation that held the run as the withdrawal arrived ends with the wait held.
+    fs::remove_file(fixture.log.join("gate")).unwrap();
+    let reports = finished_reports(&mut fixture.manager).await;
+
+    assert_eq!(order(&fixture.log), ["resume", "withdraw", "withdraw"]);
+    assert_eq!(
+        control_applications(&reports),
+        [applied(CONTROL_ID, "recorded")]
+    );
+    assert_eq!(terminal_count(&reports), 1);
+    assert_eq!(chosen_outcome(&reports).as_deref(), Some("withdrawn"));
+}
+
+// REQ-RUNNERENROLL-123: a refused withdrawal reports the command's refusal code, and the run
+// keeps waiting with no evaluation run.
+#[tokio::test]
+async fn refused_withdrawal_reports_its_code_and_the_run_keeps_waiting() {
+    let mut fixture = control_wait_fixture("approval", &[("TREE_TEST_WITHDRAWS", "refuse")]);
+    start(&mut fixture).await;
+    wait_for_waiting(&mut fixture).await;
+    send_control(&mut fixture, CONTROL_ID, json!({"kind": "withdraw"}));
+    wait_for_reports(&mut fixture.manager, |reports| {
+        !control_applications(reports).is_empty()
+    })
+    .await;
+    crate::service::Sleeper::sleep(&crate::service::TokioSleeper, Duration::from_millis(100)).await;
+    assert_eq!(resumes(&fixture.log), 0);
+    assert_eq!(order(&fixture.log), ["withdraw"]);
+    cancel_assignment(&mut fixture);
+    let reports = finished_reports(&mut fixture.manager).await;
+
+    assert_eq!(
+        control_applications(&reports),
+        [refused(CONTROL_ID, "mirror_credentials_unavailable")]
+    );
+    assert_eq!(chosen_outcome(&reports).as_deref(), Some("canceled"));
+}
+
+// REQ-RUNNERENROLL-123: a withdrawal whose command outlived its bound is read from the run's
+// record, not its controls: `applied` `withdrawn` once the record reads `exited` `withdrawn`,
+// and otherwise `refused` `control_command_failed`, the run's log naming the class
+// `timeout`, and the run keeps waiting.
+#[tokio::test]
+async fn withdrawal_that_outlived_its_bound_is_read_from_the_run_record() {
+    let mut ended = control_wait_fixture_bounded(
+        "approval",
+        &[("TREE_TEST_WITHDRAWS", "withdrawn_hang")],
+        HANGING_CONTROL_BOUND,
+    );
+    start(&mut ended).await;
+    wait_for_waiting(&mut ended).await;
+    send_control(&mut ended, CONTROL_ID, json!({"kind": "withdraw"}));
+    let reports = finished_reports(&mut ended.manager).await;
+
+    assert_eq!(
+        control_applications(&reports),
+        [applied(CONTROL_ID, "withdrawn")]
+    );
+    assert_eq!(resumes(&ended.log), 0);
+    assert_eq!(chosen_outcome(&reports).as_deref(), Some("withdrawn"));
+
+    let mut unchanged = control_wait_fixture_bounded(
+        "approval",
+        &[("TREE_TEST_WITHDRAWS", "hang")],
+        HANGING_CONTROL_BOUND,
+    );
+    start(&mut unchanged).await;
+    wait_for_waiting(&mut unchanged).await;
+    send_control(&mut unchanged, CONTROL_ID, json!({"kind": "withdraw"}));
+    wait_for_reports(&mut unchanged.manager, |reports| {
+        !control_applications(reports).is_empty()
+    })
+    .await;
+    let failed = failure_lines(&run_log(&unchanged), "control_command_failed");
+    assert_eq!(failed.len(), 1, "{failed:#?}");
+    assert!(failed[0].contains("class=timeout"), "{}", failed[0]);
+    assert_eq!(resumes(&unchanged.log), 0);
+    cancel_assignment(&mut unchanged);
+    let reports = finished_reports(&mut unchanged.manager).await;
+
+    assert_eq!(
+        control_applications(&reports),
+        [refused(CONTROL_ID, "control_command_failed")]
+    );
+    assert_eq!(order(&unchanged.log), ["withdraw"]);
     assert_eq!(chosen_outcome(&reports).as_deref(), Some("canceled"));
 }
 
@@ -3506,14 +4077,138 @@ async fn waiting_report_carries_the_questions_of_an_answer_wait_whole_or_not_at_
     }
 }
 
-// REQ-RUNNERENROLL-119: a report sent for steps alone restates the wait's questions with
-// the root it restates.
+/// The engine's `failedChild` record of a stage whose `draftPr` step failed executing.
+fn failed_child_record() -> Value {
+    json!({
+        "outcome": "failed",
+        "primaryIssue": {
+            "node": {"id": "draftPr", "role": "step"},
+            "state": "failed",
+            "detail": {"phase": "execution", "code": "command_exit", "exitCode": 1},
+        },
+    })
+}
+
+/// The `failedChild` a wait whose payload holds `failed_child_record` reports.
+fn reported_failed_child() -> Value {
+    json!({
+        "outcome": "failed",
+        "node": {"id": "draftPr", "role": "step"},
+        "state": "failed",
+        "phase": "execution",
+        "code": "command_exit",
+    })
+}
+
+// REQ-RUNNERENROLL-125: a wait's report carries the failed child its payload records,
+// reduced and whole or not at all, on a wait of any kind, and the run goes on either way.
+#[tokio::test]
+async fn waiting_report_carries_the_failed_child_of_a_wait_whole_or_not_at_all() {
+    let with = |change: &dyn Fn(&mut Value)| {
+        let mut record = failed_child_record();
+        change(&mut record);
+        json!({ "failedChild": record })
+    };
+    let finalizer = with(&|record| {
+        record["item"] = json!(2);
+        record["primaryIssue"]["node"] = json!({"id": "draftPr", "role": "finalizer"});
+    });
+    let mut finalizer_child = reported_failed_child();
+    finalizer_child["node"]["role"] = json!("finalizer");
+    let blocked = json!({"failedChild": {
+        "outcome": "failed",
+        "primaryIssue": {
+            "node": {"id": "publish", "role": "step"},
+            "state": "blocked",
+            "detail": {
+                "code": "prerequisites_unsatisfied",
+                "prerequisites": [{"kind": "body", "ref": "outputs.produce.payload"}],
+            },
+        },
+    }});
+    let cases = [
+        (
+            "repair",
+            json!({ "failedChild": failed_child_record() }),
+            Some(reported_failed_child()),
+        ),
+        ("repair", finalizer, Some(finalizer_child)),
+        (
+            "repair",
+            blocked,
+            Some(json!({
+                "outcome": "failed",
+                "node": {"id": "publish", "role": "step"},
+                "state": "blocked",
+            })),
+        ),
+        ("repair", json!({}), None),
+        (
+            "repair",
+            json!({"failedChild": "the child's own export"}),
+            None,
+        ),
+        ("repair", with(&|record| record["extra"] = json!(1)), None),
+        (
+            "repair",
+            with(&|record| record["outcome"] = json!("Not-A-Slug")),
+            None,
+        ),
+        (
+            "repair",
+            with(&|record| record["primaryIssue"]["node"]["id"] = json!("draft-pr")),
+            None,
+        ),
+        (
+            "answer",
+            json!({"questions": [{"question": "A"}], "failedChild": failed_child_record()}),
+            Some(reported_failed_child()),
+        ),
+    ];
+    for (kind, payload, failed_child) in cases {
+        let payload = payload.to_string();
+        let mut fixture =
+            control_wait_fixture(kind, &[("TREE_TEST_WAIT_PAYLOAD", payload.as_str())]);
+        start(&mut fixture).await;
+        wait_for_waiting(&mut fixture).await;
+        let control = if kind == "answer" {
+            answering("1")
+        } else {
+            resolving("retry", kind)
+        };
+        send_control(&mut fixture, CONTROL_ID, control);
+        let reports = finished_reports(&mut fixture.manager).await;
+
+        let mut expected = json!({ "kind": kind, "since": WAIT_SINCE, "step": ["merge"] });
+        if kind == "answer" {
+            expected["questions"] = json!([{ "id": "1", "text": "A" }]);
+        }
+        if let Some(failed_child) = failed_child {
+            expected["failedChild"] = failed_child;
+        }
+        let waits = reported_waits(&reports, &fixture.offer);
+        assert!(!waits.is_empty(), "{payload}: {reports:#?}");
+        for (wait, _) in &waits {
+            assert_eq!(wait, &expected, "{payload}");
+        }
+        let Some(ExecutionReport::TreeFinished { outcome, .. }) = reports.last() else {
+            panic!("expected a tree finish: {reports:#?}");
+        };
+        assert_eq!(outcome["outcome"], "succeeded", "{payload}");
+    }
+}
+
+// REQ-RUNNERENROLL-119, REQ-RUNNERENROLL-125: a report sent for steps alone restates the
+// wait's questions and failed child with the root it restates.
 #[tokio::test]
 async fn report_for_steps_alone_restates_the_questions_of_the_wait() {
-    let payload = json!({"questions": [
-        {"id": "scope", "text": "A"},
-        {"id": "q2", "text": "B"},
-    ]})
+    let payload = json!({
+        "questions": [
+            {"id": "scope", "text": "A"},
+            {"id": "q2", "text": "B"},
+        ],
+        "failedChild": failed_child_record(),
+    })
     .to_string();
     let mut fixture = fixture_with(
         TREE_DIGEST,
@@ -3562,6 +4257,7 @@ async fn report_for_steps_alone_restates_the_questions_of_the_wait() {
         "since": WAIT_SINCE,
         "step": ["merge"],
         "questions": [{ "id": "scope", "text": "A" }, { "id": "q2", "text": "B" }],
+        "failedChild": reported_failed_child(),
     });
     let waits = reported_waits(&reports, &fixture.offer);
     assert_eq!(
@@ -5714,6 +6410,91 @@ async fn continuation_offer_adopts_the_retained_run_and_resumes_it_from_the_name
     assert!(!cleanup_failed(&mut fixture.manager));
     assert!(!workspace.exists());
     assert!(!assignment_directory(&workspace, &next.assignment_id).exists());
+}
+
+// REQ-RUNNERENROLL-122: a continuation that adopts a tree run on a GitHub project resumes it
+// with the runner's Git read relay in the retained workspace, for the origin the first
+// attempt cloned however many remotes a step added there, and leaves no wiring in the
+// workspace it retains.
+#[tokio::test]
+async fn continuation_of_a_github_tree_run_resumes_it_over_the_relay_for_the_first_origin() {
+    let (mut fixture, github, marker) = github_tree_fixture();
+    let workspace = retained_first_attempt(&mut fixture).await;
+    let first = fixture.offer.clone();
+    run_fixture_git(
+        &workspace,
+        &[
+            "remote",
+            "add",
+            "upstream",
+            "https://upstream.invalid/repository.git",
+        ],
+    );
+    fs::write(fixture.log.join("answer"), "refuse").unwrap();
+    let next = continuation_of(&first, BOOT, &workspace, &["build"], "cn1");
+
+    let reports = execute_continued(&mut fixture, &next).await;
+
+    assert_eq!(
+        logged_lines(&fixture.log, "resume.args"),
+        [format!(
+            "workflow run resume {} --from build --json",
+            created_run(&workspace, &first).display()
+        )]
+    );
+    assert_eq!(
+        finished_payload(&reports, &next)["outcome"]["outcome"],
+        "failed"
+    );
+    assert_relay_observed(&fixture.log, "resume", &github, &marker);
+    assert_eq!(github.issued_workflow_git.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        retention_reports(&settled_observations(&mut fixture.manager).await),
+        [(
+            next.assignment_id.clone(),
+            next.attempt_id.clone(),
+            workspace.to_str().unwrap().to_owned(),
+        )]
+    );
+    assert_no_runner_git_wiring(
+        &workspace,
+        &assignment_directory(&workspace, &next.assignment_id).join("private"),
+    );
+}
+
+// REQ-RUNNERENROLL-122: a run whose first attempt recorded no origin, as one an earlier
+// release created, is adopted and resumed with no relay and no credential issued.
+#[tokio::test]
+async fn continuation_of_a_tree_run_without_an_origin_record_resumes_it_without_the_relay() {
+    let (mut fixture, github, _) = github_tree_fixture();
+    let workspace = retained_first_attempt(&mut fixture).await;
+    let first = fixture.offer.clone();
+    fs::remove_file(
+        super::TreeLayout::under(
+            &assignment_directory(&workspace, &first.assignment_id).join("private"),
+        )
+        .origin,
+    )
+    .unwrap();
+    fs::write(fixture.log.join("answer"), "continue").unwrap();
+    fs::write(fixture.log.join("proceed"), b"").unwrap();
+    let next = continuation_of(&first, BOOT, &workspace, &["build"], "cn1");
+
+    let reports = execute_continued(&mut fixture, &next).await;
+
+    assert_eq!(
+        logged_lines(&fixture.log, "resume.args"),
+        [format!(
+            "workflow run resume {} --from build --json",
+            created_run(&workspace, &first).display()
+        )]
+    );
+    assert_eq!(chosen_outcome(&reports).as_deref(), Some("landed"));
+    assert_eq!(
+        fs::read_to_string(fixture.log.join("resume.git-config")).unwrap(),
+        ""
+    );
+    assert_eq!(github.issued_workflow_git.load(Ordering::SeqCst), 1);
 }
 
 // REQ-RUNNERENROLL-89

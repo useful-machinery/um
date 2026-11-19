@@ -7,6 +7,7 @@ use super::admission::AdmittedWorkflow;
 use super::artifact::ArtifactStaging;
 use super::coordinator::{CommitPort, CommittedReduction, CoordinationError, CoordinatorClock};
 use super::diagnostic::StepDiagnosticLog;
+use super::evidence::FailedChild;
 use super::input::InputStaging;
 use super::local_run::{CANCELED_OUTCOME, WITHDRAWN_OUTCOME};
 use super::observation::{
@@ -44,6 +45,8 @@ pub struct WorkflowExecutionResult<Deadline = ()> {
     /// The exit an edge-scheduled walk took (REQ-WFEXEC-58), a limited edge's `else` included;
     /// `None` for a dataflow run and for an attempt that took no exit.
     pub exit_outcome: Option<String>,
+    /// The failed child each `succeeded` `workflow` step recorded, by step (REQ-WFEXEC-77).
+    pub failed_children: BTreeMap<String, FailedChild>,
 }
 
 /// The outcome an attempt records on the run record (REQ-WFEXEC-57): `withdrawn` for a run
@@ -352,6 +355,7 @@ fn observed_step_transition<Deadline>(
         (StepStateKind::Succeeded, StepState::Succeeded { outputs }) => {
             Some(ObservedStepTransition::OutputsCommitted {
                 outputs: outputs.keys().cloned().collect(),
+                failed_child: runtime.failed_child.clone(),
             })
         }
         (StepStateKind::Failed, StepState::Failed { detail }) => {
@@ -618,11 +622,17 @@ where
             return Err(CoordinationError::ReducerStateUnavailable);
         }
     };
+    let mut failed_children = BTreeMap::new();
     let (steps, recoveries) = coordinated
         .state
         .steps
         .into_iter()
-        .map(|(step, runtime)| ((step.clone(), runtime.state), (step, runtime.recovery)))
+        .map(|(step, runtime)| {
+            if let Some(failed_child) = runtime.failed_child {
+                failed_children.insert(step.clone(), failed_child);
+            }
+            ((step.clone(), runtime.state), (step, runtime.recovery))
+        })
         .unzip();
     let output_producers = coordinated.state.output_producers;
     let finalization_summary = coordinated.state.finalization_summary;
@@ -646,6 +656,7 @@ where
         content_digest,
         withdrawn,
         exit_outcome,
+        failed_children,
     })
 }
 

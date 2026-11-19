@@ -122,7 +122,7 @@
         "checkedAt": { "type": "string", "format": "date-time" },
         "installedAt": { "type": "string", "format": "date-time" },
         "selected": {
-          "description": "Whether the provider is selected, as the readiness document records it; absent where it records none.",
+          "description": "Whether the provider was selected, which a serving process of an earlier release reports; nothing reads it, and a current serving process reports it on no entry.",
           "type": "boolean"
         },
         "lastUse": {
@@ -133,6 +133,10 @@
           "description": "When that last use was, as the readiness document records it; absent where a serving process that predates it answers.",
           "type": "string",
           "format": "date-time"
+        },
+        "source": {
+          "description": "Where the coding agent's login comes from, as the readiness document records it; absent where it records none, and where a serving process that predates it answers.",
+          "enum": ["host", "grant"]
         }
       },
       "dependentRequired": {
@@ -166,7 +170,7 @@
         "expiresAt": { "type": "string", "format": "date-time" },
         "checkedAt": { "type": "string", "format": "date-time" },
         "selected": {
-          "description": "Whether the provider is selected, as the readiness document records it; absent where it records none.",
+          "description": "Whether the provider was selected, which a serving process of an earlier release reports; nothing reads it, and a current serving process reports it on no entry.",
           "type": "boolean"
         },
         "runId": {
@@ -178,11 +182,16 @@
           "description": "When that assignment ended, as the readiness document records it; absent while it runs, and where a serving process that predates it answers.",
           "type": "string",
           "format": "date-time"
+        },
+        "source": {
+          "description": "Where the provider's credential came from for that assignment, as the readiness document records it; absent where it records none, and where a serving process that predates it answers.",
+          "enum": ["host", "grant"]
         }
       },
       "dependentRequired": {
         "runId": ["checkedAt"],
-        "endedAt": ["checkedAt"]
+        "endedAt": ["checkedAt"],
+        "source": ["runId"]
       },
       "if": { "properties": { "state": { "const": "ready" } } },
       "then": { "required": ["grantId", "generation", "expiresAt"] },

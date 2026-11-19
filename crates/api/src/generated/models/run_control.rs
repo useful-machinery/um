@@ -27,7 +27,7 @@ pub struct RunControl {
     pub attempt_number: i32,
     #[serde(rename = "kind")]
     pub kind: models::RunControlKind,
-    /// The wait the control resolves; null for `stop` and for a `lift` that names none.
+    /// The wait the control resolves; null for `stop`, for `withdraw` and for a `lift` that names none.
     #[serde(rename = "wait", deserialize_with = "Option::deserialize")]
     pub wait: Option<Box<models::RunControlWait>>,
     #[serde(rename = "answers", deserialize_with = "Option::deserialize")]

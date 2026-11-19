@@ -9,10 +9,11 @@ use rustix::process::{Pid, Signal, kill_process};
 
 use super::workflow_continue::GIT_CONTINUATION_SOURCE;
 use super::workflow_run::{
-    CHILD_TREE_DECIDE, RunBundle, TreeBundle, assert_attempt_resources_released,
-    assert_executor_fault_before_execution, child_tree, child_tree_args, git,
-    initialize_git_repository, isolated_command, run, run_record, run_with_unusable_tui,
-    signal_bundle, spawn_held_child_tree, workflow_run_schema,
+    CHILD_TREE_DECIDE, INHERITED_SOURCE_COMMIT, RunBundle, TreeBundle,
+    assert_attempt_resources_released, assert_executor_fault_before_execution,
+    assert_second_attempt_saw_the_source_revision, child_tree, child_tree_args,
+    failed_source_revision_run, git, initialize_git_repository, isolated_command, run, run_record,
+    run_with_unusable_tui, signal_bundle, spawn_held_child_tree, workflow_run_schema,
 };
 
 fn retry_args(run_directory: &Path, execution_root: &Path, options: &[&str]) -> Vec<String> {
@@ -826,6 +827,24 @@ fn a_retry_of_a_tree_run_rejects_a_modified_copy() {
     );
 }
 
+// REQ-LOCALRUN-217: a retry attempt's step sees the revision the run was created with,
+// whatever the launching environment holds.
+#[test]
+fn a_retry_sees_the_source_revision_the_run_was_created_with() {
+    let (bundle, run_directory, observed) = failed_source_revision_run("source-retry");
+
+    let output = isolated_command(&retry_args(
+        &run_directory,
+        bundle.execution_root(),
+        &["--json"],
+    ))
+    .env("USEFUL_SOURCE_COMMIT_OID", INHERITED_SOURCE_COMMIT)
+    .output()
+    .unwrap();
+
+    assert_second_attempt_saw_the_source_revision(&output, &observed);
+}
+
 // REQ-LOCALRUN-177: a retry of a parent that runs a `workflow` step again creates the
 // step's next child ordinal.
 #[test]
@@ -937,6 +956,43 @@ fn resuming_an_abandoned_parent_adopts_its_exited_child() {
     let parent = run_record(&destination);
     assert_eq!(parent["outcome"], "landed");
     assert_eq!(parent["attempts"], 2);
+}
+
+// REQ-WFEXEC-77, REQ-CONTINUE-76: an adopted child whose published result is `failed` is
+// recorded as its step's failed child from that result, without another child attempt.
+#[test]
+fn resuming_an_abandoned_parent_records_its_adopted_childs_failure() {
+    let (bundle, destination) = killed_parent("abandoned-failed");
+    let child = destination.join("children/design/000001");
+    // Without its verdict the retried `decide` exits 1, so the child's result is `failed`.
+    fs::remove_file(bundle.execution_root().join("verdict-input")).unwrap();
+    super::poll_until(
+        "the killed parent's child fails its retry",
+        || run(&retry_args(&child, bundle.execution_root(), &["--json"])),
+        |_| run_record(&child)["outcome"] == "failed",
+    );
+    let published: serde_json::Value = serde_json::from_slice(
+        &fs::read(child.join("attempts/000002/result/result.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(published["outcome"], "failed", "{published}");
+
+    let terminal = resumed(&destination);
+    assert!(!child.join("attempts/000003").exists());
+    let design = super::workflow_run::result_step(&terminal, "design");
+    assert_eq!(design["state"], "succeeded", "{terminal}");
+    let record = &design["failedChild"];
+    assert_eq!(record["outcome"], "failed", "{terminal}");
+    assert_eq!(record["primaryIssue"]["node"]["id"], "decide", "{terminal}");
+    assert_eq!(
+        record["primaryIssue"], published["primaryIssue"],
+        "{terminal}"
+    );
+    assert_eq!(run_record(&destination)["outcome"], "failed");
+    // REQ-LOCALRUN-221: the view reads the adopted child's record the resumed attempt wrote.
+    let view = super::workflow_run_control::plain_view(&destination);
+    let row = super::workflow_run_control::view_row(&view, "design");
+    assert!(row.iter().any(|field| field == "state failed"), "{row:?}");
 }
 
 /// REQ-LOCALRUN-143: a failed state commit's standard error has a diagnostic line naming the

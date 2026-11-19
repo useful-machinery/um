@@ -13,8 +13,9 @@ use ring::digest::{Context, SHA256};
 use serde::Serialize;
 
 use super::document::{
-    Binding, BindingKind, OwnerDeclaration, OwnerSource, RootBlocks, StartRule, StopBefore,
-    Trigger, TriggerControlAction, TriggerRule,
+    Binding, BindingKind, BusyBehavior, IntegrationAs, IntegrationProvider, OwnerDeclaration,
+    OwnerSource, RootBlocks, RootRequires, StartRule, StopBefore, Trigger, TriggerControlAction,
+    TriggerRule,
 };
 use super::mirror::{MirrorBlock, MirrorGuard, MirrorGuardError, Template, hook_variables};
 use super::presentation_feed::normalize_terminal_scalar;
@@ -46,6 +47,9 @@ pub struct ValidatedTree {
     pub workflow_files: Vec<String>,
     pub programs: Vec<String>,
     pub required_tools: Vec<String>,
+    /// The root's declared integrations by provider id, each with the `as` that applies to
+    /// it: the entry's own, else `requires.as`, else none (REQ-WFDEF-14, REQ-WFDEF-34).
+    pub required_integrations: BTreeMap<IntegrationProvider, Option<IntegrationAs>>,
     pub triggers: BTreeMap<String, TreeTrigger>,
     pub bindings: BTreeMap<String, Binding>,
     /// Every file the walk kept, by tree-relative path, for the run copy.
@@ -73,7 +77,7 @@ impl fmt::Debug for TreeFile {
 
 /// A trigger as `useful workflow definition validate` reports it: a provider rule's source,
 /// event and `where`, or a schedule's timetable, and a start trigger's `subject`, `inputs`,
-/// `stopBefore` and `owner`.
+/// `stopBefore`, `owner` and `busyBehavior`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeTrigger {
     pub kind: TreeTriggerKind,
@@ -93,6 +97,8 @@ pub struct TreeTrigger {
     pub inputs: BTreeMap<String, String>,
     pub stop_before: Option<StopBefore>,
     pub owner: Option<OwnerDeclaration>,
+    /// A start trigger's `busyBehavior` as declared; none when undeclared and for a control.
+    pub busy_behavior: Option<BusyBehavior>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -176,6 +182,9 @@ pub struct TreeLocation {
     trigger: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     binding: Option<String>,
+    /// The provider id of an integration a stage file's `requires` override names.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    integration: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     input: Option<String>,
     /// The `mirror.linear.onOutcome` entry a mirror failure concerns.
@@ -222,6 +231,11 @@ impl TreeLocation {
         self
     }
 
+    fn integration(mut self, provider: &str) -> Self {
+        self.integration = Some(provider.to_owned());
+        self
+    }
+
     fn input(mut self, input: &str) -> Self {
         self.input = Some(input.to_owned());
         self
@@ -250,6 +264,7 @@ impl fmt::Display for TreeLocation {
             ("step", self.step.as_deref()),
             ("key", self.key),
             ("binding", self.binding.as_deref()),
+            ("integration", self.integration.as_deref()),
             ("input", self.input.as_deref()),
             ("outcome", self.outcome.as_deref()),
         ];
@@ -298,6 +313,7 @@ pub fn validate_workflow_tree(root: &Path) -> Result<ValidatedTree, Vec<TreeDiag
         match resolve_workflow_file(&root, &root.join(file)) {
             Ok(workflow) => {
                 check_stage_file(file, &workflow, &mut diagnostics);
+                check_integration_overrides(file, &workflow, &blocks, &mut diagnostics);
                 check_commands(file, &workflow.definition, &mut diagnostics);
             }
             Err(failure) => diagnostics.push(TreeDiagnostic::resolution(file, failure)),
@@ -323,16 +339,22 @@ pub fn validate_workflow_tree(root: &Path) -> Result<ValidatedTree, Vec<TreeDiag
     }
 
     let definition = root_workflow.definition;
+    let RootRequires {
+        tools: required_tools,
+        acting_as,
+        integrations,
+    } = blocks.requires.unwrap_or_default();
     Ok(ValidatedTree {
         root,
         digest: digest_tree(&walk.files),
         name: definition.name,
         version: definition.version,
         workflow_files,
-        required_tools: blocks
-            .requires
-            .map(|requires| requires.tools)
-            .unwrap_or_default(),
+        required_tools,
+        required_integrations: integrations
+            .into_iter()
+            .map(|(provider, integration)| (provider, integration.acting_as.or(acting_as)))
+            .collect(),
         programs: blocks.programs,
         triggers: blocks
             .triggers
@@ -346,14 +368,15 @@ pub fn validate_workflow_tree(root: &Path) -> Result<ValidatedTree, Vec<TreeDiag
 
 impl From<&Trigger> for TreeTrigger {
     fn from(trigger: &Trigger) -> Self {
-        let (on, subject, inputs, stop_before, owner) = match trigger {
+        let (on, subject, inputs, stop_before, owner, busy_behavior) = match trigger {
             Trigger::Start {
                 on,
                 subject,
                 inputs,
                 stop_before,
                 owner,
-            } => (on, subject, inputs, stop_before, owner),
+                busy_behavior,
+            } => (on, subject, inputs, stop_before, owner, busy_behavior),
             Trigger::Control { on, .. } => {
                 return Self::event(TreeTriggerKind::Control, on);
             }
@@ -371,6 +394,7 @@ impl From<&Trigger> for TreeTrigger {
                 inputs: BTreeMap::new(),
                 stop_before: None,
                 owner: None,
+                busy_behavior: None,
             },
         };
         Self {
@@ -378,6 +402,7 @@ impl From<&Trigger> for TreeTrigger {
             inputs: inputs.clone(),
             stop_before: stop_before.clone(),
             owner: owner.clone(),
+            busy_behavior: *busy_behavior,
             ..trigger
         }
     }
@@ -396,6 +421,7 @@ impl TreeTrigger {
             inputs: BTreeMap::new(),
             stop_before: None,
             owner: None,
+            busy_behavior: None,
         }
     }
 }
@@ -427,7 +453,8 @@ fn check_stage_file(
     diagnostics: &mut Vec<TreeDiagnostic>,
 ) {
     let definition = &workflow.definition;
-    let blocks = definition.root.as_ref();
+    let blocks = definition.root.as_ref().map(RootBlocks::without_override);
+    let blocks = blocks.as_ref();
     let present = [
         ("name", definition.name.is_some()),
         ("version", definition.version.is_some()),
@@ -461,6 +488,39 @@ fn check_stage_file(
         diagnostics.push(TreeDiagnostic::new(
             "root_only_block_outside_root",
             TreeLocation::new("workflow").path(file).key(key),
+        ));
+    }
+}
+
+/// A stage file's `requires` override names only integrations the tree's root declares
+/// (REQ-WFDEF-35). Every stage file is resolved as its own top, so only the tree knows the
+/// root an override is judged against; names alone are compared, never `as` or `bindings`.
+fn check_integration_overrides(
+    file: &str,
+    workflow: &ResolvedWorkflow,
+    root: &RootBlocks,
+    diagnostics: &mut Vec<TreeDiagnostic>,
+) {
+    let Some(requires) = workflow
+        .definition
+        .root
+        .as_ref()
+        .and_then(|blocks| blocks.requires.as_ref())
+    else {
+        return;
+    };
+    let declared = |provider: &IntegrationProvider| {
+        root.requires
+            .as_ref()
+            .is_some_and(|root| root.integrations.contains_key(provider))
+    };
+    for provider in requires.integrations.keys().filter(|key| !declared(key)) {
+        diagnostics.push(TreeDiagnostic::new(
+            "integration_undeclared",
+            TreeLocation::new("workflow")
+                .path(file)
+                .key("requires")
+                .integration(provider.as_str()),
         ));
     }
 }
@@ -531,10 +591,20 @@ fn check_triggers(
             inputs,
             stop_before,
             owner,
+            busy_behavior,
         } = trigger
         else {
             continue;
         };
+        // The slot a queued start waits on is keyed by the root's subject input.
+        if *busy_behavior == Some(BusyBehavior::QueueLatest)
+            && root_workflow.definition.subject.is_none()
+        {
+            diagnostics.push(TreeDiagnostic::new(
+                "busy_behavior_subject_missing",
+                TreeLocation::trigger(name).key("busyBehavior"),
+            ));
+        }
         for input in inputs
             .keys()
             .filter(|input| !root_workflow.declared_inputs().contains_key(*input))

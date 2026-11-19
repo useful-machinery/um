@@ -189,8 +189,8 @@ pub(super) struct AcceptedAssignment {
     pub(super) execution_version: Arc<str>,
     pub(super) process_guards: AssignmentProcessGuards,
     pub(super) guard_processes: bool,
-    /// The runner's Git relay for the workspace; a tree run uses the host's own Git
-    /// access and has none.
+    /// The runner's Git relay for the workspace (REQ-WORKSPACE-19); a tree run on a GitLab
+    /// project uses the host's own Git access and has none (REQ-WORKSPACE-42).
     pub(super) workflow_git: Option<WorkflowGitAuthority>,
     /// The assignment's grant token files, which the slot carries until the
     /// assignment ends (INV-RUNNER-28).
@@ -722,9 +722,6 @@ struct AdmissionRuntime {
     claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
     codex_installation: Option<ValidatedCodexInstallation>,
     environment: EnvironmentSnapshot,
-    /// The login variables the admission's offer withheld beside
-    /// `environment` (REQ-GRANT-51).
-    withheld_agent_logins: Vec<&'static str>,
     /// What notes how the provider answered each use of a login the
     /// admission's offer added (REQ-GRANT-52).
     harness_login_observer: Option<Arc<dyn HarnessLoginObserver>>,
@@ -811,7 +808,6 @@ impl AdmissionRuntime {
                 &root.execution,
                 git_capture,
                 &self.environment,
-                &self.withheld_agent_logins,
                 self.pi_installation.as_ref(),
                 self.claude_code_installation.as_ref(),
                 self.codex_installation.as_ref(),
@@ -850,8 +846,9 @@ impl AdmissionRuntime {
         )
     }
 
-    /// Accepts a prepared tree run (REQ-RUNNERENROLL-91): no workflow admission and no
-    /// Git relay, the outbox reserved as for any run of the spec's capacity.
+    /// Accepts a prepared tree run (REQ-RUNNERENROLL-91): no workflow admission, the outbox
+    /// reserved as for any run of the spec's capacity, and the Git relay preparation
+    /// installed, of which a tree run on a GitLab project has none (REQ-RUNNERENROLL-121).
     fn finish_tree(
         &self,
         offer: &AssignmentOffer,
@@ -871,12 +868,13 @@ impl AdmissionRuntime {
             Ok(budget) => budget,
             Err(decline) => return Err(Box::new((root, decline))),
         };
+        let workflow_git = root.workflow_git();
         self.accept(
             offer,
             root,
             AcceptedExecution::Tree(Arc::new(tree)),
             transition_budget,
-            None,
+            workflow_git,
         )
     }
 
@@ -2073,16 +2071,40 @@ fn capacity_binding_invalid() -> AssignmentDecline {
     AssignmentDecline::ExecutionSpecInvalid(ExecutionSpecInvalidReason::WorkflowAdmissionInvalid)
 }
 
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the context is built from the admission's offer and each harness installation"
-)]
+/// The pinned source a Cloud run's steps see (REQ-WORKSPACE-16), for the engine's context
+/// and a tree run's `create` alike (REQ-RUNNERENROLL-120): the workspace commit, and on a
+/// schema-2 spec the source branch as its branch; on a schema-3 spec the workspace branch
+/// when one is selected and the definition pin as the source branch and definition commit.
+pub(super) fn source_revision(
+    execution_spec: &ExecutionSpecV1RunnerProjection,
+) -> SourceRevisionProvenance {
+    let commit_oid = execution_spec.primary_workspace_source.commit_oid.as_str();
+    if execution_spec.schema_version == 3 {
+        SourceRevisionProvenance::from_parts(
+            commit_oid,
+            execution_spec.workspace_branch.as_deref(),
+            Some((
+                execution_spec.source_branch.as_str(),
+                execution_spec
+                    .workflow_definition_source
+                    .commit_oid
+                    .as_str(),
+            )),
+        )
+    } else {
+        SourceRevisionProvenance::from_parts(
+            commit_oid,
+            Some(execution_spec.source_branch.as_str()),
+            None::<(&str, &str)>,
+        )
+    }
+}
+
 fn build_execution_context(
     execution_spec: &ExecutionSpecV1RunnerProjection,
     root: &Path,
     git_capture: Option<CloudGitCaptureProjection>,
     environment: &EnvironmentSnapshot,
-    withheld_agent_logins: &[&'static str],
     pi_installation: Option<&ValidatedPiInstallation>,
     claude_code_installation: Option<&ValidatedClaudeCodeInstallation>,
     codex_installation: Option<&ValidatedCodexInstallation>,
@@ -2093,42 +2115,13 @@ fn build_execution_context(
     let cancellation_grace =
         Duration::from_secs(execution_spec.execution_limits.cancellation_grace_seconds);
     let capacity = &execution_spec.capacity;
-    let mut provenance = SourceRevisionProvenance::new(
-        execution_spec.source_branch.as_str(),
-        execution_spec.primary_workspace_source.commit_oid.as_str(),
-    );
-    if execution_spec.schema_version == 3 {
-        provenance = provenance.with_definition(
-            execution_spec.source_branch.as_str(),
-            execution_spec
-                .workflow_definition_source
-                .commit_oid
-                .as_str(),
-        );
-        if execution_spec.workspace_branch.is_none() {
-            provenance = provenance.without_workspace_branch();
-        } else if let Some(branch) = &execution_spec.workspace_branch {
-            provenance = SourceRevisionProvenance::new(
-                branch.as_str(),
-                execution_spec.primary_workspace_source.commit_oid.as_str(),
-            )
-            .with_definition(
-                execution_spec.source_branch.as_str(),
-                execution_spec
-                    .workflow_definition_source
-                    .commit_oid
-                    .as_str(),
-            );
-        }
-    }
     let context = ExecutionContext::new(
         root.to_owned(),
         default_execution_policy_limits(maximum_parallel_steps),
         environment.without_managed_runner_credentials_and_helpers(),
         CancellationPolicy::new(CancellationSource::new(), cancellation_grace),
     )
-    .with_withheld_agent_logins(withheld_agent_logins.iter().copied())
-    .with_source_revision(provenance)
+    .with_source_revision(source_revision(execution_spec))
     .with_capacity_budget(WorkflowCapacityBudget {
         maximum_invocations: capacity.maximum_invocations,
         diagnostic_retention_bytes: capacity.diagnostic_retention_bytes,

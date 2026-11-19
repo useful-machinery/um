@@ -101,7 +101,7 @@ async fn execution_lost_before_the_engine_starts_ends_the_execution_phase_failed
 // terminal report and settles it, leaving its workspace retained for a
 // continuation. Returns the manager, the initial offer, the workspace and
 // its baseline commit.
-async fn retained_initial_attempt(
+pub(super) async fn retained_initial_attempt(
     v3: bool,
 ) -> (
     tempfile::TempDir,
@@ -191,7 +191,7 @@ exports:
 }
 
 // The continuation offer of `initial`'s retained workspace on this runner boot.
-fn continuation_successor(
+pub(super) fn continuation_successor(
     manager: &AssignmentManager,
     initial: &AssignmentOffer,
     workspace: &Path,

@@ -445,6 +445,8 @@ impl ExecutionJob {
                     .flatten(),
                 recovery,
                 invocations: observer.invocations_for_step(id),
+                // The runner runs no child.
+                failed_child: None,
             });
         }
         let finalization = match (
@@ -502,6 +504,7 @@ impl ExecutionJob {
                             .flatten(),
                         recovery: None,
                         invocations: observer.invocations_for_step(id),
+                        failed_child: None,
                     });
                 }
                 if !summarized.is_empty() {

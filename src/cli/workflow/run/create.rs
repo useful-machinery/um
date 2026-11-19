@@ -34,22 +34,22 @@ use useful_execution::{
     RecoveryInvocationDiagnosticV1, RecoveryInvocationStateV1, RecoveryInvocationV1,
     RequestedPresentationMode, ResolvedAttachment, ResolvedFile, ResolvedInput, ResolvedInputs,
     ResolvedJsonInput, ResolvedWorkflow, RunOutcome, RunState, RunTimingObservation,
-    RunTimingSnapshot, StepDiagnosticLog, SystemObservationClock, TerminalCapabilities,
-    TerminalHostExit, TransitionSequence, TreeDiagnostic, UntestedHarnessAdvisory,
-    ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep, ValidatedTree,
-    WorkflowExecutionResult, WorkflowExecutionStart, WorkflowNodeRole, WorkflowRunCancellation,
-    WorkflowRunCleanupResult, WorkflowRunFinalization, WorkflowRunFinalizationCancellation,
-    WorkflowRunId, WorkflowRunOutput, WorkflowRunPresentation, WorkflowRunPresentationResult,
-    WorkflowRunPublicationResult, WorkflowRunRecord, WorkflowRunResult, WorkflowRunStep,
-    WorkflowRunStepKind, WorkflowRunTerminalResultV1, WorkflowRunTiming, WorkflowRunViewModel,
-    WorkflowStepTiming, WorkflowTerminalHost, admit_local_workflow, command_output_v1,
-    default_execution_policy_limits, discover_and_validate_claude_code_installation,
-    discover_and_validate_codex_installation, discover_and_validate_pi_installation,
-    execute_workflow_with_children, is_workflow_tree, normalize_terminal_path,
-    prepare_attempt_result_destination, production_agent_dispatcher,
-    publish_prepared_workflow_result, resolve_workflow_file_with_agent_profiles,
-    step_recovery_summary_v1, summary_disposition_matches, validate_workflow_tree,
-    write_untested_harness_advisories,
+    RunTimingSnapshot, SourceRevisionProvenance, StepDiagnosticLog, SystemObservationClock,
+    TerminalCapabilities, TerminalHostExit, TransitionSequence, TreeDiagnostic,
+    UntestedHarnessAdvisory, ValidatedHarness, ValidatedRecoveryHandler, ValidatedStep,
+    ValidatedTree, WorkflowExecutionResult, WorkflowExecutionStart, WorkflowNodeRole,
+    WorkflowRunCancellation, WorkflowRunCleanupResult, WorkflowRunFinalization,
+    WorkflowRunFinalizationCancellation, WorkflowRunId, WorkflowRunOutput, WorkflowRunPresentation,
+    WorkflowRunPresentationResult, WorkflowRunPublicationResult, WorkflowRunRecord,
+    WorkflowRunResult, WorkflowRunStep, WorkflowRunStepKind, WorkflowRunTerminalResultV1,
+    WorkflowRunTiming, WorkflowRunViewModel, WorkflowStepTiming, WorkflowTerminalHost,
+    admit_local_workflow, command_output_v1, default_execution_policy_limits,
+    discover_and_validate_claude_code_installation, discover_and_validate_codex_installation,
+    discover_and_validate_pi_installation, execute_workflow_with_children, is_lowercase_hex,
+    is_workflow_tree, normalize_terminal_path, prepare_attempt_result_destination,
+    production_agent_dispatcher, publish_prepared_workflow_result,
+    resolve_workflow_file_with_agent_profiles, step_recovery_summary_v1,
+    summary_disposition_matches, validate_workflow_tree, write_untested_harness_advisories,
 };
 use useful_execution::{
     AgentProfileReplacementDocument, AgentProfileReplacementV1, ChildRunPresentation,
@@ -192,6 +192,15 @@ pub(super) struct Command {
     )]
     external: Vec<(String, String)>,
 
+    #[arg(
+        long,
+        value_name = "NAME=VALUE",
+        value_parser = parse_source_revision,
+        conflicts_with = "cloud",
+        help = "Set the run's source revision NAME (commit, branch, workflowBranch or workflowCommit) for its steps (repeatable)"
+    )]
+    source_revision: Vec<(String, String)>,
+
     #[command(flatten)]
     presentation: super::PresentationOptions,
 
@@ -239,6 +248,9 @@ impl Command {
             }
         };
         let external = external_references(&self.external).map_err(|error| {
+            super::super::super::CommandFailure::with_exit_code(error, ExitCode::UsageError)
+        })?;
+        let source_revision = source_revision(&self.source_revision).map_err(|error| {
             super::super::super::CommandFailure::with_exit_code(error, ExitCode::UsageError)
         })?;
         let relative_workflow = tree_workflow_file(self.workflow.as_deref()).map_err(|error| {
@@ -409,6 +421,12 @@ impl Command {
         };
         let context = match tree {
             Some(tree) => context.with_tree(tree),
+            None => context,
+        };
+        // REQ-LOCALRUN-217: the revision's variables; the manifest records it for every later
+        // admission of the run and its child runs.
+        let context = match source_revision {
+            Some(source_revision) => context.with_source_revision(source_revision),
             None => context,
         };
         let untested_advisories = context.untested_harness_advisories();
@@ -1836,6 +1854,7 @@ async fn execute_attempt_phases(
                     wait,
                     admitted.inputs(),
                     &execution.steps,
+                    &execution.failed_children,
                     attempt.run()?.run_directory(),
                     dispatcher.as_ref().map(|(dispatcher, _)| dispatcher),
                 )?
@@ -2232,6 +2251,72 @@ fn external_references(entries: &[(String, String)]) -> anyhow::Result<BTreeMap<
     Ok(references)
 }
 
+/// The names `--source-revision` accepts (REQ-LOCALRUN-217).
+const SOURCE_REVISION_NAMES: [&str; 4] = ["commit", "branch", "workflowBranch", "workflowCommit"];
+
+/// REQ-LOCALRUN-217: `NAME=VALUE`, split at the first `=`, with `NAME` one of the source
+/// names and a non-empty `VALUE`.
+fn parse_source_revision(value: &str) -> Result<(String, String), String> {
+    let (name, value) = value
+        .split_once('=')
+        .ok_or_else(|| "expected NAME=VALUE".to_owned())?;
+    if !SOURCE_REVISION_NAMES.contains(&name) {
+        return Err(format!(
+            "NAME must be one of {}",
+            SOURCE_REVISION_NAMES.join(", ")
+        ));
+    }
+    if value.is_empty() {
+        return Err("VALUE must not be empty".to_owned());
+    }
+    Ok((name.to_owned(), value.to_owned()))
+}
+
+/// REQ-LOCALRUN-217: the `--source-revision` values, each name at most once, `commit`
+/// required and the workflow pair given together, as the revision every admission of the
+/// run sets; none without the option.
+fn source_revision(
+    entries: &[(String, String)],
+) -> anyhow::Result<Option<SourceRevisionProvenance>> {
+    if entries.is_empty() {
+        return Ok(None);
+    }
+    let mut values = BTreeMap::new();
+    for (name, value) in entries {
+        if values.insert(name.as_str(), value.as_str()).is_some() {
+            return Err(anyhow!("--source-revision names `{name}` more than once"));
+        }
+    }
+    for name in ["commit", "workflowCommit"] {
+        if values
+            .get(name)
+            .is_some_and(|value| !is_lowercase_hex(value, 40) && !is_lowercase_hex(value, 64))
+        {
+            return Err(anyhow!(
+                "--source-revision `{name}` must be 40 or 64 lowercase hexadecimal characters"
+            ));
+        }
+    }
+    let commit = values
+        .get("commit")
+        .copied()
+        .ok_or_else(|| anyhow!("--source-revision needs `commit`"))?;
+    let definition = match (values.get("workflowBranch"), values.get("workflowCommit")) {
+        (Some(branch), Some(commit)) => Some((*branch, *commit)),
+        (None, None) => None,
+        _ => {
+            return Err(anyhow!(
+                "--source-revision needs `workflowBranch` and `workflowCommit` together"
+            ));
+        }
+    };
+    Ok(Some(SourceRevisionProvenance::from_parts(
+        commit,
+        values.get("branch").copied(),
+        definition,
+    )))
+}
+
 fn required_agent_harnesses(
     workflow: &ResolvedWorkflow,
 ) -> impl Iterator<Item = &ValidatedHarness> {
@@ -2393,9 +2478,10 @@ pub(super) fn has_workflow_steps(workflow: &ResolvedWorkflow) -> bool {
 
 /// How a child attempt that ran to its result ended, for the parent's step
 /// (REQ-WFEXEC-60): a cancelled child is `Cancelled`; any other child exited with the
-/// outcome it records and its available `text` and `json` exports, and with the
+/// outcome it records and its available `text` and `json` exports, with the
 /// interruption that failed it when its primary issue is an `interrupted` step
-/// (REQ-WFEXEC-70).
+/// (REQ-WFEXEC-70), and with that primary issue when its result is `failed`
+/// (REQ-WFEXEC-77).
 fn child_run_outcome(
     outcome: &str,
     execution: &WorkflowExecutionResult<ExecutionInstant>,
@@ -2416,6 +2502,10 @@ fn child_run_outcome(
             })
             .collect(),
         interruption: execution.outcome.interruption(),
+        failure: match &execution.outcome {
+            RunOutcome::Failed { primary_issue, .. } => Some(Box::new(primary_issue.clone())),
+            _ => None,
+        },
     }
 }
 
@@ -2488,6 +2578,7 @@ fn entered_wait_record(
     wait: &EnteredWait,
     inputs: &useful_execution::ResolvedInputs,
     steps: &BTreeMap<String, useful_execution::StepState<CapturedValue>>,
+    failed_children: &BTreeMap<String, useful_execution::FailedChild>,
     run_directory: &Path,
     dispatcher: Option<&LocalChildRunDispatcher>,
 ) -> anyhow::Result<WaitRecord> {
@@ -2524,7 +2615,14 @@ fn entered_wait_record(
                 item,
             )
         });
-    let payload = wait_payload(wait, steps, child.as_deref(), control.as_ref());
+    // REQ-WFEXEC-77: the waiting step's failed child, when it recorded one.
+    let payload = wait_payload(
+        wait,
+        steps,
+        child.as_deref(),
+        failed_children.get(wait.step()),
+        control.as_ref(),
+    );
     WaitRecord::entered(
         wait,
         item,
@@ -2602,6 +2700,9 @@ struct LocalChildRunParent {
     /// admission drops the engine's `USEFUL_` names again and its `environmentPassthrough`
     /// selects among the names the root admitted.
     environment: EnvironmentSnapshot,
+    /// The parent's source revision, which each child's admission sets again since it
+    /// drops the parent's `USEFUL_` names (REQ-LOCALRUN-217).
+    source_revision: Option<SourceRevisionProvenance>,
     /// The step a `control.retry` continues at and the agent-profile replacement its child
     /// resolves with (REQ-CONTINUE-75).
     replacement: Option<(String, AgentProfileReplacementDocument)>,
@@ -2658,6 +2759,7 @@ impl LocalChildRunDispatcher {
                     .maximum_parallel_steps()
                     .get(),
                 environment,
+                source_revision: admitted.execution().source_revision().cloned(),
                 replacement,
                 recovery: std::sync::Mutex::new(recovery),
                 started: std::sync::Mutex::new(BTreeMap::new()),
@@ -3130,8 +3232,9 @@ fn begin_nested_continuation(
     Ok((workflow, admitted, owned))
 }
 
-/// The admission context of a child: the parent's execution root, limits and admitted
-/// environment, and the parent's tree copy; a missing harness is the child's rejection code.
+/// The admission context of a child: the parent's execution root, limits, admitted
+/// environment and source revision, and the parent's tree copy; a missing harness is the
+/// child's rejection code.
 fn child_execution_context(
     parent: &LocalChildRunParent,
     workflow: &ResolvedWorkflow,
@@ -3153,7 +3256,11 @@ fn child_execution_context(
                 .to_owned(),
         );
     }
-    Ok(context.with_tree(tree))
+    let context = context.with_tree(tree);
+    Ok(match &parent.source_revision {
+        Some(source_revision) => context.with_source_revision(source_revision.clone()),
+        None => context,
+    })
 }
 
 fn child_admission_code(failure: &useful_execution::AdmissionFailure) -> String {
@@ -4684,6 +4791,7 @@ fn build_run_result(
     };
     let mut states = execution.steps;
     let mut recoveries = execution.recoveries;
+    let mut failed_children = execution.failed_children;
     let mut steps = Vec::with_capacity(states.len());
     for id in &workflow.definition.presentation_order {
         let state = states
@@ -4742,6 +4850,7 @@ fn build_run_result(
                 .flatten(),
             recovery,
             invocations,
+            failed_child: failed_children.remove(id),
         });
     }
     let finalization = match (
@@ -4808,6 +4917,8 @@ fn build_run_result(
                     } else {
                         Vec::new()
                     },
+                    // A finalizer runs no child.
+                    failed_child: None,
                 });
             }
             if !retained.is_empty() {

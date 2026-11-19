@@ -17,11 +17,14 @@ use std::path::Path;
 
 use serde_json::{Map, Value, json};
 use useful_execution::{
-    CancellationReason, LocalRunDirectoryError, MirrorAction, MirrorHook, MirrorSkipReason,
-    MirrorWrite, MirrorWriteOutcome, WaitQuestions, read_durable_record, wait_identity,
-    wait_questions,
+    CancellationReason, FailingNodeState, LocalRunDirectoryError, MirrorAction, MirrorHook,
+    MirrorSkipReason, MirrorWrite, MirrorWriteOutcome, WaitQuestions, WorkflowNodeRole,
+    read_durable_record, wait_failed_child, wait_identity, wait_questions,
 };
-use useful_runner_protocol::{TreeExit, TreeProgressWaitQuestion, TreeProgressWaitQuestions};
+use useful_runner_protocol::{
+    TreeExit, TreeProgressFailedChild, TreeProgressFailedChildRole, TreeProgressFailedChildState,
+    TreeProgressWaitQuestion, TreeProgressWaitQuestions,
+};
 use useful_support::is_diagnostic_slug;
 
 /// The most mirror results one finish carries, the protocol's bound.
@@ -114,8 +117,9 @@ pub(in crate::service) fn mirror_read_failure(error: &LocalRunDirectoryError) ->
 /// The class recorded when the blocking worker reading a run's `mirror/` did not return.
 pub(in crate::service) const MIRROR_READER_LOST: &str = "mirror_reader_lost";
 
-/// What `wait.json` reads: the wait's kind, start and step, its rule's source and, for an
-/// `answer` wait, the questions it reports (REQ-RUNNERENROLL-119).
+/// What `wait.json` reads: the wait's kind, start and step, its rule's source, for an
+/// `answer` wait the questions it reports (REQ-RUNNERENROLL-119) and, for a wait of any
+/// kind, the failed child it reports (REQ-RUNNERENROLL-125).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::service) struct TreeWait {
     pub(in crate::service) kind: String,
@@ -125,6 +129,10 @@ pub(in crate::service) struct TreeWait {
     /// `None` when the wait reports no questions: another kind, a payload that is not an
     /// object, or questions outside the bounds Cloud admits.
     pub(in crate::service) questions: Option<TreeProgressWaitQuestions>,
+    /// `None` when the wait reports no failed child: a payload that is not an object, holds
+    /// no `failedChild` or one that does not read as the engine's record, or a record outside
+    /// the bounds Cloud admits.
+    pub(in crate::service) failed_child: Option<TreeProgressFailedChild>,
 }
 
 impl TreeWait {
@@ -141,21 +149,24 @@ impl TreeWait {
 }
 
 /// Reads `<run directory>/wait.json`; `None` when it is absent, unreadable as `read_json`
-/// reads it, or not a wait record. A question never makes it `None`.
+/// reads it, or not a wait record. Neither a question nor a failed child makes it `None`.
 pub(in crate::service) fn read_wait(run_directory: &Path) -> Option<TreeWait> {
     let wait = read_json(run_directory, "wait.json")?;
     let kind = wait["kind"].as_str()?.to_owned();
+    let payload = wait["payload"].as_object();
     let questions = if kind == "answer" {
-        wait["payload"].as_object().and_then(answer_questions)
+        payload.and_then(answer_questions)
     } else {
         None
     };
+    let failed_child = payload.and_then(reported_failed_child);
     Some(TreeWait {
         kind,
         since: wait["since"].as_str()?.to_owned(),
         step: wait["step"].as_array()?.clone(),
         source: wait["rule"]["source"].as_str()?.to_owned(),
         questions,
+        failed_child,
     })
 }
 
@@ -178,6 +189,36 @@ fn answer_questions(payload: &Map<String, Value>) -> Option<TreeProgressWaitQues
         }],
     };
     TreeProgressWaitQuestions::new(questions)
+}
+
+/// The failed child a wait's `payload` records, read as `useful workflow run status` reads
+/// it (REQ-RUNNERENROLL-125) and reduced to the outcome, the failing node's `id` and role,
+/// its state and, for a failed node, its phase and code; `None` when the payload records
+/// none or the reduction breaks a bound Cloud admits, so the wait is reported without it
+/// and nothing is truncated.
+fn reported_failed_child(payload: &Map<String, Value>) -> Option<TreeProgressFailedChild> {
+    let record = wait_failed_child(payload)?;
+    let node = record.failing_node();
+    let role = match node.role {
+        WorkflowNodeRole::Step => TreeProgressFailedChildRole::Step,
+        WorkflowNodeRole::Finalizer => TreeProgressFailedChildRole::Finalizer,
+    };
+    let (state, phase, code) = match node.state {
+        FailingNodeState::Failed { phase, code } => (
+            TreeProgressFailedChildState::Failed,
+            Some(phase.to_owned()),
+            code,
+        ),
+        FailingNodeState::Blocked => (TreeProgressFailedChildState::Blocked, None, None),
+    };
+    TreeProgressFailedChild::new(
+        record.outcome().to_owned(),
+        node.id,
+        role,
+        state,
+        phase,
+        code,
+    )
 }
 
 /// How the attempt ends on the wire.

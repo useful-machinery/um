@@ -237,6 +237,10 @@ pub fn list_identities(
 ) -> Result<ListIdentitiesOutcome, IdentityApiError> {
     let mut endpoint = endpoint(client, Operation::List, api_url, &[])?;
     http_util::append_pagination(&mut endpoint, limit, cursor);
+    endpoint.query_pairs_mut().append_pair(
+        "vocabulary",
+        &super::member_grants::PROVIDER_VOCABULARY.to_string(),
+    );
     let spec = request_spec(
         Operation::List,
         Method::GET,
@@ -775,16 +779,14 @@ impl TryFrom<generated_models::OidcIdentityLinkGrant> for IdentityGrant {
     type Error = &'static str;
 
     fn try_from(value: generated_models::OidcIdentityLinkGrant) -> Result<Self, Self::Error> {
-        use generated_models::oidc_identity_link_grant::{Provider, State};
+        use generated_models::oidc_identity_link_grant::State;
 
         if !valid_typed_id(&value.id, "pgr_") {
             return Err("the identity grant ID is invalid");
         }
-        let provider = match value.provider {
-            Provider::OIDCIdentityLinkGrantProviderGithub => "github",
-            Provider::OIDCIdentityLinkGrantProviderGitlabCom => "gitlab.com",
-            Provider::OIDCIdentityLinkGrantProviderLinear => "linear",
-        };
+        if !super::member_grants::oauth_provider(&value.provider) {
+            return Err("the identity grant provider is not an OAuth provider id");
+        }
         let state = match value.state {
             State::OIDCIdentityLinkGrantStateActive => "active",
             State::OIDCIdentityLinkGrantStateReconnectRequired => "reconnect_required",
@@ -792,7 +794,7 @@ impl TryFrom<generated_models::OidcIdentityLinkGrant> for IdentityGrant {
         };
         Ok(Self {
             id: value.id,
-            provider: provider.to_owned(),
+            provider: value.provider,
             state: state.to_owned(),
         })
     }

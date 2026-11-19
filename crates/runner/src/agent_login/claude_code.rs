@@ -5,8 +5,6 @@
 //! Code login of its own (REQ-GRANT-45).
 
 use std::ffi::OsString;
-use std::fs;
-use std::io;
 use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 
@@ -18,7 +16,8 @@ use super::cloud::Delivery;
 use super::directory::{self, LoginDirectory};
 use super::readiness::Installation;
 use super::{
-    FailureCause, FailureStage, InstallRefusal, ServiceEnvironment, StepFailure, valid_token,
+    FailureCause, FailureStage, InstallRefusal, ServiceEnvironment, StepFailure,
+    login_file_present, valid_token,
 };
 
 /// The file a `/login` keeps in Claude Code's configuration directory.
@@ -36,27 +35,15 @@ pub(crate) fn foreign_login(environment: &ServiceEnvironment) -> bool {
     if environment.claude_code_oauth_token {
         return true;
     }
-    let Some(directory) = configuration_directory(environment) else {
-        return false;
-    };
-    match fs::symlink_metadata(directory.join(CREDENTIALS_FILE)) {
-        Ok(_) => true,
-        Err(error) => error.kind() != io::ErrorKind::NotFound,
-    }
+    configuration_directory(environment)
+        .is_some_and(|directory| login_file_present(&directory.join(CREDENTIALS_FILE)))
 }
 
 fn configuration_directory(environment: &ServiceEnvironment) -> Option<PathBuf> {
-    environment
-        .claude_config_dir
-        .as_ref()
-        .map(PathBuf::from)
-        .or_else(|| {
-            environment
-                .home
-                .as_ref()
-                .map(|home| PathBuf::from(home).join(".claude"))
-        })
-        .filter(|path| path.is_absolute())
+    match &environment.claude_config_dir {
+        Some(directory) => Some(PathBuf::from(directory)).filter(|path| path.is_absolute()),
+        None => environment.under_home(".claude"),
+    }
 }
 
 /// Keeps `delivery` as the token file in the runner's directory, replacing

@@ -28,6 +28,8 @@ const RUN_CREATION_REJECTED: &str =
 // HTML-sensitive bytes sixfold; workflow paths and display/placement names add
 // less than 3 MiB at their admitted bounds. Keep the larger budget list-only.
 const MAX_RUN_LIST_BODY_BYTES: usize = 16 * 1024 * 1024;
+/// The most items a page of a run's controls holds, the API's `limit` bound.
+const MAX_PAGE_ITEMS: usize = 100;
 
 pub type Run = models::Run;
 pub type RunList = models::RunList;
@@ -155,6 +157,9 @@ pub enum RunControlSubmission {
     RunNotLive,
     /// `wait-not-current`: the control's wait is not the run's current wait.
     WaitNotCurrent,
+    /// `control-unsupported`: the runner executing the run does not advertise the control's
+    /// kind, so Cloud would not send it.
+    ControlUnsupported,
     /// `control-too-large`: the control would exceed the runner's frame.
     TooLarge,
     /// The key was first used for another request.
@@ -653,8 +658,74 @@ impl<'a> RunApi<'a> {
         limit: Option<u32>,
         cursor: Option<&str>,
     ) -> Result<(Vec<RunTriggerDelivery>, Option<String>), RunFailure> {
+        let body = self.read_run_page(organization, run_id, "trigger-deliveries", limit, cursor)?;
+        let list: models::RunTriggerDeliveryList =
+            serde_json::from_slice(&body).map_err(|_| RunFailure::protocol(false))?;
+        if valid_next_cursor(list.next_cursor.as_deref())
+            && list.items.iter().all(|delivery| {
+                useful_support::valid_typed_id(&delivery.id, "wtd_")
+                    && useful_support::valid_typed_id(&delivery.definition_id, "def_")
+                    && useful_support::valid_typed_id(&delivery.claim.claim_id, "wsc_")
+                    && delivery.revision >= 1
+            })
+        {
+            Ok((list.items, list.next_cursor))
+        } else {
+            Err(RunFailure::protocol(false))
+        }
+    }
+
+    /// One page of the controls accepted for the definition-backed run `run_id`, newest
+    /// first, with the next page's cursor (REQ-RUN-92); `limit` and `cursor` select the page.
+    /// Each control is the JSON object Cloud sent, read only for its id, so a kind or state
+    /// this release does not name is kept as sent (REQ-COMPAT-20).
+    pub fn list_run_controls(
+        &self,
+        organization: &str,
+        run_id: &str,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<(Vec<serde_json::Value>, Option<String>), RunFailure> {
+        let body = self.read_run_page(organization, run_id, "controls", limit, cursor)?;
+        let page: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|_| RunFailure::protocol(false))?;
+        let serde_json::Value::Object(mut page) = page else {
+            return Err(RunFailure::protocol(false));
+        };
+        let items = match page.remove("items") {
+            Some(serde_json::Value::Array(items)) if items.len() <= MAX_PAGE_ITEMS => items,
+            _ => return Err(RunFailure::protocol(false)),
+        };
+        let next_cursor = match page.remove("nextCursor") {
+            None => None,
+            Some(serde_json::Value::String(cursor)) => Some(cursor),
+            Some(_) => return Err(RunFailure::protocol(false)),
+        };
+        if valid_next_cursor(next_cursor.as_deref())
+            && items.iter().all(|control| {
+                control["id"]
+                    .as_str()
+                    .is_some_and(|id| useful_support::valid_typed_id(id, "rct_"))
+            })
+        {
+            Ok((items, next_cursor))
+        } else {
+            Err(RunFailure::protocol(false))
+        }
+    }
+
+    /// The body of one page of the listing `listing` under the run `run_id`, which `limit`
+    /// and `cursor` select, answered `200` as JSON that no cache keeps.
+    fn read_run_page(
+        &self,
+        organization: &str,
+        run_id: &str,
+        listing: &str,
+        limit: Option<u32>,
+        cursor: Option<&str>,
+    ) -> Result<Vec<u8>, RunFailure> {
         let mut endpoint = Url::parse(&format!(
-            "{}/{}/trigger-deliveries",
+            "{}/{}/{listing}",
             self.collection_endpoint(organization),
             apis::urlencode(run_id)
         ))
@@ -675,24 +746,7 @@ impl<'a> RunApi<'a> {
         }
         require_media_type(&response, JSON_MEDIA_TYPE, false)?;
         require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
-        let list: models::RunTriggerDeliveryList =
-            serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
-        let valid_cursor = list
-            .next_cursor
-            .as_deref()
-            .is_none_or(|cursor| !cursor.is_empty() && cursor.len() <= 2048);
-        if valid_cursor
-            && list.items.iter().all(|delivery| {
-                useful_support::valid_typed_id(&delivery.id, "wtd_")
-                    && useful_support::valid_typed_id(&delivery.definition_id, "def_")
-                    && useful_support::valid_typed_id(&delivery.claim.claim_id, "wsc_")
-                    && delivery.revision >= 1
-            })
-        {
-            Ok((list.items, list.next_cursor))
-        } else {
-            Err(RunFailure::protocol(false))
-        }
+        Ok(response.body)
     }
 
     /// Releases the subject claim the definition-backed run `run_id` currently holds, as an
@@ -798,6 +852,10 @@ impl<'a> RunApi<'a> {
                     StatusCode::CONFLICT,
                     "https://api.usefulmachinery.com/problems/wait-not-current",
                 ) => Ok(RunControlSubmission::WaitNotCurrent),
+                (
+                    StatusCode::CONFLICT,
+                    "https://api.usefulmachinery.com/problems/control-unsupported",
+                ) => Ok(RunControlSubmission::ControlUnsupported),
                 (
                     StatusCode::CONFLICT,
                     "https://api.usefulmachinery.com/problems/idempotency-conflict",
@@ -2486,12 +2544,8 @@ fn decode_linear_lifecycle_update_list(
     require_exact_header(response.cache_controls.iter(), PRIVATE_CACHE_CONTROL)?;
     let list: RunLinearLifecycleUpdateList =
         serde_json::from_slice(&response.body).map_err(|_| RunFailure::protocol(false))?;
-    let valid_cursor = list
-        .next_cursor
-        .as_deref()
-        .is_none_or(|cursor| !cursor.is_empty() && cursor.len() <= 2048);
     if list.items.len() <= 100
-        && valid_cursor
+        && valid_next_cursor(list.next_cursor.as_deref())
         && list.items.iter().all(validate_linear_lifecycle_update)
     {
         Ok(list)
@@ -2875,6 +2929,123 @@ mod recovery_read_tests {
         envelope["run"]["observation"]["lastDecline"]["recoveryReason"] =
             serde_json::json!("unclassified");
         assert!(serde_json::from_value::<models::Run>(envelope["run"].clone()).is_err());
+    }
+
+    /// The materialized run of the pending continuation fixture.
+    fn pending_fixture_run() -> serde_json::Value {
+        let document: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/run-continuation-pending.json"
+        ))
+        .unwrap();
+        document["run"].clone()
+    }
+
+    /// Reads `run` as Cloud's answer to a read of the run it names.
+    fn read_fixture_run(run: &serde_json::Value) -> Result<RunRead, RunFailure> {
+        decode_get_response(
+            BufferedBlockingResponse {
+                status: StatusCode::OK,
+                content_type: Some(HeaderValue::from_static("application/json")),
+                idempotency_keys: vec![],
+                locations: vec![],
+                cache_controls: vec![HeaderValue::from_static(PRIVATE_CACHE_CONTROL)],
+                retry_afters: vec![],
+                request_ids: vec![],
+                body: serde_json::to_vec(run).unwrap(),
+            },
+            run["id"].as_str().unwrap(),
+        )
+    }
+
+    /// Re-serializes the run the reader took from `run`, none when it took none.
+    fn show_fixture_run(run: &serde_json::Value) -> Option<serde_json::Value> {
+        match read_fixture_run(run) {
+            Ok(RunRead::Materialized(run)) => Some(serde_json::to_value(&*run).unwrap()),
+            _ => None,
+        }
+    }
+
+    // REQ-RUN-106: the run reader takes a run's credential sources, null or reported, and
+    // re-serializes them as received; an entry without its member is not Cloud's.
+    #[test]
+    fn run_reader_keeps_credential_sources_as_received() {
+        let mut run = pending_fixture_run();
+        let sources = serde_json::json!({
+            "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "recordedAt": "2026-11-17T11:00:00Z",
+            "sources": [
+                {"provider": "github", "source": "host", "principalId": null},
+                {"provider": "claude_code", "source": "grant",
+                 "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abd"},
+            ],
+        });
+        for value in [serde_json::Value::Null, sources.clone()] {
+            run["credentialSources"] = value.clone();
+            assert_eq!(
+                show_fixture_run(&run).map(|shown| shown["credentialSources"].clone()),
+                Some(value)
+            );
+        }
+        run["credentialSources"] = sources;
+        run["credentialSources"]["sources"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("principalId");
+        assert!(matches!(
+            read_fixture_run(&run),
+            Err(RunFailure::Protocol { .. })
+        ));
+    }
+
+    // REQ-RUN-108: the run reader takes a run's integration sources and re-serializes them
+    // as received, with every member of an entry, including a provider, source and acting
+    // identity Cloud does not record yet; a run without them re-serializes without them, and
+    // an entry without one of its members is not Cloud's.
+    #[test]
+    fn run_reader_keeps_integration_sources_as_received() {
+        let mut run = pending_fixture_run();
+        assert!(run.get("integrationSources").is_none());
+        assert_eq!(
+            show_fixture_run(&run).map(|shown| shown.get("integrationSources").is_none()),
+            Some(true)
+        );
+
+        let integrations = serde_json::json!([
+            {"integration": "claude_code", "actedAs": "member", "connectedBy": null,
+             "source": "grant", "tokenVersion": null},
+            {"integration": "codex", "actedAs": null, "connectedBy": null,
+             "source": null, "tokenVersion": null},
+            {"integration": "github", "actedAs": null, "connectedBy": null,
+             "source": "host", "tokenVersion": null},
+            {"integration": "linear", "actedAs": "member",
+             "connectedBy": "prn_01k0z6r1w8f4jy2m7q9v3x5abd", "source": "grant",
+             "tokenVersion": null},
+            {"integration": "mergify", "actedAs": "org", "connectedBy": null,
+             "source": "token", "tokenVersion": 2},
+        ]);
+        run["integrationSources"] = integrations.clone();
+        assert_eq!(
+            show_fixture_run(&run).map(|shown| shown["integrationSources"].clone()),
+            Some(integrations.clone())
+        );
+
+        for member in [
+            "integration",
+            "actedAs",
+            "connectedBy",
+            "source",
+            "tokenVersion",
+        ] {
+            run["integrationSources"] = integrations.clone();
+            run["integrationSources"][4]
+                .as_object_mut()
+                .unwrap()
+                .remove(member);
+            assert!(
+                matches!(read_fixture_run(&run), Err(RunFailure::Protocol { .. })),
+                "an entry without {member} was read"
+            );
+        }
     }
 
     #[test]
@@ -3271,14 +3442,21 @@ mod recovery_read_tests {
     /// An API client whose one request is answered `409` under a problem type this
     /// release does not name.
     fn unnamed_conflict_server() -> (useful_test_support::ScriptedHttpServer, HttpClient) {
+        conflict_server("a-conflict-from-a-later-release")
+    }
+
+    /// An API client whose one request is answered `409` under the problem type `slug`.
+    fn conflict_server(slug: &str) -> (useful_test_support::ScriptedHttpServer, HttpClient) {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        let body = br#"{"type":"https://api.usefulmachinery.com/problems/a-conflict-from-a-later-release","title":"Refused","status":409}"#;
+        let body = format!(
+            r#"{{"type":"https://api.usefulmachinery.com/problems/{slug}","title":"Refused","status":409}}"#
+        );
         let mut response = format!(
             "HTTP/1.1 409 Conflict\r\nContent-Type: application/problem+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             body.len()
         )
         .into_bytes();
-        response.extend_from_slice(body);
+        response.extend_from_slice(body.as_bytes());
         let server = useful_test_support::ScriptedHttpServer::respond_in_sequence(vec![response]);
         let storage = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
         (server, storage)
@@ -3323,6 +3501,30 @@ mod recovery_read_tests {
                 &RunControlRequest::new(RunControlKind::RunControlKindApprove),
             ),
             Err(RunFailure::Conflict)
+        );
+        assert_eq!(server.finish().len(), 1);
+    }
+
+    // REQ-RUN-91, REQ-LOCALRUN-218: Cloud refuses a control the runner executing the run does
+    // not apply as `control-unsupported`, which this release names.
+    #[test]
+    fn request_control_reports_control_unsupported_as_its_refusal() {
+        let (server, storage) = conflict_server("control-unsupported");
+        let api = RunApi::new(
+            &server.api_url,
+            "fixture-token",
+            HttpTransportPolicy::AllowInsecureHttp,
+            &storage,
+        )
+        .unwrap();
+        assert_eq!(
+            api.request_control(
+                "acme",
+                "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "fixture-key",
+                &RunControlRequest::new(RunControlKind::RunControlKindWithdraw),
+            ),
+            Ok(RunControlSubmission::ControlUnsupported)
         );
         assert_eq!(server.finish().len(), 1);
     }
@@ -3377,6 +3579,90 @@ mod recovery_read_tests {
         server.finish_one();
     }
 
+    /// What `list_run_controls` answers.
+    type ListedRunControls = Result<(Vec<serde_json::Value>, Option<String>), RunFailure>;
+
+    /// The controls page `page` read through `list_run_controls` with a `limit` of 100, and
+    /// the request line it sent.
+    fn listed_run_controls(page: &serde_json::Value) -> (ListedRunControls, String) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let body = serde_json::to_vec(page).unwrap();
+        let mut response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nCache-Control: {PRIVATE_CACHE_CONTROL}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        response.extend_from_slice(&body);
+        let server = useful_test_support::ScriptedHttpServer::respond(response);
+        let storage = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).unwrap();
+        let api = RunApi::new(
+            &server.api_url,
+            "fixture-token",
+            HttpTransportPolicy::AllowInsecureHttp,
+            &storage,
+        )
+        .unwrap();
+        let listed =
+            api.list_run_controls("acme", "run_01k0z6r1w8f4jy2m7q9v3x5abc", Some(100), None);
+        let request = server.finish_one();
+        (listed, request.lines().next().unwrap().to_owned())
+    }
+
+    // REQ-RUN-92, REQ-COMPAT-20: a page of controls is its items as Cloud sent them and its
+    // cursor, an item of a kind and state this release does not name included.
+    #[test]
+    fn list_run_controls_returns_a_pages_items_as_sent_and_its_cursor() {
+        let control = |id: &str, kind: &str, state: &str| {
+            serde_json::json!({
+                "id": id, "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abc", "attemptNumber": 2,
+                "kind": kind, "wait": null, "answers": null, "notes": null, "before": null,
+                "reason": null, "state": state, "code": null, "actionOutcome": null,
+                "requestedBy": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                "acceptedAt": "2026-08-10T12:04:31Z", "deliveredAt": null, "settledAt": null,
+            })
+        };
+        let items = vec![
+            control("rct_01k0z6r1w8f4jy2m7q9v3x5abd", "pause", "queued"),
+            control("rct_01k0z6r1w8f4jy2m7q9v3x5abc", "withdraw", "accepted"),
+        ];
+        let (listed, request) = listed_run_controls(&serde_json::json!({
+            "items": items, "nextCursor": "older-controls",
+        }));
+        assert_eq!(
+            request,
+            "GET /api/v1/organizations/acme/runs/run_01k0z6r1w8f4jy2m7q9v3x5abc/controls?limit=100 HTTP/1.1"
+        );
+        assert_eq!(
+            listed,
+            Ok((items.clone(), Some("older-controls".to_owned())))
+        );
+
+        let (listed, _) = listed_run_controls(&serde_json::json!({"items": []}));
+        assert_eq!(listed, Ok((vec![], None)));
+    }
+
+    // REQ-RUN-92: a page whose items are not objects with a control id, or whose cursor is
+    // not a bounded string, is not an answer this release reads.
+    #[test]
+    fn list_run_controls_refuses_a_page_that_is_not_a_list_of_controls() {
+        let control = serde_json::json!({"id": "rct_01k0z6r1w8f4jy2m7q9v3x5abc", "kind": "stop"});
+        for page in [
+            serde_json::json!({"items": ["rct_01k0z6r1w8f4jy2m7q9v3x5abc"]}),
+            serde_json::json!({"items": [control, null]}),
+            serde_json::json!({"items": {"id": "rct_01k0z6r1w8f4jy2m7q9v3x5abc"}}),
+            serde_json::json!({"items": [{"id": "wtd_01k0z6r1w8f4jy2m7q9v3x5abc"}]}),
+            serde_json::json!({"items": [{"kind": "stop"}]}),
+            serde_json::json!({"items": vec![control.clone(); 101]}),
+            serde_json::json!({"items": [control], "nextCursor": ""}),
+            serde_json::json!({"items": [control], "nextCursor": 7}),
+            serde_json::json!({"nextCursor": "older-controls"}),
+            serde_json::json!([control]),
+        ] {
+            let (listed, _) = listed_run_controls(&page);
+            assert_eq!(listed, Err(RunFailure::protocol(false)), "{page}");
+        }
+    }
+
     // REQ-RUN-80, REQ-COMPAT-20
     #[test]
     fn unlisted_create_conflict_stays_a_conflict() {
@@ -3408,6 +3694,11 @@ mod recovery_read_tests {
             RunFailure::Unreachable(UnreachableCategory::Server)
         );
     }
+}
+
+/// Whether a page's `nextCursor`, when present, is a cursor the API issues: 1 to 2048 bytes.
+fn valid_next_cursor(cursor: Option<&str>) -> bool {
+    cursor.is_none_or(|cursor| !cursor.is_empty() && cursor.len() <= 2048)
 }
 
 fn valid_continuation_snapshot(

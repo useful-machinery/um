@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.97"
 description = "Command-line interface and runner for Useful Machinery"
 license = "Apache-2.0"
-repository = "https://github.com/useful-machinery/um"
+repository = "https://github.com/useful-machinery/cli"
 publish = false
 
 [[bin]]
@@ -33,7 +33,7 @@ rustls-platform-verifier = { path = "vendor/rustls-platform-verifier" }
 edition = "2024"
 rust-version = "1.97"
 license = "Apache-2.0"
-repository = "https://github.com/useful-machinery/um"
+repository = "https://github.com/useful-machinery/cli"
 
 [workspace.lints.rust]
 unsafe_code = "deny"

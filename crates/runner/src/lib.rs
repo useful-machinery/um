@@ -25,29 +25,31 @@ use std::fmt;
 pub use control_client::{RequestFailure, request};
 pub use control_protocol::{
     AgentLoginProvider, AgentLoginReadiness, AgentLoginState, AgentLoginUse, AssignmentCounts,
-    ConnectionFailure, ConnectionState, ControlError, Operation, ProcessState, ProtocolFailure,
-    ProviderReadiness, Response, StatusSnapshot,
+    ConnectionFailure, ConnectionState, ControlError, CredentialSource, Operation, ProcessState,
+    ProtocolFailure, ProviderReadiness, Response, StatusSnapshot,
 };
 pub use doctor::{
     CheckDescriptor, CheckResult, CredentialKind, CredentialOrigin, CredentialRequirement,
-    CredentialSummary, Declaration, DeclarationKind, Node, NodeKind, OperatorConfigSource,
-    OriginDeclaration, Outcome, ReadinessCode, Registry, RegistryError, Report,
-    RepositoryRootError, RepositorySource, SelectionError, Status, Summary, UnknownCredential,
-    UnknownDeclaration, WorkflowCredentials, built_in_registry, read_workflow_credentials,
-    repository_root,
+    CredentialSummary, Declaration, DeclarationKind, DerivedCredentials, Difference,
+    IntegrationDifference, Node, NodeKind, OperatorConfigSource, OriginDeclaration, Outcome,
+    ReadinessCode, Registry, RegistryError, Report, RepositoryRootError, RepositorySource,
+    SelectionError, Status, Summary, UnknownCredential, UnknownDeclaration, WorkflowCredentials,
+    built_in_registry, read_workflow_credentials, repository_root,
 };
 pub use enrollment::{
     ActivationArtifact, ActivationArtifactParts, AmbiguousCause, ArtifactDestination,
-    ArtifactWriteError, EnrollmentError, EnrollmentOutcome, EnrollmentResponse, JoinKeyArtifact,
-    JoinOutcome, JoinRefusal, JoinRetry, PrivateArtifactError, PrivateArtifactFile,
-    PublicationStage, RecordedOptions, RegisteredRunner, RegistrationAuthority,
-    RegistrationConflict, RegistrationConflictKind, RegistrationError, RegistrationOutcome,
-    RegistrationStage, RegistrationTarget, ReplacementDisposition, RunnerHome, RunnerHomeError,
-    confirm_registration, enroll, join_unless_enrolled, load_control_socket_path,
+    ArtifactWriteError, EnrollmentError, EnrollmentOutcome, EnrollmentResponse, HeldJoinKey,
+    JoinKeyArtifact, JoinKeyHold, JoinOutcome, JoinRefusal, JoinRetry, PrivateArtifactError,
+    PrivateArtifactFile, PublicationStage, RecordedOptions, RegisteredRunner,
+    RegistrationAuthority, RegistrationConflict, RegistrationConflictKind, RegistrationError,
+    RegistrationOutcome, RegistrationStage, RegistrationTarget, RejoinOutcome,
+    ReplacementDisposition, RunnerHome, RunnerHomeError, confirm_registration, enroll,
+    enrolled_with_join_key, join_unless_enrolled, load_control_socket_path,
     register_unless_enrolled, remove_completed_join_journal, replacement_disposition,
     write_activation_file,
 };
 pub use service::{Config, ConfigError};
+pub use service::{JoinKeyMode, Rejoin, RejoinAnswer, ServiceEnd};
 
 #[derive(Debug)]
 pub struct ServiceError(service::ServiceError);
@@ -70,8 +72,14 @@ impl std::error::Error for ServiceError {
     }
 }
 
-pub fn run(config: Config, service_version: &str) -> Result<(), ServiceError> {
-    service::run(config, service_version).map_err(ServiceError)
+/// Serves the runner of `config` until a stop signal or an end
+/// `join_key`'s mode decides (INV-RUNNER-35).
+pub fn run(
+    config: Config,
+    service_version: &str,
+    join_key: JoinKeyMode,
+) -> Result<ServiceEnd, ServiceError> {
+    service::run(config, service_version, join_key).map_err(ServiceError)
 }
 
 #[cfg(feature = "test-fixtures")]

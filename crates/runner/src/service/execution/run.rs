@@ -871,7 +871,7 @@ impl ExecutionJob {
         assignment_id: &str,
         attempt_id: &str,
     ) -> ExecutionCompletion {
-        let post_stop_fence = PostStopFence::with_workflow_git(None);
+        let post_stop_fence = PostStopFence::with_workflow_git(self.accepted.workflow_git.clone());
         let cancellation = tree.cancellation().source().clone();
         if let Err(completion) = self
             .ensure_execution_authority(&cancellation, &post_stop_fence, assignment_id, attempt_id)
@@ -890,6 +890,32 @@ impl ExecutionJob {
             .await
         {
             return completion;
+        }
+        // A tree run on a GitHub project serves the workspace's Git read access under the
+        // lease as an engine run does (REQ-RUNNERENROLL-121); one on a GitLab project has
+        // no relay to start (REQ-WORKSPACE-42).
+        if self.accepted.workflow_git.is_some() {
+            if !self.activate_workflow_git().await
+                && cancellation.cancellation_reason() != Some(CancellationReason::RunnerShutdown)
+            {
+                return self.execution_environment_lost(
+                    assignment_id,
+                    attempt_id,
+                    "workflow_git_activation_failed",
+                    "workflow_git_activation",
+                );
+            }
+            if let Err(completion) = self
+                .ensure_execution_authority(
+                    &cancellation,
+                    &post_stop_fence,
+                    assignment_id,
+                    attempt_id,
+                )
+                .await
+            {
+                return completion;
+            }
         }
         let initial_authority = self.authority_updates.borrow().clone();
         let initial_wait = match self
@@ -929,6 +955,9 @@ impl ExecutionJob {
             Arc::clone(&self.engine_terminal),
         )
         .await;
+        if let Some(workflow_git) = &self.accepted.workflow_git {
+            workflow_git.disable();
+        }
         let end = match execution {
             LeaseExecution::Completed {
                 output: Ok(end), ..

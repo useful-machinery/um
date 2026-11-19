@@ -49,6 +49,9 @@ pub enum RunnerFrame {
         /// tree an earlier attempt left in its retained workspace, so Cloud may
         /// offer it a definition-backed run's continuation (REQ-COMPAT-18).
         tree_continuation: bool,
+        /// Advertises `treeWithdraw: 1`: this runner applies a `withdraw` control, so Cloud
+        /// may send it one (REQ-RUNNERENROLL-123).
+        tree_withdraw: bool,
     },
     WorkspaceInventoryComplete {
         envelope: RunnerEnvelope,
@@ -255,17 +258,118 @@ pub struct TreeRootProgress {
 }
 
 /// The wait a waiting tree run reports: the `{kind, since, step}` of its
-/// `wait.json` and, for an answer wait, the questions it asks (REQ-COMPAT-18).
-/// `questions` is `None` when the wait reports none, and the encoder then
-/// writes no `questions` member; `Some` of an empty list is written as `[]`.
-/// The schema admits `questions` only on kind `answer`, which the encoder does
-/// not check.
+/// `wait.json`, for an answer wait the questions it asks, and the failed child
+/// it reports (REQ-COMPAT-18). `questions` is `None` when the wait reports
+/// none, and the encoder then writes no `questions` member; `Some` of an empty
+/// list is written as `[]`. The schema admits `questions` only on kind
+/// `answer`, which the encoder does not check. `failed_child` is `None` when
+/// the wait reports none, and the encoder then writes no `failedChild` member;
+/// the schema admits it on a wait of any kind.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeProgressWait {
     pub kind: String,
     pub since: String,
     pub step: Vec<Value>,
     pub questions: Option<TreeProgressWaitQuestions>,
+    pub failed_child: Option<TreeProgressFailedChild>,
+}
+
+/// The role of the failing node of a wait's failed child in that child's
+/// workflow: a step or a finalizer.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TreeProgressFailedChildRole {
+    Step,
+    Finalizer,
+}
+
+impl TreeProgressFailedChildRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Step => "step",
+            Self::Finalizer => "finalizer",
+        }
+    }
+}
+
+/// The state of the failing node of a wait's failed child: failed, or blocked
+/// behind a failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TreeProgressFailedChildState {
+    Failed,
+    Blocked,
+}
+
+impl TreeProgressFailedChildState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+        }
+    }
+}
+
+/// The failed child one wait reports, within the bounds Cloud admits
+/// (REQ-COMPAT-18): the child run's outcome, the failing node's `id` and role,
+/// its state and, when known, its phase and code. Only
+/// [`TreeProgressFailedChild::new`] makes one, so the encoder is never handed a
+/// value Cloud refuses: a refused value would fail `encode_runner_frame`, and a
+/// root report that cannot be sent ends the run.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreeProgressFailedChild {
+    outcome: String,
+    node_id: String,
+    role: TreeProgressFailedChildRole,
+    state: TreeProgressFailedChildState,
+    phase: Option<String>,
+    code: Option<String>,
+}
+
+impl TreeProgressFailedChild {
+    /// The failed child, or `None` when any bound breaks: an `outcome`, a
+    /// `phase` or a `code` that is not a diagnostic slug
+    /// (`^[a-z][a-z0-9_]{0,63}$`), or a node id that is not of the schema's
+    /// form (`^[a-z][A-Za-z0-9]*$`, at most 64 characters). Nothing is
+    /// truncated. The kind of the wait and any tie between `state` and `phase`
+    /// or `code` are not checked: the schema leaves them free.
+    pub fn new(
+        outcome: String,
+        node_id: String,
+        role: TreeProgressFailedChildRole,
+        state: TreeProgressFailedChildState,
+        phase: Option<String>,
+        code: Option<String>,
+    ) -> Option<Self> {
+        let admitted = is_diagnostic_slug(&outcome)
+            && node_id
+                .parse::<generated::TreeProgressWaitFailedChildNodeId>()
+                .is_ok()
+            && phase.as_deref().is_none_or(is_diagnostic_slug)
+            && code.as_deref().is_none_or(is_diagnostic_slug);
+        admitted.then_some(Self {
+            outcome,
+            node_id,
+            role,
+            state,
+            phase,
+            code,
+        })
+    }
+}
+
+/// The `failedChild` object exactly as the encoder writes it.
+fn tree_progress_wait_failed_child_value(child: &TreeProgressFailedChild) -> Value {
+    let mut value = json!({
+        "outcome": child.outcome,
+        "node": { "id": child.node_id, "role": child.role.as_str() },
+        "state": child.state.as_str(),
+    });
+    if let Some(phase) = &child.phase {
+        value["phase"] = json!(phase);
+    }
+    if let Some(code) = &child.code {
+        value["code"] = json!(code);
+    }
+    value
 }
 
 /// At most this many questions on one wait; mirrors the schema's `maxItems` on
@@ -480,8 +584,8 @@ pub struct RunControl {
 }
 
 /// What a control asks of the run, each kind with only its own members: the `useful workflow
-/// run` command it names (`answer`, `approve`, `hand-back`, `lift`, `stop` or `retry`) and
-/// the wait it resolves, when it names one.
+/// run` command it names (`answer`, `approve`, `hand-back`, `lift`, `stop`, `retry` or
+/// `withdraw`) and the wait it resolves, when it names one. A `withdraw` holds no member.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum RunControlAction {
     Answer {
@@ -506,6 +610,7 @@ pub enum RunControlAction {
     Retry {
         wait: RunControlWait,
     },
+    Withdraw,
 }
 
 /// The wait a control resolves: the `kind` and `since` of the pending wait as
@@ -1342,6 +1447,7 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
             recovery_root,
             tree_execution,
             tree_continuation,
+            tree_withdraw,
         } => {
             let mut payload = json!({ "runnerVersion": runner_version });
             if *tree_execution {
@@ -1349,6 +1455,9 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
             }
             if *tree_continuation {
                 payload["treeContinuation"] = json!(1);
+            }
+            if *tree_withdraw {
+                payload["treeWithdraw"] = json!(1);
             }
             if let Some(root) = recovery_root {
                 payload["workspaceRecoveryVersion"] = json!(1);
@@ -1585,6 +1694,9 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
                     });
                     if let Some(questions) = &wait.questions {
                         value["questions"] = tree_progress_wait_questions_value(questions);
+                    }
+                    if let Some(child) = &wait.failed_child {
+                        value["failedChild"] = tree_progress_wait_failed_child_value(child);
                     }
                     value
                 }),
@@ -2515,6 +2627,7 @@ fn run_control_action(control: generated::RunControl) -> Result<RunControlAction
         generated::RunControlKind::Retry => RunControlAction::Retry {
             wait: required(wait)?,
         },
+        generated::RunControlKind::Withdraw => RunControlAction::Withdraw,
     })
 }
 
@@ -3237,6 +3350,7 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
             "workspaceRecoveryRoot",
             "treeExecution",
             "treeContinuation",
+            "treeWithdraw",
         ],
         "workspace_inventory" => &["discovery", "diagnostic"],
         "execution_transition" | "execution_interrupted" => &["diagnostic"],
@@ -3555,6 +3669,11 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/tree-progress-waiting-questions.json"
         )),
+        // REQ-COMPAT-18
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/tree-progress-waiting-failed-child.json"
+        )),
         // REQ-TRIGGER-136
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -3585,6 +3704,16 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/cloud-run-control-lift.json"
         )),
+        // REQ-RUNNERENROLL-123
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/cloud-run-control-withdraw.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/hello-tree-withdraw.json"
+        )),
+        // REQ-RUNNERENROLL-90
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/run-control-applied.json"
@@ -3718,6 +3847,19 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/invalid/tree-progress-questions-empty-id.json"
         )),
+        // REQ-COMPAT-18
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/tree-progress-failed-child-unknown-state.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/tree-progress-failed-child-without-node.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/tree-progress-failed-child-code-not-slug.json"
+        )),
         // REQ-TRIGGER-136
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -3748,6 +3890,20 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/invalid/cloud-run-control-stop-with-wait.json"
         )),
+        // REQ-RUNNERENROLL-123
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/cloud-run-control-withdraw-with-wait.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/cloud-run-control-withdraw-with-reason.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/hello-tree-withdraw-unknown.json"
+        )),
+        // REQ-RUNNERENROLL-90
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/invalid/run-control-applied-with-code.json"
@@ -3912,6 +4068,7 @@ mod tests {
             recovery_root: None,
             tree_execution: true,
             tree_continuation: false,
+            tree_withdraw: false,
         };
 
         let encoded = encode_runner_frame(&frame).unwrap();
@@ -3923,16 +4080,32 @@ mod tests {
         assert!(value["payload"].get("treeContinuation").is_none());
 
         let continuing = RunnerFrame::Hello {
-            envelope,
+            envelope: envelope.clone(),
             runner_version: "0.2.0".to_owned(),
             recovery_root: None,
             tree_execution: true,
             tree_continuation: true,
+            tree_withdraw: false,
         };
         let encoded = encode_runner_frame(&continuing).unwrap();
         assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
         let value: Value = serde_json::from_slice(&encoded).unwrap();
         assert_eq!(value["payload"]["treeContinuation"], 1);
+        // REQ-RUNNERENROLL-123
+        assert!(value["payload"].get("treeWithdraw").is_none());
+
+        let withdrawing = RunnerFrame::Hello {
+            envelope,
+            runner_version: "0.2.0".to_owned(),
+            recovery_root: None,
+            tree_execution: true,
+            tree_continuation: true,
+            tree_withdraw: true,
+        };
+        let encoded = encode_runner_frame(&withdrawing).unwrap();
+        assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
+        let value: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["payload"]["treeWithdraw"], 1);
     }
 
     // REQ-COMPAT-18
@@ -4035,18 +4208,31 @@ mod tests {
         kind: &str,
         questions: Option<TreeProgressWaitQuestions>,
     ) -> RunnerFrame {
+        fixture_waiting_report_at("merge", kind, questions, None)
+    }
+
+    /// The waiting report of `tree-progress-waiting.json` at the given
+    /// position and wait step, with the given wait kind, questions and failed
+    /// child.
+    fn fixture_waiting_report_at(
+        step: &str,
+        kind: &str,
+        questions: Option<TreeProgressWaitQuestions>,
+        failed_child: Option<TreeProgressFailedChild>,
+    ) -> RunnerFrame {
         tree_progress_frame(
             "rmsg_01k0z6r1w8f4jy2m7q9v3x5atp",
             6,
             2,
             TreeRootProgress {
                 attempt: 2,
-                position: vec![json!("merge")],
+                position: vec![json!(step)],
                 wait: Some(TreeProgressWait {
                     kind: kind.to_owned(),
                     since: "2026-07-23T00:00:05Z".to_owned(),
-                    step: vec![json!("merge")],
+                    step: vec![json!(step)],
                     questions,
+                    failed_child,
                 }),
                 reported_at: "2026-07-23T00:00:06Z".to_owned(),
                 steps: Vec::new(),
@@ -4199,6 +4385,14 @@ mod tests {
                     questions: TreeProgressWaitQuestions::new(questions_of_encoded_size(
                         MAXIMUM_TREE_PROGRESS_WAIT_QUESTIONS_BYTES,
                     )),
+                    failed_child: Some(failed_child(
+                        &"o".repeat(64),
+                        &"n".repeat(64),
+                        TreeProgressFailedChildRole::Finalizer,
+                        TreeProgressFailedChildState::Failed,
+                        Some(&"p".repeat(64)),
+                        Some(&"c".repeat(64)),
+                    )),
                 }),
                 reported_at: "9999-12-31T23:59:59.999999999Z".to_owned(),
                 steps: (0..64)
@@ -4219,6 +4413,194 @@ mod tests {
         };
         let encoded = encode_runner_frame(&maximal).expect("the maximal report encodes");
         assert!(encoded.len() <= MAXIMUM_ORDINARY_FRAME_BYTES);
+    }
+
+    /// The failed child of the given values, which the test expects admitted.
+    fn failed_child(
+        outcome: &str,
+        id: &str,
+        role: TreeProgressFailedChildRole,
+        state: TreeProgressFailedChildState,
+        phase: Option<&str>,
+        code: Option<&str>,
+    ) -> TreeProgressFailedChild {
+        TreeProgressFailedChild::new(
+            outcome.to_owned(),
+            id.to_owned(),
+            role,
+            state,
+            phase.map(str::to_owned),
+            code.map(str::to_owned),
+        )
+        .unwrap_or_else(|| panic!("refused {outcome:?} {id:?} {phase:?} {code:?}"))
+    }
+
+    // REQ-COMPAT-18: a wait's failed child is reported within the bounds Cloud
+    // admits, whole or not at all, and only when the wait holds one.
+    #[test]
+    fn tree_progress_wait_writes_only_a_failed_child_cloud_admits() {
+        use TreeProgressFailedChildRole::{Finalizer, Step};
+        use TreeProgressFailedChildState::{Blocked, Failed};
+        let encoded_payload = |frame: &RunnerFrame| {
+            let encoded = encode_runner_frame(frame).expect("the frame encodes");
+            assert!(decode_frame(&encoded).is_ok());
+            serde_json::from_slice::<Value>(&encoded).unwrap()
+        };
+
+        let draft_pr = failed_child(
+            "failed",
+            "draftPr",
+            Step,
+            Failed,
+            Some("execution"),
+            Some("command_exit"),
+        );
+        assert_eq!(
+            encoded_payload(&fixture_waiting_report_at(
+                "design",
+                "repair",
+                None,
+                Some(draft_pr.clone()),
+            )),
+            valid_runner_fixture("tree-progress-waiting-failed-child.json")
+        );
+        let none = encoded_payload(&fixture_waiting_report_at("design", "repair", None, None));
+        assert!(none["payload"]["wait"].get("failedChild").is_none());
+        let asked = TreeProgressWaitQuestions::new(vec![question("scope", None)])
+            .expect("one question is admitted");
+        let both = encoded_payload(&fixture_waiting_report_at(
+            "design",
+            "answer",
+            Some(asked),
+            Some(draft_pr),
+        ));
+        assert_eq!(
+            both["payload"]["wait"]["questions"],
+            json!([{"id": "scope"}])
+        );
+        assert_eq!(
+            both["payload"]["wait"]["failedChild"],
+            valid_runner_fixture("tree-progress-waiting-failed-child.json")["payload"]["wait"]["failedChild"]
+        );
+
+        let over = "a".repeat(65);
+        let admitted = |outcome: &str, id: &str, phase: Option<&str>, code: Option<&str>| {
+            TreeProgressFailedChild::new(
+                outcome.to_owned(),
+                id.to_owned(),
+                Step,
+                Failed,
+                phase.map(str::to_owned),
+                code.map(str::to_owned),
+            )
+        };
+        let mut refused = Vec::new();
+        for outcome in ["", over.as_str(), "Failed", "draft-pr"] {
+            refused.push(admitted(
+                outcome,
+                "draftPr",
+                Some("execution"),
+                Some("command_exit"),
+            ));
+        }
+        for id in ["", over.as_str(), "draft-pr", "DraftPr"] {
+            refused.push(admitted(
+                "failed",
+                id,
+                Some("execution"),
+                Some("command_exit"),
+            ));
+        }
+        for slug in ["", over.as_str(), "command exit"] {
+            refused.push(admitted(
+                "failed",
+                "draftPr",
+                Some(slug),
+                Some("command_exit"),
+            ));
+            refused.push(admitted("failed", "draftPr", Some("execution"), Some(slug)));
+        }
+        for refusal in refused {
+            assert_eq!(refusal, None);
+        }
+
+        let bound = format!("a{}", "_".repeat(63));
+        let id = format!("d{}", "A".repeat(63));
+        let accepted = [
+            (
+                "failed",
+                "draftPr",
+                Step,
+                Failed,
+                Some("execution"),
+                Some("command_exit"),
+            ),
+            (
+                bound.as_str(),
+                "draftPr",
+                Step,
+                Failed,
+                Some("execution"),
+                Some("command_exit"),
+            ),
+            (
+                "failed",
+                id.as_str(),
+                Step,
+                Failed,
+                Some("execution"),
+                Some("command_exit"),
+            ),
+            (
+                "failed",
+                "draftPr",
+                Step,
+                Failed,
+                Some(bound.as_str()),
+                Some(bound.as_str()),
+            ),
+            (
+                "failed",
+                "verify",
+                Finalizer,
+                Failed,
+                Some("execution"),
+                None,
+            ),
+            (
+                "failed",
+                "verify",
+                Finalizer,
+                Failed,
+                None,
+                Some("command_exit"),
+            ),
+            ("blocked", "merge", Step, Blocked, None, None),
+        ];
+        for (outcome, id, role, state, phase, code) in accepted {
+            let child = failed_child(outcome, id, role, state, phase, code);
+            let frame = encoded_payload(&fixture_waiting_report_at(
+                "design",
+                "repair",
+                None,
+                Some(child),
+            ));
+            let mut expected = json!({
+                "outcome": outcome,
+                "node": {
+                    "id": id,
+                    "role": match role { Step => "step", Finalizer => "finalizer" },
+                },
+                "state": match state { Failed => "failed", Blocked => "blocked" },
+            });
+            if let Some(phase) = phase {
+                expected["phase"] = json!(phase);
+            }
+            if let Some(code) = code {
+                expected["code"] = json!(code);
+            }
+            assert_eq!(frame["payload"]["wait"]["failedChild"], expected);
+        }
     }
 
     // REQ-COMPAT-18
@@ -4543,6 +4925,19 @@ mod tests {
             ))
             .is_err()
         );
+    }
+
+    // REQ-RUNNERENROLL-123: this release advertises `treeWithdraw`, so a `withdraw` reaching
+    // it is a control it applies.
+    #[test]
+    fn run_control_decodes_a_withdraw() {
+        let withdraw = valid_runner_fixture("cloud-run-control-withdraw.json");
+        let CloudFrame::RunControl { control, .. } =
+            decode_cloud_frame(&serde_json::to_vec(&withdraw).unwrap()).unwrap()
+        else {
+            panic!("expected a run control");
+        };
+        assert_eq!(control.action, RunControlAction::Withdraw);
     }
 
     // REQ-TRIGGER-136

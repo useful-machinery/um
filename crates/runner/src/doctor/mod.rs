@@ -20,8 +20,9 @@ pub use agent_logins::OperatorConfigSource;
 pub use git::{RepositoryRootError, repository_root};
 pub use workflow_credentials::{
     CredentialKind, CredentialOrigin, CredentialRequirement, CredentialSummary, Declaration,
-    DeclarationKind, Node, NodeKind, OriginDeclaration, ReadinessCode, RepositorySource,
-    UnknownCredential, UnknownDeclaration, WorkflowCredentials, read_workflow_credentials,
+    DeclarationKind, DerivedCredentials, Difference, IntegrationDifference, Node, NodeKind,
+    OriginDeclaration, ReadinessCode, RepositorySource, UnknownCredential, UnknownDeclaration,
+    WorkflowCredentials, read_workflow_credentials,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -683,21 +684,18 @@ mod tests {
         );
     }
 
-    // REQ-RUNNERENROLL-86
+    // REQ-RUNNERENROLL-86, REQ-GRANT-51
     #[test]
-    fn agent_logins_check_fails_with_the_state_of_an_authorized_provider_that_is_not_ready() {
+    fn agent_logins_check_passes_while_the_host_logs_in_for_a_provider() {
         let host = AgentLoginHost::new();
         host.record_codex("foreign_login");
 
         let outcome = host.run();
 
+        assert_eq!((outcome.status, outcome.code), (Status::Pass, "ok"));
         assert_eq!(
-            (outcome.status, outcome.code),
-            (Status::Fail, "foreign_login")
-        );
-        assert_eq!(
-            outcome.details.get("provider").map(String::as_str),
-            Some("codex")
+            outcome.details.get("codex").map(String::as_str),
+            Some("foreign_login")
         );
     }
 
@@ -718,9 +716,9 @@ mod tests {
         }
     }
 
-    // REQ-RUNNERENROLL-86, REQ-GRANT-51
+    // REQ-RUNNERENROLL-86, REQ-GRANT-38
     #[test]
-    fn agent_logins_check_fails_a_selected_provider_cloud_refuses() {
+    fn agent_logins_check_passes_for_a_provider_an_earlier_release_recorded_as_selected() {
         let host = AgentLoginHost::new();
         host.record_codex_entry(serde_json::json!({
             "provider": "codex",
@@ -732,14 +730,7 @@ mod tests {
 
         let outcome = host.run();
 
-        assert_eq!(
-            (outcome.status, outcome.code),
-            (Status::Fail, "not_authorized")
-        );
-        assert_eq!(
-            outcome.details.get("provider").map(String::as_str),
-            Some("codex")
-        );
+        assert_eq!((outcome.status, outcome.code), (Status::Pass, "ok"));
     }
 
     // REQ-RUNNERENROLL-86
@@ -809,6 +800,48 @@ mod tests {
             outcome.details.get("codex_next_action").map(String::as_str),
             Some("check_target")
         );
+    }
+
+    // REQ-GRANT-92, REQ-RUNNERENROLL-86
+    #[test]
+    fn agent_logins_check_names_each_recorded_source() {
+        for (source, state) in [("host", "foreign_login"), ("grant", "ready")] {
+            let host = AgentLoginHost::new();
+            let mut codex = serde_json::json!({
+                "provider": "codex",
+                "state": state,
+                "checkedAt": "2026-11-12T01:00:00Z",
+                "source": source,
+            });
+            if state == "ready" {
+                codex["agentLoginId"] = "agl_01k0z6r1w8f4jy2m7q9v3x5abc".into();
+                codex["generation"] = 2.into();
+                codex["installedAt"] = "2026-11-12T00:55:00Z".into();
+                codex["installedPath"] = host
+                    .root
+                    .path()
+                    .join("state/.runner-agent-login/codex/auth.json")
+                    .to_str()
+                    .unwrap()
+                    .into();
+            }
+            host.record_codex_entry(codex);
+
+            let outcome = host.run();
+
+            assert_eq!(
+                (outcome.status, outcome.code),
+                (Status::Pass, "ok"),
+                "{source}"
+            );
+            assert_eq!(
+                outcome.details.get("codex_source").map(String::as_str),
+                Some(source),
+                "{outcome:?}"
+            );
+            // A provider that records no source names none.
+            assert_eq!(outcome.details.get("github_source"), None, "{outcome:?}");
+        }
     }
 
     // REQ-RUNNERENROLL-86

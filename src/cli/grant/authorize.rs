@@ -277,7 +277,7 @@ impl Command {
             |grant| runner_choice::to_authorize(deployment, options, grant),
             |grant| format!("to authorize for grant {}", grant.id),
             // A Codex grant serves one runner at a time (REQ-GRANT-59).
-            |grant| grant.provider != MemberGrantProvider::GrantProviderCodex,
+            |grant| grant.provider != MemberGrantProvider::GrantProviderCodex.as_str(),
         )? {
             Ok(acting) => acting,
             Err(exit) => return Ok(exit),

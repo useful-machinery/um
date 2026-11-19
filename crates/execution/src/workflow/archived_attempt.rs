@@ -16,8 +16,8 @@ use time::OffsetDateTime;
 use super::artifact_set;
 use super::document::{FailurePolicy, FinalizationTrigger, Output};
 use super::evidence::{
-    FailureDetail, NodeDetail, NonExecutionCode, Prerequisite, PrimaryIssue, PrimaryIssueDetail,
-    PrimaryIssueState,
+    FailedChild, FailureDetail, NodeDetail, NonExecutionCode, Prerequisite, PrimaryIssue,
+    PrimaryIssueDetail, PrimaryIssueState,
 };
 use super::force_abort_evidence::{
     finalization_cancellation_matches_force_phase, finalization_node_cancellation_matches,
@@ -175,6 +175,56 @@ pub(crate) struct ArchivedStep {
     pub(crate) command_output: Option<ArchivedCommandOutput>,
     pub(crate) recovery: Option<super::publication::StepRecoverySummaryV1>,
     pub(crate) invocations: Vec<super::publication::RecoveryInvocationV1>,
+    /// The failed child of a `succeeded` `workflow` step (REQ-LOCALRUN-219); `None` for
+    /// any other step.
+    pub(crate) failed_child: Option<FailedChild>,
+    /// The count of outputs the step committed, as the attempt recorded them; `None` for an
+    /// attempt recorded without them, which keeps the declared count (REQ-LOCALRUN-221).
+    pub(crate) committed_outputs: Option<usize>,
+}
+
+impl ArchivedStep {
+    /// The state the step is presented with: `failed` for a `succeeded` step whose child
+    /// failed, its recorded state otherwise (REQ-LOCALRUN-221). The recorded `state` stays
+    /// what output dispositions, validation and the advisory rules read.
+    pub(crate) fn presented_state(&self) -> WorkflowStepStateV1 {
+        presented_step_state(self.state, self.failed_child.as_ref())
+    }
+
+    /// The count of outputs the step committed, or `declared` for an attempt recorded
+    /// without them (REQ-OUTPUTS-17, REQ-LOCALRUN-221).
+    pub(crate) fn committed_output_count(&self, declared: usize) -> usize {
+        self.committed_outputs.unwrap_or(declared)
+    }
+}
+
+/// A step state the presented-state rule reads: one with a `succeeded` and a `failed` value.
+pub(crate) trait PresentedStepState: Copy + Eq {
+    const SUCCEEDED: Self;
+    const FAILED: Self;
+}
+
+impl PresentedStepState for WorkflowStepStateV1 {
+    const SUCCEEDED: Self = Self::Succeeded;
+    const FAILED: Self = Self::Failed;
+}
+
+impl PresentedStepState for super::runtime::StepStateKind {
+    const SUCCEEDED: Self = Self::Succeeded;
+    const FAILED: Self = Self::Failed;
+}
+
+/// The state a step is presented with, live or archived: `failed` for a `succeeded` step
+/// that carries its child's failure, `state` otherwise (REQ-LOCALRUN-221).
+pub(crate) fn presented_step_state<State: PresentedStepState>(
+    state: State,
+    failed_child: Option<&FailedChild>,
+) -> State {
+    if state == State::SUCCEEDED && failed_child.is_some() {
+        State::FAILED
+    } else {
+        state
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -237,7 +287,8 @@ pub fn load_local_archived_attempt(
 /// How the finished child run at `child` ended, for a parent that recovers from abandonment
 /// without running it again (REQ-CONTINUE-76): `Cancelled` for a child whose run record
 /// reads `canceled` or whose published result is cancelled, `Exited` with the recorded
-/// outcome and the published result's available `text` and `json` exports, and
+/// outcome, the published result's available `text` and `json` exports and the primary issue
+/// of a `failed` result, and
 /// `Interrupted` for a child with no outcome or no readable published result.
 pub fn adopted_child_outcome(child: &Path) -> super::step_runtime::ChildRunOutcome {
     use super::step_runtime::ChildRunOutcome;
@@ -279,11 +330,18 @@ pub fn adopted_child_outcome(child: &Path) -> super::step_runtime::ChildRunOutco
         };
         exports.insert(name.clone(), value);
     }
-    // An adopted child ran in an earlier attempt, so no interruption of this one failed it.
+    // An adopted child ran in an earlier attempt, so no interruption of this one failed it;
+    // its failure is the primary issue of its published result when that is `failed`
+    // (REQ-WFEXEC-77).
+    let failure = (loaded.result.outcome == WorkflowOutcomeV1::Failed)
+        .then(|| loaded.result.primary_issue.clone())
+        .flatten()
+        .map(Box::new);
     ChildRunOutcome::Exited {
         outcome,
         exports,
         interruption: None,
+        failure,
     }
 }
 
@@ -878,6 +936,7 @@ fn project_steps(
                 || !step_kind_matches(&step.kind, definition)
                 || !step_state_matches(step.state, durable.state)
                 || durable.detail != step.detail
+                || durable.failed_child != step.failed_child
                 || !durable_recovery_matches_wire(root, attempt, durable, step)
             {
                 return Err(());
@@ -891,6 +950,7 @@ fn project_steps(
                     .output_producers
                     .get(&step.id)
                     .is_some_and(|outputs| !outputs.is_empty()),
+                durable.outputs.as_ref().map(Vec::len),
             )
         })
         .collect()
@@ -985,6 +1045,7 @@ fn project_finalization(
                 WorkflowNodeRole::Finalizer,
                 maximum_stream_bytes,
                 false,
+                durable.outputs.as_ref().map(Vec::len),
             )
         })
         .collect::<Result<Vec<_>, ()>>()?;
@@ -1382,7 +1443,16 @@ fn project_step(
     role: WorkflowNodeRole,
     maximum_stream_bytes: u64,
     inherited_data_available: bool,
+    committed_outputs: Option<usize>,
 ) -> Result<ArchivedStep, ()> {
+    // Only a `succeeded` `workflow` step records its failed child (REQ-LOCALRUN-219).
+    if step.failed_child.is_some()
+        && (step.state != WorkflowStepStateV1::Succeeded
+            || role != WorkflowNodeRole::Step
+            || !matches!(definition, ValidatedStep::Workflow(_)))
+    {
+        return Err(());
+    }
     let (started_at, duration) = match (&step.started_at, step.duration_milliseconds) {
         (Some(started_at), Some(duration)) => (
             Some(parse_canonical_utc_timestamp(started_at).ok_or(())?),
@@ -1493,6 +1563,8 @@ fn project_step(
         command_output,
         recovery: step.recovery.clone(),
         invocations: step.invocations.clone(),
+        failed_child: step.failed_child.clone(),
+        committed_outputs,
     })
 }
 
@@ -2023,6 +2095,8 @@ mod tests {
             command_output: None,
             recovery: None,
             invocations: Vec::new(),
+            failed_child: None,
+            committed_outputs: None,
         }
     }
 
@@ -2059,7 +2133,7 @@ mod tests {
             "detail": {"code": "not_reached"}
         }))
         .unwrap();
-        let project = |role| project_step(&step, &workflow.steps["build"], role, 1024, false);
+        let project = |role| project_step(&step, &workflow.steps["build"], role, 1024, false, None);
 
         let archived = project(WorkflowNodeRole::Step).unwrap();
         assert_eq!(
@@ -2074,6 +2148,104 @@ mod tests {
             Some(ExportUnavailableReasonV1::NotRun)
         );
         assert_eq!(project(WorkflowNodeRole::Finalizer), Err(()));
+    }
+
+    // REQ-LOCALRUN-219: the loader keeps the failed child a `succeeded` `workflow` step
+    // recorded, and refuses one on a step of any other state or kind.
+    #[test]
+    fn only_a_succeeded_workflow_step_carries_a_failed_child() {
+        let summary = super::super::validation::ChildWorkflowSummary {
+            outcomes: vec!["worked".to_owned(), "failed".to_owned()],
+            exports: BTreeMap::new(),
+            inputs: BTreeMap::new(),
+            nesting: super::super::validation::ChildNesting::Stage,
+            has_root_blocks: false,
+            paths: BTreeSet::new(),
+        };
+        let stage = super::super::validation::validate_with_children(
+            super::super::decode(
+                b"schemaVersion: 1\noutcomes: [landed, failed]\nsteps:\n  design:\n    kind: workflow\n    workflow: design.yaml\n    on:\n      worked: exit.landed\n      failed: exit.failed\n",
+            )
+            .unwrap(),
+            None,
+            &BTreeMap::from([("design.yaml".to_owned(), summary)]),
+        )
+        .unwrap();
+        let command = super::super::validation::validate(
+            super::super::decode(
+                b"schemaVersion: 1\nsteps:\n  build:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let record = FailedChild {
+            outcome: "failed".to_owned(),
+            item: None,
+            primary_issue: Box::new(PrimaryIssue::failed(
+                super::super::validated::WorkflowNode {
+                    id: "route".to_owned(),
+                    role: WorkflowNodeRole::Step,
+                },
+                FailureDetail::interrupted_in_execution(),
+            )),
+        };
+        let entry = |id: &str, kind: &str, state: WorkflowStepStateV1| {
+            let mut step: WorkflowStepV1 = serde_json::from_value(serde_json::json!({
+                "id": id,
+                "role": "step",
+                "kind": kind,
+                "failurePolicy": "required",
+                "state": "succeeded",
+                "startedAt": "2026-08-06T12:00:01Z",
+                "durationMilliseconds": 1000
+            }))
+            .unwrap();
+            step.state = state;
+            if state == WorkflowStepStateV1::Failed {
+                step.detail = Some(NodeDetail::Failed(FailureDetail::interrupted_in_execution()));
+            }
+            if kind == "cmd" {
+                step.command_output = Some(
+                    serde_json::from_value(serde_json::json!({
+                        "stdout": {"encoding": "base64", "data": "", "retainedBytes": 0, "discardedBytes": 0, "truncated": false, "fullyDrained": true},
+                        "stderr": {"encoding": "base64", "data": "", "retainedBytes": 0, "discardedBytes": 0, "truncated": false, "fullyDrained": true}
+                    }))
+                    .unwrap(),
+                );
+            }
+            step
+        };
+        let project = |step: &WorkflowStepV1, definition| {
+            project_step(
+                step,
+                definition,
+                WorkflowNodeRole::Step,
+                1024,
+                false,
+                Some(1),
+            )
+        };
+
+        let mut succeeded = entry("design", "workflow", WorkflowStepStateV1::Succeeded);
+        succeeded.failed_child = Some(record.clone());
+        let archived = project(&succeeded, &stage.steps["design"]).unwrap();
+        assert_eq!(archived.failed_child, Some(record.clone()));
+        assert_eq!(archived.committed_outputs, Some(1));
+
+        for (mut step, definition) in [
+            (
+                entry("design", "workflow", WorkflowStepStateV1::Failed),
+                &stage.steps["design"],
+            ),
+            (
+                entry("build", "cmd", WorkflowStepStateV1::Succeeded),
+                &command.steps["build"],
+            ),
+        ] {
+            assert!(project(&step, definition).is_ok(), "{step:?}");
+            step.failed_child = Some(record.clone());
+            assert_eq!(project(&step, definition), Err(()), "{step:?}");
+        }
     }
 
     // REQ-WFEXEC-58

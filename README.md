@@ -912,21 +912,26 @@ the option is not global.
 ## Grants
 
 `useful grant` manages what Useful Machinery may do as you at other providers. A grant is an
-OAuth grant (`github`, `gitlab.com`, `linear`), your consent at the provider, whose ID begins
-`pgr_`, or a native grant (`claude_code`, `codex`), a coding agent's own login imported for
-one organization, whose ID begins `agl_`. Each grant is used only on the runners you authorize
-for it. The commands take your signed-in session only, never a service API key.
+OAuth grant, your consent at the provider, whose ID begins `pgr_`, or a native grant
+(`claude_code`, `codex`), a coding agent's own login imported for one organization, whose ID
+begins `agl_`. The built-in OAuth providers are `github`, `gitlab.com` and `linear`; any other
+OAuth provider your deployment serves is given by its id. Each grant is used only on the
+runners you authorize for it. The commands take your signed-in session only, never a service API key.
 
 ```sh
-# Make a grant through the provider's own sign-in. For github, gitlab.com and linear this
-# starts the provider's consent, prints its URL, opens it in your browser when this machine has
-# one (not over SSH, and on Linux only with a display), and waits until the grant is active;
-# approving the URL in any browser completes it. --no-wait returns once the consent has
-# started. When you already hold a grant of the provider, the command asks before replacing it
-# on a terminal and otherwise exits 2 unless you pass --replace; the new sign-in becomes that
-# grant's next generation, keeping its ID and the runners it is authorized for.
+# Make a grant through the provider's own sign-in. For an OAuth provider this starts the
+# provider's consent, prints its URL, opens it in your browser when this machine has one (not
+# over SSH, and on Linux only with a display), and waits until the grant is active; approving
+# the URL in any browser completes it. --no-wait returns once the consent has started. The
+# built-in OAuth providers are github, gitlab.com and linear; any other OAuth provider your
+# deployment serves is given by its id, as useful grant list shows it, and the command checks
+# that the deployment serves it before starting anything. When you already hold a grant of the
+# provider, the command asks before replacing it on a terminal and otherwise exits 2 unless you
+# pass --replace; the new sign-in becomes that grant's next generation, keeping its ID and the
+# runners it is authorized for.
 useful grant create linear
 useful grant create github --replace --json
+useful grant create example
 
 # For codex this runs `codex login` in a private temporary Codex home (mode 0700) that it
 # removes afterwards, and imports the login it writes; your own Codex home is never read or
@@ -951,8 +956,9 @@ useful grant create claude_code
 useful grant create claude_code --token-file - --organization acme < token.txt
 
 # Without a provider, or with --all, run the sign-in of each provider you hold no active or
-# reconnect_required grant of, one after another: github, gitlab.com, linear, claude_code,
-# codex. Each provider's name is printed on standard error before its prompts. A sign-in that
+# reconnect_required grant of, one after another: github, gitlab.com, linear, each other OAuth
+# provider this deployment serves in the order it names them, claude_code, codex. Each
+# provider's name is printed on standard error before its prompts. A sign-in that
 # fails does not stop the ones after it; a provider this deployment does not serve is reported
 # provider_unavailable and passed over. The coding agents' grants are for your only
 # organization, or the one --organization names; when you are a member of none or of several
@@ -989,7 +995,9 @@ useful grant create --workflow workflow.yaml --replace
 # linked identity, a native grant's organization), its state and generation, and each runner
 # it is authorized for with that runner's availability and next action and, for a native
 # grant, the last use the runner reported and when. Then name each provider you hold nothing
-# for. It reads every page; there is no --limit or --cursor.
+# for, in the order useful grant create signs in to them: github, gitlab.com, linear, each other
+# OAuth provider this deployment serves, claude_code and codex. It reads every page; there is
+# no --limit or --cursor.
 useful grant list
 
 # Show one grant in detail: for a native grant what each runner was last delivered and
@@ -1089,7 +1097,7 @@ A refusal exits 1 with its outcome (`runner_not_found`, `runner_holds_login`,
 
 Every runner authorization `list` prints, and every provider you hold nothing for, carries one
 `availability` (`available`, `unverified`, `reconnect_required`, `pending`, `delivery_failed`,
-`insufficient_permission`, `not_delivered` or `not_connected`) and one `nextAction`, and the
+`not_delivered` or `not_connected`) and one `nextAction`, and the
 text form names the command or step that next action means: `useful grant create PROVIDER
 --replace` to reconnect, `useful grant authorize GRANT RUNNER --yes` for a grant no runner is
 authorized for, `useful runner grant sync` on the runner's host after a failed
@@ -1822,17 +1830,21 @@ useful workflow definition cloud evaluation show acme-labs DEFINITION EVALUATION
   --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc
 ```
 
-With `--cloud ORGANIZATION`, `useful workflow run show`, `resume` and `release` take a Cloud
-run ID as `RUN` and read or write no local run: `show` reads the run with its definition,
-subject claim, workflow state, latest progress, exits and newest trigger deliveries;
-`resume` asks Cloud to continue it, as `useful run continue` does; and `release` asks Cloud,
-as an organization owner, to release the subject claim of the exited run. The control
-leaves take the same option ([Cloud runs](#cloud-runs)).
+With `--cloud ORGANIZATION`, `useful workflow run show`, `resume`, `release`, `withdraw` and
+`cancel` take a Cloud run ID as `RUN` and read or write no local run: `show` reads the run
+with its definition, subject claim, workflow state, cancellation, latest progress, exits,
+newest controls and newest trigger deliveries; `resume` asks Cloud to continue it, as `useful run continue` does;
+`release` asks Cloud, as an organization owner, to release the subject claim of the exited
+run; `withdraw` asks Cloud to carry a withdrawal to the runner executing the run; and
+`cancel` asks Cloud for a graceful cancellation, as `useful run cancel` does without
+`--force` or `--wait`. The control leaves take the same option ([Cloud runs](#cloud-runs)).
 
 ```sh
 useful workflow run show run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --json
 useful workflow run resume run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --from build
 useful workflow run release run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs
+useful workflow run withdraw run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs
+useful workflow run cancel run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --json
 ```
 
 ## Cloud runs
@@ -1878,7 +1890,7 @@ given, `--no-owner`, and `--wait` with `--timeout`, uses one idempotency key per
 and writes one `create` result. A run you create is owned by you unless `--no-owner` starts
 it with no owner, in the project's runner pools. The local options (`--path`,
 `--execution-root`, `--run-dir`, `--agent-profiles`, `--stop-before`, `--owner`,
-`--external`) are usage errors beside `--cloud`, as the Cloud options are without it. A run
+`--external`, `--source-revision`) are usage errors beside `--cloud`, as the Cloud options are without it. A run
 of a definition names no publication: publish an export of a succeeded run with
 `useful publication create`.
 
@@ -1968,6 +1980,18 @@ useful workflow run retry run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --jso
 useful workflow run stop run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs \
   --before review --reason "Hold for review"
 useful workflow run lift run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --before review
+```
+
+To end a Cloud run, `useful workflow run withdraw RUN --cloud ORGANIZATION` sends a
+withdrawal without reading the run; the runner ends the run `withdrawn`. Cloud refuses it
+`run_not_live` when no runner executes the run and `control_unsupported` when the runner's
+`useful` does not apply a withdrawal; `useful workflow run cancel RUN --cloud ORGANIZATION`
+then asks Cloud for a graceful cancellation and reports the cancellation request Cloud
+accepted. Either acceptance is not yet the run's end.
+
+```sh
+useful workflow run withdraw run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs --json
+useful workflow run cancel run_01k0z6r1w8f4jy2m7q9v3x5abc --cloud acme-labs
 ```
 
 Without an input flag, `workflow run create --cloud` admits an inputless run. The mixed-input flags may be
@@ -2129,7 +2153,15 @@ same facts with a remedy. Such a refusal created no run and is never
 is unconfirmed: a transport failure, a `5xx`, or an unreadable response after dispatch.
 Progress goes to stderr. Human show results show the Run's automatic publication
 handoff and any observed Publication state, outcome, receipt disposition, failure, and
-redacted confirmed pull-request URL separately from execution. On failure, inspect the existing publication or handoff
+redacted confirmed pull-request URL separately from execution. After the run's actor,
+`run show` prints one `credential PROVIDER:` line for each provider whose credential source
+the run's runner reported: `host`, `grant of` and the member's principal id, or `grant` when
+Cloud recorded no member; a run with no reported sources prints none. After them it prints
+one `integration ID:` line for each integration the run's workflow declares, in Cloud's
+order: `host`, `connected by` and the member's principal id, `connected by the organization`
+or `connected by a member` when Cloud names no principal, or `not provided`, followed by
+`, token v` and the version when there is one; a run whose read carries no integration
+sources prints none. On failure, inspect the existing publication or handoff
 and provider effects before creating another publication attempt. Human cancellation
 errors retain the requested mode, known receipt, Run state, interruption, and artifact
 delivery evidence for same-key reconciliation.
@@ -2488,11 +2520,12 @@ home that holds no configuration is read as its default layout, with the state a
 `runner/state.json`. No other check reads the configuration or anything under the `useful`
 home, so the default checks run with neither `USEFUL_HOME` nor `HOME` set. It passes when every agent login Cloud authorized
 for the runner is `ready` and was not refused at its last use, or Cloud authorized none
-(`revoked`, or `not_authorized` with no authorization in force), and otherwise fails with that
-provider's state as its code, such as `foreign_login`, `not_authorized` for a login whose
-authorization stands while Cloud refuses its owner, or `reconnect_required` for a `ready`
-login the provider refused at its last use. Its details name each provider's availability and next action as
-`<provider>_availability` and `<provider>_next_action`. It fails
+(`revoked` or `not_authorized`), and otherwise fails with that provider's state as its code,
+such as `install_failed`, `unsupported_target`, `stale_generation` or `cloud_unavailable`, or
+`reconnect_required` for a `ready` login the provider refused at its last use. A provider in
+`foreign_login`, whose steps run on the service's own login, passes. Its details name each provider's availability and next action as
+`<provider>_availability` and `<provider>_next_action`, and where the runner recorded one the
+provider's credential source as `<provider>_source` (`host` or `grant`). It fails
 `readiness_unknown` when the runner has recorded no readiness yet, a runner home that holds
 no configuration included, `config_invalid` for a configuration it cannot load, and
 `config_required` when no `--config` is given and the `useful` home cannot be located because
@@ -2688,7 +2721,8 @@ unresolved, or a join key is given beside an unfinished registration; and
 `registration_state_missing` when the record says enrollment completed and the state file
 is absent. Each failure names the recorded runner's ID, the file to inspect and the way
 forward. A host whose runner was deleted reports `authentication_failed` until its state
-file and `.runner-registration.json` are removed.
+file and `.runner-registration.json` are removed: its credential came from an activation,
+so it never rejoins as a host that joined with a key does.
 
 A host can instead join a pool when the service first starts, with no activation, by
 giving `runner serve` a join key (see
@@ -2718,18 +2752,24 @@ USEFUL_RUNNER_JOIN_KEY="$BUILDERS_JOIN_KEY" useful runner serve --config /etc/us
 
 On a host that holds no enrolled state, the service generates its credential, joins the
 key's pool as a new runner, writes enrolled state, and serves. On a host that already holds
-enrolled state, it serves with that state and ignores the key, so the same command can
-start the service every time. A host that holds enrolled state never reads the key and is
-not prompted for one, and when its configuration or state does not load the start reports
-that cause. On a host that holds no enrolled state, the service checks the host's
+enrolled state, it serves with that state, so the same command can start the service every
+time. A host that holds enrolled state is not prompted for a key, and when its
+configuration or state does not load the start reports that cause whatever the key. A host
+whose credential came from a join key, started with a key by `--join-key-file` or
+`USEFUL_RUNNER_JOIN_KEY`, holds the key in memory until Cloud answers the process's first
+connection attempt, so that it can rejoin if Cloud refuses its credential, and drops it
+unused once Cloud accepts the credential; a host whose credential came from an activation
+reads no key. A key that cannot be read or has expired never stops an enrolled host's
+start: it serves as one given no key, and says so only if Cloud then refuses its
+credential. On a host that holds no enrolled state, the service checks the host's
 configuration, its work root included, before it reads the key, prompts for it or contacts
 Cloud, so a host that cannot serve registers no runner. A key given with `--join-key-file`
 is read as an activation is: from a regular file private to the current user, which is
 left in place, or from piped standard input with `--join-key-file -`; an interactive
 terminal is refused there, since `--join-key` is the terminal's input. `--join-key`,
 `--join-key-file` and `USEFUL_RUNNER_JOIN_KEY` exclude one another: giving the key in more than
-one way is a usage error, and an expired key is refused before Cloud is contacted. The
-service reads the key once, removes `USEFUL_RUNNER_JOIN_KEY` from its own environment by
+one way is a usage error, and on a host that holds no enrolled state an expired key is
+refused before Cloud is contacted. The service reads the key once, removes `USEFUL_RUNNER_JOIN_KEY` from its own environment by
 restarting itself without it, never writes the key to its state or keeps it for a later
 start, and never passes it to a workflow step.
 
@@ -2752,6 +2792,33 @@ the key may be revoked or expired, its issuer may no longer issue a key for the 
 runner the earlier join registered may have been deleted; the journal is removed, and the
 failure says that Cloud holds no runner for the host's join rather than that none was
 registered.
+
+A host whose runner Cloud removed or an owner deleted still holds that runner's enrolled
+state, and Cloud refuses its credential. Started with a current key by `--join-key-file`
+or `USEFUL_RUNNER_JOIN_KEY`, it rejoins once it holds no work: it joins the key's pool as a
+new runner, named as the old runner was when no runner has taken that name, replaces its
+enrolled state with the new runner's, reports the new runner's ID, name, pool and
+credential ID on standard error, and serves as that runner in the same process. The
+workspaces the host kept for failed runs under the old runner stay in its work root for
+the operator to inspect or remove, and those runs can no longer be continued. The new
+runner starts with no kept workspace of its own; as any runner does, it removes the
+workspaces of its successful runs and keeps the others for `useful run continue`. A lost
+answer is retried as the same join, and a later start with the same key resends it, so a
+host never makes two runners from one rejoin. Cloud does not replace a runner it still
+holds: a runner an owner disabled, or whose credential was revoked, is not replaced, and a
+revoked or expired key is refused the same way; the host keeps its state, names the
+refusal on standard error with a `code:` line, and `runner status` reports
+`authentication_failed`. `--join-key` never rejoins, since an enrolled host is not
+prompted. A host started with no key reports `authentication_failed` until its state file
+is removed and it starts with a current key, which joins it as a new runner.
+
+A `runner serve` that was started with a key by `--join-key-file` or
+`USEFUL_RUNNER_JOIN_KEY`, and whose credential Cloud accepted or whose rejoin succeeded,
+exits with status 1 when Cloud later refuses its credential, once it holds no work, naming
+the refusal, so a service manager that restarts it on failure starts it again and the new
+start can rejoin. A process started with no key or with one it could not use, one whose
+rejoin Cloud refused, and one on a host whose credential came from an activation keep
+running and report `authentication_failed`.
 
 The connection URL, runner ID, and current credential come only from the enrolled state
 written by enrollment or by a join. There are no endpoint environment overrides or command-line aliases for the removed
@@ -2792,10 +2859,13 @@ login with the runner's whole Codex home. It keeps the logins in its own
 `.runner-agent-login/` directory beside `runnerStatePath`, never in the service's `~/.codex`
 or Claude Code configuration, and offers them to each assignment as `CODEX_HOME` and
 `CLAUDE_CODE_OAUTH_TOKEN`: a workflow's steps use a delivered login only when the workflow's
-`environmentPassthrough` names that variable. Steps given the runner's `CODEX_HOME` read
-only its configuration there, not the service's own Codex configuration. While the service
-sets `CODEX_HOME` or has a Claude Code login of its own, that provider is reported
-`foreign_login` and nothing is installed for it. Runner Serve also checks a login with its
+`environmentPassthrough` names that variable or the workflow declares that coding agent,
+`codex` or `claude_code`, under `requires.integrations`. Steps given the runner's `CODEX_HOME` read
+only its configuration there, not the service's own Codex configuration. The service's own
+login comes first: while the service sets `CODEX_HOME` or has an `auth.json` in `~/.codex`,
+or has a Claude Code login of its own, that provider is reported `foreign_login`, nothing is
+installed for it, and steps run on the service's login. Where neither the service nor the
+runner has a login, the variable is simply unset and the step starts. Runner Serve also checks a login with its
 provider by running that coding agent's own program once with the login, outside any run,
 with a fixed prompt that asks for a one-word answer: a login it installs when it starts or
 while it holds no assignment, and every `ready` login when you ask it to set up now. A check
@@ -2820,6 +2890,13 @@ issued, and once that assignment has ended it shows it as of that run and the ti
 check, never as current, a `ready` one with availability `unverified` and `--json` carrying
 `runId` and `endedAt`
 (`github login:      ready as of run run_01k0z6r1w8f4jy2m7q9v3x5abp at 2026-11-14T15:02:11Z (generation 2), availability unverified`).
+Each line, in `useful runner status` too, ends with where the provider's credential comes from
+where Runner Serve recorded one, and `--json` carries it as `source`: `host` when the
+service provides it (its own Claude Code or Codex login, or a `GH_TOKEN`, `GITLAB_TOKEN` or
+`USEFUL_LINEAR_ACCESS_TOKEN` in its environment, or the `_FILE` form) and `grant` when a grant
+does (a login Runner Serve installed and offers, or a token issued for the run named), as of
+the last setup for a coding agent and of the run named for `github`, `gitlab` and `linear`
+(`codex login:       ready (generation 3), availability available · source: grant`).
 The setup it asks for checks every `ready` login before it answers, so the command can take
 about a minute longer for each login whose provider is slow to answer. A login is
 `available` once a check or a step succeeded with it, `reconnect_required` once the provider
@@ -2830,8 +2907,8 @@ providers' lines the command prints one line naming that provider and the cause
 `unansweredChecks` with its `provider` and `cause`, one of `program_unavailable` (Runner
 Serve found no supported `claude` or `codex` on its `PATH` when it started), `start_failed`,
 `timed_out` (no answer within 60 seconds) or `harness_error`. It exits 1 when a provider
-authorized for the runner is not `ready`, one Cloud refuses the owner of
-(`insufficient_permission`) included, or its login was refused at its last use, and 4 when
+authorized for the runner is not `ready`, but not for one in `foreign_login`, whose steps run
+on the service's own login, or its login was refused at its last use, and 4 when
 Runner Serve is not reachable or holds an assignment (`runner_busy`); a check with no answer
 does not change the exit status. A Runner Serve process started from an older `useful` refuses
 the request; restart it on this release.
@@ -2887,7 +2964,8 @@ acceptance. The fixed preparation deadline is not extended
 by progress. Verified staging remains under the assignment root through execution and is
 removed or quarantined by the existing release path. Cloud commands, agents, and
 finalizers receive the exact recorded source branch and pinned commit as
-`USEFUL_SOURCE_BRANCH` and `USEFUL_SOURCE_COMMIT_OID`; local execution receives neither.
+`USEFUL_SOURCE_BRANCH` and `USEFUL_SOURCE_COMMIT_OID`; local execution receives them only
+from `--source-revision` on `useful workflow run create`.
 After the later start effect, a token-free repository helper can obtain lease-bound read
 access only for the credential-free primary `origin`. Runner Serve disables the helper,
 revokes every known issuance after process quiescence, destroys local helper and token
@@ -3004,7 +3082,7 @@ artifact; GitHub Actions verifies the candidate contract, builds the x86-64 and 
 Linux and Apple Silicon macOS archives, and asks a human to approve the proposed version
 and notes in the protected `cli-release` environment before the final write-scoped job
 publishes the archives, `SHA256SUMS`, and build-provenance attestations on the
-[Releases](https://github.com/useful-machinery/um/releases) page. A pre-tag failure is
+[Releases](https://github.com/useful-machinery/cli/releases) page. A pre-tag failure is
 repaired by advancing `main` with a corrected candidate. See
 [`CONTRIBUTING.md`](CONTRIBUTING.md#release-policy-and-archived-notes) for the complete
 candidate contract and repair rules.
@@ -3022,7 +3100,7 @@ sha256sum --ignore-missing --check SHA256SUMS
 shasum -a 256 --ignore-missing --check SHA256SUMS
 
 gh attestation verify "$archive" \
-  --repo useful-machinery/um
+  --repo useful-machinery/cli
 ```
 
 ## Source boundary

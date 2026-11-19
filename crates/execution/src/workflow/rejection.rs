@@ -830,7 +830,7 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
         ),
         ValidationFailureKind::ChildWorkflowRootBlocks => (
             "child_workflow_root_blocks",
-            "Remove name, version and the root-only blocks from the child workflow.",
+            "Remove name, version and the root-only blocks from the child workflow; only a requires without tools may stay.",
         ),
         ValidationFailureKind::ChildInputUndeclared => (
             "child_input_undeclared",

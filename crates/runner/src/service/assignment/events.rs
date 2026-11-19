@@ -781,7 +781,6 @@ impl AssignmentManager {
             claude_code_installation: self.claude_code_installation.clone(),
             codex_installation: self.codex_installation.clone(),
             environment: self.environment.clone(),
-            withheld_agent_logins: Vec::new(),
             harness_login_observer: None,
             grant_tokens: None,
             execution_version: Arc::clone(&self.execution_version),

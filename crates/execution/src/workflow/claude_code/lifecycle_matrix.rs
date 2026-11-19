@@ -3,37 +3,51 @@
 //! subagent work, followup, round, ending), each driven natively against the pinned binary
 //! through the production adapter and the loopback provider.
 //!
-//! `pinned_real_claude_code_11_lifecycle_matrix_drives_every_cell` prints one line per cell,
-//! `cell <name>: ok`, `gap <ticket>`, `skipped` or `FAILED <reason>`, and fails at the end
-//! naming every failed cell, so one run reports the whole matrix. Two environment variables
-//! narrow a developer's run; the qualification gate sets neither:
+//! `pinned_real_claude_code_11_lifecycle_matrix_drives_every_cell` holds the exact-binary guard
+//! for its whole run and drives its cells in two passes (INV-HARNESS-19): every selected cell
+//! outside the slow tier alone, in the matrix's order, and then the slow tier (any
+//! `ScheduleWakeup`, a subagent's two-minute promotion) with at most three cells in flight, a
+//! waiting cell admitted as one in flight reports. It prints one line per cell, `cell <name>: ok`,
+//! `gap <ticket>`, `skipped` or `FAILED <reason>`, the slow cells' lines as they report after
+//! `lifecycle matrix: slow tier, <n> cells, at most <k> in flight`, and fails at the end naming
+//! every failed cell, so one run reports the whole matrix. Three environment variables shape a
+//! developer's run; the qualification gate sets none of them:
 //!
 //! - `USEFUL_CLAUDE_CODE_LIFECYCLE_CELLS`: comma-separated name fragments; only cells whose name
 //!   contains one of them run.
-//! - `USEFUL_CLAUDE_CODE_CONFORMANCE_SKIP_SLOW_CELLS=1`: the slow tier (any `ScheduleWakeup`,
-//!   a subagent's two-minute promotion) prints `skipped` instead of running.
+//! - `USEFUL_CLAUDE_CODE_CONFORMANCE_SKIP_SLOW_CELLS=1`: the slow tier prints `skipped` instead
+//!   of running.
+//! - `USEFUL_CLAUDE_CODE_LIFECYCLE_SLOW_CELLS_IN_FLIGHT`: the slow tier's limit, a positive
+//!   integer, 3 when unset or empty; `1` drives the tier one cell at a time, a serial control.
 //!
 //! A failed cell's native transcript, observations and rejection are retained under
 //! `USEFUL_CLAUDE_CODE_LIFECYCLE_RETAIN_DIR` when that variable is set, which the qualification
 //! script does so that a CI job can upload them, otherwise under the temporary directory.
 
-use std::collections::VecDeque;
+use std::cell::RefCell;
+use std::collections::{HashMap, VecDeque};
 use std::ffi::OsStr;
+use std::future::poll_fn;
 use std::io::Write as _;
+use std::num::NonZeroUsize;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::process::Stdio;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
-use futures_util::FutureExt as _;
+use futures_util::{FutureExt as _, StreamExt as _};
 use nix::sys::stat::Mode as FifoMode;
 use nix::unistd::mkfifo;
 use rustix::process::{Pid, getpgid};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::process::Command;
+use tokio::sync::oneshot;
 
 use super::test_support::{
     BACKGROUND_SUBAGENT_DESCRIPTION, BACKGROUND_SUBAGENT_PROMPT, BackgroundSubagent,
@@ -59,6 +73,9 @@ use crate::workflow::test_support::{MAX_WATCHDOG_SCALE, host_load, watchdog_scal
 const CELL_FILTER: &str = "USEFUL_CLAUDE_CODE_LIFECYCLE_CELLS";
 const SKIP_SLOW_CELLS: &str = "USEFUL_CLAUDE_CODE_CONFORMANCE_SKIP_SLOW_CELLS";
 const RETAIN_DIRECTORY: &str = "USEFUL_CLAUDE_CODE_LIFECYCLE_RETAIN_DIR";
+const SLOW_CELLS_IN_FLIGHT: &str = "USEFUL_CLAUDE_CODE_LIFECYCLE_SLOW_CELLS_IN_FLIGHT";
+/// How many slow cells the matrix drives at once when `SLOW_CELLS_IN_FLIGHT` is unset.
+const DEFAULT_SLOW_CELLS_IN_FLIGHT: NonZeroUsize = NonZeroUsize::new(3).unwrap();
 /// Claude Code's foreground-to-background promotion timeout. 2.1.310 reads it for the main
 /// agent only and floors it at 2000 ms, so only a main-thread promotion is fast.
 const PROMOTION_TIMEOUT: (&str, &str) = ("CLAUDE_CODE_AUTO_BACKGROUND_TIMEOUT_MS", "2000");
@@ -3468,6 +3485,86 @@ fn selected(cell: &LifecycleCell, filter: Option<&str>) -> bool {
     })
 }
 
+/// The slow tier's limit: the positive integer `USEFUL_CLAUDE_CODE_LIFECYCLE_SLOW_CELLS_IN_FLIGHT`
+/// names when `configured`, otherwise `DEFAULT_SLOW_CELLS_IN_FLIGHT`. An empty value is unset;
+/// any other value panics before a cell is driven.
+fn slow_cells_in_flight(configured: Option<&OsStr>) -> NonZeroUsize {
+    match configured {
+        Some(limit) if !limit.is_empty() => limit
+            .to_str()
+            .and_then(|limit| limit.parse().ok())
+            .unwrap_or_else(|| {
+                panic!("{SLOW_CELLS_IN_FLIGHT} must be a positive integer, not {limit:?}")
+            }),
+        _ => DEFAULT_SLOW_CELLS_IN_FLIGHT,
+    }
+}
+
+/// Drives the cells of `lifecycle_cells()` that `filter` selects through `run` (INV-HARNESS-19)
+/// and returns how many it drove and the names of those that failed. In the matrix's order it
+/// drives every cell outside the slow tier alone and prints its line, and prints a slow cell as
+/// `skipped` when `skip_slow` is set or defers it otherwise; then it drives the deferred slow
+/// cells at most `slow_cells_in_flight` at a time, admitting a waiting cell as one in flight
+/// reports and printing each cell's line as it reports. Every cell runs inside the caller's
+/// task, so the caller's exact-binary guard and subreaper cover it, and each cell's future is
+/// built when the cell is admitted, which is when `run_cell` starts its watchdog. Each future
+/// is boxed so that admitting it moves a pointer, not `drive`'s large future.
+async fn drive_lifecycle_matrix<Run, Cell>(
+    filter: Option<&str>,
+    skip_slow: bool,
+    slow_cells_in_flight: NonZeroUsize,
+    mut run: Run,
+) -> (usize, Vec<String>)
+where
+    Run: FnMut(LifecycleCell) -> Cell,
+    Cell: Future<Output = (String, bool)>,
+{
+    let mut failed = Vec::new();
+    let mut ran = 0;
+    let mut deferred = Vec::new();
+    for cell in lifecycle_cells() {
+        if !selected(&cell, filter) {
+            continue;
+        }
+        let name = cell.name();
+        if cell.is_slow() {
+            if skip_slow {
+                println!("cell {name}: skipped");
+            } else {
+                deferred.push(cell);
+            }
+            continue;
+        }
+        ran += 1;
+        let (report, cell_failed) = Box::pin(run(cell)).await;
+        println!("cell {name}: {report}");
+        if cell_failed {
+            failed.push(name);
+        }
+    }
+    if deferred.is_empty() {
+        return (ran, failed);
+    }
+    println!(
+        "lifecycle matrix: slow tier, {} cells, at most {slow_cells_in_flight} in flight",
+        deferred.len()
+    );
+    ran += deferred.len();
+    let mut slow_tier = futures_util::stream::iter(deferred)
+        .map(|cell| {
+            let name = cell.name();
+            Box::pin(run(cell)).map(move |(report, cell_failed)| (name, report, cell_failed))
+        })
+        .buffer_unordered(slow_cells_in_flight.get());
+    while let Some((name, report, cell_failed)) = slow_tier.next().await {
+        println!("cell {name}: {report}");
+        if cell_failed {
+            failed.push(name);
+        }
+    }
+    (ran, failed)
+}
+
 // INV-HARNESS-8
 // INV-HARNESS-13
 // INV-HARNESS-14
@@ -3489,30 +3586,206 @@ async fn pinned_real_claude_code_11_lifecycle_matrix_drives_every_cell() {
     nix::sys::prctl::set_child_subreaper(true).unwrap();
     let filter = std::env::var(CELL_FILTER).ok();
     let skip_slow = std::env::var_os(SKIP_SLOW_CELLS).is_some_and(|value| value == "1");
-    let mut failed = Vec::new();
-    let mut ran = 0;
-    for cell in lifecycle_cells() {
-        if !selected(&cell, filter.as_deref()) {
-            continue;
-        }
-        let name = cell.name();
-        if skip_slow && cell.is_slow() {
-            println!("cell {name}: skipped");
-            continue;
-        }
-        ran += 1;
-        let (report, cell_failed) = run_cell(executable.clone(), cell).await;
-        println!("cell {name}: {report}");
-        if cell_failed {
-            failed.push(name);
-        }
-    }
+    let slow_in_flight = slow_cells_in_flight(std::env::var_os(SLOW_CELLS_IN_FLIGHT).as_deref());
+    let (ran, failed) =
+        drive_lifecycle_matrix(filter.as_deref(), skip_slow, slow_in_flight, |cell| {
+            run_cell(executable.clone(), cell)
+        })
+        .await;
     println!(
         "lifecycle matrix: {ran} cells driven, {} failed",
         failed.len()
     );
     assert!(ran > 0 || filter.is_some(), "the matrix drove no cell");
     assert!(failed.is_empty(), "lifecycle cells failed: {failed:?}");
+}
+
+/// What the fake cells of `drive_fake_matrix` record: each cell in admission order, the cells in
+/// flight and the cells reported, and the sender that releases each cell in flight.
+#[derive(Default)]
+struct FakeMatrix {
+    admitted: Vec<String>,
+    in_flight: Vec<String>,
+    reported: Vec<String>,
+    releases: HashMap<String, oneshot::Sender<()>>,
+}
+
+/// One wait of the driver on its fake cells: the cells in flight and the cells reported.
+struct FakeWait {
+    in_flight: Vec<String>,
+    reported: Vec<String>,
+}
+
+struct FakeDrive {
+    ran: usize,
+    failed: Vec<String>,
+    admitted: Vec<String>,
+    waits: Vec<FakeWait>,
+}
+
+/// Drives the matrix through fake cells that record themselves when first polled and report,
+/// failing when `failing` names them, once the test releases them. Each time the driver
+/// waits, one cell in flight is released, a different position each time so that cells
+/// report in an order the driver does not choose.
+async fn drive_fake_matrix(
+    filter: Option<&str>,
+    skip_slow: bool,
+    limit: usize,
+    failing: &[&str],
+) -> FakeDrive {
+    let matrix = Rc::new(RefCell::new(FakeMatrix::default()));
+    let failing = failing
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    let run = {
+        let matrix = Rc::clone(&matrix);
+        move |cell: LifecycleCell| {
+            let matrix = Rc::clone(&matrix);
+            let name = cell.name();
+            let fails = failing.contains(&name);
+            async move {
+                let (release, released) = oneshot::channel();
+                {
+                    let mut matrix = matrix.borrow_mut();
+                    matrix.admitted.push(name.clone());
+                    matrix.in_flight.push(name.clone());
+                    matrix.releases.insert(name.clone(), release);
+                }
+                released.await.unwrap();
+                let mut matrix = matrix.borrow_mut();
+                matrix.in_flight.retain(|cell| *cell != name);
+                matrix.reported.push(name);
+                if fails {
+                    ("FAILED by the fake".to_owned(), true)
+                } else {
+                    ("ok".to_owned(), false)
+                }
+            }
+        }
+    };
+    let limit = NonZeroUsize::new(limit).unwrap();
+    // The test polls the driver by hand without yielding to the runtime, so Tokio's
+    // cooperative budget, which only a yield refills, would make a released receiver
+    // spuriously pending.
+    let mut driver = pin!(tokio::task::unconstrained(drive_lifecycle_matrix(
+        filter, skip_slow, limit, run
+    )));
+    let mut waits = Vec::new();
+    loop {
+        if let Poll::Ready((ran, failed)) =
+            poll_fn(|context| Poll::Ready(driver.as_mut().poll(context))).await
+        {
+            let admitted = matrix.borrow().admitted.clone();
+            return FakeDrive {
+                ran,
+                failed,
+                admitted,
+                waits,
+            };
+        }
+        let mut matrix = matrix.borrow_mut();
+        assert!(
+            !matrix.in_flight.is_empty(),
+            "the driver waits with no cell in flight"
+        );
+        let released = matrix.in_flight[waits.len() % matrix.in_flight.len()].clone();
+        waits.push(FakeWait {
+            in_flight: matrix.in_flight.clone(),
+            reported: matrix.reported.clone(),
+        });
+        matrix.releases.remove(&released).unwrap().send(()).unwrap();
+    }
+}
+
+// INV-HARNESS-19
+#[tokio::test]
+async fn the_matrix_drives_other_cells_alone_and_then_the_slow_tier_under_its_limit() {
+    let cells = lifecycle_cells();
+    let names = cells.iter().map(LifecycleCell::name).collect::<Vec<_>>();
+    let slow = cells
+        .iter()
+        .filter(|cell| cell.is_slow())
+        .map(LifecycleCell::name)
+        .collect::<Vec<_>>();
+    let ordinary = cells
+        .iter()
+        .filter(|cell| !cell.is_slow())
+        .map(LifecycleCell::name)
+        .collect::<Vec<_>>();
+    assert!(slow.len() > 3, "the slow tier must exceed the limit");
+    let is_slow = |name: &String| slow.contains(name);
+    let sorted = |names: &[String]| {
+        let mut names = names.to_vec();
+        names.sort();
+        names
+    };
+
+    let drive = drive_fake_matrix(None, false, 3, &[]).await;
+    assert_eq!(drive.ran, cells.len());
+    assert_eq!(sorted(&drive.admitted), sorted(&names));
+    assert!(drive.failed.is_empty());
+    for wait in &drive.waits {
+        if wait.in_flight.iter().any(is_slow) {
+            let unreported = slow.len() - wait.reported.iter().filter(|name| is_slow(name)).count();
+            assert_eq!(
+                wait.in_flight.len(),
+                unreported.min(3),
+                "slow cells in flight: {:?}",
+                wait.in_flight
+            );
+        } else {
+            assert_eq!(wait.in_flight.len(), 1, "in flight: {:?}", wait.in_flight);
+        }
+    }
+    assert_eq!(
+        drive.admitted.iter().position(is_slow),
+        Some(ordinary.len()),
+        "a slow cell was admitted before a cell outside the slow tier"
+    );
+    assert!(
+        drive.admitted[..ordinary.len()] == ordinary[..],
+        "cells outside the slow tier left the matrix's order"
+    );
+
+    let serial = drive_fake_matrix(None, false, 1, &[]).await;
+    assert_eq!(serial.ran, cells.len());
+    assert!(serial.waits.iter().all(|wait| wait.in_flight.len() == 1));
+
+    let failing = [ordinary[0].as_str(), slow[slow.len() - 1].as_str()];
+    let failures = drive_fake_matrix(None, false, 3, &failing).await;
+    assert_eq!(sorted(&failures.admitted), sorted(&names));
+    assert_eq!(failures.failed, failing);
+
+    let skipped = drive_fake_matrix(None, true, 3, &[]).await;
+    assert_eq!(skipped.ran, ordinary.len());
+    assert_eq!(skipped.admitted, ordinary);
+
+    let fragments = ["cancel-in-drain", "wakeup"];
+    let matching = names
+        .iter()
+        .filter(|name| fragments.iter().any(|fragment| name.contains(fragment)))
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(matching.iter().any(is_slow) && !matching.iter().all(is_slow));
+    let filtered = drive_fake_matrix(Some(&fragments.join(",")), false, 3, &[]).await;
+    assert_eq!(filtered.ran, matching.len());
+    assert_eq!(sorted(&filtered.admitted), sorted(&matching));
+}
+
+// INV-HARNESS-19
+#[test]
+fn the_slow_tier_limit_defaults_to_three_and_reads_a_positive_integer() {
+    assert_eq!(slow_cells_in_flight(None).get(), 3);
+    assert_eq!(slow_cells_in_flight(Some(OsStr::new(""))).get(), 3);
+    assert_eq!(slow_cells_in_flight(Some(OsStr::new("1"))).get(), 1);
+    assert_eq!(slow_cells_in_flight(Some(OsStr::new("5"))).get(), 5);
+}
+
+#[test]
+#[should_panic(expected = "USEFUL_CLAUDE_CODE_LIFECYCLE_SLOW_CELLS_IN_FLIGHT")]
+fn a_slow_tier_limit_of_zero_is_refused_naming_the_variable() {
+    slow_cells_in_flight(Some(OsStr::new("0")));
 }
 
 // INV-HARNESS-13

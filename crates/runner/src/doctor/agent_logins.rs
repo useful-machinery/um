@@ -109,9 +109,10 @@ impl DoctorCheck for AgentLoginsCheck {
 }
 
 /// The check's outcome for the readiness the runner recorded: it fails for
-/// the first agent login Cloud authorized that is not ready to use, and never
-/// for an OAuth provider's entry, which records one assignment's outcome
-/// (REQ-GRANT-88).
+/// the first agent login Cloud authorized that is not ready to use, never for
+/// one in `foreign_login`, where the service's own login is in use
+/// (REQ-GRANT-51), and never for an OAuth provider's entry, which records one
+/// assignment's outcome (REQ-GRANT-88).
 fn readiness_outcome(readiness: &AgentLoginReadiness) -> Outcome {
     let mut details = BTreeMap::new();
     for entry in &readiness.providers {
@@ -135,6 +136,11 @@ fn readiness_outcome(readiness: &AgentLoginReadiness) -> Outcome {
             if let Some(value) = value {
                 details.insert(format!("{provider}_{suffix}"), value.clone());
             }
+        }
+        // Where the provider's credential comes from, where the entry
+        // records it (REQ-GRANT-92).
+        if let Some(source) = entry.source {
+            details.insert(format!("{provider}_source"), source.as_str().to_owned());
         }
     }
     if let Some((entry, code)) = readiness
@@ -161,12 +167,16 @@ fn readiness_outcome(readiness: &AgentLoginReadiness) -> Outcome {
             details,
         };
     }
-    let message = if readiness
-        .providers
-        .iter()
-        .any(|entry| !entry.provider.is_brokered() && entry.state == AgentLoginState::Ready)
-    {
+    let any_login = |state| {
+        readiness
+            .providers
+            .iter()
+            .any(|entry| !entry.provider.is_brokered() && entry.state == state)
+    };
+    let message = if any_login(AgentLoginState::Ready) {
         "Every agent login Cloud authorized for the runner is ready."
+    } else if any_login(AgentLoginState::ForeignLogin) {
+        "The runner's service uses its own login, and no agent login Cloud authorized for the runner fails."
     } else {
         "Cloud has authorized no agent login for the runner."
     };
@@ -182,7 +192,8 @@ fn readiness_outcome(readiness: &AgentLoginReadiness) -> Outcome {
 mod tests {
     use super::readiness_outcome;
     use crate::control_protocol::{
-        AgentLoginProvider, AgentLoginReadiness, AgentLoginState, ProviderReadiness,
+        AgentLoginProvider, AgentLoginReadiness, AgentLoginState, EarlierSelection,
+        ProviderReadiness,
     };
     use crate::doctor::Status;
 
@@ -196,11 +207,12 @@ mod tests {
             installed_at: None,
             grant_id: None,
             expires_at: None,
-            selected: Some(true),
+            earlier_selection: EarlierSelection,
             last_use: None,
             last_use_at: None,
             run_id: None,
             ended_at: None,
+            source: None,
         }
     }
 
@@ -210,10 +222,7 @@ mod tests {
         let readiness = AgentLoginReadiness {
             updated_at: "2026-11-12T01:00:00Z".to_owned(),
             providers: vec![
-                ProviderReadiness {
-                    selected: Some(false),
-                    ..entry(AgentLoginProvider::Codex, AgentLoginState::NotAuthorized)
-                },
+                entry(AgentLoginProvider::Codex, AgentLoginState::NotAuthorized),
                 entry(
                     AgentLoginProvider::Github,
                     AgentLoginState::CloudUnavailable,

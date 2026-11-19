@@ -599,7 +599,7 @@ fn an_interrupted_repair_wait_payload_names_the_interruption_over_a_committed_su
             ]),
         },
     )]);
-    let payload = wait_payload(&wait, &steps, Some("children/build/000001"), None);
+    let payload = wait_payload(&wait, &steps, Some("children/build/000001"), None, None);
 
     assert_eq!(payload["outcome"], "failed");
     assert_eq!(payload["child"], "children/build/000001");
@@ -619,7 +619,7 @@ fn an_interrupted_repair_wait_payload_names_the_interruption_over_a_committed_su
         None,
         Some(json!({"reason": "pausing for a fix"})),
     );
-    let payload = wait_payload(&wait, &steps, None, Some(&interrupt));
+    let payload = wait_payload(&wait, &steps, None, None, Some(&interrupt));
     assert_eq!(
         payload["interrupted"],
         json!({
@@ -641,9 +641,83 @@ fn an_interrupted_repair_wait_payload_names_the_interruption_over_a_committed_su
         &steps,
         None,
         None,
+        None,
     );
     assert_eq!(plain["summary"], "the child's own summary");
     assert!(!plain.contains_key("interrupted"));
+}
+
+// REQ-WFEXEC-61, REQ-WFEXEC-77: the waiting step's failed child is the payload's
+// `failedChild`, which replaces an export of that name as `child` does; a `stop` wait's
+// payload names only its control.
+#[test]
+fn a_wait_payload_carries_the_steps_failed_child_over_an_export_of_its_name() {
+    let record = FailedChild {
+        outcome: "failed".to_owned(),
+        item: None,
+        primary_issue: Box::new(crate::workflow::evidence::PrimaryIssue::failed(
+            crate::workflow::validated::WorkflowNode {
+                id: "route".to_owned(),
+                role: crate::workflow::validated::WorkflowNodeRole::Step,
+            },
+            crate::workflow::evidence::FailureDetail::interrupted_in_execution(),
+        )),
+    };
+    let steps = BTreeMap::from([(
+        "build".to_owned(),
+        StepState::Succeeded {
+            outputs: BTreeMap::from([
+                (
+                    "outcome".to_owned(),
+                    CapturedValue::text(Arc::from("failed")),
+                ),
+                (
+                    "failedChild".to_owned(),
+                    CapturedValue::text(Arc::from("the child's own export")),
+                ),
+            ]),
+        },
+    )]);
+    let payload = wait_payload(
+        &entered(WaitKind::Repair, "build", "build", None),
+        &steps,
+        Some("children/build/000001"),
+        Some(&record),
+        None,
+    );
+    assert_eq!(payload["outcome"], "failed");
+    assert_eq!(
+        payload["failedChild"],
+        serde_json::to_value(&record).unwrap()
+    );
+    assert_eq!(
+        payload["failedChild"]["primaryIssue"]["node"]["id"],
+        "route"
+    );
+    assert!(payload["failedChild"].get("item").is_none());
+
+    let stop = wait_payload(
+        &entered(WaitKind::Stop, "build", "build", None),
+        &steps,
+        None,
+        Some(&record),
+        None,
+    );
+    assert!(!stop.contains_key("failedChild"));
+
+    let mut wait = self::record(WaitKind::Repair, "build", "build", None);
+    wait.payload = payload;
+    assert_eq!(wait.failed_child(), Some(record));
+}
+
+// REQ-WFEXEC-61: a payload without `failedChild`, or whose `failedChild` does not read as the
+// record, has no failed child.
+#[test]
+fn a_wait_payload_without_a_failed_child_record_reads_none() {
+    let mut wait = record(WaitKind::Repair, "build", "build", None);
+    assert_eq!(wait.failed_child(), None);
+    wait.payload = object(json!({"failedChild": "the child's own export"}));
+    assert_eq!(wait.failed_child(), None);
 }
 
 /// The `merge` step's `admitted` edge: an `external` wait on the queue of the pull request

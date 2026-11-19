@@ -181,6 +181,14 @@ pub enum GetGrantError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`get_grant_o_auth_client_metadata`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GetGrantOAuthClientMetadataError {
+    Status404(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`get_grant_session`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -865,21 +873,26 @@ pub fn complete_grant_o_auth_callback(
     }
 }
 
-/// Starts an OAuth consent at the named provider for its scope set for an active human who has no identity link there yet (REQ-GRANT-1); the callback creates the identity link and the grant together, or installs the grant on a link the member already holds for the returned subject. The body names only the provider and cannot choose scopes, lifetime or account. A member has at most one consent in progress per provider; a second while one is pending conflicts. A Linear consent is refused `provider-unavailable` in this release, as is a provider whose OAuth application the deployment has not configured.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing provider. Exact replay returns the original created response with the session's current state. Reusing the key for another provider conflicts.  Problem types: 409 `grant-session-conflict`; 503 `provider-unavailable`.
+/// Starts an OAuth consent at the named provider for its scope set for an active human who has no identity link there yet (REQ-GRANT-1); the callback creates the identity link and the grant together, or installs the grant on a link the member already holds for the returned subject. The body names only the provider and cannot choose scopes, lifetime or account. A member has at most one consent in progress per provider; a second while one is pending conflicts. A Linear consent is refused `provider-unavailable` in this release, as is a provider whose OAuth application the deployment has not configured.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing provider. Exact replay returns the original created response with the session's current state. Reusing the key for another provider conflicts.  A consent that names its provider is begun whatever the provider, so `vocabulary` does not gate it; a value that is not a positive integer is still answered 400 (REQ-GRANT-95).  Problem types: 409 `grant-session-conflict`; 503 `provider-unavailable`.
 pub fn create_grant_session(
     configuration: &configuration::Configuration,
     idempotency_key: &str,
     create_grant_session_request: models::CreateGrantSessionRequest,
+    vocabulary: Option<i32>,
 ) -> Result<models::ProviderGrantSession, Error<CreateGrantSessionError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_header_idempotency_key = idempotency_key;
     let p_body_create_grant_session_request = create_grant_session_request;
+    let p_query_vocabulary = vocabulary;
 
     let uri_str = format!("{}/v1/me/grants", configuration.base_path);
     let mut req_builder = configuration
         .client
         .request(reqwest::Method::POST, &uri_str);
 
+    if let Some(ref param_value) = p_query_vocabulary {
+        req_builder = req_builder.query(&[("vocabulary", &param_value.to_string())]);
+    }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
     }
@@ -926,16 +939,18 @@ pub fn create_grant_session(
     }
 }
 
-/// Deprecated: replaced by `createGrantSession` (`POST /v1/me/grants`), whose consent also installs the grant on an identity link the member already holds for the returned subject (REQ-GRANT-63). This route stays served.  Starts an OAuth consent at the provider of one of the active human's own linked identities for that provider's scope set (REQ-GRANT-1) and answers the pending consent session with its authorization URL. The request accepts no body and cannot choose scopes, lifetime or account. An identity that is unknown or belongs to another member is not found. A member has at most one consent in progress per provider; a second while one is pending conflicts. A Linear consent is refused `provider-unavailable` in this release, as is a provider whose OAuth application the deployment has not configured.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing identityId. Exact replay returns the original created response with the session's current state. Reusing the key for another identity conflicts.  Problem types: 404 `identity-not-found`; 409 `grant-session-conflict`; 503 `provider-unavailable`.
+/// Deprecated: replaced by `createGrantSession` (`POST /v1/me/grants`), whose consent also installs the grant on an identity link the member already holds for the returned subject (REQ-GRANT-63). This route stays served.  Starts an OAuth consent at the provider of one of the active human's own linked identities for that provider's scope set (REQ-GRANT-1) and answers the pending consent session with its authorization URL. The request accepts no body and cannot choose scopes, lifetime or account. An identity that is unknown or belongs to another member is not found. A member has at most one consent in progress per provider; a second while one is pending conflicts. A Linear consent is refused `provider-unavailable` in this release, as is a provider whose OAuth application the deployment has not configured.  Idempotency-Key is scoped to the exact acting OIDC identity and a semantic fingerprint containing identityId. Exact replay returns the original created response with the session's current state. Reusing the key for another identity conflicts.  An identity whose provider is outside the requested `vocabulary` is refused `provider-unavailable` and begins nothing, a replay included (REQ-GRANT-95); the vocabulary is not part of the fingerprint.  Problem types: 404 `identity-not-found`; 409 `grant-session-conflict`; 503 `provider-unavailable`.
 #[deprecated]
 pub fn create_identity_grant_session(
     configuration: &configuration::Configuration,
     identity_id: &str,
     idempotency_key: &str,
+    vocabulary: Option<i32>,
 ) -> Result<models::ProviderGrantSession, Error<CreateIdentityGrantSessionError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_identity_id = identity_id;
     let p_header_idempotency_key = idempotency_key;
+    let p_query_vocabulary = vocabulary;
 
     let uri_str = format!(
         "{}/v1/me/identities/{identityId}/grants",
@@ -946,6 +961,9 @@ pub fn create_identity_grant_session(
         .client
         .request(reqwest::Method::POST, &uri_str);
 
+    if let Some(ref param_value) = p_query_vocabulary {
+        req_builder = req_builder.query(&[("vocabulary", &param_value.to_string())]);
+    }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
     }
@@ -1223,13 +1241,15 @@ pub fn get_docs_account_handoff_status(
     }
 }
 
-/// Returns one of the active human's own grants of either kind, chosen by its ID: a `pgr_` ID names an OAuth grant and an `agl_` ID a native grant (REQ-GRANT-58). The grant carries what the list shows for it. A grant that is unknown or belongs to another member is not found, and no response carries grant material.  Problem types: 404 `grant-not-found`; 503 `provider-unavailable`.
+/// Returns one of the active human's own grants of either kind, chosen by its ID: a `pgr_` ID names an OAuth grant and an `agl_` ID a native grant (REQ-GRANT-58). The grant carries what the list shows for it. A grant that is unknown or belongs to another member is not found, and no response carries grant material.  An OAuth grant whose provider is outside the requested `vocabulary` is not found (REQ-GRANT-95).  Problem types: 404 `grant-not-found`; 503 `provider-unavailable`.
 pub fn get_grant(
     configuration: &configuration::Configuration,
     grant_id: &str,
+    vocabulary: Option<i32>,
 ) -> Result<models::Grant, Error<GetGrantError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_grant_id = grant_id;
+    let p_query_vocabulary = vocabulary;
 
     let uri_str = format!(
         "{}/v1/me/grants/{grantId}",
@@ -1238,6 +1258,9 @@ pub fn get_grant(
     );
     let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
 
+    if let Some(ref param_value) = p_query_vocabulary {
+        req_builder = req_builder.query(&[("vocabulary", &param_value.to_string())]);
+    }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
     }
@@ -1282,13 +1305,71 @@ pub fn get_grant(
     }
 }
 
-/// Returns one of the active human's own consent sessions with its status and reason, its authorization URL while the consent is pending and its callback unclaimed, and the resulting grant once it completed (REQ-GRANT-3). Session inspection is authoritative for the outcome of a callback. Another member's session, an unknown one, and a malformed session ID are not found. No response carries the consent's state, verifier or grant material.  Problem types: 404 `grant-session-not-found`; 503 `provider-unavailable`.
+/// The client metadata document of a provider whose OAuth client is `cimd` (REQ-PROVIDER-8). Its URL is the client id the deployment presents at that provider, which fetches it without authentication (REQ-PROVIDER-9). The answer is the same bytes for every request until the deployment restarts, is cacheable for an hour, and carries no secret. A provider with no row, or whose client is not `cimd`, is a 404.
+pub fn get_grant_o_auth_client_metadata(
+    configuration: &configuration::Configuration,
+    provider: &str,
+) -> Result<models::GrantOAuthClientMetadata, Error<GetGrantOAuthClientMetadataError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_provider = provider;
+
+    let uri_str = format!(
+        "{}/v1/integrations/grants/oauth/clients/{provider}",
+        configuration.base_path,
+        provider = crate::generated::apis::urlencode(p_path_provider)
+    );
+    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::GrantOAuthClientMetadata`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::GrantOAuthClientMetadata`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<GetGrantOAuthClientMetadataError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Returns one of the active human's own consent sessions with its status and reason, its authorization URL while the consent is pending and its callback unclaimed, and the resulting grant once it completed (REQ-GRANT-3). Session inspection is authoritative for the outcome of a callback. Another member's session, an unknown one, and a malformed session ID are not found. No response carries the consent's state, verifier or grant material.  A session whose provider is outside the requested `vocabulary` is not found (REQ-GRANT-95).  Problem types: 404 `grant-session-not-found`; 503 `provider-unavailable`.
 pub fn get_grant_session(
     configuration: &configuration::Configuration,
     session_id: &str,
+    vocabulary: Option<i32>,
 ) -> Result<models::ProviderGrantSession, Error<GetGrantSessionError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_session_id = session_id;
+    let p_query_vocabulary = vocabulary;
 
     let uri_str = format!(
         "{}/v1/me/grant-sessions/{sessionId}",
@@ -1297,6 +1378,9 @@ pub fn get_grant_session(
     );
     let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
 
+    if let Some(ref param_value) = p_query_vocabulary {
+        req_builder = req_builder.query(&[("vocabulary", &param_value.to_string())]);
+    }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
     }
@@ -1648,15 +1732,17 @@ pub fn list_agent_logins(
     }
 }
 
-/// Returns only OIDC links belonging to the active principal. Human items include retained email provenance; service workload items omit it. Workload authentication marks its exact issuer-subject current, while a platform credential marks no workload link current. Listing is read-only.  Results are ordered from oldest to newest by creation time and opaque identity-link ID. The cursor is opaque and may be used only with this operation. If the exact authenticating identity is no longer linked when the listing query evaluates authorization, the request is forbidden and no identity metadata is returned.
+/// Returns only OIDC links belonging to the active principal. Human items include retained email provenance; service workload items omit it. Workload authentication marks its exact issuer-subject current, while a platform credential marks no workload link current. Listing is read-only.  Results are ordered from oldest to newest by creation time and opaque identity-link ID. The cursor is opaque and may be used only with this operation. If the exact authenticating identity is no longer linked when the listing query evaluates authorization, the request is forbidden and no identity metadata is returned.  A human item's grant is left out when its provider is outside the requested `vocabulary` (REQ-GRANT-95); the link itself is listed.
 pub fn list_current_principal_identities(
     configuration: &configuration::Configuration,
     limit: Option<i32>,
     cursor: Option<&str>,
+    vocabulary: Option<i32>,
 ) -> Result<models::OidcIdentityList, Error<ListCurrentPrincipalIdentitiesError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_query_limit = limit;
     let p_query_cursor = cursor;
+    let p_query_vocabulary = vocabulary;
 
     let uri_str = format!("{}/v1/me/identities", configuration.base_path);
     let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
@@ -1666,6 +1752,9 @@ pub fn list_current_principal_identities(
     }
     if let Some(ref param_value) = p_query_cursor {
         req_builder = req_builder.query(&[("cursor", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_vocabulary {
+        req_builder = req_builder.query(&[("vocabulary", &param_value.to_string())]);
     }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
@@ -1904,7 +1993,7 @@ pub fn list_current_service_credentials(
     }
 }
 
-/// Returns the providers for which this deployment makes grants, each with its kind (REQ-GRANT-78): an `oauth` provider (GitHub, GitLab.com or Linear) for which the deployment holds an OAuth application, then a `native` provider (Claude Code or Codex) for which it lists a target. No other provider is named, and a deployment that serves neither kind answers an empty list. The answer is the deployment's, not the member's: it names no grant and carries no material. A client reads it before a coding agent's sign-in, so that a provider the deployment does not serve is passed over before any provider token is minted.  The list is not paged: it names at most the five providers.
+/// Returns the providers for which this deployment makes grants, each with its kind and its display name (REQ-GRANT-78): every `oauth` provider of the deployment's provider table for which it holds an OAuth application, in table order, then a `native` provider (Claude Code or Codex) for which it lists a target. No other provider is named, and a deployment that serves neither kind answers an empty list. The answer is the deployment's, not the member's: it names no grant and carries no material. A client reads it before a coding agent's sign-in, so that a provider the deployment does not serve is passed over before any provider token is minted.  The list is not paged and has no fixed length: it names as many providers as the deployment serves, and a client passes over a provider it does not know.
 pub fn list_grant_providers(
     configuration: &configuration::Configuration,
 ) -> Result<models::GrantProviderList, Error<ListGrantProvidersError>> {
@@ -1955,17 +2044,19 @@ pub fn list_grant_providers(
     }
 }
 
-/// Returns one page of the uses of one of the active human's own grants, newest first, each with the run, assignment, organization, provider and time of issue (REQ-GRANT-8); a use never carries the issued token. A native grant (`agl_`), from which no token is issued, answers an empty page (REQ-GRANT-62). A grant that is unknown or belongs to another member is not found. The cursor is opaque and may be used only with this operation and grant.  Problem types: 404 `grant-not-found`; 503 `provider-unavailable`.
+/// Returns one page of the uses of one of the active human's own grants, newest first, each with the run, assignment, organization, provider and time of issue (REQ-GRANT-8); a use never carries the issued token. A native grant (`agl_`), from which no token is issued, answers an empty page (REQ-GRANT-62). A grant that is unknown or belongs to another member is not found. The cursor is opaque and may be used only with this operation and grant.  The uses of an OAuth grant whose provider is outside the requested `vocabulary` are not found, as the grant is not (REQ-GRANT-95).  Problem types: 404 `grant-not-found`; 503 `provider-unavailable`.
 pub fn list_grant_uses(
     configuration: &configuration::Configuration,
     grant_id: &str,
     limit: Option<i32>,
     cursor: Option<&str>,
+    vocabulary: Option<i32>,
 ) -> Result<models::ProviderGrantUseList, Error<ListGrantUsesError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_grant_id = grant_id;
     let p_query_limit = limit;
     let p_query_cursor = cursor;
+    let p_query_vocabulary = vocabulary;
 
     let uri_str = format!(
         "{}/v1/me/grants/{grantId}/uses",
@@ -1979,6 +2070,9 @@ pub fn list_grant_uses(
     }
     if let Some(ref param_value) = p_query_cursor {
         req_builder = req_builder.query(&[("cursor", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_vocabulary {
+        req_builder = req_builder.query(&[("vocabulary", &param_value.to_string())]);
     }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
@@ -2024,17 +2118,19 @@ pub fn list_grant_uses(
     }
 }
 
-/// Returns one page of the active human's own grants of the requested `kind` (REQ-GRANT-58): `oauth` grants (GitHub, GitLab.com and Linear), `native` grants (Claude Code and Codex), or `all`, which lists the OAuth grants first and then the native grants. Each kind is listed oldest first by creation time and opaque grant ID. Each grant states its kind, provider, state, generation, creation time and authorizations in force, and what its kind adds: an OAuth grant its identity, scopes, last successful use and the provider-reported expiry of its access and refresh material (REQ-GRANT-3); a native grant its organization, label, record schema and key versions, import time, each authorization's delivery and report, and its ended authorizations (REQ-GRANT-13). Another member's grants are never listed, and no response carries grant material.  A request without `kind` is answered as `oauth`; that form is deprecated, and a client names the kind it reads. The cursor is opaque and may be used only with this operation and the `kind` that issued it; a cursor issued for another kind is refused.  A deployment may serve only one kind. `all` then lists the kind it serves, and a cursor positioned in the other kind continues from the next grant the deployment serves. A request for `oauth` or `native` where the deployment does not serve that kind, or for `all` where it serves neither, is refused as unavailable.  Problem types: 503 `provider-unavailable`.
+/// Returns one page of the active human's own grants of the requested `kind` (REQ-GRANT-58): `oauth` grants (a provider of the deployment's provider table), `native` grants (Claude Code and Codex), or `all`, which lists the OAuth grants first and then the native grants. Each kind is listed oldest first by creation time and opaque grant ID. Each grant states its kind, provider, state, generation, creation time and authorizations in force, and what its kind adds: an OAuth grant its identity, scopes, last successful use and the provider-reported expiry of its access and refresh material (REQ-GRANT-3); a native grant its organization, label, record schema and key versions, import time, each authorization's delivery and report, and its ended authorizations (REQ-GRANT-13). Another member's grants are never listed, and no response carries grant material.  A request without `kind` is answered as `oauth`; that form is deprecated, and a client names the kind it reads. The cursor is opaque and may be used only with this operation and the `kind` that issued it; a cursor issued for another kind is refused.  A deployment may serve only one kind. `all` then lists the kind it serves, and a cursor positioned in the other kind continues from the next grant the deployment serves. A request for `oauth` or `native` where the deployment does not serve that kind, or for `all` where it serves neither, is refused as unavailable.  An OAuth grant whose provider is outside the requested `vocabulary` is left out (REQ-GRANT-95), and a page is as full as under any vocabulary. The cursor is independent of `vocabulary`: one issued under one vocabulary continues under another.  Problem types: 503 `provider-unavailable`.
 pub fn list_grants(
     configuration: &configuration::Configuration,
     kind: Option<&str>,
     limit: Option<i32>,
     cursor: Option<&str>,
+    vocabulary: Option<i32>,
 ) -> Result<models::GrantList, Error<ListGrantsError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_query_kind = kind;
     let p_query_limit = limit;
     let p_query_cursor = cursor;
+    let p_query_vocabulary = vocabulary;
 
     let uri_str = format!("{}/v1/me/grants", configuration.base_path);
     let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
@@ -2047,6 +2143,9 @@ pub fn list_grants(
     }
     if let Some(ref param_value) = p_query_cursor {
         req_builder = req_builder.query(&[("cursor", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_vocabulary {
+        req_builder = req_builder.query(&[("vocabulary", &param_value.to_string())]);
     }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());

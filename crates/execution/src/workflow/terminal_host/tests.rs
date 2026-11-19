@@ -1617,6 +1617,17 @@ fn inspector_renders_authoritative_command_states_and_dispositions() {
         ),
         (
             direct_command_step(
+                StepStateKind::Succeeded,
+                None,
+                Some(timing.clone()),
+                WorkflowRunOutputDisposition::Unavailable(
+                    WorkflowRunOutputUnavailableReason::NotCommitted,
+                ),
+            ),
+            ["succeeded", "unavailable (absent)"].as_slice(),
+        ),
+        (
+            direct_command_step(
                 StepStateKind::Failed,
                 Some(ObservedStepTransition::Failed {
                     detail: super::super::evidence::failure_detail(
@@ -3011,6 +3022,7 @@ fn complete_scripted_view(
             command_output: None,
             recovery: None,
             invocations: Vec::new(),
+            failed_child: None,
         }],
         finalization: None,
         exports: BTreeMap::new(),
@@ -3417,6 +3429,7 @@ fn direct_command_step(
             discarded_records: 0,
             discarded_bytes: 0,
         },
+        failed_child: None,
     }
 }
 
@@ -3730,4 +3743,67 @@ fn open_help_ignores_every_key_but_escape_ctrl_c_and_q() {
     assert!(!interaction.help_visible);
     press_unmodified_key(&mut interaction, &snapshot, KeyCode::Down, &cancellation);
     assert_eq!(interaction.selected, 1);
+}
+
+// REQ-LOCALRUN-221, REQ-LOCALRUN-14, REQ-LOCALRUN-26: a stage that succeeded on a failed
+// child is drawn with the failed state's symbol, label and tone, counted failed, and gives
+// the failing node's path as its detail and the inspector's failure; it is not an advisory
+// issue. Without the record the stage reads succeeded.
+#[test]
+fn a_stage_whose_child_failed_is_presented_failed() {
+    let mut snapshot = snapshot_from_yaml(
+        "schemaVersion: 1\nsteps:\n  design:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    );
+    let record = crate::workflow::evidence::FailedChild {
+        outcome: "failed".to_owned(),
+        item: None,
+        primary_issue: Box::new(crate::workflow::evidence::PrimaryIssue::failed(
+            crate::workflow::validated::WorkflowNode {
+                id: "decide".to_owned(),
+                role: crate::workflow::validated::WorkflowNodeRole::Step,
+            },
+            crate::workflow::evidence::FailureDetail::interrupted_in_execution(),
+        )),
+    };
+    let design = &mut snapshot.steps[0];
+    design.definition = WorkflowPresentationStep::Workflow {
+        file: "design.yaml".to_owned(),
+        failure_policy: FailurePolicy::Advisory,
+        direct_dependencies: Vec::new(),
+        outputs: BTreeMap::new(),
+    };
+    design.state = StepStateKind::Succeeded;
+    design.outputs = BTreeMap::from([(
+        "outcome".to_owned(),
+        WorkflowRunOutputDisposition::Committed,
+    )]);
+    design.failed_child = Some(record.clone());
+
+    let step = &snapshot.steps[0];
+    assert_eq!(step_state_glyph(step), "×");
+    assert_eq!(step_state_label(step.state()), "failed");
+    assert!(matches!(step_state_tone(step.state()), Tone::Failure));
+    let counts = step_counts(&snapshot);
+    assert_eq!((counts.failed, counts.succeeded), (1, 0));
+    let detail = live_step_detail(step).unwrap();
+    assert!(detail.contains("design.decide"));
+    assert!(!detail.contains("advisory"));
+    assert_eq!(
+        detail,
+        crate::workflow::presentation::failed_stage_detail("design", &record, 1)
+    );
+    let fact = step.inspector_fact().unwrap();
+    assert!(matches!(fact.tone, Tone::Failure));
+    assert_eq!(fact.value, detail);
+
+    snapshot.steps[0].failed_child = None;
+    let step = &snapshot.steps[0];
+    assert_eq!(step_state_glyph(step), "✓");
+    assert_eq!(step_state_label(step.state()), "succeeded");
+    let counts = step_counts(&snapshot);
+    assert_eq!((counts.failed, counts.succeeded), (0, 1));
+    assert_eq!(
+        live_step_detail(step),
+        Some(crate::workflow::render_style::success_detail(false, 1))
+    );
 }

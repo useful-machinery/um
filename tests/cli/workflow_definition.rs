@@ -274,6 +274,113 @@ fn validate_json_reports_the_files_the_digest_covers() {
     );
 }
 
+fn declaring_integrations(declaration: &str) -> String {
+    let root = ROOT_WORKFLOW.replacen(
+        "requires:\n  tools:",
+        &format!("requires:\n{declaration}  tools:"),
+        1,
+    );
+    assert_ne!(root, ROOT_WORKFLOW);
+    root
+}
+
+fn valid_report(directory: &str) -> Value {
+    let output = validate(directory, true);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    report(&output)
+}
+
+fn integrations_lines(directory: &str) -> Vec<String> {
+    let output = validate(directory, false);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    String::from_utf8(output.stdout)
+        .expect("human output should be UTF-8")
+        .lines()
+        .filter(|line| line.starts_with("integrations:"))
+        .map(str::to_owned)
+        .collect()
+}
+
+// REQ-WFDEF-14, REQ-WFDEF-34: a root that declares integrations reports each with the `as`
+// that applies to it, and otherwise validates and publishes as it does without them, the
+// digest apart; a root that declares none reports no `requiresIntegrations` and no line.
+#[test]
+fn a_root_declaring_integrations_reports_them_and_publishes_as_without_them() {
+    let declared_root = declaring_integrations(
+        "  as: member\n  integrations: {linear: {as: org}, github: {}, claude_code: {}}\n",
+    );
+    let without_identity = |mut report: Value| {
+        let object = report.as_object_mut().unwrap();
+        object.remove("digest");
+        object.remove("tree");
+        object.remove("requiresIntegrations");
+        report
+    };
+    let plain = Tree::engineering();
+    let declared = Tree::with(&declared_root, DESIGN_WORKFLOW);
+    let declared_report = valid_report(declared.path());
+    let plain_report = valid_report(plain.path());
+    assert_eq!(
+        declared_report["requiresIntegrations"],
+        json!({
+            "claude_code": {"as": "member"},
+            "github": {"as": "member"},
+            "linear": {"as": "org"},
+        })
+    );
+    assert!(
+        !plain_report
+            .as_object()
+            .unwrap()
+            .contains_key("requiresIntegrations"),
+        "{plain_report}"
+    );
+    assert_eq!(
+        without_identity(declared_report),
+        without_identity(plain_report)
+    );
+
+    let lines = integrations_lines(declared.path());
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    for expected in ["claude_code as member", "github as member", "linear as org"] {
+        assert!(
+            lines[0].contains(expected),
+            "missing {expected:?} in {lines:?}"
+        );
+    }
+    assert_eq!(integrations_lines(plain.path()), Vec::<String>::new());
+
+    for tree in [&plain, &declared] {
+        let home = Home::new();
+        let published = home.publish(tree, &["--bindings", &tree.engineering_bindings()]);
+        assert_eq!(published["revision"]["n"], 1);
+        assert_eq!(published["definition"]["current"], 1);
+    }
+}
+
+// REQ-WFDEF-14, REQ-WFDEF-34: without `requires.as` an entry's own `as` is reported and an
+// entry without one has none; a stage file's override (REQ-WFDEF-35) is not reported.
+#[test]
+fn validate_reports_the_roots_own_as_for_each_integration() {
+    let tree = Tree::with(
+        &declaring_integrations("  integrations: {github: {}, linear: {as: org}}\n"),
+        DESIGN_WORKFLOW,
+    );
+    assert_eq!(
+        valid_report(tree.path())["requiresIntegrations"],
+        json!({"github": {}, "linear": {"as": "org"}})
+    );
+
+    let overridden = Tree::with(
+        &declaring_integrations("  integrations: {linear: {as: org}}\n"),
+        &format!("{DESIGN_WORKFLOW}requires:\n  integrations:\n    linear: {{as: member}}\n"),
+    );
+    assert_eq!(
+        valid_report(overridden.path())["requiresIntegrations"],
+        json!({"linear": {"as": "org"}})
+    );
+}
+
 fn report_digest(output: &std::process::Output) -> String {
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     report(output)["digest"]["value"]
@@ -312,6 +419,79 @@ fn root_only_block_in_a_stage_file_is_rejected() {
     assert_eq!(location["kind"], "workflow");
     assert_eq!(location["path"], "design.yaml");
     assert_eq!(location["key"], "bindings");
+}
+
+// REQ-WFDEF-35, REQ-WFDEF-9: a stage file may override integrations the root declares and
+// no others; `Tree::with`'s root names `design.yaml` in no `workflow` step, so the check
+// covers a file no step reaches.
+#[test]
+fn a_stage_file_overrides_only_integrations_the_root_declares() {
+    let declaring = declaring_integrations("  integrations: {linear: {}, github: {}}\n");
+    let overriding = |block: &str| format!("{DESIGN_WORKFLOW}requires:\n{block}");
+    let assert_undeclared = |location: &Value, integration: &str| {
+        assert_eq!(location["kind"], "workflow");
+        assert_eq!(location["path"], "design.yaml");
+        assert_eq!(location["key"], "requires");
+        assert_eq!(location["integration"], integration);
+    };
+
+    let tree = Tree::with(
+        &declaring,
+        &overriding("  integrations:\n    linear: {as: org}\n"),
+    );
+    let output = validate(tree.path(), true);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        report(&output)["workflowFiles"],
+        json!(["workflow.yaml", "design.yaml"])
+    );
+
+    let codex = overriding("  integrations:\n    codex: {}\n");
+    let (code, location) = single_rejection(&declaring, &codex);
+    assert_eq!(code, "integration_undeclared");
+    assert_undeclared(&location, "codex");
+    let tree = Tree::with(&declaring, &codex);
+    let human = validate(tree.path(), false);
+    assert_eq!(human.status.code(), Some(1), "{human:?}");
+    let stdout = String::from_utf8(human.stdout).expect("human output should be UTF-8");
+    for expected in ["integration_undeclared", "design.yaml", "codex"] {
+        assert!(
+            stdout.contains(expected),
+            "missing {expected:?} in {stdout}"
+        );
+    }
+
+    let (code, location) = single_rejection(
+        ROOT_WORKFLOW,
+        &overriding("  integrations:\n    linear: {}\n"),
+    );
+    assert_eq!(code, "integration_undeclared");
+    assert_undeclared(&location, "linear");
+
+    let tree = Tree::with(
+        &declaring,
+        &overriding("  integrations:\n    gitlab.com: {}\n    codex: {}\n"),
+    );
+    let codes = rejection_codes(tree.path());
+    assert_eq!(codes.len(), 2, "{codes:?}");
+    for ((code, location), integration) in codes.iter().zip(["codex", "gitlab.com"]) {
+        assert_eq!(code, "integration_undeclared");
+        assert_undeclared(location, integration);
+    }
+
+    let tree = Tree::with(&declaring, &overriding("  as: org\n"));
+    let output = validate(tree.path(), true);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    for block in [
+        "  tools: [git]\n",
+        "  tools: [git]\n  integrations:\n    linear: {}\n",
+    ] {
+        let (code, location) = single_rejection(&declaring, &overriding(block));
+        assert_eq!(code, "root_only_block_outside_root");
+        assert_eq!(location["path"], "design.yaml");
+        assert_eq!(location["key"], "requires");
+    }
 }
 
 // REQ-WFDEF-9
@@ -1074,7 +1254,8 @@ fn member_bindings_are_reported_and_shown_as_typed_values() {
     );
 }
 
-/// The engineering root with a start policy on `start` and a `nightly` schedule trigger.
+/// The engineering root with a start policy on `start` and a `nightly` schedule trigger that
+/// queues the latest start while its subject is busy.
 fn start_policy_root() -> String {
     let replacements = [
         (
@@ -1087,7 +1268,7 @@ fn start_policy_root() -> String {
         ),
         (
             "  release:",
-            "  nightly:\n    on: {schedule: \"0 6 * * *\", timezone: \"UTC\"}\n    subject: \"nightly-sweep\"\n    owner: $nightlyOwner\n    inputs:\n      ticket: \"nightly\"\n  release:",
+            "  nightly:\n    on: {schedule: \"0 6 * * *\", timezone: \"UTC\"}\n    subject: \"nightly-sweep\"\n    owner: $nightlyOwner\n    busyBehavior: queueLatest\n    inputs:\n      ticket: \"nightly\"\n  release:",
         ),
     ];
     replacements
@@ -1098,9 +1279,10 @@ fn start_policy_root() -> String {
         })
 }
 
-// REQ-WFDEF-10, REQ-WFDEF-14, REQ-WFDEF-30, REQ-WFDEF-31: the report prints each start
-// trigger's `where`, `subject`, `inputs`, `stopBefore` and `owner` and names a schedule
-// trigger by its kind and timetable; publishing the tree starts no run.
+// REQ-WFDEF-10, REQ-WFDEF-14, REQ-WFDEF-30, REQ-WFDEF-31, REQ-WFDEF-33: the report prints
+// each start trigger's `where`, `subject`, `inputs`, `stopBefore`, `owner` and a declared
+// `busyBehavior` and names a schedule trigger by its kind and timetable; publishing the tree
+// starts no run.
 #[test]
 fn start_policies_and_schedule_triggers_are_reported_and_start_nothing() {
     let tree = Tree::with(&start_policy_root(), DESIGN_WORKFLOW);
@@ -1129,6 +1311,7 @@ fn start_policies_and_schedule_triggers_are_reported_and_start_nothing() {
                 "subject": "nightly-sweep",
                 "inputs": {"ticket": "nightly"},
                 "owner": {"from": "$nightlyOwner"},
+                "busyBehavior": "queueLatest",
             },
             "release": {
                 "kind": "control",
@@ -1150,12 +1333,63 @@ fn start_policies_and_schedule_triggers_are_reported_and_start_nothing() {
             "event.issue.blocked == false",
             "nightly-sweep",
             "event.issue.identifier",
+            "queueLatest",
         ],
     );
 
     let home = Home::new();
     home.publish(&tree, &["--bindings", &tree.engineering_bindings()]);
     home.assert_no_runs();
+}
+
+/// The engineering root with a `github` connection and a `pushed` start trigger on `event`.
+fn push_trigger_root(event: &str) -> String {
+    let replacements = [
+        (
+            "  repository:      {kind: github.repository}\n".to_owned(),
+            "  repository:      {kind: github.repository}\n  github:          {kind: connection}\n"
+                .to_owned(),
+        ),
+        (
+            "  release:".to_owned(),
+            format!(
+                "  pushed:\n    on:      {{source: $github, event: {event}, where: \"event.projectBranch == true\"}}\n    subject: event.branch\n    inputs:\n      ticket: event.commit\n      branch: event.branch\n  release:"
+            ),
+        ),
+    ];
+    replacements
+        .into_iter()
+        .fold(ROOT_WORKFLOW.to_owned(), |root, (from, to)| {
+            assert!(root.contains(&from), "{from}");
+            root.replacen(&from, &to, 1)
+        })
+}
+
+// REQ-WFDEF-36: a start trigger on the one-segment event `push` validates and is reported as
+// written beside a two-segment one; an event name of any other shape is structurally invalid.
+#[test]
+fn one_segment_trigger_event_is_reported_as_written() {
+    let tree = Tree::with(&push_trigger_root("push"), DESIGN_WORKFLOW);
+    let output = validate(tree.path(), true);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let triggers = &report(&output)["triggers"];
+    assert_eq!(
+        triggers["pushed"],
+        json!({
+            "kind": "start",
+            "source": "$github",
+            "event": "push",
+            "where": "event.projectBranch == true",
+            "subject": "event.branch",
+            "inputs": {"ticket": "event.commit", "branch": "event.branch"},
+        })
+    );
+    assert_eq!(triggers["start"]["event"], "issue.state_entered");
+
+    for event in ["push.", "Push"] {
+        let (code, _) = single_rejection(&push_trigger_root(event), DESIGN_WORKFLOW);
+        assert_eq!(code, "invalid_workflow_structure", "{event}");
+    }
 }
 
 impl Home {
@@ -1997,16 +2231,30 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
         .strip_prefix(&format!("GET {definitions}/"))
         .and_then(|rest| rest.split_once("/evaluations"))
     {
-        return super::json_http_response(
-            "200 OK",
-            match evaluation.strip_prefix('/') {
-                Some(evaluation) => gateway_evaluation(id, evaluation),
-                None => json!({
-                    "items": [gateway_evaluation(id, CLOUD_EVALUATION)],
-                    "nextCursor": "older-evaluations",
-                }),
-            },
-        );
+        // As Cloud does (REQ-TRIGGER-166), the push evaluation is listed and read only under
+        // evaluation vocabulary 2.
+        let latest = request
+            .path
+            .split_once('?')
+            .is_some_and(|(_, query)| query.split('&').any(|pair| pair == "vocabulary=2"));
+        let answer = match evaluation.strip_prefix('/') {
+            Some(CLOUD_PUSH_EVALUATION) if !latest => return gateway_not_found(),
+            Some(CLOUD_PUSH_EVALUATION) => gateway_push_evaluation(id),
+            Some(CLOUD_NOT_READY_EVALUATION) => gateway_not_ready_evaluation(id),
+            Some(evaluation) => gateway_evaluation(id, evaluation),
+            None => {
+                let mut items = vec![
+                    gateway_evaluation(id, CLOUD_EVALUATION),
+                    gateway_blocked_evaluation(id),
+                    gateway_not_ready_evaluation(id),
+                ];
+                if latest {
+                    items.insert(0, gateway_push_evaluation(id));
+                }
+                json!({"items": items, "nextCursor": "older-evaluations"})
+            }
+        };
+        return super::json_http_response("200 OK", answer);
     }
     if let Some(id) = route.strip_prefix(&format!("GET {definitions}/")) {
         let answered = if state.fault(Fault::ReadOtherDefinition) {
@@ -2087,6 +2335,31 @@ fn gateway_definition(id: &str, definition: &FakeDefinition) -> Value {
 }
 
 const CLOUD_EVALUATION: &str = "wev_01k0z6r1w8f4jy2m7q9v3x5abc";
+const CLOUD_BLOCKED_EVALUATION: &str = "wev_01k0z6r1w8f4jy2m7q9v3x5abd";
+const CLOUD_BLOCKING_RUN: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abd";
+const CLOUD_NOT_READY_EVALUATION: &str = "wev_01k0z6r1w8f4jy2m7q9v3x5abe";
+
+/// A `failed` evaluation of definition `id` whose project was not ready, with the readiness
+/// blockers Cloud observed when it refused the start (REQ-TRIGGER-164).
+fn gateway_not_ready_evaluation(id: &str) -> Value {
+    let mut evaluation = gateway_evaluation(id, CLOUD_NOT_READY_EVALUATION);
+    evaluation["reason"] = json!("project_not_ready");
+    evaluation["observations"] = json!({
+        "observedAt": CLOUD_TIME,
+        "admissionFailure": {"phase": "create_run", "cause": "source_unavailable"},
+        "project": {"blockers": ["runner_pool_unassigned", "repository_detached"]},
+    });
+    evaluation
+}
+
+/// A `skipped_active` evaluation of definition `id` that names the run holding its subject.
+fn gateway_blocked_evaluation(id: &str) -> Value {
+    let mut evaluation = gateway_evaluation(id, CLOUD_BLOCKED_EVALUATION);
+    evaluation["state"] = json!("skipped_active");
+    evaluation["reason"] = json!("subject_busy");
+    evaluation["blockingRunId"] = json!(CLOUD_BLOCKING_RUN);
+    evaluation
+}
 
 /// A failed start evaluation `evaluation` of definition `id` with its stored reason.
 fn gateway_evaluation(id: &str, evaluation: &str) -> Value {
@@ -2120,6 +2393,30 @@ fn gateway_evaluation(id: &str, evaluation: &str) -> Value {
         "expiresAt": "2026-12-10T12:00:00Z",
         "settledAt": CLOUD_TIME,
     })
+}
+
+const CLOUD_PUSH_EVALUATION: &str = "wev_01k0z6r1w8f4jy2m7q9v3x5abf";
+const CLOUD_PUSH_COMMIT: &str = "9fceb02d0ae598e95dc970b74767f19372d61af8";
+
+/// The start evaluation of a push to `main` of definition `id`, newer than
+/// [`CLOUD_EVALUATION`], which Cloud shows only under evaluation vocabulary 2.
+fn gateway_push_evaluation(id: &str) -> Value {
+    let mut evaluation = gateway_evaluation(id, CLOUD_PUSH_EVALUATION);
+    evaluation["triggerName"] = json!("pushed");
+    evaluation["connectionId"] = json!("ghi_01k0z6r1w8f4jy2m7q9v3x5ab0");
+    evaluation["eventName"] = json!("push");
+    evaluation["event"] = json!({
+        "repository": {"id": "11", "fullName": "acme/widgets"},
+        "ref": "refs/heads/main",
+        "branch": "main",
+        "commit": CLOUD_PUSH_COMMIT,
+        "before": null,
+        "created": true,
+        "forced": false,
+        "projectBranch": true,
+        "at": CLOUD_TIME,
+    });
+    evaluation
 }
 
 /// What a create or publication request asks its revision to publish.
@@ -3586,7 +3883,9 @@ fn cloud_group_reports_the_stage_and_check_of_an_invalid_response() {
 }
 
 // REQ-CLOUDDEF-15: `evaluation list` sends its filters and page as typed and `evaluation
-// show` reads one evaluation; both report each evaluation's state and stored reason.
+// show` reads one evaluation, both asking for representation 2; both report each
+// evaluation's state, stored reason and blocking run, `-` when it has none, and the
+// readiness blockers of an evaluation whose project was not ready.
 #[test]
 fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason() {
     let home = Home::new();
@@ -3631,8 +3930,10 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
         [
             "cursor=page-2",
             "limit=5",
+            "representation=2",
             &format!("runId={run_id}"),
-            "state=failed"
+            "state=failed",
+            "vocabulary=2"
         ]
     );
     let listed = report(&output);
@@ -3646,12 +3947,26 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
     assert_eq!(listed["definitionId"], definition.as_str());
     assert_eq!(listed["nextCursor"], "older-evaluations");
     let items = listed["evaluations"].as_array().expect("evaluations");
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0], gateway_evaluation(&definition, CLOUD_EVALUATION));
+    assert_eq!(items.len(), 4);
+    assert_eq!(
+        &items[1..],
+        &[
+            gateway_evaluation(&definition, CLOUD_EVALUATION),
+            gateway_blocked_evaluation(&definition),
+            gateway_not_ready_evaluation(&definition),
+        ]
+    );
+    assert_eq!(
+        items[3]["observations"]["project"]["blockers"],
+        json!(["runner_pool_unassigned", "repository_detached"])
+    );
 
     let (output, requests) = list(&[]);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
-    assert_eq!(requests[0].path, evaluations);
+    assert_eq!(
+        requests[0].path,
+        format!("{evaluations}?representation=2&vocabulary=2")
+    );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_contains_all(
         &stdout,
@@ -3663,13 +3978,38 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
             "older-evaluations",
         ],
     );
+    let line = |id: &str| {
+        stdout
+            .lines()
+            .find(|line| line.contains(id))
+            .unwrap_or_else(|| panic!("a line for {id}: {stdout}"))
+    };
+    let blocking_run = |id: &str| {
+        line(id)
+            .rsplit(" · ")
+            .next()
+            .and_then(|field| field.strip_prefix("blocking run "))
+            .map(str::to_owned)
+    };
+    assert_eq!(blocking_run(CLOUD_EVALUATION).as_deref(), Some("-"));
+    assert_eq!(
+        blocking_run(CLOUD_BLOCKED_EVALUATION).as_deref(),
+        Some(CLOUD_BLOCKING_RUN)
+    );
+    let not_ready = line(CLOUD_NOT_READY_EVALUATION);
+    assert_contains_all(not_ready, &["project_not_ready"]);
+    assert_eq!(
+        not_ready.rsplit(" · ").next(),
+        Some("project blockers runner_pool_unassigned, repository_detached"),
+        "{not_ready}"
+    );
 
-    let show = |json: bool| {
+    let show = |id: &str, json: bool| {
         let mut args = vec![
             "show",
             CLOUD_ORGANIZATION,
             definition.as_str(),
-            CLOUD_EVALUATION,
+            id,
             "--project-id",
             CLOUD_PROJECT,
         ];
@@ -3678,11 +4018,16 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
         }
         evaluation(&args)
     };
-    let (output, requests) = show(true);
+    let (output, requests) = show(CLOUD_EVALUATION, true);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(
-        routes(&requests),
-        vec![format!("GET {evaluations}/{CLOUD_EVALUATION}")]
+        requests
+            .iter()
+            .map(|request| &request.path)
+            .collect::<Vec<_>>(),
+        [&format!(
+            "{evaluations}/{CLOUD_EVALUATION}?representation=2&vocabulary=2"
+        )]
     );
     let shown = report(&output);
     assert_eq!(shown["outcome"], "shown", "{shown}");
@@ -3690,10 +4035,17 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
         shown["evaluation"],
         gateway_evaluation(&definition, CLOUD_EVALUATION)
     );
-    let (output, _) = show(false);
+    let project_blockers = |stdout: &str| {
+        stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("project blockers: "))
+            .map(str::to_owned)
+    };
+    let (output, _) = show(CLOUD_EVALUATION, false);
     assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
     assert_contains_all(
-        &String::from_utf8_lossy(&output.stdout),
+        &stdout,
         &[
             CLOUD_EVALUATION,
             "failed",
@@ -3702,5 +4054,90 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
             CLOUD_PRINCIPAL,
         ],
     );
+    assert_eq!(project_blockers(&stdout).as_deref(), Some("-"), "{stdout}");
+
+    let (output, _) = show(CLOUD_NOT_READY_EVALUATION, true);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let shown = report(&output);
+    assert_eq!(
+        shown["evaluation"]["observations"]["project"]["blockers"],
+        json!(["runner_pool_unassigned", "repository_detached"]),
+        "{shown}"
+    );
+    let (output, _) = show(CLOUD_NOT_READY_EVALUATION, false);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_contains_all(&stdout, &["project_not_ready"]);
+    assert_eq!(
+        project_blockers(&stdout).as_deref(),
+        Some("runner_pool_unassigned, repository_detached"),
+        "{stdout}"
+    );
+    assert!(home.workflow_entries().is_empty());
+}
+
+// REQ-CLOUDDEF-15, REQ-TRIGGER-166: `evaluation list` and `evaluation show` ask for evaluation
+// vocabulary 2, so a push evaluation is listed and read, printed as Cloud sent it under
+// `--json` and with its branch and commit in human output.
+#[test]
+fn cloud_evaluations_ask_for_vocabulary_2_and_show_a_push_with_its_branch_and_commit() {
+    let home = Home::new();
+    let gateway = FakeGateway::new();
+    let definition = format!("{CLOUD_ID_STEM}c");
+    gateway.define(&definition, 2);
+    let evaluations = format!(
+        "/api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions/{definition}/evaluations"
+    );
+    let pushed = gateway_push_evaluation(&definition);
+    let evaluation = |leaf: &str, extra: &[&str]| {
+        let mut all = vec![
+            "workflow",
+            "definition",
+            "cloud",
+            "evaluation",
+            leaf,
+            CLOUD_ORGANIZATION,
+            definition.as_str(),
+        ];
+        all.extend_from_slice(extra);
+        all.extend_from_slice(&["--project-id", CLOUD_PROJECT, "--allow-insecure-http"]);
+        let (output, requests) = gateway.run(&home, &all);
+        super::assert_no_secret_output(&output, &[CLOUD_TOKEN]);
+        (output, requests)
+    };
+
+    let (output, requests) = evaluation("list", &["--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(requests.len(), 1);
+    let (path, query) = requests[0].path.split_once('?').expect("a query");
+    assert_eq!(path, evaluations);
+    assert!(
+        query.split('&').any(|pair| pair == "vocabulary=2"),
+        "{query}"
+    );
+    let listed = report(&output);
+    assert_eq!(listed["outcome"], "listed", "{listed}");
+    let items = listed["evaluations"].as_array().expect("evaluations");
+    assert!(items.contains(&pushed), "{listed}");
+
+    let (output, requests) = evaluation("show", &[CLOUD_PUSH_EVALUATION, "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].path,
+        format!("{evaluations}/{CLOUD_PUSH_EVALUATION}?representation=2&vocabulary=2")
+    );
+    let shown = report(&output);
+    assert_eq!(shown["outcome"], "shown", "{shown}");
+    assert_eq!(shown["evaluation"], pushed);
+
+    for args in [vec!["list"], vec!["show", CLOUD_PUSH_EVALUATION]] {
+        let (output, _) = evaluation(args[0], &args[1..]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_contains_all(
+            &String::from_utf8_lossy(&output.stdout),
+            &[CLOUD_PUSH_EVALUATION, "push", "main", CLOUD_PUSH_COMMIT],
+        );
+    }
     assert!(home.workflow_entries().is_empty());
 }

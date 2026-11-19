@@ -3137,6 +3137,8 @@ pub(crate) fn opening_hello(
         tree_execution: true,
         // It adopts a retained tree run on a continuation offer (REQ-RUNNERENROLL-89).
         tree_continuation: true,
+        // It applies a `withdraw` control to the run it executes (REQ-RUNNERENROLL-123).
+        tree_withdraw: true,
     })
     .map_err(|_| {
         ConnectionError::terminal(
@@ -5405,6 +5407,8 @@ mod tests {
             assert_eq!(hello["payload"]["treeExecution"], 1);
             // REQ-RUNNERENROLL-89
             assert_eq!(hello["payload"]["treeContinuation"], 1);
+            // REQ-RUNNERENROLL-123
+            assert_eq!(hello["payload"]["treeWithdraw"], 1);
             socket.send(welcome()).await.expect("send welcome");
             socket
                 .send(observation_acknowledgement(OPENING_MESSAGE_ID, 1))

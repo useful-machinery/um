@@ -15,41 +15,28 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// ServedGrantProvider : A provider this deployment serves grants for, and the kind of grant it makes.
+/// ServedGrantProvider : A provider this deployment serves grants for, the kind of grant it makes, and its display name.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ServedGrantProvider {
     /// The provider, named as a grant names it.
     #[serde(rename = "provider")]
-    pub provider: Provider,
+    pub provider: String,
     /// `oauth` for a provider the deployment holds an OAuth application for; `native` for a coding agent the deployment lists a target for.
     #[serde(rename = "kind")]
     pub kind: Kind,
+    /// The provider's name for people, at most 64 bytes, such as `GitHub` or `Claude Code`.
+    #[serde(rename = "displayName")]
+    pub display_name: String,
 }
 
 impl ServedGrantProvider {
-    /// A provider this deployment serves grants for, and the kind of grant it makes.
-    pub fn new(provider: Provider, kind: Kind) -> ServedGrantProvider {
-        ServedGrantProvider { provider, kind }
-    }
-}
-/// The provider, named as a grant names it.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Provider {
-    #[serde(rename = "github")]
-    ServedGrantProviderGithub,
-    #[serde(rename = "gitlab.com")]
-    ServedGrantProviderGitlabCom,
-    #[serde(rename = "linear")]
-    ServedGrantProviderLinear,
-    #[serde(rename = "claude_code")]
-    ServedGrantProviderClaudeCode,
-    #[serde(rename = "codex")]
-    ServedGrantProviderCodex,
-}
-
-impl Default for Provider {
-    fn default() -> Provider {
-        Self::ServedGrantProviderGithub
+    /// A provider this deployment serves grants for, the kind of grant it makes, and its display name.
+    pub fn new(provider: String, kind: Kind, display_name: String) -> ServedGrantProvider {
+        ServedGrantProvider {
+            provider,
+            kind,
+            display_name,
+        }
     }
 }
 /// `oauth` for a provider the deployment holds an OAuth application for; `native` for a coding agent the deployment lists a target for.

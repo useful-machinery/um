@@ -2325,7 +2325,7 @@ fn record_codex_readiness(directory: &Path, state: &str) {
     fs::set_permissions(&path, Permissions::from_mode(0o600)).expect("protect readiness document");
 }
 
-// REQ-RUNNERENROLL-86, REQ-GRANT-53
+// REQ-RUNNERENROLL-86, REQ-GRANT-53, REQ-GRANT-51
 #[test]
 fn runner_doctor_agent_logins_check_reads_the_recorded_readiness() {
     let runner_directory = private_credential_directory();
@@ -2340,18 +2340,18 @@ fn runner_doctor_agent_logins_check_reads_the_recorded_readiness() {
     assert_eq!(unknown.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&unknown.stdout).contains("readiness_unknown"));
 
-    record_codex_readiness(runner_directory.path(), "foreign_login");
+    record_codex_readiness(runner_directory.path(), "unsupported_target");
     let failed = run(&with_config);
     assert_eq!(failed.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&failed.stdout);
-    assert!(stdout.contains("code: foreign_login"), "{stdout}");
+    assert!(stdout.contains("code: unsupported_target"), "{stdout}");
     // Each provider's availability and next action (REQ-GRANT-53).
     let codex = stdout
         .lines()
         .find(|line| line.trim_start().starts_with("codex login:"))
         .unwrap_or_else(|| panic!("{stdout}"));
-    assert!(codex.contains("not_delivered"), "{stdout}");
-    assert!(codex.contains("resolve_service_login"), "{stdout}");
+    assert!(codex.contains("delivery_failed"), "{stdout}");
+    assert!(codex.contains("check_target"), "{stdout}");
     assert!(failed.stderr.is_empty());
 
     let json = run(&[with_config.as_slice(), &["--json"]].concat());
@@ -2360,8 +2360,29 @@ fn runner_doctor_agent_logins_check_reads_the_recorded_readiness() {
         serde_json::from_slice(&json.stdout).expect("runner doctor report should be JSON");
     assert_eq!(report["checks"][0]["id"], "credentials.agent-logins");
     assert_eq!(report["checks"][0]["status"], "fail");
-    assert_eq!(report["checks"][0]["code"], "foreign_login");
+    assert_eq!(report["checks"][0]["code"], "unsupported_target");
     assert_eq!(report["checks"][0]["details"]["provider"], "codex");
+    assert_eq!(
+        report["checks"][0]["details"]["codex_availability"],
+        "delivery_failed"
+    );
+    assert_eq!(
+        report["checks"][0]["details"]["codex_next_action"],
+        "check_target"
+    );
+    assert_eq!(
+        report["summary"],
+        serde_json::json!({"passed": 0, "failed": 1})
+    );
+
+    // The host's own login is in use: the check passes and names it
+    // (REQ-GRANT-51).
+    record_codex_readiness(runner_directory.path(), "foreign_login");
+    let json = run(&[with_config.as_slice(), &["--json"]].concat());
+    assert!(json.status.success(), "{json:?}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("runner doctor report should be JSON");
+    assert_eq!(report["checks"][0]["code"], "ok");
     assert_eq!(
         report["checks"][0]["details"]["codex_availability"],
         "not_delivered"
@@ -2369,10 +2390,6 @@ fn runner_doctor_agent_logins_check_reads_the_recorded_readiness() {
     assert_eq!(
         report["checks"][0]["details"]["codex_next_action"],
         "resolve_service_login"
-    );
-    assert_eq!(
-        report["summary"],
-        serde_json::json!({"passed": 0, "failed": 1})
     );
 
     record_codex_readiness(runner_directory.path(), "ready");

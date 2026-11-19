@@ -345,8 +345,11 @@ fn reports_cloud_enrollment_separately_when_runner_serve_is_unreachable() {
     }
 }
 
-const JOIN_KEY_ID: &str = "rjk_01k0z6r1w8f4jy2m7q9v3x5abc";
+pub(super) const JOIN_KEY_ID: &str = "rjk_01k0z6r1w8f4jy2m7q9v3x5abc";
 const JOIN_SECRET: &str = "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc";
+/// The `Idempotency-Key` of a join a test stages on the host.
+const STAGED_IDEMPOTENCY_KEY: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 pub(super) const JOIN_KEY_VARIABLE: &str = "USEFUL_RUNNER_JOIN_KEY";
 const JOINED_CREDENTIAL_IDS: [&str; 3] = [
     "rrc_01k0z6r1w8f4jy2m7q9v3x5ab1",
@@ -484,18 +487,32 @@ impl JoinHost {
 
     /// A join journal staged for `JOIN_KEY_ID` with the credential `secret`.
     pub(super) fn write_join_journal(&self, base: &str, secret: &str) {
+        self.write_journal(base, secret, None);
+    }
+
+    /// A rejoin of `RUNNER_ID` staged for `JOIN_KEY_ID` with the credential
+    /// `secret`, as a start whose rejoin went unanswered leaves it.
+    fn write_rejoin_journal(&self, base: &str, secret: &str) {
+        self.write_journal(base, secret, Some(RUNNER_ID));
+    }
+
+    fn write_journal(&self, base: &str, secret: &str, previous_runner_id: Option<&str>) {
+        let mut join_key = serde_json::json!({
+            "joinUrl": format!("{base}/v1/runner-join-keys/{JOIN_KEY_ID}/join"),
+            "joinKeyId": JOIN_KEY_ID,
+            "expiresAt": future_expiry()
+        });
+        if let Some(previous_runner_id) = previous_runner_id {
+            join_key["previousRunnerId"] = previous_runner_id.into();
+        }
         write_private_json(
             &self.journal,
             &serde_json::json!({
                 "schemaVersion": 1,
-                "joinKey": {
-                    "joinUrl": format!("{base}/v1/runner-join-keys/{JOIN_KEY_ID}/join"),
-                    "joinKeyId": JOIN_KEY_ID,
-                    "expiresAt": future_expiry()
-                },
+                "joinKey": join_key,
                 "credentialSecret": secret,
                 "credentialSecretVerifier": verifier_of(secret),
-                "idempotencyKey": "0".repeat(64),
+                "idempotencyKey": STAGED_IDEMPOTENCY_KEY,
                 "replaceCredential": false,
                 "stagedAt": "2026-08-06T12:00:00Z"
             }),
@@ -546,7 +563,10 @@ pub(super) fn write_private_json(path: &Path, document: &serde_json::Value) {
 }
 
 /// `useful runner serve ARGUMENTS` with telemetry off and no join key inherited
-/// from the suite's environment.
+/// from the suite's environment. Its work root keeps cleanup identities in
+/// directory metadata, so a service run that ends, such as the one a rejoin
+/// ends, can release its boot root in the Nix build sandbox, which rejects
+/// extended attributes.
 pub(super) fn serve_command(arguments: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_useful"));
     command
@@ -556,7 +576,9 @@ pub(super) fn serve_command(arguments: &[&str]) -> Command {
     for variable in RUNNER_TELEMETRY_VARIABLES {
         command.env_remove(variable);
     }
-    command.env("OTEL_SDK_DISABLED", "true");
+    command
+        .env("OTEL_SDK_DISABLED", "true")
+        .env("USEFUL_TEST_METADATA_CLEANUP_IDENTITY", "1");
     command
 }
 
@@ -624,6 +646,8 @@ impl Drop for ServeProcess {
 /// request and closes the connection, so the runner keeps reconnecting.
 pub(super) struct ConnectionWitness {
     pub(super) url: String,
+    /// The endpoint's HTTP origin, for a fake Cloud route such as a join.
+    base: String,
     requests: mpsc::Receiver<String>,
 }
 
@@ -637,13 +661,20 @@ impl ConnectionWitness {
     /// that is, once it has read the refusal.
     pub(super) fn rejecting() -> Self {
         Self::answering(Some(
-            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n",
+            b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n".to_vec(),
         ))
     }
 
-    fn answering(response: Option<&'static [u8]>) -> Self {
+    /// A fake Cloud route that gives every request it receives `response`,
+    /// and so records a request it was not expected to receive.
+    fn answering_every_request(response: Vec<u8>) -> Self {
+        Self::answering(Some(response))
+    }
+
+    fn answering(response: Option<Vec<u8>>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!("ws://{}/v1/runner/connect", listener.local_addr().unwrap());
+        let address = listener.local_addr().unwrap();
+        let url = format!("ws://{address}/v1/runner/connect");
         let (sender, requests) = mpsc::channel();
         thread::spawn(move || {
             for stream in listener.incoming() {
@@ -651,7 +682,7 @@ impl ConnectionWitness {
                     break;
                 };
                 let request = String::from_utf8_lossy(&read_request(&mut stream)).into_owned();
-                if let Some(response) = response {
+                if let Some(response) = &response {
                     let _ = stream.write_all(response);
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(10)));
                     let _ = io::copy(&mut stream, &mut io::sink());
@@ -661,7 +692,16 @@ impl ConnectionWitness {
                 }
             }
         });
-        Self { url, requests }
+        Self {
+            url,
+            base: format!("http://{address}"),
+            requests,
+        }
+    }
+
+    /// The requests received so far.
+    fn received(&self) -> Vec<String> {
+        self.requests.try_iter().collect()
     }
 
     pub(super) fn next_connection(&self, serve: &mut ServeProcess) -> Option<String> {
@@ -725,6 +765,29 @@ fn assert_joined_state(host: &JoinHost, index: usize, connection_url: &str) -> S
 }
 
 fn assert_join_request(request: &str, secret: &str) {
+    assert_join_request_with_body(
+        request,
+        secret,
+        &serde_json::json!({"schemaVersion": 1, "credentialSecretVerifier": verifier_of(secret)}),
+    );
+}
+
+/// Asserts that `request` is a rejoin of `RUNNER_ID` with the key's token and
+/// the verifier of `secret`, and answers its `Idempotency-Key`.
+fn assert_rejoin_request<'a>(request: &'a str, secret: &str) -> &'a str {
+    assert_join_request_with_body(
+        request,
+        secret,
+        &serde_json::json!({
+            "schemaVersion": 1,
+            "credentialSecretVerifier": verifier_of(secret),
+            "previousRunnerId": RUNNER_ID
+        }),
+    );
+    header_value(request, "idempotency-key")
+}
+
+fn assert_join_request_with_body(request: &str, secret: &str, body: &serde_json::Value) {
     assert!(
         request.starts_with(&format!(
             "POST /v1/runner-join-keys/{JOIN_KEY_ID}/join HTTP/1.1\r\n"
@@ -736,10 +799,7 @@ fn assert_join_request(request: &str, secret: &str) {
         format!("Bearer {}", join_token())
     );
     assert!(!header_value(request, "idempotency-key").is_empty());
-    assert_eq!(
-        join_body(request),
-        serde_json::json!({"schemaVersion": 1, "credentialSecretVerifier": verifier_of(secret)})
-    );
+    assert_eq!(&join_body(request), body);
     assert!(!request.contains(secret));
 }
 
@@ -955,7 +1015,7 @@ fn assert_serving_environment_holds_no_join_key(
     );
 }
 
-// REQ-RUNNERENROLL-97
+// REQ-RUNNERENROLL-97, REQ-RUNNERENROLL-127
 #[test]
 fn the_serving_process_holds_no_join_key_in_its_environment() {
     // A host that joins with the key.
@@ -966,7 +1026,7 @@ fn the_serving_process_holds_no_join_key_in_its_environment() {
     assert_serving_environment_holds_no_join_key("a host that joins", &host, &artifact, &witness);
     server.finish_one();
 
-    // A host already enrolled, which never contacts Cloud.
+    // A host enrolled with an activation, which never contacts Cloud.
     let witness = ConnectionWitness::new();
     let cloud = TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", cloud.local_addr().unwrap());
@@ -979,6 +1039,22 @@ fn the_serving_process_holds_no_join_key_in_its_environment() {
         cloud.accept().unwrap_err().kind(),
         io::ErrorKind::WouldBlock
     );
+
+    // A host that joined with a key, whose refused credential it rejoins.
+    let rejecting = ConnectionWitness::rejecting();
+    let witness = ConnectionWitness::new();
+    let server = api_test_support::ScriptedHttpServer::respond(join_response(0, &witness.url));
+    let artifact = join_key_artifact(&join_base(&server), &future_expiry());
+    let host = JoinHost::new(&artifact);
+    host.write_joined_state(&rejecting.url);
+    assert_serving_environment_holds_no_join_key(
+        "a key-joined host that rejoins",
+        &host,
+        &artifact,
+        &witness,
+    );
+    let secret = assert_joined_state(&host, 0, &witness.url);
+    assert_rejoin_request(&server.finish_one(), &secret);
 }
 
 // REQ-RUNNERENROLL-97
@@ -1117,9 +1193,9 @@ fn an_unsafe_or_expired_join_key_is_refused_before_contacting_cloud() {
     );
 }
 
-// REQ-RUNNERENROLL-97: a host that holds enrolled state serves with it and
-// never reads its join key, so a key that is missing, unsafe, empty or
-// malformed does not stop the start.
+// REQ-RUNNERENROLL-97, REQ-RUNNERENROLL-127: a host whose credential came from
+// an activation serves with its state and never reads its join key, so a key
+// that is missing, unsafe, empty or malformed does not stop the start.
 #[test]
 fn an_enrolled_host_serves_without_reading_its_join_key() {
     let cloud = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1383,6 +1459,315 @@ fn an_enrolled_host_removes_only_its_completed_joins_journal() {
     assert_eq!(
         cloud.accept().unwrap_err().kind(),
         io::ErrorKind::WouldBlock
+    );
+}
+
+/// The `connection:` field of what `useful runner status --config CONFIG`
+/// answers.
+fn connection_state(config: &str) -> String {
+    let output = run(&["runner", "status", "--config", config]);
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("connection:"))
+        .map(|state| state.trim().to_owned())
+        .unwrap()
+}
+
+/// Waits past the first reconnect delays, whose caps are one and two seconds
+/// (REQ-RUNNERENROLL-37), so that a join a parked runner would send again
+/// has had the time to arrive.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "only a span longer than the resend delay shows that a parked runner sends no further join"
+)]
+fn wait_past_a_resend_delay() {
+    thread::sleep(Duration::from_secs(3));
+}
+
+/// The problem Cloud answers to a rejoin of a runner it still holds, the body
+/// of `contracts/fixtures/public-api/runner-rejoin-unavailable-409.json`.
+fn rejoin_unavailable_response() -> Vec<u8> {
+    problem_http_response(
+        "409 Conflict",
+        serde_json::json!({
+            "type": "https://api.usefulmachinery.com/problems/runner-rejoin-unavailable",
+            "title": "Runner rejoin unavailable",
+            "status": 409,
+            "detail": "The runner this host names as its previous runner is still registered in the organization, so the host cannot join as another runner. Nothing was registered."
+        }),
+    )
+}
+
+// REQ-RUNNERENROLL-127
+#[test]
+fn a_key_joined_host_whose_credential_is_refused_rejoins_and_serves_as_the_new_runner() {
+    let rejecting = ConnectionWitness::rejecting();
+    let witness = ConnectionWitness::new();
+    let server = api_test_support::ScriptedHttpServer::respond(join_response(0, &witness.url));
+    let host = JoinHost::new(&join_key_artifact(&join_base(&server), &future_expiry()));
+    host.write_joined_state(&rejecting.url);
+
+    let bearer = connection_bearer(host.serve_with_key_file(), &witness);
+
+    let secret = assert_joined_state(&host, 0, &witness.url);
+    assert_eq!(
+        bearer,
+        format!("Bearer {}.{secret}", JOINED_CREDENTIAL_IDS[0])
+    );
+    assert_rejoin_request(&server.finish_one(), &secret);
+}
+
+// REQ-RUNNERENROLL-127: a connection with no definite answer keeps the key
+// unused, so the host sends no join and keeps its state.
+#[test]
+fn a_key_joined_host_whose_connection_is_unanswered_sends_no_join() {
+    let witness = ConnectionWitness::new();
+    let cloud = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", cloud.local_addr().unwrap());
+    let host = JoinHost::new(&join_key_artifact(&base, &future_expiry()));
+    host.write_joined_state(&witness.url);
+    let original = fs::read(&host.state).unwrap();
+
+    let mut serve = host.serve_with_key_file();
+    assert!(witness.next_connection(&mut serve).is_some());
+    let bearer = connection_bearer(serve, &witness);
+
+    assert_eq!(
+        bearer,
+        format!("Bearer {CURRENT_CREDENTIAL_ID}.{CURRENT_SECRET}")
+    );
+    assert_eq!(fs::read(&host.state).unwrap(), original);
+    cloud.set_nonblocking(true).unwrap();
+    assert_eq!(
+        cloud.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}
+
+// REQ-RUNNERENROLL-127, REQ-RUNNERENROLL-35: a refused rejoin leaves the
+// host's state as it was and parks the runner, which sends no further join.
+#[test]
+fn a_refused_rejoin_keeps_the_state_and_parks_the_runner() {
+    let refusals = [
+        http_response("410 Gone", None, b""),
+        http_response("401 Unauthorized", None, b""),
+        rejoin_unavailable_response(),
+        http_response("400 Bad Request", None, b""),
+    ];
+    let mut started = Vec::new();
+    for refusal in refusals {
+        let rejecting = ConnectionWitness::rejecting();
+        let cloud = ConnectionWitness::answering_every_request(refusal);
+        let host = JoinHost::new(&join_key_artifact(&cloud.base, &future_expiry()));
+        host.write_joined_state(&rejecting.url);
+        let original = fs::read(&host.state).unwrap();
+        let serve = host.serve_with_key_file();
+        started.push((rejecting, cloud, host, original, serve));
+    }
+
+    for (_, cloud, _, _, serve) in &mut started {
+        let Some(join) = cloud.next_connection(serve) else {
+            panic!("Runner Serve stopped before it rejoined");
+        };
+        assert_eq!(join_body(&join)["previousRunnerId"], RUNNER_ID);
+    }
+    wait_past_a_resend_delay();
+
+    for (_, cloud, host, original, mut serve) in started {
+        assert_eq!(fs::read(&host.state).unwrap(), original);
+        assert_eq!(connection_state(&host.config), "authentication_failed");
+        assert!(cloud.received().is_empty());
+        assert!(serve.exited().is_none());
+        let stderr = serve.stop();
+        assert!(!stderr.contains(JOIN_SECRET), "{stderr}");
+    }
+}
+
+/// The environment a case gives Runner Serve.
+type Environment<'a> = &'a [(&'a str, &'a str)];
+
+/// Starts Runner Serve on each host, whose state names `rejecting`'s
+/// connection endpoint, with the arguments and environment of its case, and
+/// asserts that once each has read the refusal of its credential, and after
+/// a wait past a resend delay, it is still running and sent `cloud` nothing.
+fn assert_refused_hosts_send_no_join(
+    cases: &[(&JoinHost, &ConnectionWitness, bool, Environment<'_>)],
+    cloud: &TcpListener,
+) {
+    let mut started = Vec::new();
+    for (host, rejecting, with_key_file, environment) in cases {
+        let key_file = host.key_file.to_string_lossy().into_owned();
+        let arguments: &[&str] = if *with_key_file {
+            &["--join-key-file", &key_file]
+        } else {
+            &[]
+        };
+        let mut serve = host.serve(arguments, environment);
+        assert!(rejecting.next_connection(&mut serve).is_some());
+        started.push(serve);
+    }
+    wait_past_a_resend_delay();
+
+    for mut serve in started {
+        assert!(serve.exited().is_none());
+        let stderr = serve.stop();
+        assert!(!stderr.contains(JOIN_SECRET), "{stderr}");
+    }
+    cloud.set_nonblocking(true).unwrap();
+    assert_eq!(
+        cloud.accept().unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+}
+
+// REQ-RUNNERENROLL-127: a host whose credential came from an activation reads
+// no join key and never rejoins.
+#[test]
+fn an_activation_enrolled_host_whose_credential_is_refused_sends_no_join() {
+    let cloud = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", cloud.local_addr().unwrap());
+    let host = JoinHost::new(&join_key_artifact(&base, &future_expiry()));
+    let rejecting = ConnectionWitness::rejecting();
+    host.write_enrolled_state(&rejecting.url);
+
+    assert_refused_hosts_send_no_join(&[(&host, &rejecting, true, &[])], &cloud);
+}
+
+/// Key-joined hosts each started with a join key it cannot use, whose state
+/// names `connection_url`: each case is the host, whether it names its key
+/// file, and its environment.
+fn hosts_with_unusable_join_keys(
+    base: &str,
+    connection_url: &str,
+) -> Vec<(JoinHost, bool, Environment<'static>)> {
+    let artifact = join_key_artifact(base, &future_expiry());
+    let missing = JoinHost::new(&artifact);
+    fs::remove_file(&missing.key_file).unwrap();
+    let shared = JoinHost::new(&artifact);
+    fs::set_permissions(&shared.key_file, Permissions::from_mode(0o644)).unwrap();
+    let malformed = JoinHost::new("not a join key");
+    let expired = JoinHost::new(&join_key_artifact(base, "2020-01-01T00:00:00Z"));
+    let cases = vec![
+        (missing, true, &[][..]),
+        (shared, true, &[][..]),
+        (malformed, true, &[][..]),
+        (expired, true, &[][..]),
+        (
+            JoinHost::new(&artifact),
+            false,
+            &[(JOIN_KEY_VARIABLE, "not a join key")][..],
+        ),
+        (
+            JoinHost::new(&artifact),
+            false,
+            &[(JOIN_KEY_VARIABLE, "")][..],
+        ),
+    ];
+    for (host, _, _) in &cases {
+        host.write_joined_state(connection_url);
+    }
+    cases
+}
+
+// REQ-RUNNERENROLL-127: a key that cannot be read, is not a join key artifact
+// or has expired never stops a key-joined host's start, which serves with its
+// state, and it never rejoins with it.
+#[test]
+fn a_key_joined_host_given_an_unusable_key_serves_and_never_rejoins() {
+    let cloud = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", cloud.local_addr().unwrap());
+
+    let witness = ConnectionWitness::new();
+    for (host, with_key_file, environment) in hosts_with_unusable_join_keys(&base, &witness.url) {
+        let key_file = host.key_file.to_string_lossy().into_owned();
+        let arguments: &[&str] = if with_key_file {
+            &["--join-key-file", &key_file]
+        } else {
+            &[]
+        };
+
+        let bearer = connection_bearer(host.serve(arguments, environment), &witness);
+
+        assert_eq!(
+            bearer,
+            format!("Bearer {CURRENT_CREDENTIAL_ID}.{CURRENT_SECRET}")
+        );
+    }
+
+    let rejecting = ConnectionWitness::rejecting();
+    let hosts = hosts_with_unusable_join_keys(&base, &rejecting.url);
+    let cases: Vec<_> = hosts
+        .iter()
+        .map(|(host, with_key_file, environment)| (host, &rejecting, *with_key_file, *environment))
+        .collect();
+    assert_refused_hosts_send_no_join(&cases, &cloud);
+}
+
+// REQ-RUNNERENROLL-127: a rejoin an earlier start staged is resent as the same
+// request, so one host never makes two runners from one rejoin.
+#[test]
+fn a_staged_rejoin_is_resent_as_the_same_request() {
+    let rejecting = ConnectionWitness::rejecting();
+    let witness = ConnectionWitness::new();
+    let server = api_test_support::ScriptedHttpServer::respond(join_response(0, &witness.url));
+    let base = join_base(&server);
+    let host = JoinHost::new(&join_key_artifact(&base, &future_expiry()));
+    host.write_joined_state(&rejecting.url);
+    host.write_rejoin_journal(&base, PENDING_SECRET);
+
+    let bearer = connection_bearer(host.serve_with_key_file(), &witness);
+
+    let secret = assert_joined_state(&host, 0, &witness.url);
+    assert_eq!(secret, PENDING_SECRET);
+    assert_eq!(
+        bearer,
+        format!("Bearer {}.{PENDING_SECRET}", JOINED_CREDENTIAL_IDS[0])
+    );
+    let request = server.finish_one();
+    assert_eq!(
+        assert_rejoin_request(&request, PENDING_SECRET),
+        STAGED_IDEMPOTENCY_KEY
+    );
+}
+
+// REQ-RUNNERENROLL-127, REQ-RUNNERENROLL-113
+#[test]
+fn an_unanswered_rejoin_is_reported_and_sent_again_as_the_same_request() {
+    let rejecting = ConnectionWitness::rejecting();
+    let witness = ConnectionWitness::new();
+    let server = api_test_support::ScriptedHttpServer::respond_in_sequence(vec![
+        http_response("503 Service Unavailable", None, b""),
+        join_response(0, &witness.url),
+    ]);
+    let host = JoinHost::new(&join_key_artifact(&join_base(&server), &future_expiry()));
+    host.write_joined_state(&rejecting.url);
+
+    let mut serve = host.serve_with_key_file();
+    let connection = witness.next_connection(&mut serve);
+    let stderr = serve.stop();
+    let Some(connection) = connection else {
+        panic!("Runner Serve stopped before it rejoined: {stderr}");
+    };
+
+    let secret = assert_joined_state(&host, 0, &witness.url);
+    assert_eq!(
+        header_value(&connection, "authorization"),
+        format!("Bearer {}.{secret}", JOINED_CREDENTIAL_IDS[0])
+    );
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.trim() == "cause: cloud_unavailable"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains(JOIN_SECRET), "{stderr}");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(
+        assert_rejoin_request(&requests[0], &secret),
+        assert_rejoin_request(&requests[1], &secret)
     );
 }
 

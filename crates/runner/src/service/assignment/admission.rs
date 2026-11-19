@@ -500,21 +500,35 @@ impl AssignmentManager {
             }
             // The steps, a tree run's `useful` commands included, draw from the
             // process environment with the agent logins the runner keeps now,
-            // looked at for this admission (REQ-GRANT-37, REQ-GRANT-44); a
-            // selected provider's login the runner keeps none of is withheld
-            // instead, and the engine refuses an agent step that would have
-            // received it (REQ-GRANT-51, INV-RUNNER-17). The admission's
-            // grant tokens and their files are offered too, in place of the
-            // service's values of their names, and a selected provider's
-            // names it holds no token of are absent, which refuses no step
-            // (REQ-GRANT-87).
+            // looked at for this admission (REQ-GRANT-37, REQ-GRANT-44),
+            // where the service has none of its own; where the runner keeps
+            // none either, nothing is added or withheld (REQ-GRANT-51,
+            // INV-RUNNER-17). The admission's grant tokens and their files
+            // are offered too; it holds none of a provider whose names the
+            // service carries, which keeps the service's values, and a
+            // provider neither provides has its names unset (REQ-GRANT-87).
             let offered = crate::agent_login::offer_with_grant_tokens(
                 &runtime.environment,
                 agent_login_directory.as_ref(),
                 runtime.grant_tokens.as_deref(),
             );
+            // The admission reports where each provider's credential comes
+            // from to Cloud once, before any step starts, from what the
+            // offer settled (REQ-GRANT-93, INV-RUNNER-31). Whatever Cloud
+            // answers, a panic included, the admission goes on with the
+            // offer as it is; a report Cloud does not take is the setup's
+            // own record (REQ-TELEMETRY-48).
+            if let Some(setup) = &agent_login_setup {
+                let sources = crate::agent_login::reported_sources(
+                    &offered.sources,
+                    &offered.offered,
+                    runtime.grant_tokens.as_deref(),
+                );
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    setup.report_sources(&worker_offer.assignment_id, sources);
+                }));
+            }
             runtime.environment = offered.environment;
-            runtime.withheld_agent_logins = offered.withheld;
             // How the provider answers each agent step given a login the
             // runner added is noted for the next pass, never for a variable
             // the service carried (REQ-GRANT-52).
@@ -1147,8 +1161,9 @@ impl AdmissionRuntime {
 
 /// The preparation of a tree run (REQ-RUNNERENROLL-91): the workspace checkout and run
 /// inputs as for any run, then the published tree in place of the Git definition
-/// checkout and workflow admission; or, for a continuation, the adoption of the run an
-/// earlier attempt created (REQ-RUNNERENROLL-89).
+/// checkout and workflow admission and, on a GitHub project, the workspace's Git relay
+/// (REQ-RUNNERENROLL-121); or, for a continuation, the adoption of the run an earlier
+/// attempt created (REQ-RUNNERENROLL-89).
 struct TreeAdmission<'a> {
     runtime: &'a AdmissionRuntime,
     tree_run: &'a TreeRunDependencies,
@@ -1174,20 +1189,22 @@ impl TreeAdmission<'_> {
         let workspace = root.workspace.path();
         let source = super::super::source::MaterializationRequest::from_validated(spec)
             .for_workspace(&spec.primary_workspace_source.commit_oid);
-        // Dropping the checkout restores the clone's canonical origin: the runtime's
-        // steps use the host's own Git access, not the runner's relay.
-        drop(
-            super::super::source::checkout(
-                self.broker,
-                self.environment,
-                &offer.assignment_id,
-                &source,
-                self.cancellation,
-                &workspace,
-                &root.private,
-            )
-            .map_err(materialization_decline)?,
-        );
+        let checkout = super::super::source::checkout(
+            Arc::clone(&self.broker),
+            self.environment,
+            &offer.assignment_id,
+            &source,
+            self.cancellation,
+            &workspace,
+            &root.private,
+        )
+        .map_err(materialization_decline)?;
+        // A GitHub checkout's origin is the repository, which the runtime's steps read
+        // through the runner's relay (REQ-RUNNERENROLL-121). Dropping a GitLab checkout
+        // restores the clone's canonical origin, and its steps use the host's own Git
+        // access (REQ-WORKSPACE-42).
+        let relay_origin = checkout.relay_origin();
+        drop(checkout);
         root.execution.clone_from(&workspace);
         self.runtime.run_event.enter(RunPhase::Preparation);
         self.runtime.progress(offer, 2, "input_download")?;
@@ -1202,7 +1219,7 @@ impl TreeAdmission<'_> {
         )
         .map_err(run_input_decline)?;
         self.runtime.progress(offer, 3, "workflow_admission")?;
-        super::super::tree_run::prepare(
+        let prepared = super::super::tree_run::prepare(
             self.tree_run,
             &super::super::tree_run::TreePreparation {
                 assignment_id: &offer.assignment_id,
@@ -1213,16 +1230,74 @@ impl TreeAdmission<'_> {
                 environment: &self.runtime.environment,
                 deadline: self.deadline,
                 cancellation: self.cancellation,
-                sleeper: self.sleeper,
+                sleeper: Arc::clone(&self.sleeper),
             },
             &inputs,
-        )
+        )?;
+        let Some(origin) = relay_origin else {
+            return Ok(prepared);
+        };
+        // Installed once the tree is published, as the engine path installs after
+        // `resolve_checkout`; a continuation, which clones nothing, reads the origin back.
+        super::super::tree_run::record_origin(&root.private, &origin).map_err(|error| {
+            self.runtime.preparation_failure(
+                offer,
+                "workflow_git_origin_record",
+                io_error_kind(&error),
+            );
+            environment_unavailable()
+        })?;
+        self.install_relay(root, origin)?;
+        Ok(prepared)
+    }
+
+    /// Installs the workspace's Git relay for `origin` in the execution root
+    /// (REQ-RUNNERENROLL-121, REQ-RUNNERENROLL-122), leaving the workspace's remotes as they
+    /// read; `finish_tree` carries it and `run_tree` activates it.
+    fn install_relay(
+        &self,
+        root: &mut AssignmentRoot,
+        origin: Arc<str>,
+    ) -> Result<(), AssignmentDecline> {
+        let workflow_git = self
+            .tree_run
+            .helper_executable()
+            .map_err(anyhow::Error::from)
+            .and_then(|helper_executable| {
+                WorkflowGitAuthority::install(WorkflowGitInstall {
+                    broker: Arc::clone(&self.broker),
+                    assignment_id: &self.offer.assignment_id,
+                    origin,
+                    canonical_origin: None,
+                    replace_origin: false,
+                    previous_private_root: None,
+                    workspace: &root.execution,
+                    private_root: &root.private,
+                    environment: self.environment,
+                    helper_executable: &helper_executable,
+                    clock: Arc::clone(&self.sleeper),
+                    recorder: self.runtime.recorder.clone(),
+                    cancellation: self.cancellation,
+                })
+            })
+            .map_err(|_| {
+                self.runtime.preparation_failure(
+                    self.offer,
+                    "workflow_git_install",
+                    "install_failed",
+                );
+                environment_unavailable()
+            })?;
+        root.install_workflow_git(workflow_git);
+        Ok(())
     }
 
     /// Proves the retained workspace as for any continuation, then adopts the run in the
     /// run-scoped home of the one attempt of the retained chain that holds one, the
     /// attempt that created the run: no checkout, no run input and no tree download. The
-    /// run executes in the retained workspace its record names, which the claim proved.
+    /// run executes in the retained workspace its record names, which the claim proved,
+    /// with the workspace's Git relay for the origin that attempt recorded, when it
+    /// recorded one (REQ-RUNNERENROLL-122).
     fn adopt(
         self,
         root: &mut AssignmentRoot,
@@ -1239,17 +1314,19 @@ impl TreeAdmission<'_> {
         )?;
         self.runtime.run_event.enter(RunPhase::Preparation);
         self.runtime.progress(offer, 2, "workflow_admission")?;
-        let homes = root
+        let creators = root
             .retained_private_roots
             .values()
-            .map(|private| super::super::tree_run::tree_home(private))
-            .filter(|home| std::fs::symlink_metadata(home).is_ok_and(|home| home.is_dir()))
+            .filter(|private| {
+                std::fs::symlink_metadata(super::super::tree_run::tree_home(private))
+                    .is_ok_and(|home| home.is_dir())
+            })
             .collect::<Vec<_>>();
-        let [home] = homes.as_slice() else {
+        let [creator] = creators.as_slice() else {
             self.runtime.preparation_failure(
                 offer,
                 "continuation_tree_home",
-                if homes.is_empty() {
+                if creators.is_empty() {
                     "absent"
                 } else {
                     "ambiguous"
@@ -1260,18 +1337,32 @@ impl TreeAdmission<'_> {
             )
             .diagnosed("workflow_tree_adoption", "tree_run_home_unavailable"));
         };
-        super::super::tree_run::adopt(
+        // Only a GitHub project's first attempt records its origin. The workspace's own
+        // remotes are not read: a step may have rewritten or added them.
+        let origin = super::super::tree_run::recorded_origin(creator).map_err(|error| {
+            self.runtime.preparation_failure(
+                offer,
+                "continuation_tree_origin",
+                io_error_kind(&error),
+            );
+            environment_unavailable()
+        })?;
+        let run = super::super::tree_run::adopt(
             self.tree_run,
             &super::super::tree_run::TreeAdoption {
                 assignment_id: &offer.assignment_id,
-                home,
+                home: &super::super::tree_run::tree_home(creator),
                 private: &root.private,
                 environment: &self.runtime.environment,
                 execution_spec: &offer.execution_spec,
-                sleeper: self.sleeper,
+                sleeper: Arc::clone(&self.sleeper),
                 steps: &continuation.reexecuted_steps,
                 pending_deliveries: &self.tree.pending_deliveries,
             },
-        )
+        )?;
+        if let Some(origin) = origin {
+            self.install_relay(root, origin)?;
+        }
+        Ok(run)
     }
 }

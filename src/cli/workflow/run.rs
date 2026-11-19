@@ -30,11 +30,11 @@ pub(super) use super::{
 pub(super) use create::acquire_agent_profile_replacement;
 
 /// `--cloud ORGANIZATION`, which sends a `useful workflow run` leaf to Cloud in that organization
-/// instead of the `useful` home: `resume`, `show`, `release` and the control leaves `answer`,
-/// `approve`, `hand-back`, `lift`, `stop` and `retry` to the Cloud run `RUN` names, and `create`
-/// to a new Cloud run of the Cloud definition `ID` (REQ-RUN-94), with the authentication and
-/// transport options only a Cloud request reads; a leaf's local-only options conflict with the
-/// argument id `cloud`.
+/// instead of the `useful` home: `resume`, `show`, `release`, `withdraw`, `cancel` and the control
+/// leaves `answer`, `approve`, `hand-back`, `lift`, `stop` and `retry` to the Cloud run `RUN`
+/// names, and `create` to a new Cloud run of the Cloud definition `ID` (REQ-RUN-94), with the
+/// authentication and transport options only a Cloud request reads; a leaf's local-only options
+/// conflict with the argument id `cloud`.
 #[derive(Debug, Args)]
 #[command(
     mut_arg("service_api_key_file", |arg| arg.requires("cloud")),
@@ -70,8 +70,8 @@ enum RunCommand {
     Answer(answer::Command),
     #[command(about = approve::APPROVE_ABOUT, after_help = cloud::CONTROL_AFTER_HELP)]
     Approve(approve::Approve),
-    #[command(about = end::CANCEL_ABOUT)]
-    Cancel(end::Command),
+    #[command(about = end::CANCEL_ABOUT, after_help = end::CANCEL_AFTER_HELP)]
+    Cancel(end::Ending),
     #[command(about = create::ABOUT, after_help = create::AFTER_HELP)]
     Create(Box<create::Command>),
     #[command(about = event::ABOUT)]
@@ -85,7 +85,7 @@ enum RunCommand {
     #[command(about = list::ABOUT)]
     List(list::Command),
     #[command(about = end::RELEASE_ABOUT, after_help = end::RELEASE_AFTER_HELP)]
-    Release(end::Release),
+    Release(end::Ending),
     #[command(about = restart::ABOUT, after_help = restart::AFTER_HELP)]
     Restart(restart::Command),
     #[command(about = resume::ABOUT, after_help = resume::AFTER_HELP)]
@@ -102,8 +102,8 @@ enum RunCommand {
     Upgrade(upgrade::Command),
     #[command(about = view::ABOUT, after_help = view::AFTER_HELP)]
     View(view::Command),
-    #[command(about = end::WITHDRAW_ABOUT)]
-    Withdraw(end::Command),
+    #[command(about = end::WITHDRAW_ABOUT, after_help = end::WITHDRAW_AFTER_HELP)]
+    Withdraw(end::Ending),
 }
 
 impl Command {
@@ -119,7 +119,7 @@ impl Command {
             Some(RunCommand::Interrupt(command)) => command.execute(),
             Some(RunCommand::Lift(command)) => command.execute(),
             Some(RunCommand::List(command)) => command.execute(),
-            Some(RunCommand::Release(command)) => command.execute(),
+            Some(RunCommand::Release(command)) => command.release(),
             Some(RunCommand::Restart(command)) => command.execute(),
             Some(RunCommand::Resume(command)) => command.execute(),
             Some(RunCommand::Retry(command)) => command.execute(),

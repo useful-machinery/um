@@ -206,9 +206,9 @@ fn list_returns_one_exact_page_with_current_and_provenance_fields() {
     );
     assert!(output.stderr.is_empty());
     let request = server.finish().pop().unwrap();
-    assert!(
-        request.starts_with("GET /api/v1/me/identities?limit=2&cursor=page-before HTTP/1.1\r\n")
-    );
+    assert!(request.starts_with(
+        "GET /api/v1/me/identities?limit=2&cursor=page-before&vocabulary=2 HTTP/1.1\r\n"
+    ));
     assert_eq!(
         header_value(&request, "authorization"),
         format!("Bearer {CURRENT_TOKEN}")
@@ -264,6 +264,45 @@ fn list_passes_through_an_identity_grant_and_prints_its_state_and_id() {
         }
         server.finish();
     }
+}
+
+// REQ-GRANT-96
+#[test]
+fn list_passes_through_an_identity_grant_of_any_provider() {
+    let grant = serde_json::json!({
+        "id": "pgr_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "provider": "example",
+        "state": "active"
+    });
+    let mut granted = identity(CURRENT_IDENTITY_ID, "https://example.test", "12345", true);
+    granted["grant"] = grant.clone();
+    let (server, _directory, path) =
+        prepared_identity_command(vec![identity_page(serde_json::json!([granted]), None)]);
+    let environment =
+        deployment_environment_with_issuer(&server.api_url, &server.issuer, path.to_str().unwrap());
+    let output = run_with_env(
+        &[
+            "auth",
+            "identity",
+            "list",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &environment,
+    );
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["items"][0]["grant"], grant);
+    let request = server.finish().pop().unwrap();
+    assert!(
+        request.starts_with("GET /api/v1/me/identities?vocabulary=2 HTTP/1.1\r\n"),
+        "{request}"
+    );
 }
 
 // REQ-ACCOUNT-44
@@ -709,7 +748,7 @@ fn link_uses_fresh_separate_browser_proof_and_keeps_the_local_session() {
     assert_eq!(fs::read(&credential_path).unwrap(), before);
     let requests = server.finish();
     assert_eq!(requests.len(), 5);
-    assert!(requests[0].starts_with("GET /api/v1/me/identities?limit=1 HTTP/1.1\r\n"));
+    assert!(requests[0].starts_with("GET /api/v1/me/identities?limit=1&vocabulary=2 HTTP/1.1\r\n"));
     assert!(requests[1].starts_with("POST /auth/oauth/device/code HTTP/1.1\r\n"));
     assert_eq!(
         request_form(&requests[1]).get("scope").map(String::as_str),
@@ -808,7 +847,7 @@ fn link_keeps_the_preflight_acting_session_across_browser_proof() {
     assert!(
         server
             .next_request()
-            .starts_with("GET /api/v1/me/identities?limit=1 HTTP/1.1\r\n")
+            .starts_with("GET /api/v1/me/identities?limit=1&vocabulary=2 HTTP/1.1\r\n")
     );
     assert!(
         server
@@ -1124,7 +1163,7 @@ fn stored_unclaimed_login_requires_forced_original_sign_in_before_separate_link(
     assert!(requests[0].starts_with("GET /api/v1/me HTTP/1.1"));
     assert!(requests[1].starts_with("POST /auth/oauth/device/code HTTP/1.1"));
     assert!(requests[4].starts_with("GET /api/v1/me HTTP/1.1"));
-    assert!(requests[5].starts_with("GET /api/v1/me/identities?limit=1 HTTP/1.1"));
+    assert!(requests[5].starts_with("GET /api/v1/me/identities?limit=1&vocabulary=2 HTTP/1.1"));
     assert_eq!(
         header_value(&requests[8], "authorization"),
         "Bearer original-principal-token"

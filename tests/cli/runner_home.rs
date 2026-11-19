@@ -8,9 +8,9 @@ use super::runner_agent_login::{
     EARLIER_SYNC, READY_CODEX, SYNC, SYNC_REQUEST, ScriptedControlSocket, synced_response,
 };
 use super::runner_enrollment::{
-    ACTIVATION_ID, ConnectionWitness, ServeProcess, StandardInput, activation_artifact,
-    connection_bearer, enrollment_body, future_expiry, join_base, join_key_artifact, join_response,
-    serve_command, verifier_of,
+    ACTIVATION_ID, ConnectionWitness, JOIN_KEY_ID, ServeProcess, StandardInput,
+    activation_artifact, connection_bearer, enrollment_body, future_expiry, join_base,
+    join_key_artifact, join_response, join_response_body, serve_command, verifier_of,
 };
 use super::runner_status::{
     CONNECTED_STATUS, STATUS_REQUEST, ServeStatusFixture, enrolled_state_document,
@@ -140,11 +140,32 @@ impl ServeHome {
     /// Enrolled state at the home's `runner/state.json` for `endpoint`,
     /// answering the bearer it connects with and the state's bytes.
     fn write_enrolled_state(&self, endpoint: &str) -> (String, Vec<u8>) {
-        let state = enrolled_state_document(endpoint);
+        self.write_state(enrolled_state_document(endpoint))
+    }
+
+    /// Enrolled state as `write_enrolled_state` writes it, except that its
+    /// credential came from the join key `JOIN_KEY_ID`.
+    fn write_joined_state(&self, endpoint: &str) -> (String, Vec<u8>) {
+        let mut state = enrolled_state_document(endpoint);
+        let credential = state["currentCredential"].as_object_mut().unwrap();
+        credential.remove("activationId");
+        credential.insert("joinKeyId".to_owned(), JOIN_KEY_ID.into());
+        self.write_state(state)
+    }
+
+    fn write_state(&self, state: serde_json::Value) -> (String, Vec<u8>) {
         let bytes = serde_json::to_vec_pretty(&state).unwrap();
         fs::write(self.state(), &bytes).unwrap();
         fs::set_permissions(self.state(), Permissions::from_mode(0o600)).unwrap();
         (bearer_of(&state), bytes)
+    }
+
+    /// A protected join key file for the Cloud at `base`, outside the home.
+    fn write_join_key_file(&self, base: &str) -> PathBuf {
+        let key_file = self.root.path().join("join-key.json");
+        fs::write(&key_file, join_key_artifact(base, &future_expiry())).unwrap();
+        fs::set_permissions(&key_file, Permissions::from_mode(0o600)).unwrap();
+        key_file
     }
 
     fn serve(&self, arguments: &[&str]) -> ServeProcess {
@@ -266,13 +287,7 @@ fn serve_without_a_configuration_joins_and_writes_the_homes_state() {
     let server = api_test_support::ScriptedHttpServer::respond(join_response(0, &witness.url));
     let home = ServeHome::new();
     home.write_development_config(&home.state());
-    let key_file = home.root.path().join("join-key.json");
-    fs::write(
-        &key_file,
-        join_key_artifact(&join_base(&server), &future_expiry()),
-    )
-    .unwrap();
-    fs::set_permissions(&key_file, Permissions::from_mode(0o600)).unwrap();
+    let key_file = home.write_join_key_file(&join_base(&server));
 
     let bearer = connection_bearer(
         home.serve(&["--join-key-file", key_file.to_str().unwrap()]),
@@ -284,6 +299,40 @@ fn serve_without_a_configuration_joins_and_writes_the_homes_state() {
         serde_json::from_slice(&fs::read(home.state()).unwrap()).unwrap();
     assert_eq!(bearer, bearer_of(&state));
     server.finish_one();
+}
+
+// REQ-RUNNERENROLL-127
+#[test]
+fn serve_without_a_configuration_rejoins_a_key_joined_home_whose_credential_is_refused() {
+    let rejecting = ConnectionWitness::rejecting();
+    let witness = ConnectionWitness::new();
+    let server = api_test_support::ScriptedHttpServer::respond(join_response(0, &witness.url));
+    let home = ServeHome::new();
+    home.write_development_config(&home.state());
+    home.write_joined_state(&rejecting.url);
+    let key_file = home.write_join_key_file(&join_base(&server));
+
+    let bearer = connection_bearer(
+        home.serve(&["--join-key-file", key_file.to_str().unwrap()]),
+        &witness,
+    );
+
+    assert_eq!(mode(&home.state()), 0o600);
+    assert!(!home.journal().exists());
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(home.state()).unwrap()).unwrap();
+    let joined = join_response_body(0, &witness.url);
+    assert_eq!(state["runnerId"], joined["runnerId"]);
+    assert_eq!(state["currentCredential"]["id"], joined["credentialId"]);
+    assert_eq!(state["currentCredential"]["joinKeyId"], JOIN_KEY_ID);
+    assert_eq!(bearer, bearer_of(&state));
+    let request = server.finish_one();
+    let body: serde_json::Value =
+        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
+    assert_eq!(
+        body["previousRunnerId"],
+        enrolled_state_document(&rejecting.url)["runnerId"]
+    );
 }
 
 // REQ-RUNNERENROLL-65, REQ-RUNNERENROLL-34
@@ -736,7 +785,7 @@ fn doctor_agent_logins_reads_the_readiness_beside_the_state_the_homes_configurat
     home.write_development_config(&state_directory.join("state.json"));
     record_codex_readiness(&state_directory, "ready");
     // A document at the default layout's place the check must not read.
-    record_codex_readiness(&home.runner(), "foreign_login");
+    record_codex_readiness(&home.runner(), "install_failed");
 
     let output = home.run(&DOCTOR_AGENT_LOGINS);
 

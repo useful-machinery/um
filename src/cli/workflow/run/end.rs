@@ -1,6 +1,6 @@
 //! `useful workflow run withdraw`, `cancel` and `release` (REQ-LOCALRUN-186, REQ-LOCALRUN-187);
-//! `release --cloud ORGANIZATION` releases a Cloud run's subject claim instead
-//! (REQ-CLOUDDEF-19).
+//! with `--cloud ORGANIZATION`, `withdraw` and `cancel` ask Cloud to end a Cloud run instead
+//! (REQ-LOCALRUN-218) and `release` releases its subject claim (REQ-CLOUDDEF-19).
 
 use std::path::Path;
 use std::time::Duration;
@@ -22,6 +22,8 @@ pub(super) const CANCEL_ABOUT: &str = "End a run, signalling the process that ru
 pub(super) const RELEASE_ABOUT: &str =
     "Record the release of an exited run, or release a Cloud run's claim with --cloud";
 pub(super) const RELEASE_AFTER_HELP: &str = "With --cloud ORGANIZATION, RUN is a Cloud run ID: the command asks Cloud, as an organization owner, to release the subject claim of that exited run under one request key, sent again if the response is lost. It reads and writes no local run.";
+pub(super) const WITHDRAW_AFTER_HELP: &str = "With --cloud ORGANIZATION, RUN is a Cloud run ID: the command asks Cloud, under one request key sent again if the response is lost, to carry a withdrawal to the runner executing that run, which ends it withdrawn as this command ends a local run. It does not read the run first. Cloud's acceptance is not the run's end: the runner applies the withdrawal when it receives it, and a runner whose useful does not apply one is refused. It reads and writes no local run.";
+pub(super) const CANCEL_AFTER_HELP: &str = "With --cloud ORGANIZATION, RUN is a Cloud run ID: the command asks Cloud for a graceful cancellation of that run under one request key sent again if the response is lost, as useful run cancel does, and reports the cancellation request Cloud answers. Cloud's acceptance is not the run's end. Forcing a cancellation and waiting for it to settle stay useful run cancel's. It reads and writes no local run.";
 const WITHDRAW_COMMAND: &str = "useful workflow run withdraw";
 const CANCEL_COMMAND: &str = "useful workflow run cancel";
 const RELEASE_COMMAND: &str = "useful workflow run release";
@@ -43,10 +45,10 @@ pub(super) struct Command {
     output: super::control::JsonOutput,
 }
 
-/// `release`'s arguments: the shared ones and the Cloud selector, which `withdraw` and
-/// `cancel` do not take.
+/// The arguments of `withdraw`, `cancel` and `release`: the shared ones beside the Cloud
+/// selector, which sends the leaf to the Cloud run `RUN` names instead of the local run.
 #[derive(Debug, Args)]
-pub(super) struct Release {
+pub(super) struct Ending {
     #[command(flatten)]
     command: Command,
 
@@ -54,27 +56,52 @@ pub(super) struct Release {
     cloud: super::CloudSelector,
 }
 
-impl Release {
-    pub(super) fn execute(mut self) -> super::super::super::CommandResult {
+impl Ending {
+    /// Withdraws the local run, or asks Cloud to carry a withdrawal to the Cloud run's runner
+    /// (REQ-LOCALRUN-218).
+    pub(super) fn withdraw(self) -> super::super::super::CommandResult {
+        self.select(
+            |cloud| cloud.control(super::cloud::Control::Withdraw),
+            Command::withdraw,
+        )
+    }
+
+    /// Cancels the local run, or asks Cloud to cancel the Cloud run gracefully
+    /// (REQ-LOCALRUN-218).
+    pub(super) fn cancel(self) -> super::super::super::CommandResult {
+        self.select(super::cloud::CloudRun::cancel, Command::cancel)
+    }
+
+    /// Records the local run's release, or asks Cloud to release the Cloud run's claim
+    /// (REQ-CLOUDDEF-19).
+    pub(super) fn release(self) -> super::super::super::CommandResult {
+        self.select(super::cloud::CloudRun::release, Command::release)
+    }
+
+    /// `cloud` for the Cloud run `RUN` names when `--cloud` is given, and `local` otherwise.
+    fn select(
+        mut self,
+        cloud: impl FnOnce(super::cloud::CloudRun) -> super::super::super::CommandResult,
+        local: impl FnOnce(Command) -> super::super::super::CommandResult,
+    ) -> super::super::super::CommandResult {
         match self.cloud.organization.take() {
-            Some(organization) => super::cloud::CloudRun::new(
+            Some(organization) => cloud(super::cloud::CloudRun::new(
                 self.command.run,
                 organization,
                 self.cloud,
                 self.command.output.json,
-            )?
-            .release(),
-            None => self.command.release(),
+            )?),
+            None => local(self.command),
         }
     }
 }
 
 impl Command {
-    pub(super) fn withdraw(self) -> super::super::super::CommandResult {
+    fn withdraw(self) -> super::super::super::CommandResult {
         super::control::execute(WITHDRAW_COMMAND, &self.run, self.output.json, withdraw_run)
     }
 
-    pub(super) fn cancel(self) -> super::super::super::CommandResult {
+    fn cancel(self) -> super::super::super::CommandResult {
         super::control::execute(CANCEL_COMMAND, &self.run, self.output.json, cancel_run)
     }
 

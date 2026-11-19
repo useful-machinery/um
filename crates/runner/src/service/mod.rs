@@ -111,6 +111,115 @@ const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
     SHUTDOWN_CLEANUP_START_TIMEOUT.as_secs() + SHUTDOWN_CLEANUP_RESERVE.as_secs(),
 );
 
+/// What a start holds of the join key its host joined with, which decides
+/// what the service does once Cloud refuses its credential (INV-RUNNER-35).
+pub enum JoinKeyMode {
+    /// No key was given, or the host's credential came from an activation:
+    /// a refused credential parks the runner at `authentication_failed`.
+    None,
+    /// A key was given but cannot be used; its report says why, once, when
+    /// the credential is refused, and the runner then parks.
+    Unusable(Box<dyn FnOnce() + Send>),
+    /// A key held in memory for a rejoin. It is dropped, and the mode becomes
+    /// `Spent`, once a connection completes its handshake.
+    Held(Box<dyn Rejoin>),
+    /// The process no longer holds the key it was started with: a refused
+    /// credential ends the service as `ServiceEnd::CredentialRefused`.
+    Spent,
+}
+
+impl JoinKeyMode {
+    const fn holds_key(&self) -> bool {
+        matches!(self, Self::Unusable(_) | Self::Held(_))
+    }
+
+    /// A connection's handshake completed: a connected runner holds no key.
+    fn handshake_completed(&mut self) {
+        *self = match std::mem::replace(self, Self::None) {
+            Self::Held(_) | Self::Spent => Self::Spent,
+            Self::Unusable(_) | Self::None => Self::None,
+        };
+    }
+}
+
+impl Config {
+    /// The runner the host's enrolled state names, the one a rejoin replaces
+    /// (REQ-RUNNERENROLL-127).
+    pub fn runner_id(&self) -> &str {
+        self.credential().runner_id()
+    }
+
+    /// The host's enrollment journal, beside its state file, where a rejoin
+    /// is staged before it is sent (INV-RUNNER-36).
+    pub fn enrollment_journal_path(&self) -> Option<PathBuf> {
+        let state = self.state_access()?.path();
+        Some(state.parent()?.join(crate::enrollment::JOURNAL_FILE))
+    }
+}
+
+/// The rejoin a held join key sends when Cloud refuses the runner's
+/// credential. `attempt` blocks for one send and is run on the blocking pool.
+pub trait Rejoin: Send {
+    fn attempt(&mut self) -> RejoinAnswer;
+    /// The attempt went unanswered and is sent again after `retry.delay`.
+    fn retrying(&mut self, retry: crate::enrollment::JoinRetry);
+}
+
+/// The answer to one rejoin attempt.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RejoinAnswer {
+    /// Cloud registered the host as a new runner, whose state replaced the
+    /// host's.
+    Rejoined,
+    /// Cloud gave no definite answer; the staged rejoin is sent again.
+    Unanswered(crate::enrollment::AmbiguousCause),
+    /// Cloud refused the rejoin, or it could not be sent.
+    Refused,
+}
+
+/// How a service run ended without an error.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ServiceEnd {
+    /// A stop signal ended it.
+    Stopped,
+    /// The host rejoined as a new runner, which a new service run serves.
+    Rejoined,
+    /// Cloud refused the credential of a process that no longer holds its
+    /// join key.
+    CredentialRefused,
+}
+
+/// What the loop does, parked behind a refused credential, given its mode
+/// and the assignments it holds: nothing while it holds one.
+#[derive(Debug, Eq, PartialEq)]
+enum RefusalStep {
+    Wait,
+    Report,
+    Rejoin,
+    End,
+}
+
+fn refusal_step(join_key: &JoinKeyMode, counts: AssignmentCounts) -> RefusalStep {
+    if counts != AssignmentCounts::default() {
+        return RefusalStep::Wait;
+    }
+    match join_key {
+        JoinKeyMode::None => RefusalStep::Wait,
+        JoinKeyMode::Unusable(_) => RefusalStep::Report,
+        JoinKeyMode::Held(_) => RefusalStep::Rejoin,
+        JoinKeyMode::Spent => RefusalStep::End,
+    }
+}
+
+/// How answering a refused credential left the loop.
+enum RefusalAnswer {
+    /// The loop parks, as it does with no key.
+    Parked,
+    /// A stop signal arrived while a rejoin was sent or waited to be sent.
+    Shutdown,
+    Ended(ServiceEnd),
+}
+
 pub(crate) trait Sleeper: Send + Sync {
     fn now(&self) -> std::time::Instant;
     fn utc_now(&self) -> time::OffsetDateTime;
@@ -198,6 +307,7 @@ enum ActiveAttemptResult {
 
 enum ActiveEvent {
     ManualReload(ReloadRequest),
+    Handshake,
     StartupReload,
     AssignmentNotification,
     Shutdown,
@@ -425,15 +535,26 @@ pub(crate) fn run_workflow_git_helper() -> bool {
     workflow_git::run_internal_helper()
 }
 
-pub(crate) fn run(config: Config, service_version: &str) -> Result<(), ServiceError> {
+/// Serves `config` until a stop or an end. Every task the run started, the
+/// blocking pool's included, is gone when it returns, so the work root it
+/// leased can be leased again by the next run.
+pub(crate) fn run(
+    config: Config,
+    service_version: &str,
+    join_key: JoinKeyMode,
+) -> Result<ServiceEnd, ServiceError> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|_| ServiceError::BuildRuntime)?;
-    runtime.block_on(run_until_cancelled(config, service_version))
+    runtime.block_on(run_until_cancelled(config, service_version, join_key))
 }
 
-async fn run_until_cancelled(config: Config, service_version: &str) -> Result<(), ServiceError> {
+async fn run_until_cancelled(
+    config: Config,
+    service_version: &str,
+    join_key: JoinKeyMode,
+) -> Result<ServiceEnd, ServiceError> {
     let frame_source: Arc<dyn FrameSource> = Arc::new(SystemFrameSource);
     let sleeper: Arc<dyn Sleeper> = Arc::new(TokioSleeper);
     let boot_id = frame_source.public_id("rbt_");
@@ -473,6 +594,7 @@ async fn run_until_cancelled(config: Config, service_version: &str) -> Result<()
         &WebSocketConnector,
         Backoff::new(),
         &mut shutdown,
+        join_key,
     ))
     .await
 }
@@ -485,7 +607,8 @@ async fn run_until_cancelled_with_dependencies(
     recorder: Arc<Recorder>,
     source_broker: Option<Arc<dyn source::SourceCredentialBroker>>,
     mut shutdown: Box<dyn Shutdown>,
-) -> Result<(), ServiceError> {
+    join_key: JoinKeyMode,
+) -> Result<ServiceEnd, ServiceError> {
     let boot_id = frame_source.public_id("rbt_");
     let lease_clock = LeaseClock::system().map_err(ServiceError::LeaseClock)?;
     run_connection_loop_with_filesystem(
@@ -504,6 +627,7 @@ async fn run_until_cancelled_with_dependencies(
         Backoff::new(),
         shutdown.as_mut(),
         workspace::WorkspaceFilesystem::testing(),
+        join_key,
     )
     .await
 }
@@ -513,13 +637,15 @@ async fn run_connection_loop(
     connector: &dyn Connector,
     backoff: Backoff,
     shutdown: &mut dyn Shutdown,
-) -> Result<(), ServiceError> {
+    join_key: JoinKeyMode,
+) -> Result<ServiceEnd, ServiceError> {
     Box::pin(run_connection_loop_acquiring(
         dependencies,
         connector,
         backoff,
         shutdown,
         |root, boot| workspace::WorkRootLease::acquire(&root, &boot),
+        join_key,
     ))
     .await
 }
@@ -531,13 +657,15 @@ async fn run_connection_loop_with_filesystem(
     backoff: Backoff,
     shutdown: &mut dyn Shutdown,
     filesystem: workspace::WorkspaceFilesystem,
-) -> Result<(), ServiceError> {
+    join_key: JoinKeyMode,
+) -> Result<ServiceEnd, ServiceError> {
     run_connection_loop_acquiring(
         dependencies,
         connector,
         backoff,
         shutdown,
         move |root, boot| workspace::WorkRootLease::acquire_with(&root, &boot, filesystem),
+        join_key,
     )
     .await
 }
@@ -548,7 +676,8 @@ async fn run_connection_loop_acquiring<Acquire>(
     backoff: Backoff,
     shutdown: &mut dyn Shutdown,
     acquire: Acquire,
-) -> Result<(), ServiceError>
+    join_key: JoinKeyMode,
+) -> Result<ServiceEnd, ServiceError>
 where
     Acquire: FnOnce(PathBuf, String) -> Result<Arc<workspace::WorkRootLease>, workspace::WorkRootError>
         + Send
@@ -574,10 +703,31 @@ where
     let recovery_host = Arc::clone(&dependencies.recovery_host);
     let runner_id = dependencies.config.credential().runner_id().to_owned();
     let recovery_recorder = Arc::clone(&dependencies.recorder);
+    let state_access = dependencies.config.state_access().cloned();
     // Verify before advertising a root. Failure is optional for ordinary
     // work, but must not be reported as an exhaustive inventory.
     let _ = tokio::task::spawn_blocking(move || {
-        if let Err(error) = recovery_root.enable_recovery(&runner_id, recovery_host) {
+        // The runners this host's rejoins replaced, whose root record the
+        // open may replace for this runner (INV-RUNNER-37). A record that
+        // cannot be read replaces nothing.
+        let replaced = state_access
+            .map_or(Ok(Vec::new()), |access| access.replaced_runners())
+            .unwrap_or_else(|error| {
+                record_optional_recovery_failure(
+                    &recovery_recorder,
+                    "local_recovery_record_invalid",
+                    serde_json::json!({
+                        "errorType": "local_recovery_record_invalid",
+                        "stage": "replaced_runner_record",
+                        "cause": error.cause(),
+                    })
+                    .to_string(),
+                );
+                Vec::new()
+            });
+        if let Err(error) =
+            recovery_root.enable_recovery_replacing(&runner_id, &replaced, recovery_host)
+        {
             record_optional_recovery_failure(
                 &recovery_recorder,
                 error.error_type(),
@@ -587,12 +737,13 @@ where
     })
     .await;
     record_startup_retention(&dependencies.recorder, work_root.startup_retained());
-    let result = Box::pin(run_connection_loop_with_work_root(
+    let result = Box::pin(run_connection_loop_in_mode(
         dependencies,
         connector,
         backoff,
         shutdown,
         Arc::clone(&work_root),
+        join_key,
     ))
     .await;
     if result.is_err() {
@@ -605,20 +756,43 @@ where
 /// the runner-protocol types it holds across await points). Returned by value,
 /// it was copied into each awaiting caller's frame, and with frame decoding on
 /// top that overflowed a two-megabyte test-thread stack.
-fn run_connection_loop_with_work_root<'a>(
+fn run_connection_loop_in_mode<'a>(
     dependencies: ConnectionLoopDependencies,
     connector: &'a dyn Connector,
     backoff: Backoff,
     shutdown: &'a mut dyn Shutdown,
     work_root: Arc<workspace::WorkRootLease>,
-) -> Pin<Box<impl Future<Output = Result<(), ServiceError>> + 'a>> {
+    join_key: JoinKeyMode,
+) -> Pin<Box<impl Future<Output = Result<ServiceEnd, ServiceError>> + 'a>> {
     Box::pin(connection_loop_with_work_root(
         dependencies,
         connector,
         backoff,
         shutdown,
         work_root,
+        join_key,
     ))
+}
+
+/// The loop of a start that holds no join key, whose only end is a stop.
+#[cfg(test)]
+async fn run_connection_loop_with_work_root(
+    dependencies: ConnectionLoopDependencies,
+    connector: &dyn Connector,
+    backoff: Backoff,
+    shutdown: &mut dyn Shutdown,
+    work_root: Arc<workspace::WorkRootLease>,
+) -> Result<(), ServiceError> {
+    run_connection_loop_in_mode(
+        dependencies,
+        connector,
+        backoff,
+        shutdown,
+        work_root,
+        JoinKeyMode::None,
+    )
+    .await
+    .map(|_stopped| ())
 }
 
 async fn connection_loop_with_work_root(
@@ -627,7 +801,8 @@ async fn connection_loop_with_work_root(
     mut backoff: Backoff,
     shutdown: &mut dyn Shutdown,
     work_root: Arc<workspace::WorkRootLease>,
-) -> Result<(), ServiceError> {
+    mut join_key: JoinKeyMode,
+) -> Result<ServiceEnd, ServiceError> {
     let ConnectionLoopDependencies {
         mut config,
         frame_source,
@@ -766,6 +941,9 @@ async fn connection_loop_with_work_root(
     let mut startup_reload_pending = config.startup_pending().is_some();
     let mut promoted_attempt: Option<PromotedAttempt> = None;
     let mut shutting_down = false;
+    // What a graceful stop returns: a rejoin's end or a refused credential's
+    // takes the stop's path out of the loop (INV-RUNNER-35).
+    let mut ending = ServiceEnd::Stopped;
     let mut shutdown_deadline: Option<Pin<Box<dyn Future<Output = ()> + Send>>> = None;
 
     loop {
@@ -796,7 +974,9 @@ async fn connection_loop_with_work_root(
             let Some(deadline) = shutdown_deadline.as_mut() else {
                 return Err(ServiceError::AssignmentShutdown);
             };
-            return finish_shutdown_cleanup(&work_root, &recorder, shutdown, deadline).await;
+            return finish_shutdown_cleanup(&work_root, &recorder, shutdown, deadline)
+                .await
+                .map(|()| ending);
         }
         if shutting_down
             && assignment_manager
@@ -894,7 +1074,8 @@ async fn connection_loop_with_work_root(
                         return Err(ServiceError::AssignmentShutdown);
                     };
                     return finish_shutdown_cleanup(&work_root, &recorder, shutdown, deadline)
-                        .await;
+                        .await
+                        .map(|()| ending);
                 }
                 if shutting_down {
                     let Some(deadline) = shutdown_deadline.as_mut() else {
@@ -921,6 +1102,10 @@ async fn connection_loop_with_work_root(
                         Some(request) = reload_requests.recv() => {
                             ActiveEvent::ManualReload(request)
                         }
+                        // A connected runner holds no join key (INV-RUNNER-35).
+                        () = live_status.wait_until_connected(), if join_key.holds_key() => {
+                            ActiveEvent::Handshake
+                        }
                         () = live_status.wait_until_connected(), if startup_reload_pending => {
                             ActiveEvent::StartupReload
                         }
@@ -931,6 +1116,10 @@ async fn connection_loop_with_work_root(
                     let reload = match event {
                         ActiveEvent::ManualReload(request) => Some((Some(request), false)),
                         ActiveEvent::StartupReload => Some((None, true)),
+                        ActiveEvent::Handshake => {
+                            join_key.handshake_completed();
+                            None
+                        }
                         ActiveEvent::AssignmentNotification => None,
                         ActiveEvent::Shutdown => {
                             shutdown_deadline =
@@ -1074,7 +1263,8 @@ async fn connection_loop_with_work_root(
                             return finish_shutdown_cleanup(
                                 &work_root, &recorder, shutdown, deadline,
                             )
-                            .await;
+                            .await
+                            .map(|()| ending);
                         }
                         wait_for_shutdown_progress(
                             &assignment_manager,
@@ -1085,6 +1275,44 @@ async fn connection_loop_with_work_root(
                         )
                         .await?;
                         continue;
+                    }
+                    // A runner that holds no assignment answers the refusal by
+                    // its start's mode (INV-RUNNER-35); one that holds work
+                    // waits for it to be let go and looks again.
+                    let counts = assignment_manager
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .status_counts();
+                    if refusal_step(&join_key, counts) != RefusalStep::Wait {
+                        let answer = Box::pin(answer_refusal(
+                            &mut join_key,
+                            &mut backoff,
+                            sleeper.as_ref(),
+                            shutdown,
+                        ))
+                        .await?;
+                        match answer {
+                            RefusalAnswer::Parked => {}
+                            RefusalAnswer::Shutdown => {
+                                shutdown_deadline = Some(begin_shutdown(
+                                    &live_status,
+                                    &assignment_manager,
+                                    &sleeper,
+                                )?);
+                                shutting_down = true;
+                                continue;
+                            }
+                            RefusalAnswer::Ended(end) => {
+                                ending = end;
+                                shutdown_deadline = Some(begin_shutdown(
+                                    &live_status,
+                                    &assignment_manager,
+                                    &sleeper,
+                                )?);
+                                shutting_down = true;
+                                continue;
+                            }
+                        }
                     }
                     tokio::select! {
                         () = &mut notified => {}
@@ -1127,6 +1355,7 @@ async fn connection_loop_with_work_root(
         };
         if progress.handshake_completed {
             backoff.reset();
+            join_key.handshake_completed();
         }
         live_status.backing_off(connection_failure(cause));
         let delay = backoff.next_delay();
@@ -1226,6 +1455,62 @@ async fn connection_loop_with_work_root(
                     shutting_down = true;
                 }
                 _ = sleeper.sleep(delay) => {}
+            }
+        }
+    }
+}
+
+/// Answers a refused credential by the start's mode, leaving the mode as the
+/// answer leaves the process: an unusable key's report runs once, a held
+/// key's rejoin is sent one attempt at a time on the blocking pool until it
+/// is answered, and a spent key ends the service. A stop signal is answered
+/// while a rejoin is sent or waits: the staged journal stays on disk, so the
+/// answer it would have read can be abandoned.
+async fn answer_refusal(
+    join_key: &mut JoinKeyMode,
+    backoff: &mut Backoff,
+    sleeper: &dyn Sleeper,
+    shutdown: &mut dyn Shutdown,
+) -> Result<RefusalAnswer, ServiceError> {
+    let mut rejoin = match std::mem::replace(join_key, JoinKeyMode::None) {
+        JoinKeyMode::None => return Ok(RefusalAnswer::Parked),
+        JoinKeyMode::Spent => {
+            *join_key = JoinKeyMode::Spent;
+            return Ok(RefusalAnswer::Ended(ServiceEnd::CredentialRefused));
+        }
+        JoinKeyMode::Unusable(report) => {
+            tokio::task::spawn_blocking(report)
+                .await
+                .map_err(|_| ServiceError::BuildRuntime)?;
+            return Ok(RefusalAnswer::Parked);
+        }
+        JoinKeyMode::Held(rejoin) => rejoin,
+    };
+    loop {
+        let attempt = tokio::task::spawn_blocking(move || {
+            let answer = rejoin.attempt();
+            (rejoin, answer)
+        });
+        let (returned, answer) = tokio::select! {
+            biased;
+            () = shutdown.wait() => return Ok(RefusalAnswer::Shutdown),
+            joined = attempt => joined.map_err(|_| ServiceError::BuildRuntime)?,
+        };
+        rejoin = returned;
+        match answer {
+            RejoinAnswer::Rejoined => {
+                *join_key = JoinKeyMode::Spent;
+                return Ok(RefusalAnswer::Ended(ServiceEnd::Rejoined));
+            }
+            RejoinAnswer::Refused => return Ok(RefusalAnswer::Parked),
+            RejoinAnswer::Unanswered(cause) => {
+                let delay = backoff.next_delay();
+                rejoin.retrying(crate::enrollment::JoinRetry { cause, delay });
+                tokio::select! {
+                    biased;
+                    () = shutdown.wait() => return Ok(RefusalAnswer::Shutdown),
+                    () = sleeper.sleep(delay) => {}
+                }
             }
         }
     }
@@ -1871,12 +2156,16 @@ mod tests {
     };
     use super::{
         AssignmentConfig, Config, ConnectionCause, ConnectionLoopDependencies, FailureKind,
-        LiveStatus, ReloadDependencies, ReloadRequest, SHUTDOWN_TIMEOUT, Sequence, ServiceError,
-        Sleeper, TokioSleeper, record_startup_retention, run_connection_loop_with_work_root,
+        JoinKeyMode, LiveStatus, RefusalStep, Rejoin, RejoinAnswer, ReloadDependencies,
+        ReloadRequest, SHUTDOWN_TIMEOUT, Sequence, ServiceEnd, ServiceError, Sleeper, TokioSleeper,
+        record_startup_retention, refusal_step, run_connection_loop_with_work_root,
         run_until_cancelled_with_dependencies,
     };
-    use crate::control_protocol::{ConnectionState, ControlError, Operation, Response};
+    use crate::control_protocol::{
+        AssignmentCounts, ConnectionState, ControlError, Operation, Response, StatusSnapshot,
+    };
     use crate::credential::test_credential;
+    use crate::enrollment::{AmbiguousCause, JoinRetry};
     use crate::service::assignment::test_support::manager_with_dependencies as assignment_manager_with_dependencies;
     use crate::service::config::RepositoryUrlPolicy;
     use crate::telemetry::{TestCapture, test_recorder};
@@ -2690,6 +2979,487 @@ mod tests {
         with_watchdog(server).await.unwrap().unwrap();
     }
 
+    /// A call the service made on a test rejoin object, or its drop.
+    #[derive(Debug, Eq, PartialEq)]
+    enum RejoinCall {
+        Attempt,
+        Retrying(JoinRetry),
+        Dropped,
+    }
+
+    #[derive(Clone, Default)]
+    struct RejoinCalls(Arc<std::sync::Mutex<Vec<RejoinCall>>>);
+
+    impl RejoinCalls {
+        fn record(&self, call: RejoinCall) {
+            self.0.lock().unwrap().push(call);
+        }
+
+        fn take(&self) -> Vec<RejoinCall> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+
+        fn contains(&self, call: &RejoinCall) -> bool {
+            self.0.lock().unwrap().contains(call)
+        }
+
+        fn retry(&self) -> Option<JoinRetry> {
+            self.0.lock().unwrap().iter().find_map(|call| match call {
+                RejoinCall::Retrying(retry) => Some(*retry),
+                RejoinCall::Attempt | RejoinCall::Dropped => None,
+            })
+        }
+
+        async fn wait_until_dropped(&self) {
+            with_watchdog(async {
+                while !self.contains(&RejoinCall::Dropped) {
+                    TokioSleeper.sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the service did not drop its rejoin object");
+        }
+    }
+
+    /// A rejoin that answers its attempts from a script and records its calls.
+    struct ScriptedRejoin {
+        answers: std::collections::VecDeque<RejoinAnswer>,
+        calls: RejoinCalls,
+    }
+
+    impl Rejoin for ScriptedRejoin {
+        fn attempt(&mut self) -> RejoinAnswer {
+            self.calls.record(RejoinCall::Attempt);
+            self.answers
+                .pop_front()
+                .expect("the service sent a rejoin the test did not script")
+        }
+
+        fn retrying(&mut self, retry: JoinRetry) {
+            self.calls.record(RejoinCall::Retrying(retry));
+        }
+    }
+
+    impl Drop for ScriptedRejoin {
+        fn drop(&mut self) {
+            self.calls.record(RejoinCall::Dropped);
+        }
+    }
+
+    fn held_join_key(answers: &[RejoinAnswer]) -> (JoinKeyMode, RejoinCalls) {
+        let calls = RejoinCalls::default();
+        let rejoin = ScriptedRejoin {
+            answers: answers.iter().copied().collect(),
+            calls: calls.clone(),
+        };
+        (JoinKeyMode::Held(Box::new(rejoin)), calls)
+    }
+
+    /// Answers every connection's upgrade 401, as Cloud answers the credential
+    /// of a runner it removed.
+    fn refuse_every_upgrade(listener: tokio::net::TcpListener) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("accept fixture connection");
+                let mut request = [0_u8; 4096];
+                let _ = stream
+                    .read(&mut request)
+                    .await
+                    .expect("read upgrade request");
+                stream
+                    .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n")
+                    .await
+                    .expect("refuse the runner credential");
+            }
+        })
+    }
+
+    fn spawn_refused_service(
+        fixture: &RotationFixture,
+        sleeper: Arc<dyn Sleeper>,
+        join_key: JoinKeyMode,
+    ) -> (
+        tokio::task::JoinHandle<Result<ServiceEnd, ServiceError>>,
+        ControlledShutdownTrigger,
+    ) {
+        let (service, _capture, shutdown_trigger) = spawn_service_with_join_key(
+            fixture.config.clone(),
+            sleeper,
+            Some(unavailable_source_broker()),
+            None,
+            join_key,
+        );
+        (service, shutdown_trigger)
+    }
+
+    async fn wait_for_connection_state(
+        socket_path: &Path,
+        state: ConnectionState,
+    ) -> StatusSnapshot {
+        with_watchdog(async {
+            loop {
+                if let Response::Status(status) =
+                    request_control(socket_path.to_owned(), Operation::Status).await
+                    && status.connection_state == state
+                {
+                    return status;
+                }
+                TokioSleeper.sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the runner's status did not reach the expected connection state")
+    }
+
+    /// Makes a parked runner's loop look again, as a further event would: a
+    /// reload request with no pending credential is answered and changes
+    /// nothing.
+    async fn look_again(socket_path: &Path) {
+        assert_eq!(
+            request_control(socket_path.to_owned(), Operation::ReloadCredential).await,
+            Response::Error(ControlError::NoPendingCredential)
+        );
+    }
+
+    /// The controlled sleep the service requested for the retry it told its
+    /// rejoin object about.
+    async fn retry_sleep(
+        sleeps: &mut tokio::sync::mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
+        calls: &RejoinCalls,
+    ) -> (JoinRetry, SleepRelease) {
+        loop {
+            let (delay, release) = with_watchdog(sleeps.recv())
+                .await
+                .expect("the service requested no retry delay")
+                .expect("controlled sleeper closed");
+            if let Some(retry) = calls.retry()
+                && retry.delay == delay
+            {
+                return (retry, release);
+            }
+        }
+    }
+
+    // INV-RUNNER-35, REQ-RUNNERENROLL-127
+    #[tokio::test]
+    async fn a_held_key_rejoins_at_the_first_refusal_and_ends_the_service() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        let server = refuse_every_upgrade(listener);
+        let (join_key, calls) = held_join_key(&[RejoinAnswer::Rejoined]);
+        let (service, _shutdown_trigger) =
+            spawn_refused_service(&fixture, fixture_sleeper(), join_key);
+
+        let end = with_watchdog(service).await.unwrap().unwrap().unwrap();
+
+        assert_eq!(end, ServiceEnd::Rejoined);
+        assert_eq!(calls.take(), [RejoinCall::Attempt, RejoinCall::Dropped]);
+        // The service that serves the rejoined runner leases the same work root.
+        WorkRootLease::acquire_for_test(
+            fixture.config.assignment().work_root(),
+            "rbt_00000000000000000000000009",
+        )
+        .expect("the ended service still holds its work root");
+        server.abort();
+    }
+
+    // INV-RUNNER-35, REQ-RUNNERENROLL-127
+    #[tokio::test]
+    async fn a_refused_rejoin_parks_the_runner_and_is_not_sent_again() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
+        let server = refuse_every_upgrade(listener);
+        let (join_key, calls) = held_join_key(&[RejoinAnswer::Refused]);
+        let (service, shutdown_trigger) =
+            spawn_refused_service(&fixture, fixture_sleeper(), join_key);
+
+        calls.wait_until_dropped().await;
+        wait_for_connection_state(&socket_path, ConnectionState::AuthenticationFailed).await;
+        look_again(&socket_path).await;
+
+        assert_eq!(calls.take(), [RejoinCall::Attempt, RejoinCall::Dropped]);
+        assert!(!service.is_finished());
+        shutdown_trigger.notify_one();
+        assert_eq!(
+            with_watchdog(service).await.unwrap().unwrap().unwrap(),
+            ServiceEnd::Stopped
+        );
+        server.abort();
+    }
+
+    // INV-RUNNER-35, REQ-RUNNERENROLL-127
+    #[tokio::test]
+    async fn an_unanswered_rejoin_is_sent_again_after_the_reconnect_delay() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        let server = refuse_every_upgrade(listener);
+        let (join_key, calls) = held_join_key(&[
+            RejoinAnswer::Unanswered(AmbiguousCause::CloudUnavailable(503)),
+            RejoinAnswer::Rejoined,
+        ]);
+        let (sleeper, mut sleeps) = controlled_sleeper();
+        let (service, _shutdown_trigger) = spawn_refused_service(&fixture, sleeper, join_key);
+
+        let (retry, release) = retry_sleep(&mut sleeps, &calls).await;
+        assert_eq!(retry.cause, AmbiguousCause::CloudUnavailable(503));
+        assert_eq!(
+            calls.take(),
+            [RejoinCall::Attempt, RejoinCall::Retrying(retry)]
+        );
+        release.release();
+
+        assert_eq!(
+            with_watchdog(service).await.unwrap().unwrap().unwrap(),
+            ServiceEnd::Rejoined
+        );
+        assert_eq!(calls.take(), [RejoinCall::Attempt, RejoinCall::Dropped]);
+        server.abort();
+    }
+
+    // INV-RUNNER-35, REQ-RUNNERENROLL-127
+    #[tokio::test]
+    async fn a_stop_between_rejoin_attempts_ends_the_service_without_another() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        let server = refuse_every_upgrade(listener);
+        let (join_key, calls) = held_join_key(&[RejoinAnswer::Unanswered(AmbiguousCause::Network)]);
+        let (sleeper, mut sleeps) = controlled_sleeper();
+        let (service, shutdown_trigger) = spawn_refused_service(&fixture, sleeper, join_key);
+
+        // The retry's delay is never released: only the stop can end the wait.
+        let (retry, _held_delay) = retry_sleep(&mut sleeps, &calls).await;
+        shutdown_trigger.notify_one();
+
+        assert_eq!(
+            with_watchdog(service).await.unwrap().unwrap().unwrap(),
+            ServiceEnd::Stopped
+        );
+        assert_eq!(
+            calls.take(),
+            [
+                RejoinCall::Attempt,
+                RejoinCall::Retrying(retry),
+                RejoinCall::Dropped
+            ]
+        );
+        server.abort();
+    }
+
+    // INV-RUNNER-35, REQ-RUNNERENROLL-128
+    #[tokio::test]
+    async fn a_completed_handshake_drops_the_key_and_a_later_refusal_ends_the_service() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
+        let (connected_sent, connected) = tokio::sync::oneshot::channel();
+        let (close_sent, close) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut socket = accept_opened_fixture_socket(&listener).await;
+            socket.send(welcome()).await.unwrap();
+            socket
+                .send(observation_acknowledgement(
+                    "rmsg_00000000000000000000000002",
+                    1,
+                ))
+                .await
+                .unwrap();
+            connected_sent.send(()).unwrap();
+            close.await.unwrap();
+            socket.close(None).await.unwrap();
+            while socket.next().await.is_some() {}
+            refuse_every_upgrade(listener).await.unwrap();
+        });
+        let (join_key, calls) = held_join_key(&[]);
+        let (service, _shutdown_trigger) =
+            spawn_refused_service(&fixture, fixture_sleeper(), join_key);
+
+        with_watchdog(connected).await.unwrap().unwrap();
+        calls.wait_until_dropped().await;
+        wait_for_connection_state(&socket_path, ConnectionState::Connected).await;
+        assert_eq!(calls.take(), [RejoinCall::Dropped]);
+        close_sent.send(()).unwrap();
+
+        assert_eq!(
+            with_watchdog(service).await.unwrap().unwrap().unwrap(),
+            ServiceEnd::CredentialRefused
+        );
+        assert_eq!(calls.take(), []);
+        server.abort();
+    }
+
+    // INV-RUNNER-35, REQ-RUNNERENROLL-128
+    #[tokio::test]
+    async fn a_process_without_its_key_ends_at_a_refused_credential() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        let server = refuse_every_upgrade(listener);
+        let (service, _shutdown_trigger) =
+            spawn_refused_service(&fixture, fixture_sleeper(), JoinKeyMode::Spent);
+
+        assert_eq!(
+            with_watchdog(service).await.unwrap().unwrap().unwrap(),
+            ServiceEnd::CredentialRefused
+        );
+        server.abort();
+    }
+
+    // INV-RUNNER-35, REQ-RUNNERENROLL-127
+    #[tokio::test]
+    async fn a_promoted_pending_credential_is_not_answered_with_a_rejoin() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::new(&endpoint);
+        let server = tokio::spawn(async move {
+            let (mut current, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = current.read(&mut request).await.unwrap();
+            current
+                .write_all(b"HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            let mut pending = accept_fixture_socket(&listener).await;
+            let Some(Ok(Message::Text(hello))) = pending.next().await else {
+                panic!("pending connection omitted hello");
+            };
+            let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
+            pending.send(welcome()).await.unwrap();
+            pending
+                .send(observation_acknowledgement(
+                    hello["messageId"].as_str().unwrap(),
+                    hello["sequence"].as_u64().unwrap(),
+                ))
+                .await
+                .unwrap();
+            while pending.next().await.is_some() {}
+        });
+        let (join_key, calls) = held_join_key(&[]);
+        let (service, shutdown_trigger) =
+            spawn_refused_service(&fixture, fixture_sleeper(), join_key);
+
+        // The pending credential's handshake drops the key unused.
+        calls.wait_until_dropped().await;
+        shutdown_trigger.notify_one();
+
+        assert_eq!(
+            with_watchdog(service).await.unwrap().unwrap().unwrap(),
+            ServiceEnd::Stopped
+        );
+        assert_eq!(calls.take(), [RejoinCall::Dropped]);
+        with_watchdog(server).await.unwrap().unwrap();
+    }
+
+    // INV-RUNNER-35, REQ-RUNNERENROLL-127
+    #[tokio::test]
+    async fn an_unusable_key_is_reported_once_and_the_runner_parks() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
+        let server = refuse_every_upgrade(listener);
+        let reports = Arc::new(AtomicUsize::new(0));
+        let reported = Arc::clone(&reports);
+        let report = Box::new(move || {
+            reported.fetch_add(1, Ordering::SeqCst);
+        });
+        let (service, shutdown_trigger) =
+            spawn_refused_service(&fixture, fixture_sleeper(), JoinKeyMode::Unusable(report));
+
+        with_watchdog(async {
+            while reports.load(Ordering::SeqCst) == 0 {
+                TokioSleeper.sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the unusable key's report did not run");
+        wait_for_connection_state(&socket_path, ConnectionState::AuthenticationFailed).await;
+        look_again(&socket_path).await;
+
+        assert_eq!(reports.load(Ordering::SeqCst), 1);
+        assert!(!service.is_finished());
+        shutdown_trigger.notify_one();
+        assert_eq!(
+            with_watchdog(service).await.unwrap().unwrap().unwrap(),
+            ServiceEnd::Stopped
+        );
+        server.abort();
+    }
+
+    // INV-RUNNER-35, REQ-RUNNERENROLL-128
+    #[tokio::test]
+    async fn a_refused_credential_does_not_end_a_runner_that_holds_an_assignment() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        let (source_broker, offer) = fixture.accepted_source();
+        let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
+        let (accepted_sent, accepted_received) = tokio::sync::oneshot::channel();
+        let (close_sent, mut close) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _accepted) = accept_offered_assignment(&listener, offer).await;
+            accepted_sent.send(()).unwrap();
+            loop {
+                tokio::select! {
+                    _ = &mut close => break,
+                    frame = socket.next() => {
+                        let Some(Ok(Message::Text(frame))) = frame else {
+                            continue;
+                        };
+                        let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                        if frame["type"] == "workspace_inventory" {
+                            reject_fixture_registration(&mut socket, &frame).await;
+                        } else {
+                            acknowledge_runner_frame(&mut socket, &frame, "acknowledge observation")
+                                .await;
+                        }
+                    }
+                }
+            }
+            socket.close(None).await.unwrap();
+            while socket.next().await.is_some() {}
+            refuse_every_upgrade(listener).await.unwrap();
+        });
+        let (join_key, calls) = held_join_key(&[]);
+        let (service, _capture, _shutdown_trigger) = spawn_service_with_join_key(
+            fixture.config.clone(),
+            fixture_sleeper(),
+            Some(source_broker),
+            None,
+            join_key,
+        );
+        with_watchdog(accepted_received).await.unwrap().unwrap();
+        calls.wait_until_dropped().await;
+        close_sent.send(()).unwrap();
+
+        let status =
+            wait_for_connection_state(&socket_path, ConnectionState::AuthenticationFailed).await;
+        assert_eq!(status.assignment_counts.accepted, 1);
+        look_again(&socket_path).await;
+
+        assert!(!service.is_finished());
+        assert_eq!(calls.take(), [RejoinCall::Dropped]);
+        abort_service(service).await;
+        server.abort();
+    }
+
+    // INV-RUNNER-35, REQ-RUNNERENROLL-127, REQ-RUNNERENROLL-128
+    #[test]
+    fn a_refused_credential_is_answered_only_once_no_assignment_is_held() {
+        let held = AssignmentCounts {
+            accepted: 1,
+            ..AssignmentCounts::default()
+        };
+        let idle = AssignmentCounts::default();
+        let (rejoin, _calls) = held_join_key(&[]);
+        let unusable = JoinKeyMode::Unusable(Box::new(|| {}));
+        for (mode, answer) in [
+            (JoinKeyMode::Spent, RefusalStep::End),
+            (rejoin, RefusalStep::Rejoin),
+            (unusable, RefusalStep::Report),
+            (JoinKeyMode::None, RefusalStep::Wait),
+        ] {
+            assert_eq!(refusal_step(&mode, held), RefusalStep::Wait);
+            assert_eq!(refusal_step(&mode, idle), answer);
+        }
+    }
+
     // These integration proofs intentionally exercise different interleavings
     // against the same closed handshake; keeping each scenario explicit makes
     // its ordering contract auditable.
@@ -3284,7 +4054,7 @@ mod tests {
         endpoint: &str,
         sleeper: Arc<dyn Sleeper>,
     ) -> (
-        tokio::task::JoinHandle<Result<(), ServiceError>>,
+        tokio::task::JoinHandle<Result<ServiceEnd, ServiceError>>,
         TestCapture,
         ControlledShutdownTrigger,
     ) {
@@ -3302,7 +4072,7 @@ mod tests {
         config: Config,
         sleeper: Arc<dyn Sleeper>,
     ) -> (
-        tokio::task::JoinHandle<Result<(), ServiceError>>,
+        tokio::task::JoinHandle<Result<ServiceEnd, ServiceError>>,
         TestCapture,
         ControlledShutdownTrigger,
     ) {
@@ -3320,7 +4090,27 @@ mod tests {
         source_broker: Option<Arc<dyn SourceCredentialBroker>>,
         config_fixture: Option<ConfigFixture>,
     ) -> (
-        tokio::task::JoinHandle<Result<(), ServiceError>>,
+        tokio::task::JoinHandle<Result<ServiceEnd, ServiceError>>,
+        TestCapture,
+        ControlledShutdownTrigger,
+    ) {
+        spawn_service_with_join_key(
+            config,
+            sleeper,
+            source_broker,
+            config_fixture,
+            JoinKeyMode::None,
+        )
+    }
+
+    fn spawn_service_with_join_key(
+        config: Config,
+        sleeper: Arc<dyn Sleeper>,
+        source_broker: Option<Arc<dyn SourceCredentialBroker>>,
+        config_fixture: Option<ConfigFixture>,
+        join_key: JoinKeyMode,
+    ) -> (
+        tokio::task::JoinHandle<Result<ServiceEnd, ServiceError>>,
         TestCapture,
         ControlledShutdownTrigger,
     ) {
@@ -3335,6 +4125,7 @@ mod tests {
                 recorder,
                 source_broker,
                 shutdown,
+                join_key,
             )
             .await
         });
@@ -3343,7 +4134,7 @@ mod tests {
 
     struct AcceptedAssignmentService {
         _temporary: tempfile::TempDir,
-        task: tokio::task::JoinHandle<Result<(), ServiceError>>,
+        task: tokio::task::JoinHandle<Result<ServiceEnd, ServiceError>>,
         shutdown_trigger: ControlledShutdownTrigger,
         _sleep_requests: tokio::sync::mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
     }
@@ -3396,7 +4187,7 @@ mod tests {
         }
     }
 
-    async fn abort_service(service: tokio::task::JoinHandle<Result<(), ServiceError>>) {
+    async fn abort_service(service: tokio::task::JoinHandle<Result<ServiceEnd, ServiceError>>) {
         service.abort();
         assert!(
             service
@@ -3483,6 +4274,7 @@ mod tests {
             recorder,
             None,
             shutdown,
+            JoinKeyMode::None,
         ))
         .await
         .expect("runner retried a terminal policy close")
@@ -3567,6 +4359,7 @@ mod tests {
             recorder,
             None,
             shutdown,
+            JoinKeyMode::None,
         ))
         .await
         .expect("runner retried a terminal policy close")
@@ -3725,6 +4518,122 @@ mod tests {
             abort_service(service).await;
             result.unwrap().unwrap();
         }
+    }
+
+    const REPLACED_RUNNER: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abe";
+
+    // Leaves the fixture's work root with the recovery root record of
+    // `REPLACED_RUNNER`, written by an earlier boot, and answers its work-root
+    // ID.
+    fn prepare_replaced_runners_work_root(fixture: &RotationFixture) -> String {
+        let work_root = fixture.config.assignment().work_root();
+        let lease =
+            WorkRootLease::acquire_for_test(work_root, "rbt_01k0z6r1w8f4jy2m7q9v3x5abc").unwrap();
+        lease
+            .enable_recovery(
+                REPLACED_RUNNER,
+                super::recovery::host_fixture::fixture_host(),
+            )
+            .unwrap();
+        drop(lease);
+        let record: serde_json::Value = serde_json::from_slice(
+            &fs::read(work_root.join(".useful-recovery-root-v1.json")).unwrap(),
+        )
+        .unwrap();
+        record["workRootId"].as_str().unwrap().to_owned()
+    }
+
+    // The opening hello's `workspaceRecoveryRoot`, once the service completed
+    // the handshake the listener offers, and the service's records.
+    async fn opening_recovery_root(
+        fixture: &RotationFixture,
+        listener: tokio::net::TcpListener,
+    ) -> (serde_json::Value, TestCapture) {
+        let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
+        let (hello_sent, hello_received) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut socket = accept_fixture_socket(&listener).await;
+            let Some(Ok(Message::Text(hello))) = socket.next().await else {
+                panic!("missing opening hello")
+            };
+            let hello: serde_json::Value = serde_json::from_str(&hello).unwrap();
+            socket.send(welcome()).await.unwrap();
+            socket
+                .send(observation_acknowledgement(
+                    hello["messageId"].as_str().unwrap(),
+                    hello["sequence"].as_u64().unwrap(),
+                ))
+                .await
+                .unwrap();
+            hello_sent.send(hello).unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Text(frame) = message else {
+                    continue;
+                };
+                let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                if frame["type"] == "workspace_inventory_complete" {
+                    socket
+                        .send(observation_acknowledgement(
+                            frame["messageId"].as_str().unwrap(),
+                            frame["sequence"].as_u64().unwrap(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let (service, capture, shutdown_trigger) =
+            spawn_configured_service(fixture.config.clone(), fixture_sleeper());
+        let hello = with_watchdog(hello_received).await.unwrap().unwrap();
+        wait_for_connection_state(&socket_path, ConnectionState::Connected).await;
+        shutdown_trigger.notify_one();
+        with_watchdog(service).await.unwrap().unwrap().unwrap();
+        with_watchdog(server).await.unwrap().unwrap();
+        (hello["payload"]["workspaceRecoveryRoot"].clone(), capture)
+    }
+
+    // REQ-RUNNERENROLL-129
+    #[tokio::test]
+    async fn a_rejoined_host_advertises_a_new_verified_work_root() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        let replaced_root = prepare_replaced_runners_work_root(&fixture);
+        let record = fixture.state_path.with_file_name(".runner-replaced.json");
+        fs::write(
+            &record,
+            serde_json::to_vec(&serde_json::json!({
+                "schemaVersion": 1,
+                "replacedRunnerIds": [REPLACED_RUNNER]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let (root, _capture) = opening_recovery_root(&fixture, listener).await;
+
+        assert_eq!(root["bindingState"], "verified");
+        let work_root_id = root["workRootId"].as_str().unwrap();
+        assert!(work_root_id.starts_with("rwr_"));
+        assert_ne!(work_root_id, replaced_root);
+    }
+
+    // REQ-RUNNERENROLL-129
+    #[tokio::test]
+    async fn a_work_root_of_a_runner_no_rejoin_replaced_is_advertised_unavailable() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        prepare_replaced_runners_work_root(&fixture);
+
+        let (root, capture) = opening_recovery_root(&fixture, listener).await;
+
+        assert_eq!(root["bindingState"], "unavailable");
+        let failure = capture
+            .records()
+            .into_iter()
+            .find(|record| record["event.name"] == "runner.workspace_recovery")
+            .expect("recovery failure record");
+        assert_eq!(failure["error.type"], "local_recovery_record_invalid");
     }
 
     #[tokio::test]
@@ -4205,6 +5114,7 @@ mod tests {
                 recorder,
                 Some(source_broker),
                 shutdown,
+                JoinKeyMode::None,
             ));
         panic!("serving owner stopped before it was killed: {outcome:?}");
     }

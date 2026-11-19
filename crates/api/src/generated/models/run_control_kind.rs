@@ -29,6 +29,8 @@ pub enum RunControlKind {
     RunControlKindStop,
     #[serde(rename = "retry")]
     RunControlKindRetry,
+    #[serde(rename = "withdraw")]
+    RunControlKindWithdraw,
 }
 
 impl std::fmt::Display for RunControlKind {
@@ -40,6 +42,7 @@ impl std::fmt::Display for RunControlKind {
             Self::RunControlKindLift => write!(f, "lift"),
             Self::RunControlKindStop => write!(f, "stop"),
             Self::RunControlKindRetry => write!(f, "retry"),
+            Self::RunControlKindWithdraw => write!(f, "withdraw"),
         }
     }
 }

@@ -20,28 +20,12 @@ use serde::{Deserialize, Serialize};
 pub struct CreateGrantSessionRequest {
     /// The provider to ask for a grant.
     #[serde(rename = "provider")]
-    pub provider: Provider,
+    pub provider: String,
 }
 
 impl CreateGrantSessionRequest {
     /// A link-creating consent names only its provider (REQ-GRANT-1).
-    pub fn new(provider: Provider) -> CreateGrantSessionRequest {
+    pub fn new(provider: String) -> CreateGrantSessionRequest {
         CreateGrantSessionRequest { provider }
-    }
-}
-/// The provider to ask for a grant.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Provider {
-    #[serde(rename = "github")]
-    CreateGrantSessionRequestProviderGithub,
-    #[serde(rename = "gitlab.com")]
-    CreateGrantSessionRequestProviderGitlabCom,
-    #[serde(rename = "linear")]
-    CreateGrantSessionRequestProviderLinear,
-}
-
-impl Default for Provider {
-    fn default() -> Provider {
-        Self::CreateGrantSessionRequestProviderGithub
     }
 }

@@ -1,0 +1,16 @@
+# requires declares integrations and their acting identity with no tools (REQ-WFFORMAT-82).
+schemaVersion: 1
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["true"]
+requires:
+  as: member
+  integrations:
+    linear:
+      as: org
+      bindings:
+        team: {kind: team}
+    github: {}
+    claude_code: {}

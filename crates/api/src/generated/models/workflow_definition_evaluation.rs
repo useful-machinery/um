@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// WorkflowDefinitionEvaluation : One accepted Linear delivery's or schedule due time's evaluation of a start trigger, pinned at acceptance to the revision then current, the trigger and the execution principal.
+/// WorkflowDefinitionEvaluation : One accepted Linear delivery's, GitHub push's or schedule due time's evaluation of a start trigger, pinned at acceptance to the revision then current, the trigger and the execution principal.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowDefinitionEvaluation {
     #[serde(rename = "id")]
@@ -27,7 +27,7 @@ pub struct WorkflowDefinitionEvaluation {
     pub revision: i32,
     #[serde(rename = "triggerName")]
     pub trigger_name: String,
-    /// The Linear connection the event arrived on; null for a schedule evaluation.
+    /// The Linear connection the event arrived on, or for a push evaluation the GitHub installation binding the push arrived on; null for a schedule evaluation.
     #[serde(rename = "connectionId", deserialize_with = "Option::deserialize")]
     pub connection_id: Option<String>,
     #[serde(rename = "executionPrincipalId")]
@@ -38,7 +38,7 @@ pub struct WorkflowDefinitionEvaluation {
     pub event: Box<models::WorkflowDefinitionStartEvent>,
     #[serde(rename = "state")]
     pub state: State,
-    /// The closed reason code of the state, such as `rule_not_matched`, `owner_unresolved` or `input_type_invalid`; null when the state needs none.
+    /// The closed reason code of the state, such as `rule_not_matched`, `owner_unresolved` or `input_type_invalid`; null when the state needs none. A `retry_waiting` evaluation retained for its subject by a `queueLatest` trigger carries the reason of the refusal it waits on, `subject_busy`, `subject_settled` or `active_run`, and `superseded` with `skipped` is an evaluation a newer one replaced.
     #[serde(rename = "reason", deserialize_with = "Option::deserialize")]
     pub reason: Option<String>,
     /// What the latest attempt read and resolved; null before an attempt records any.
@@ -46,7 +46,7 @@ pub struct WorkflowDefinitionEvaluation {
     pub observations: Option<Box<models::WorkflowDefinitionEvaluationObservations>>,
     #[serde(rename = "runId", deserialize_with = "Option::deserialize")]
     pub run_id: Option<String>,
-    /// The run holding or having settled the subject slot of a `skipped_active` evaluation, or, for a schedule evaluation, the trigger's previous run still live.
+    /// The run holding or having settled the subject slot of a `skipped_active` evaluation, or, for a schedule evaluation, the trigger's previous run still live; for a `retry_waiting` evaluation retained for its subject, the run it waits behind.
     #[serde(rename = "blockingRunId", deserialize_with = "Option::deserialize")]
     pub blocking_run_id: Option<String>,
     #[serde(rename = "cycleNumber")]
@@ -57,6 +57,7 @@ pub struct WorkflowDefinitionEvaluation {
     pub cycle_started_at: String,
     #[serde(rename = "cycleDeadline")]
     pub cycle_deadline: String,
+    /// When the next attempt is scheduled; null when no attempt is scheduled, which for a `retry_waiting` evaluation means it is retained until its subject is free.
     #[serde(rename = "nextAttemptAt", deserialize_with = "Option::deserialize")]
     pub next_attempt_at: Option<String>,
     #[serde(rename = "acceptedAt")]
@@ -68,7 +69,7 @@ pub struct WorkflowDefinitionEvaluation {
 }
 
 impl WorkflowDefinitionEvaluation {
-    /// One accepted Linear delivery's or schedule due time's evaluation of a start trigger, pinned at acceptance to the revision then current, the trigger and the execution principal.
+    /// One accepted Linear delivery's, GitHub push's or schedule due time's evaluation of a start trigger, pinned at acceptance to the revision then current, the trigger and the execution principal.
     pub fn new(
         id: String,
         definition_id: String,
@@ -125,6 +126,8 @@ pub enum EventName {
     IssueStateLeft,
     #[serde(rename = "schedule.due")]
     ScheduleDue,
+    #[serde(rename = "push")]
+    Push,
 }
 
 impl Default for EventName {

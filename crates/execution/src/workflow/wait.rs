@@ -27,6 +27,7 @@ use time::format_description::well_known::Rfc3339;
 use super::admission::{ResolvedInput, ResolvedInputs};
 use super::document::{Trigger, TriggerControlAction};
 pub use super::document::{WaitKind, WaitRule};
+use super::evidence::FailedChild;
 use super::local_run::{
     CONTROLS_DIRECTORY, LocalRunDirectoryError, PRIVATE_DIRECTORY, create_or_open_directory,
     directory_entries, encode_json, file_error, open_directory_at, open_run_root,
@@ -174,6 +175,14 @@ pub fn wait_questions(payload: &Map<String, Value>) -> WaitQuestions {
             })
             .collect(),
     )
+}
+
+/// The failed child `payload`, a wait record's payload, records (REQ-WFEXEC-77): its
+/// `failedChild` when that reads as the record, else none. `useful workflow run status`,
+/// the summary's wait line and the runner's progress report read a wait's failed child
+/// through this one function (REQ-LOCALRUN-221, REQ-RUNNERENROLL-125).
+pub fn wait_failed_child(payload: &Map<String, Value>) -> Option<FailedChild> {
+    FailedChild::deserialize(payload.get("failedChild")?).ok()
 }
 
 /// One `controls/<NNNN>-<event>.json` (REQ-WFDEF-6).
@@ -454,6 +463,12 @@ impl WaitRecord {
         position_path(&self.step)
     }
 
+    /// The failed child of the waiting stage (REQ-WFEXEC-61), as `wait_failed_child` reads
+    /// it from the payload.
+    pub fn failed_child(&self) -> Option<FailedChild> {
+        wait_failed_child(&self.payload)
+    }
+
     /// The fan-out step and one-based element the wait is at, read from `step` as
     /// `fan_out_element` reads a position.
     pub fn fan_out_element(&self) -> Option<(&str, u64)> {
@@ -731,9 +746,11 @@ fn resolve(operand: &Operand, run_id: &str, wait: &WaitRecord, event: &Value) ->
 /// A wait record's payload (REQ-WFEXEC-61, REQ-WFEXEC-62): for a `stop` wait the stop
 /// control's `by`, `at` and `payload`; otherwise the waiting step's committed outputs, its
 /// `outcome` and each `text` or `json` value, and `child`, the child run's directory
-/// relative to the run directory, when one ran. A `repair` wait an interrupted child routed
-/// to also carries `interrupted`, the interruption's `reason` and the child's `step`, and a
-/// `summary` beginning `interrupted` in place of any the step committed (REQ-WFEXEC-70).
+/// relative to the run directory, when one ran, and `failedChild`, the failed child the step
+/// recorded, when it recorded one (REQ-WFEXEC-77); each replaces an export of its name. A
+/// `repair` wait an interrupted child routed to also carries `interrupted`, the
+/// interruption's `reason` and the child's `step`, and a `summary` beginning `interrupted`
+/// in place of any the step committed (REQ-WFEXEC-70).
 /// `control` is the stop in force for a `stop` wait and, for an interrupted wait, the
 /// `control.interrupt` that requested the interruption: `interrupted` then also carries it
 /// as `control` and the `summary` names its `payload.reason`.
@@ -741,6 +758,7 @@ pub fn wait_payload(
     wait: &EnteredWait,
     steps: &BTreeMap<String, StepState<CapturedValue>>,
     child: Option<&str>,
+    failed_child: Option<&FailedChild>,
     control: Option<&ControlEvent>,
 ) -> Map<String, Value> {
     if wait.kind == WaitKind::Stop {
@@ -765,6 +783,9 @@ pub fn wait_payload(
     }
     if let Some(child) = child {
         payload.insert("child".to_owned(), Value::String(child.to_owned()));
+    }
+    if let Some(failed_child) = failed_child.and_then(|record| serde_json::to_value(record).ok()) {
+        payload.insert("failedChild".to_owned(), failed_child);
     }
     if let Some(interrupted) = wait.interrupted() {
         let reason = interrupted.reason.as_str();

@@ -89,6 +89,53 @@ fn frozen_archive_renders_context_dag_inspector_and_declarations() {
     );
 }
 
+// REQ-LOCALRUN-221: the archived interface draws a stage whose child failed with the failed
+// state's symbol, names the child's failing node in its graph detail and gives its failure
+// in the inspector, while its recorded state stays `succeeded`.
+#[test]
+fn archived_stage_whose_child_failed_is_drawn_failed() {
+    let mut attempt = archived_attempt(None);
+    attempt.workflow.steps.insert(
+        "prepare".to_owned(),
+        WorkflowPresentationStep::Workflow {
+            file: "design.yaml".to_owned(),
+            failure_policy: FailurePolicy::Required,
+            direct_dependencies: Vec::new(),
+            outputs: BTreeMap::from([
+                ("outcome".to_owned(), Output::TextAgentResponse),
+                ("plan".to_owned(), Output::TextAgentResponse),
+            ]),
+        },
+    );
+    attempt.steps[0].failed_child = Some(crate::workflow::evidence::FailedChild {
+        outcome: "failed".to_owned(),
+        item: None,
+        primary_issue: Box::new(PrimaryIssue::failed(
+            crate::workflow::validated::WorkflowNode {
+                id: "route".to_owned(),
+                role: WorkflowNodeRole::Step,
+            },
+            FailureDetail::interrupted_in_execution(),
+        )),
+    });
+    attempt.steps[0].committed_outputs = Some(1);
+    let view = ArchivedTerminalView::new(attempt);
+    let stage = &view.steps[0];
+    assert_eq!(stage.state(), StepStateKind::Failed);
+    let detail = stage.dag_detail().unwrap();
+    assert!(detail.contains("prepare.route"), "{detail}");
+    assert!(detail.contains("1 output committed"), "{detail}");
+    let fact = stage.inspector_fact().unwrap();
+    assert!(matches!(fact.tone, Tone::Failure));
+    assert!(fact.value.contains("prepare.route"), "{}", fact.value);
+
+    let graph = DagLayout::for_steps(&view.steps);
+    let mut interaction = ArchivedHostInteraction::default();
+    let rendered = buffer_text(&render_view(&view, &graph, &mut interaction, 300, 40));
+    assert!(rendered.contains("× prepare"), "{rendered:?}");
+    assert!(!rendered.contains("✓ prepare"), "{rendered:?}");
+}
+
 #[test]
 fn hostile_node_evidence_is_safe_in_live_and_archived_presentations() {
     let detail = crate::workflow::evidence::BlockedDetail::new([
@@ -598,6 +645,8 @@ fn archived_attempt(command_output: Option<ArchivedCommandOutput>) -> LocalArchi
                 command_output,
                 recovery: None,
                 invocations: Vec::new(),
+                failed_child: None,
+                committed_outputs: None,
             },
             ArchivedStep {
                 id: "verify".to_owned(),
@@ -611,6 +660,8 @@ fn archived_attempt(command_output: Option<ArchivedCommandOutput>) -> LocalArchi
                 command_output: None,
                 recovery: None,
                 invocations: Vec::new(),
+                failed_child: None,
+                committed_outputs: None,
             },
         ],
     }

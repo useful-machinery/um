@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "providers": [
+    {
+      "provider": "github",
+      "environment": {
+        "token": "GH_TOKEN",
+        "tokenFile": "GH_TOKEN_FILE"
+      }
+    },
+    {
+      "provider": "example",
+      "environment": {
+        "token": "EXAMPLE_ACCESS_TOKEN",
+        "tokenFile": "EXAMPLE_ACCESS_TOKEN_FILE"
+      }
+    }
+  ]
+}

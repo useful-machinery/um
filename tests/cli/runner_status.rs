@@ -614,9 +614,8 @@ fn runner_status_prints_each_provider_readiness_once_the_runner_has_set_up() {
     ]
     .concat();
     assert!(stdout.starts_with(&expected), "{stdout}");
-    // A readiness without `selected` or `lastUse`, as an earlier runner
-    // reports it, gives the availability its state alone gives
-    // (REQ-GRANT-53).
+    // A readiness without `lastUse`, as an earlier runner reports it, gives
+    // the availability its state alone gives (REQ-GRANT-53).
     super::runner_agent_login::assert_provider_lines(
         &stdout,
         &[
@@ -642,6 +641,41 @@ fn runner_status_prints_each_provider_readiness_once_the_runner_has_set_up() {
         !line("gitlab").contains("useful runner grant sync"),
         "{stdout}"
     );
+    assert!(output.stderr.is_empty());
+}
+
+// REQ-GRANT-92, REQ-RUNNERENROLL-42
+#[test]
+fn runner_status_prints_each_recorded_source_beside_its_provider() {
+    let output = run_status_with_response(
+        b"{\"schemaVersion\":1,\"outcome\":\"ok\",\"status\":{\"processState\":\"running\",\"bootId\":\"rbt_01k0z6r1w8f4jy2m7q9v3x5abc\",\"uptimeMilliseconds\":10000,\"connectionState\":\"connected\",\"assignmentCounts\":{\"preparing\":0,\"accepted\":0,\"running\":0,\"finishing\":0,\"reporting\":0},\"agentLogins\":{\"updatedAt\":\"2026-11-12T01:00:00Z\",\"providers\":[{\"provider\":\"codex\",\"state\":\"ready\",\"agentLoginId\":\"agl_01k0z6r1w8f4jy2m7q9v3x5abc\",\"generation\":3,\"checkedAt\":\"2026-11-12T01:00:00Z\",\"installedAt\":\"2026-11-12T00:55:00Z\",\"source\":\"grant\"},{\"provider\":\"claude_code\",\"state\":\"not_authorized\",\"checkedAt\":\"2026-11-12T01:00:00Z\",\"source\":\"host\"},{\"provider\":\"github\",\"state\":\"not_delivered\",\"checkedAt\":\"2026-11-12T01:00:00Z\",\"runId\":\"run_01k0z6r1w8f4jy2m7q9v3x5abp\",\"source\":\"host\"},{\"provider\":\"gitlab\",\"state\":\"not_authorized\",\"checkedAt\":\"2026-11-12T01:00:00Z\",\"runId\":\"run_01k0z6r1w8f4jy2m7q9v3x5abp\"},{\"provider\":\"linear\",\"state\":\"not_delivered\"}]}}}\n",
+    );
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    super::runner_agent_login::assert_provider_lines(
+        &stdout,
+        &[
+            ("codex", "ready", "unverified"),
+            ("claude_code", "not_authorized", "not_connected"),
+            ("github", "not_delivered", "not_delivered"),
+            ("gitlab", "not_authorized", "not_connected"),
+            ("linear", "not_delivered", "not_delivered"),
+        ],
+    );
+    for (provider, source) in [
+        ("codex", Some("grant")),
+        ("claude_code", Some("host")),
+        ("github", Some("host")),
+        ("gitlab", None),
+        ("linear", None),
+    ] {
+        assert_eq!(
+            super::runner_agent_login::printed_source(&stdout, provider),
+            source,
+            "{stdout}"
+        );
+    }
     assert!(output.stderr.is_empty());
 }
 
@@ -720,42 +754,35 @@ fn runner_status_names_the_grant_to_reconnect_by_its_grant_provider() {
     assert!(output.stderr.is_empty());
 }
 
-// REQ-RUNNERENROLL-42, REQ-GRANT-53, REQ-GRANT-77
+// REQ-RUNNERENROLL-42, REQ-GRANT-53, REQ-GRANT-77, REQ-GRANT-38
 #[test]
-fn runner_status_prints_the_availability_selection_and_last_use_give() {
+fn runner_status_prints_the_availability_the_state_and_last_use_give() {
     let output = run_status_with_response(
         b"{\"schemaVersion\":1,\"outcome\":\"ok\",\"status\":{\"processState\":\"running\",\"bootId\":\"rbt_01k0z6r1w8f4jy2m7q9v3x5abc\",\"uptimeMilliseconds\":10000,\"connectionState\":\"connected\",\"assignmentCounts\":{\"preparing\":0,\"accepted\":0,\"running\":0,\"finishing\":0,\"reporting\":0},\"agentLogins\":{\"updatedAt\":\"2026-11-12T01:00:00Z\",\"providers\":[{\"provider\":\"codex\",\"state\":\"ready\",\"agentLoginId\":\"agl_01k0z6r1w8f4jy2m7q9v3x5abc\",\"generation\":3,\"checkedAt\":\"2026-11-12T01:00:00Z\",\"installedAt\":\"2026-11-12T00:55:00Z\",\"selected\":true,\"lastUse\":\"refused\"},{\"provider\":\"claude_code\",\"state\":\"not_authorized\",\"agentLoginId\":\"agl_01k0z6r1w8f4jy2m7q9v3x5abd\",\"checkedAt\":\"2026-11-12T01:00:00Z\",\"selected\":true},{\"provider\":\"github\",\"state\":\"not_delivered\"},{\"provider\":\"gitlab\",\"state\":\"not_delivered\"},{\"provider\":\"linear\",\"state\":\"not_delivered\"}]}}}\n",
     );
 
-    // Status reports; it does not fail for a provider's availability.
+    // Status reports; it does not fail for a provider's availability. A
+    // serving process of an earlier release still says whether a provider
+    // was selected, which changes nothing.
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     super::runner_agent_login::assert_provider_lines(
         &stdout,
         &[
             ("codex", "ready", "reconnect_required"),
-            ("claude_code", "not_authorized", "insufficient_permission"),
+            ("claude_code", "not_authorized", "not_connected"),
             ("github", "not_delivered", "not_delivered"),
             ("gitlab", "not_delivered", "not_delivered"),
             ("linear", "not_delivered", "not_delivered"),
         ],
     );
-    // Each next action is the owner's, so its line names the agent login.
-    for (provider, next_action, agent_login_id) in [
-        ("codex", "reconnect", "agl_01k0z6r1w8f4jy2m7q9v3x5abc"),
-        (
-            "claude_code",
-            "restore_membership",
-            "agl_01k0z6r1w8f4jy2m7q9v3x5abd",
-        ),
-    ] {
-        let line = stdout
-            .lines()
-            .find(|line| line.starts_with(&format!("{provider} login:")))
-            .unwrap();
-        assert!(line.contains(next_action), "{line}");
-        assert!(line.contains(agent_login_id), "{line}");
-    }
+    // The next action is the owner's, so its line names the agent login.
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("codex login:"))
+        .unwrap();
+    assert!(line.contains("reconnect"), "{line}");
+    assert!(line.contains("agl_01k0z6r1w8f4jy2m7q9v3x5abc"), "{line}");
     // Its owner reconnects it with `useful grant create` (REQ-GRANT-77).
     let codex = stdout.lines().find(|line| line.starts_with("codex login:"));
     assert!(

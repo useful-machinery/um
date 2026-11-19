@@ -980,7 +980,7 @@
     },
     "EventName": {
       "type": "string",
-      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$"
+      "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)*$"
     },
     "ControlName": {
       "enum": ["answer", "approve", "hand_back", "retry", "stop", "lift", "withdraw", "cancel", "release"]
@@ -1001,8 +1001,9 @@
     },
     "Requires": {
       "type": "object",
+      "description": "What the workflow needs: host tools probed at admission and the integrations it declares, at least one of them.",
       "additionalProperties": false,
-      "required": ["tools"],
+      "minProperties": 1,
       "properties": {
         "tools": {
           "type": "array",
@@ -1010,6 +1011,45 @@
           "minItems": 1,
           "uniqueItems": true,
           "items": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$" }
+        },
+        "as": { "$ref": "#/$defs/IntegrationAs" },
+        "integrations": {
+          "type": "object",
+          "description": "The services the workflow needs, by provider id; declared only, read by no run.",
+          "minProperties": 1,
+          "propertyNames": { "$ref": "#/$defs/IntegrationProvider" },
+          "additionalProperties": { "$ref": "#/$defs/Integration" }
+        }
+      }
+    },
+    "IntegrationProvider": {
+      "description": "A provider id: the provider table's rows followed by the coding agents a member signs in.",
+      "enum": ["github", "gitlab.com", "linear", "claude_code", "codex"]
+    },
+    "IntegrationAs": {
+      "description": "Whose credentials act for an integration: a member's or the organization's.",
+      "enum": ["member", "org"]
+    },
+    "IntegrationBinding": {
+      "type": "object",
+      "description": "An integration binding's kind, a lowercase name whose vocabulary is not yet fixed.",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "maxLength": 64, "pattern": "^[a-z][a-z0-9_]*$" }
+      }
+    },
+    "Integration": {
+      "type": "object",
+      "description": "One declared integration: an optional as overriding requires.as, and optional bindings.",
+      "additionalProperties": false,
+      "properties": {
+        "as": { "$ref": "#/$defs/IntegrationAs" },
+        "bindings": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "$ref": "#/$defs/Identifier" },
+          "additionalProperties": { "$ref": "#/$defs/IntegrationBinding" }
         }
       }
     },
@@ -1127,7 +1167,11 @@
           "additionalProperties": { "type": "string" }
         },
         "stopBefore": { "$ref": "#/$defs/StopBefore" },
-        "owner": { "$ref": "#/$defs/Owner" }
+        "owner": { "$ref": "#/$defs/Owner" },
+        "busyBehavior": {
+          "description": "What a start does while the run for its subject is live: skip it, or queue the latest. Omitted, skip.",
+          "enum": ["skip", "queueLatest"]
+        }
       }
     },
     "ControlTrigger": {

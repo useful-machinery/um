@@ -2,6 +2,7 @@ use std::io::{self, Write};
 
 use anyhow::Context;
 use serde::Serialize;
+use serde_json::Value;
 use useful_api::{
     ProjectReadinessBlocker, Publication, PublicationState, Run, RunArtifactDelivery,
     RunCancellationReceipt, RunObservation, RunPublicationHandoffState,
@@ -513,6 +514,59 @@ pub(crate) fn write_route(out: &mut impl Write, run: &Run) -> io::Result<()> {
     Ok(())
 }
 
+/// One line for each provider of a Cloud run's credential sources, where the runner took
+/// its credential: the host, a grant of a member or a grant Cloud recorded no member of
+/// (REQ-RUN-107). A run that records none prints no line.
+pub(super) fn write_credential_sources(out: &mut impl Write, run: &Run) -> anyhow::Result<()> {
+    let Some(Some(sources)) = &run.credential_sources else {
+        return Ok(());
+    };
+    for entry in &sources.sources {
+        let provider = visible_text(&super::enum_text(&entry.provider)?);
+        let source = super::enum_text(&entry.source)?;
+        match entry.principal_id.as_deref() {
+            Some(principal) if source == "grant" => writeln!(
+                out,
+                "credential {provider}: grant of {}",
+                visible_text(principal)
+            )?,
+            _ => writeln!(out, "credential {provider}: {}", visible_text(&source))?,
+        }
+    }
+    Ok(())
+}
+
+/// One line for each integration a Cloud run's workflow declares, in the API's order, saying
+/// where its credential came from: the host, the member who connected it, the organization
+/// or a member Cloud names no principal of, or that nothing provided one, with the token
+/// version where there is one (REQ-RUN-109). A run without integration sources prints no
+/// line; a source this release has no words for prints as given.
+pub(super) fn write_integration_sources(out: &mut impl Write, run: &Run) -> anyhow::Result<()> {
+    let Some(entries) = &run.integration_sources else {
+        return Ok(());
+    };
+    for entry in entries {
+        let integration = visible_text(&entry.integration);
+        let source = entry.source.as_ref().map(super::enum_text).transpose()?;
+        let acted_as = entry.acted_as.as_ref().map(super::enum_text).transpose()?;
+        let what = match (source.as_deref(), entry.connected_by.as_deref()) {
+            (None, _) => "not provided".to_owned(),
+            (Some("host"), _) => "host".to_owned(),
+            (Some(_), Some(principal)) => format!("connected by {}", visible_text(principal)),
+            (Some(source), None) => match acted_as.as_deref() {
+                Some("org") => "connected by the organization".to_owned(),
+                Some("member") => "connected by a member".to_owned(),
+                _ => visible_text(source),
+            },
+        };
+        match entry.token_version {
+            Some(version) => writeln!(out, "integration {integration}: {what}, token v{version}")?,
+            None => writeln!(out, "integration {integration}: {what}")?,
+        }
+    }
+    Ok(())
+}
+
 /// The line saying what a queued run waits for, its reason in words and an unrecognized
 /// reason as given (REQ-RUN-100, REQ-RUN-101); nothing when it waits for nothing.
 pub(crate) fn write_waiting(out: &mut impl Write, observation: &RunObservation) -> io::Result<()> {
@@ -560,6 +614,92 @@ pub(crate) fn write_rejection(out: &mut impl Write, run: &Run) -> io::Result<()>
             io::Error::other("Cloud run recovery reason is not a contracted string")
         })?;
         writeln!(out, "  recovery reason: {}", visible_text(&reason))?;
+    }
+    Ok(())
+}
+
+/// A runner-reported scalar as the run commands print it, normalized for the terminal so a
+/// control character prints as an escape.
+pub(crate) fn reported_text(value: &str) -> String {
+    useful_execution::normalize_terminal_scalar(value.as_bytes())
+}
+
+/// The string at `key` of `object` as `reported_text` prints it, or `-` when it is absent,
+/// null or not a string.
+pub(crate) fn reported_field(object: &Value, key: &str) -> String {
+    object[key]
+        .as_str()
+        .map_or_else(|| "-".to_owned(), reported_text)
+}
+
+/// A position or wait step path as its elements joined by `.`, an item by its number.
+pub(crate) fn step_path(elements: &Value) -> String {
+    elements.as_array().map_or_else(
+        || "-".to_owned(),
+        |elements| {
+            elements
+                .iter()
+                .map(|element| match element {
+                    Value::String(step) => reported_text(step),
+                    other => other["item"]
+                        .as_i64()
+                        .map_or_else(|| "?".to_owned(), |item| item.to_string()),
+                })
+                .collect::<Vec<_>>()
+                .join(".")
+        },
+    )
+}
+
+/// A workflow wait's wire document as `<kind> at <step> since <since>`, the one rendering
+/// that `useful workflow run show --cloud`, `useful run show`, `useful run list` and the
+/// `--wait` observation line share (REQ-RUN-88, REQ-RUN-116, REQ-RUN-113).
+pub(crate) fn wait_phrase(wait: &Value) -> String {
+    format!(
+        "{} at {} since {}",
+        reported_field(wait, "kind"),
+        step_path(&wait["step"]),
+        reported_field(wait, "since")
+    )
+}
+
+/// A typed wait, a run read's or a listed run's, as `wait_phrase` renders its wire document.
+pub(super) fn typed_wait_phrase(wait: &impl Serialize) -> io::Result<String> {
+    serde_json::to_value(wait)
+        .map(|wait| wait_phrase(&wait))
+        .map_err(io::Error::other)
+}
+
+/// What a run read says its workflow waits for: `None` unless its workflow state is
+/// `waiting`, and then the wait's phrase, or `None` within when its progress carries no wait.
+pub(super) fn read_wait(run: &Run) -> io::Result<Option<Option<String>>> {
+    let state = run
+        .workflow_state
+        .flatten()
+        .and_then(useful_support::wire_name);
+    if state.as_deref() != Some("waiting") {
+        return Ok(None);
+    }
+    run.workflow_progress
+        .as_ref()
+        .and_then(Option::as_deref)
+        .and_then(|progress| progress.wait.as_deref())
+        .map(typed_wait_phrase)
+        .transpose()
+        .map(Some)
+}
+
+/// The line naming a run's workflow state, nothing when its read carries none, and under it
+/// while it waits the wait's kind, step and since (REQ-RUN-116).
+pub(super) fn write_workflow_state(out: &mut impl Write, run: &Run) -> io::Result<()> {
+    let Some(state) = run.workflow_state.flatten() else {
+        return Ok(());
+    };
+    let state = useful_support::wire_name(state)
+        .ok_or_else(|| io::Error::other("Cloud run workflow state is not a contracted string"))?;
+    writeln!(out, "workflow state: {state}")?;
+    if let Some(Some(wait)) = read_wait(run)? {
+        writeln!(out, "workflow wait: {wait}")?;
     }
     Ok(())
 }

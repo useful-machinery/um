@@ -36,6 +36,8 @@ const CLEANUP_AUTHORITY_STAGING_PREFIX: &str = ".useful-runner-serve-cleanup-sta
 const CLEANUP_AUTHORITY_HEADER: &str = "useful-runner-serve/cleanup-authority/v1";
 const CLEANUP_IDENTITY_ATTRIBUTE: &str = "user.useful.runner-cleanup-v1";
 const CLEANUP_IDENTITY_BYTES: usize = 32;
+#[cfg(feature = "test-fixtures")]
+const METADATA_CLEANUP_IDENTITY_VARIABLE: &str = "USEFUL_TEST_METADATA_CLEANUP_IDENTITY";
 const BOOT_MARKER: &[u8] = b"useful-runner-serve/boot-root/v1\n";
 const ASSIGNMENT_MARKER: &[u8] = b"useful-runner-serve/assignment-root/v1\n";
 // Historical boots are diagnostic-only. Never rewrite their evidence or use
@@ -434,6 +436,22 @@ impl WorkspaceFilesystem {
             cleanup_identity: Arc::new(ExtendedAttributeCleanupIdentityStore),
             workspace_release_spawner: Arc::new(ThreadWorkspaceReleaseSpawner),
         }
+    }
+
+    /// The filesystem of a serving runner's work root: the system's, except
+    /// that a `test-fixtures` build started with
+    /// `USEFUL_TEST_METADATA_CLEANUP_IDENTITY` set keeps cleanup identities in
+    /// directory metadata, as `testing` does, so the end-to-end tests of
+    /// `useful runner serve` can release a boot root in the Nix build sandbox,
+    /// which rejects extended attributes. Any other build reads no variable.
+    fn serving() -> Self {
+        #[cfg(feature = "test-fixtures")]
+        {
+            if std::env::var_os(METADATA_CLEANUP_IDENTITY_VARIABLE).is_some() {
+                return Self::testing();
+            }
+        }
+        Self::system()
     }
 
     #[cfg(any(test, feature = "test-fixtures"))]
@@ -1560,7 +1578,7 @@ pub(super) struct WorkRootLease {
 
 impl WorkRootLease {
     pub(super) fn acquire(work_root: &Path, boot_id: &str) -> Result<Arc<Self>, WorkRootError> {
-        Self::acquire_with(work_root, boot_id, WorkspaceFilesystem::system())
+        Self::acquire_with(work_root, boot_id, WorkspaceFilesystem::serving())
     }
 
     #[cfg(test)]
@@ -2024,9 +2042,23 @@ impl WorkRootLease {
         self.cancellation.cancel();
     }
 
+    #[cfg(test)]
     pub(super) fn enable_recovery(
         &self,
         runner_id: &str,
+        host: Arc<dyn super::recovery::RecoveryHost>,
+    ) -> Result<(), super::recovery::RecoveryError> {
+        self.enable_recovery_replacing(runner_id, &[], host)
+    }
+
+    /// Opens the work root's recovery store for `runner_id`. A root record
+    /// that names a runner in `replaced`, the runners this host's rejoins
+    /// replaced, is replaced for `runner_id` when it authenticates as that
+    /// runner's root (INV-RUNNER-37).
+    pub(super) fn enable_recovery_replacing(
+        &self,
+        runner_id: &str,
+        replaced: &[String],
         host: Arc<dyn super::recovery::RecoveryHost>,
     ) -> Result<(), super::recovery::RecoveryError> {
         let _cleanup = self
@@ -2042,6 +2074,7 @@ impl WorkRootLease {
             runner_id,
             self.boot_id()
                 .ok_or(super::recovery::RecoveryError::Record("boot ID"))?,
+            replaced,
             Arc::clone(&self.engine.serialized),
             host,
         )?;

@@ -31,7 +31,9 @@ use super::artifact::{ArtifactExposeFailure, ArtifactStaging, CaptureFailureKind
 use super::artifact_set;
 use super::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use super::document::{FailurePolicy, FinalizationTrigger};
-use super::evidence::{FailureDetail, NodeDetail, PrimaryIssue, deserialize_non_null_option};
+use super::evidence::{
+    FailedChild, FailureDetail, NodeDetail, PrimaryIssue, deserialize_non_null_option,
+};
 use super::execution_root::open_directory;
 use super::export_presentation::{ContentReason, Field, resolve_text};
 use super::git_capture::GitCaptureFailure;
@@ -105,6 +107,9 @@ pub struct WorkflowRunStep {
     pub command_output: Option<StepDiagnostic>,
     pub recovery: Option<StepRecoverySummaryV1>,
     pub invocations: Vec<RecoveryInvocationV1>,
+    /// The failed child a `succeeded` `workflow` step recorded (REQ-WFEXEC-77); `None` for
+    /// any other step.
+    pub failed_child: Option<FailedChild>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -824,6 +829,12 @@ impl WorkflowRunTerminalResultV1 {
     pub fn set_wait(&mut self, wait: super::wait::WaitRecord) {
         self.wait = Some(wait);
     }
+
+    /// The wait record the attempt wrote, which the summary's wait line reads
+    /// (REQ-LOCALRUN-220); `None` for an attempt that did not end `waiting`.
+    pub(crate) fn wait(&self) -> Option<&super::wait::WaitRecord> {
+        self.wait.as_ref()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1164,6 +1175,13 @@ pub struct WorkflowStepV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) diagnostic: Option<FailureDiagnosticV1>,
+    /// The failed child of a `succeeded` `workflow` step (REQ-WFEXEC-77, REQ-LOCALRUN-219).
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) failed_child: Option<FailedChild>,
     #[serde(
         default,
         deserialize_with = "deserialize_non_null_option",
@@ -3301,6 +3319,11 @@ fn step_v1(step: &WorkflowRunStep, local: bool) -> Result<WorkflowStepV1, LocalP
         StepState::Failed { detail } if local => FailureDiagnosticV1::project(detail)?,
         _ => None,
     };
+    // REQ-LOCALRUN-219: only a `succeeded` entry carries its failed child.
+    let failed_child = match &step.state {
+        StepState::Succeeded { .. } => step.failed_child.clone(),
+        _ => None,
+    };
     let command_output = step
         .command_output
         .as_ref()
@@ -3328,6 +3351,7 @@ fn step_v1(step: &WorkflowRunStep, local: bool) -> Result<WorkflowStepV1, LocalP
         duration_milliseconds,
         detail,
         diagnostic,
+        failed_child,
         command_output,
     })
 }
@@ -3785,7 +3809,6 @@ fn agent_failure_cause(failure: &AgentFailure) -> FailureCauseV1 {
 fn agent_failure_code(failure: &AgentFailureCause) -> FailureCodeV1 {
     match failure {
         AgentFailureCause::HarnessStartFailed { .. }
-        | AgentFailureCause::AgentLoginUnavailable
         | AgentFailureCause::HarnessSetupFailed { .. }
         | AgentFailureCause::HarnessSetupRejected { .. } => FailureCodeV1::HarnessStartFailed,
         AgentFailureCause::HarnessInputTooLarge { .. } => FailureCodeV1::HarnessInputTooLarge,

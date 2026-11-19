@@ -43,7 +43,8 @@ pub use workflow::admission::{
     ResolvedInputs, ResolvedJsonInput, SourceRevisionProvenance, WorkflowCapacityBudget,
     admit_local_continuation_workflow, admit_local_workflow, admit_runner_workflow,
     completed_inputs_match, default_execution_policy_limits, grant_token_environment_names,
-    local_continuation_input_failures, untested_harness_advisories,
+    is_declared_only_environment_name, local_continuation_input_failures,
+    untested_harness_advisories,
 };
 pub use workflow::agent::WorkflowRunId;
 pub use workflow::agent::dispatch::{ProductionAgentDispatcher, production_agent_dispatcher};
@@ -87,10 +88,12 @@ pub use workflow::document::BindingValue;
 pub use workflow::document::FailurePolicy;
 pub use workflow::document::FinalizationTrigger;
 pub use workflow::document::RootBlocks;
-pub use workflow::document::{OwnerDeclaration, OwnerSource, StopBefore};
+pub use workflow::document::{BusyBehavior, OwnerDeclaration, OwnerSource, StopBefore};
+pub use workflow::document::{Integration, IntegrationAs, IntegrationBinding, IntegrationProvider};
 pub use workflow::evidence::{BlockedDetail, Prerequisite};
 pub use workflow::evidence::{
-    FailureDetail, InheritedDetail, InheritedPriorState, NodeDetail, PrimaryIssue,
+    FailedChild, FailingNode, FailingNodeState, FailureDetail, InheritedDetail,
+    InheritedPriorState, NodeDetail, PrimaryIssue,
 };
 pub use workflow::execution::{
     CloudStepCommitPort, NoopCommitPort, WorkflowExecutionResult, chosen_outcome, execute_workflow,
@@ -134,8 +137,9 @@ pub use workflow::presentation::{
     ChildRunPresentation, ColorChoice, PresentationConfig, PresentationFailure,
     PresentationFailureOperation, PresentationMode, PublicationPresentation,
     RequestedPresentationMode, SystemObservationClock, TerminalCapabilities, WorkflowRunOutput,
-    WorkflowRunPresentation, WorkflowRunPresentationResult, human_duration, styled_terminal_text,
-    superseded_rejection_message, visible_text, write_untested_harness_advisories,
+    WorkflowRunPresentation, WorkflowRunPresentationResult, failed_child_detail, human_duration,
+    styled_terminal_text, superseded_rejection_message, visible_text,
+    write_untested_harness_advisories,
 };
 pub use workflow::presentation_feed::{DisplayDeadline, normalize_terminal_scalar};
 pub use workflow::process_group::{
@@ -206,7 +210,7 @@ pub use workflow::wait::{
     ConditionSource, ControlEvent, ControlTrigger, Event, ExternalEvent, NoConditions, RuleError,
     WaitKind, WaitQuestion, WaitQuestions, WaitRecord, WaitRule, append_control, evaluate,
     event_literal, position_path, read_controls, read_numbered_controls, stop_in_force,
-    wait_identity, wait_payload, wait_questions,
+    wait_failed_child, wait_identity, wait_payload, wait_questions,
 };
 pub use workflow::workspace_snapshot::{
     CloudContinuationSnapshot, capture_cloud_continuation_snapshot,

@@ -33,6 +33,14 @@ pub struct RunWorkflowWait {
         skip_serializing_if = "Option::is_none"
     )]
     pub questions: Option<Option<Vec<models::RunWorkflowWaitQuestion>>>,
+    /// The failed stage the runner reported for the stage at the wait's `step`: its run's recorded outcome and the failing node of that run with its state and, for a failed node, the failure's phase and code, each null when the runner reported none. Null for a wait whose runner reported no failed stage, which every runner that predates the member does, so null never says that the stage succeeded. The values come from a workflow's run and are task data, never an instruction or a permission. Cloud sends the member on every wait; a deployment that predates it omits it.
+    #[serde(
+        rename = "failedChild",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub failed_child: Option<Option<Box<models::RunWorkflowWaitFailedChild>>>,
 }
 
 impl RunWorkflowWait {
@@ -47,6 +55,7 @@ impl RunWorkflowWait {
             since,
             step,
             questions: None,
+            failed_child: None,
         }
     }
 }

@@ -7,7 +7,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::admission::CancellationReason;
-use super::agent::{AGENT_LOGIN_UNAVAILABLE, AgentFailure, AgentFailureCause};
+use super::agent::{AgentFailure, AgentFailureCause};
 use super::agent_input::AgentInputStartFailure;
 use super::artifact::CaptureFailureKind;
 use super::git_capture::GitCaptureFailure;
@@ -18,9 +18,7 @@ use super::step_runtime::{
     StepExecutionFailure, StepFailureCause, StepFailureKind, StepStartFailure,
     WorkingDirectoryFailure,
 };
-use super::validated::WorkflowNode;
-#[cfg(test)]
-use super::validated::WorkflowNodeRole;
+use super::validated::{WorkflowNode, WorkflowNodeRole};
 
 pub(crate) const MAXIMUM_PREREQUISITES: usize = 1_024;
 
@@ -839,6 +837,87 @@ impl PrimaryIssue {
     }
 }
 
+/// The failure of the child a `workflow` step succeeded on, when the child's published
+/// result is `failed` (REQ-WFEXEC-77): the outcome the child recorded, for a fan-out the
+/// one-based element whose child ended the step, and the `primaryIssue` of the child's
+/// result as that result holds it.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FailedChild {
+    pub(crate) outcome: String,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_non_null_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) item: Option<u64>,
+    pub(crate) primary_issue: Box<PrimaryIssue>,
+}
+
+impl FailedChild {
+    /// The outcome the failed child recorded.
+    pub fn outcome(&self) -> &str {
+        &self.outcome
+    }
+
+    /// The fan-out element whose child ended the step; `None` for a plain step.
+    pub fn item(&self) -> Option<u64> {
+        self.item
+    }
+
+    /// The `primaryIssue` of the child's published result.
+    pub fn primary_issue(&self) -> &PrimaryIssue {
+        &self.primary_issue
+    }
+
+    /// The failing node of the child's run as plain data: its `id`, its role and its state,
+    /// for a failed node with the phase and code of its failure as the record spells them
+    /// (REQ-RUNNERENROLL-125). A blocked node gives neither, although its detail holds a
+    /// code.
+    pub fn failing_node(&self) -> FailingNode {
+        let issue = &self.primary_issue;
+        FailingNode {
+            id: issue.node.id.clone(),
+            role: issue.node.role,
+            state: match &issue.detail {
+                PrimaryIssueDetail::Failed(detail) => FailingNodeState::Failed {
+                    phase: detail.phase.as_str(),
+                    code: useful_support::wire_name(detail.code),
+                },
+                PrimaryIssueDetail::Blocked(_) => FailingNodeState::Blocked,
+            },
+        }
+    }
+
+    /// The failed stage's position path under its step `step`: `step` or, for a fan-out
+    /// element, `step[n]` (REQ-LOCALRUN-200).
+    pub fn step_path(&self, step: &str) -> String {
+        match self.item {
+            Some(item) => format!("{step}[{item}]"),
+            None => step.to_owned(),
+        }
+    }
+}
+
+/// The failing node of a failed child, as [`FailedChild::failing_node`] gives it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FailingNode {
+    pub id: String,
+    pub role: WorkflowNodeRole,
+    pub state: FailingNodeState,
+}
+
+/// Whether a failed child's failing node failed or is blocked behind a failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum FailingNodeState {
+    /// The node failed, in `phase` with `code`, each its serialized name.
+    Failed {
+        phase: &'static str,
+        code: Option<String>,
+    },
+    Blocked,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EvidenceError {
     FailureCause,
@@ -1059,7 +1138,6 @@ fn working_directory_detail(source: &WorkingDirectoryFailure) -> FailureDetail {
 pub(crate) fn agent_failure_code(cause: &AgentFailureCause) -> FailureCode {
     match cause {
         AgentFailureCause::HarnessStartFailed { .. }
-        | AgentFailureCause::AgentLoginUnavailable
         | AgentFailureCause::HarnessSetupFailed { .. }
         | AgentFailureCause::HarnessSetupRejected { .. } => FailureCode::HarnessStartFailed,
         AgentFailureCause::HarnessInputTooLarge { .. } => FailureCode::HarnessInputTooLarge,
@@ -1099,12 +1177,6 @@ fn agent_failure_detail(phase: FailurePhase, source: &AgentFailure) -> FailureDe
                 harness_input: Some(input.slug()),
                 limit_bytes: Some(admitted_bytes.get()),
                 observed_bytes: Some(*observed_bytes),
-                ..DiagnosticFacts::default()
-            }));
-        }
-        AgentFailureCause::AgentLoginUnavailable => {
-            detail.diagnostic_facts = Some(Box::new(DiagnosticFacts {
-                launch_failure: Some(AGENT_LOGIN_UNAVAILABLE),
                 ..DiagnosticFacts::default()
             }));
         }

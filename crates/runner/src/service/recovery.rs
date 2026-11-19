@@ -446,6 +446,7 @@ impl RecoveryStore {
         authority: WorkRootAuthority,
         runner_id: &str,
         boot_id: &str,
+        replaced: &[String],
         cleanup_gate: std::sync::Arc<std::sync::Mutex<()>>,
         host: std::sync::Arc<dyn RecoveryHost>,
     ) -> Result<Self, RecoveryError> {
@@ -475,31 +476,55 @@ impl RecoveryStore {
                 }
                 // A torn catalog cannot be healed by minting new IDs. The first
                 // record for a root is created only when no V1 record is present.
-                let record = RootRecord {
-                    schema_version: 1,
-                    runner_id: runner_id.to_owned(),
-                    work_root_id: public_id("rwr_"),
-                    installation_id: public_id("rin_"),
-                    binding: store.binding.clone(),
-                    catalog: Vec::new(),
-                };
-                persist(dir, ROOT, &record, false)?;
+                persist(dir, ROOT, &store.first_root_record(), false)?;
             }
             Ok(_) => {
-                store.root()?;
+                if let Err(error) = store.root() {
+                    // A rejoin replaced the runner this record names: one rename
+                    // installs a first record for the host's runner over a record
+                    // that authenticates as that runner's root (INV-RUNNER-37).
+                    // The replaced runner's trees stay, uncataloged.
+                    let replaced_root = read_record::<RootRecord>(dir, ROOT).is_ok_and(|record| {
+                        record.runner_id != store.runner_id
+                            && replaced.contains(&record.runner_id)
+                            && store.root_of(&record.runner_id).is_ok()
+                    });
+                    if !replaced_root {
+                        return Err(error);
+                    }
+                    persist(dir, ROOT, &store.first_root_record(), true)?;
+                }
             }
             Err(_) => return Err(invalid("root record")),
         }
         Ok(store)
     }
 
+    // A new root record for this store's runner and binding: new work-root
+    // and installation IDs and an empty catalog.
+    fn first_root_record(&self) -> RootRecord {
+        RootRecord {
+            schema_version: 1,
+            runner_id: self.runner_id.clone(),
+            work_root_id: public_id("rwr_"),
+            installation_id: public_id("rin_"),
+            binding: self.binding.clone(),
+            catalog: Vec::new(),
+        }
+    }
+
     fn root(&self) -> Result<RootRecord, RecoveryError> {
+        self.root_of(&self.runner_id)
+    }
+
+    // The root record, authenticated as `runner_id`'s root for this directory.
+    fn root_of(&self, runner_id: &str) -> Result<RootRecord, RecoveryError> {
         self.authority
             .validate()
             .map_err(|_| invalid("root lease"))?;
         let root: RootRecord = read_record(&self.authority.shared.directory_lock, ROOT)?;
         if root.schema_version != 1
-            || root.runner_id != self.runner_id
+            || root.runner_id != runner_id
             || root.binding != self.binding
             || !valid_id(&root.runner_id, "rnr_")
             || !valid_id(&root.work_root_id, "rwr_")
@@ -1153,6 +1178,9 @@ fn open_private_directory(
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
+
+#[cfg(test)]
+mod rebind_tests;
 
 #[cfg(test)]
 pub(super) mod host_fixture;

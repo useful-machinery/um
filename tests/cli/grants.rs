@@ -123,7 +123,11 @@ fn list_returns_one_page_of_grants_without_material() {
     assert_eq!(after_notice(&output, "useful grant list"), "");
     assert_no_secret_output(&output, &[SENTINEL]);
     let request = server.finish().pop().unwrap();
-    assert!(request.starts_with("GET /api/v1/me/grants?limit=2&cursor=page-before HTTP/1.1\r\n"));
+    assert!(
+        request.starts_with(
+            "GET /api/v1/me/grants?limit=2&cursor=page-before&vocabulary=2 HTTP/1.1\r\n"
+        )
+    );
     assert_eq!(
         header_value(&request, "authorization"),
         format!("Bearer {TOKEN}")
@@ -232,7 +236,7 @@ fn uses_lists_the_tokens_issued_from_one_grant() {
     assert_no_secret_output(&output, &[SENTINEL]);
     let request = server.finish().pop().unwrap();
     assert!(request.starts_with(&format!(
-        "GET /api/v1/me/grants/{GRANT_ID}/uses?limit=1 HTTP/1.1\r\n"
+        "GET /api/v1/me/grants/{GRANT_ID}/uses?limit=1&vocabulary=2 HTTP/1.1\r\n"
     )));
 }
 
@@ -413,7 +417,7 @@ fn create_starts_a_consent_prints_its_url_and_polls_until_the_grant_exists() {
     assert_no_secret_output(&output, &[SENTINEL]);
     let requests = server.finish();
     assert_eq!(requests.len(), 3);
-    assert!(requests[0].starts_with("POST /api/v1/me/grants HTTP/1.1\r\n"));
+    assert!(requests[0].starts_with("POST /api/v1/me/grants?vocabulary=2 HTTP/1.1\r\n"));
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(request_body(&requests[0])).unwrap(),
         serde_json::json!({"provider": "github"})
@@ -422,7 +426,7 @@ fn create_starts_a_consent_prints_its_url_and_polls_until_the_grant_exists() {
     assert!(!header_value(&requests[0], "idempotency-key").is_empty());
     for request in &requests[1..] {
         assert!(request.starts_with(&format!(
-            "GET /api/v1/me/grant-sessions/{SESSION_ID} HTTP/1.1\r\n"
+            "GET /api/v1/me/grant-sessions/{SESSION_ID}?vocabulary=2 HTTP/1.1\r\n"
         )));
     }
 }
@@ -505,10 +509,55 @@ fn create_for_a_linked_identity_posts_no_body_and_returns_without_waiting() {
     let requests = server.finish();
     assert_eq!(requests.len(), 1);
     assert!(requests[0].starts_with(&format!(
-        "POST /api/v1/me/identities/{IDENTITY_ID}/grants HTTP/1.1\r\n"
+        "POST /api/v1/me/identities/{IDENTITY_ID}/grants?vocabulary=2 HTTP/1.1\r\n"
     )));
     assert!(!header_value(&requests[0], "idempotency-key").is_empty());
     assert_eq!(request_body(&requests[0]), "");
+}
+
+// REQ-GRANT-96: a consent at a provider with no built-in title is named and titled by its id,
+// never as another provider's.
+#[test]
+fn create_for_a_linked_identity_at_any_provider_names_the_consent_by_its_provider() {
+    let mut pending = consent("pending");
+    pending["identityId"] = IDENTITY_ID.into();
+    pending["provider"] = "example".into();
+    let started = || json_http_response("201 Created", pending.clone());
+    let (server, _directory, credential) = prepared(vec![started(), started()]);
+    let args = [
+        "create",
+        "github",
+        "--identity-id",
+        IDENTITY_ID,
+        "--no-wait",
+    ];
+    let json = run_grant(&server, &credential, &[&args[..], &["--json"]].concat());
+    let human = run_grant(&server, &credential, &args);
+
+    assert!(
+        json.status.success(),
+        "{}",
+        String::from_utf8_lossy(&json.stderr)
+    );
+    let lines = json_lines(&json);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["event"], "consent_required");
+    assert_eq!(lines[0]["provider"], "example");
+    assert_eq!(human.status.code(), Some(0));
+    let text = String::from_utf8(human.stdout).unwrap();
+    assert!(text.contains("provider: example"), "{text}");
+    assert!(!text.contains("GitHub"), "{text}");
+    assert!(!text.contains("provider: github"), "{text}");
+    let requests = server.finish();
+    assert_eq!(requests.len(), 2);
+    for request in &requests {
+        assert!(
+            request.starts_with(&format!(
+                "POST /api/v1/me/identities/{IDENTITY_ID}/grants?vocabulary=2 HTTP/1.1\r\n"
+            )),
+            "{request}"
+        );
+    }
 }
 
 // REQ-GRANT-1, REQ-GRANT-4

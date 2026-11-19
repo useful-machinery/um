@@ -978,8 +978,10 @@ pub(super) async fn exclusive_conformance_executable()
     let executable = conformance_executable();
     // Native startup is resource-intensive enough that concurrent qualification cases can
     // exhaust their anti-hang watchdogs before reaching controlled provider I/O, so this
-    // mutex admits one exact-binary case at a time. Load from outside the suite is left to
-    // `host_scaled_watchdog`, which scales each case's `WATCHDOG` base by the host's load.
+    // mutex admits one exact-binary case at a time. The lifecycle matrix is one such case: it
+    // holds the guard for its whole run and overlaps only its own slow tier under it
+    // (INV-HARNESS-19). Load from outside the suite is left to `host_scaled_watchdog`, which
+    // scales each case's `WATCHDOG` base by the host's load.
     let exclusive = EXACT_BINARY_CONFORMANCE.lock().await;
     (executable, exclusive)
 }

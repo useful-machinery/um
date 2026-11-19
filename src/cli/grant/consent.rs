@@ -49,9 +49,9 @@ impl Front {
 }
 
 /// One consent to run.
-pub(in crate::cli) struct Consent {
+pub(in crate::cli) struct Consent<'a> {
     pub(in crate::cli) front: Front,
-    pub(in crate::cli) provider: ConsentProvider,
+    pub(in crate::cli) provider: ConsentProvider<'a>,
     /// The linked identity to bind the grant to; without one the consent finds or creates the
     /// link.
     pub(in crate::cli) identity_id: Option<String>,
@@ -60,6 +60,27 @@ pub(in crate::cli) struct Consent {
     pub(in crate::cli) no_wait: bool,
     pub(in crate::cli) timeout: Option<Duration>,
     pub(in crate::cli) options: Options,
+}
+
+/// A consent as it runs, apart from the command that began it, so the provider's name and title
+/// are its own: a served title is the deployment's text, not the CLI's.
+struct Running {
+    front: Front,
+    name: String,
+    title: String,
+    identity_id: Option<String>,
+    open: bool,
+    no_wait: bool,
+    options: Options,
+}
+
+impl Running {
+    fn provider(&self) -> ConsentProvider<'_> {
+        ConsentProvider {
+            name: &self.name,
+            title: &self.title,
+        }
+    }
 }
 
 /// The consent this invocation started, once its session is known.
@@ -75,7 +96,7 @@ pub(super) struct Ended {
     pub(super) unavailable: bool,
 }
 
-impl Consent {
+impl Consent<'_> {
     pub(in crate::cli) fn run(self, deployment: &Deployment) -> super::super::CommandResult {
         self.run_to_end(deployment).map(|ended| ended.code)
     }
@@ -89,9 +110,18 @@ impl Consent {
         let key = useful_support::generate_idempotency_key()
             .context("generate provider grant consent request key")?;
         let timeout = (!self.no_wait).then(|| self.timeout.unwrap_or(CONSENT_TIMEOUT));
+        let consent = Running {
+            front: self.front,
+            name: self.provider.name.to_owned(),
+            title: self.provider.title.to_owned(),
+            identity_id: self.identity_id,
+            open: self.open,
+            no_wait: self.no_wait,
+            options: self.options,
+        };
         let deployment = deployment.clone();
-        let front = self.front;
-        let json = self.options.json;
+        let front = consent.front;
+        let json = consent.options.json;
         let signal_deployment = deployment.fingerprint().api_url().to_owned();
         let timeout_deployment = signal_deployment.clone();
         let code = super::super::execute_mutation_with_signals_and_deferred_timeout(
@@ -102,11 +132,11 @@ impl Consent {
                 if !control.begin_dispatch() {
                     return Ok(ExitCode::Interrupted);
                 }
-                let result = with_api(&deployment, &self.options, |api| {
+                let result = with_api(&deployment, &consent.options, |api| {
                     // A lost response may have started the consent. Replay only this key, once.
-                    let start = || match &self.identity_id {
+                    let start = || match &consent.identity_id {
                         Some(identity_id) => api.start_for_identity(identity_id, &key),
-                        None => api.start(self.provider.request, &key),
+                        None => api.start(&consent.name, &key),
                     };
                     match start() {
                         Err(GrantFailure::Unreachable { .. }) => start(),
@@ -124,7 +154,7 @@ impl Consent {
                             output::write_consent_failure(
                                 api_url,
                                 front,
-                                self.provider,
+                                consent.provider(),
                                 None,
                                 &failure,
                                 json,
@@ -137,7 +167,7 @@ impl Consent {
                 }) {
                     return Ok(ExitCode::Interrupted);
                 }
-                let view = SessionView::new(&session, front);
+                let view = SessionView::new(&session, front, consent.provider());
                 if !view.is_pending() {
                     return finish(control, || view.write_result(api_url, false, json));
                 }
@@ -145,12 +175,12 @@ impl Consent {
                 // the browser is only started, so the wait below does not wait on it either.
                 let show = || {
                     let code = view.write_pending(api_url, json)?;
-                    if let Some(url) = view.authorization_url().filter(|_| self.open) {
+                    if let Some(url) = view.authorization_url().filter(|_| consent.open) {
                         super::browser::open(url);
                     }
                     Ok(code)
                 };
-                if self.no_wait {
+                if consent.no_wait {
                     return finish(control, show);
                 }
                 if control.is_cancelled() {
@@ -158,7 +188,7 @@ impl Consent {
                 }
                 show()?;
                 timeout_start.start();
-                observe(&deployment, &self, &session.id, control)
+                observe(&deployment, &consent, &session.id, control)
             },
             move |signal, snapshot| {
                 if !snapshot.dispatched {
@@ -197,7 +227,7 @@ fn with_api<T>(
 /// and a rate-limited one waits out the server's `Retry-After`.
 fn observe(
     deployment: &Deployment,
-    consent: &Consent,
+    consent: &Running,
     id: &str,
     control: &OperationControl,
 ) -> super::super::CommandResult {
@@ -209,12 +239,15 @@ fn observe(
             return Ok(ExitCode::Interrupted);
         }
         match with_api(deployment, &consent.options, |api| api.session(id))? {
-            Ok(session) if SessionView::new(&session, consent.front).is_pending() => {
+            Ok(session)
+                if SessionView::new(&session, consent.front, consent.provider()).is_pending() =>
+            {
                 next = ceremony_poll_interval();
             }
             Ok(session) => {
                 return finish(control, || {
-                    SessionView::new(&session, consent.front).write_result(api_url, true, json)
+                    SessionView::new(&session, consent.front, consent.provider())
+                        .write_result(api_url, true, json)
                 });
             }
             Err(GrantFailure::RateLimited { retry_after }) => next = retry_delay(retry_after),
@@ -223,7 +256,7 @@ fn observe(
                     output::write_consent_failure(
                         api_url,
                         consent.front,
-                        consent.provider,
+                        consent.provider(),
                         Some(id),
                         &failure,
                         json,

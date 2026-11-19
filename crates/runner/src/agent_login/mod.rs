@@ -6,7 +6,10 @@
 //! answered each use of what it offered (REQ-GRANT-52), and checking a
 //! login it holds with its provider (REQ-GRANT-90). Each admission also
 //! asks Cloud for the grant tokens of its own assignment and keeps them
-//! until the assignment ends (REQ-GRANT-86).
+//! until the assignment ends (REQ-GRANT-86). Where each provider's
+//! credential comes from, the host or a grant, is settled by one rule,
+//! `credential_source`, which the readiness document, the offer and what
+//! the runner reports all take (REQ-GRANT-92, INV-RUNNER-31).
 
 pub(crate) mod check;
 pub(crate) mod claude_code;
@@ -17,16 +20,18 @@ pub(crate) mod grant_token;
 pub(crate) mod readiness;
 pub(crate) mod setup;
 
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::io;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use useful_execution::{
-    CLAUDE_CODE_LOGIN_VARIABLE, CODEX_LOGIN_VARIABLE, EnvironmentSnapshot,
-    grant_token_environment_names,
-};
+use useful_execution::{CLAUDE_CODE_LOGIN_VARIABLE, CODEX_LOGIN_VARIABLE, EnvironmentSnapshot};
 
-use crate::control_protocol::{AgentLoginCheckCause, AgentLoginProvider, AgentLoginState};
+use crate::control_protocol::{
+    AgentLoginCheckCause, AgentLoginProvider, AgentLoginState, CredentialSource,
+};
 use crate::telemetry;
 use directory::LoginDirectory;
 
@@ -43,29 +48,96 @@ pub(crate) fn valid_token(bytes: &[u8]) -> bool {
 }
 
 /// The serving process's environment as far as standing back for the
-/// service's own logins needs it. Setup takes it as a value so that the
+/// service's own credentials needs it. Setup takes it as a value so that the
 /// decision rests on the service's environment, which only the serving
-/// process has. It keeps whether the service carries
-/// `CLAUDE_CODE_OAUTH_TOKEN` or `CODEX_HOME`, never their values.
+/// process has. It keeps the name of every variable the service carries,
+/// never a value, so that whether the host provides an OAuth provider can be
+/// answered for any name, one first seen in Cloud's list of an assignment's
+/// providers included (REQ-GRANT-87); whether the service carries
+/// `CLAUDE_CODE_OAUTH_TOKEN` or `CODEX_HOME`; and where its `HOME` and
+/// `CLAUDE_CONFIG_DIR` are, so that a login file under them can be looked
+/// for.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ServiceEnvironment {
     home: Option<OsString>,
     claude_config_dir: Option<OsString>,
     claude_code_oauth_token: bool,
     codex_home: bool,
+    /// The name of every variable the service carries.
+    names: BTreeSet<OsString>,
 }
 
 impl ServiceEnvironment {
-    /// Reads `HOME`, `CLAUDE_CONFIG_DIR` and whether
-    /// `CLAUDE_CODE_OAUTH_TOKEN` and `CODEX_HOME` are set through `lookup`,
-    /// for example `std::env::var_os`.
-    pub(crate) fn from_lookup(lookup: impl Fn(&str) -> Option<OsString>) -> Self {
-        Self {
-            home: lookup("HOME"),
-            claude_config_dir: lookup("CLAUDE_CONFIG_DIR"),
-            claude_code_oauth_token: lookup(CLAUDE_CODE_LOGIN_VARIABLE).is_some(),
-            codex_home: lookup(CODEX_LOGIN_VARIABLE).is_some(),
+    /// The environment of a service whose variables are `variables`, for
+    /// example `std::env::vars_os()`: the name of each, and the values of
+    /// `HOME` and `CLAUDE_CONFIG_DIR` alone.
+    pub(crate) fn from_variables<I, Name, Value>(variables: I) -> Self
+    where
+        I: IntoIterator<Item = (Name, Value)>,
+        Name: Into<OsString>,
+        Value: Into<OsString>,
+    {
+        let mut environment = Self::default();
+        for (name, value) in variables {
+            let name = name.into();
+            if name == "HOME" {
+                environment.home = Some(value.into());
+            } else if name == "CLAUDE_CONFIG_DIR" {
+                environment.claude_config_dir = Some(value.into());
+            }
+            environment.names.insert(name);
         }
+        environment.claude_code_oauth_token = environment.carries(CLAUDE_CODE_LOGIN_VARIABLE);
+        environment.codex_home = environment.carries(CODEX_LOGIN_VARIABLE);
+        environment
+    }
+
+    /// The environment of the service whose process environment is
+    /// `process`.
+    pub(crate) fn of(process: &EnvironmentSnapshot) -> Self {
+        Self::from_variables(
+            process
+                .variables()
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        )
+    }
+
+    /// Whether the service carries the variable `name`, whatever its value.
+    pub(crate) fn carries(&self, name: &str) -> bool {
+        self.names.contains(OsStr::new(name))
+    }
+
+    /// Whether the host provides the OAuth provider: the service carries
+    /// either of its two names, so the runner asks for and offers no grant
+    /// token of it, and both names stay as the service has them
+    /// (REQ-GRANT-87).
+    pub(crate) fn provides(&self, provider: AgentLoginProvider) -> bool {
+        grant_token::OFFERED_VARIABLES
+            .iter()
+            .any(|&(offered, variable, file_variable)| {
+                offered == provider && (self.carries(variable) || self.carries(file_variable))
+            })
+    }
+
+    /// `relative` under the service's `HOME`; none while `HOME` is unset or
+    /// not absolute.
+    fn under_home(&self, relative: &str) -> Option<PathBuf> {
+        self.home
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|home| home.is_absolute())
+            .map(|home| home.join(relative))
+    }
+}
+
+/// Whether a file of the service's own login is present at `path`. It is
+/// only looked at, never opened or followed, and one the runner cannot tell
+/// is absent counts as present (REQ-GRANT-45, REQ-GRANT-51).
+fn login_file_present(path: &Path) -> bool {
+    match fs::symlink_metadata(path) {
+        Ok(_) => true,
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
     }
 }
 
@@ -175,22 +247,69 @@ impl FailureCause {
     }
 }
 
-/// What an admission is offered: the environment its steps draw from, and
-/// the login variables withheld from it (REQ-GRANT-51, INV-RUNNER-17).
+/// Where `provider`'s credential comes from for an assignment the runner
+/// admits now (REQ-GRANT-92, INV-RUNNER-31): `host` for an OAuth provider
+/// the service environment `service` provides (REQ-GRANT-87) and for a
+/// coding agent the service has a login of its own of (REQ-GRANT-51),
+/// whatever Cloud answered; `grant` for an OAuth provider whose token
+/// `grant_tokens` holds and can read back, and for a coding agent whose
+/// login the runner keeps in `directory` and the offer therefore adds; none
+/// otherwise. It reads what the offer reads, through the same functions, so
+/// the source recorded, reported and offered never disagree.
+pub(crate) fn credential_source(
+    provider: AgentLoginProvider,
+    service: &ServiceEnvironment,
+    directory: Option<&LoginDirectory>,
+    grant_tokens: Option<&grant_token::AssignmentGrantTokens>,
+) -> Option<CredentialSource> {
+    let (host, grant) = match provider {
+        AgentLoginProvider::Codex => (
+            codex::foreign_login(service),
+            directory.is_some_and(|directory| codex::offered_home(service, directory).is_some()),
+        ),
+        AgentLoginProvider::ClaudeCode => (
+            claude_code::foreign_login(service),
+            directory
+                .is_some_and(|directory| claude_code::offered_token(service, directory).is_some()),
+        ),
+        AgentLoginProvider::Github | AgentLoginProvider::Gitlab | AgentLoginProvider::Linear => (
+            service.provides(provider),
+            grant_tokens.is_some_and(|tokens| tokens.holds(provider)),
+        ),
+    };
+    if host {
+        Some(CredentialSource::Host)
+    } else if grant {
+        Some(CredentialSource::Grant)
+    } else {
+        None
+    }
+}
+
+/// A provider's credential source as an admission settled it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderSource {
+    pub(crate) provider: AgentLoginProvider,
+    pub(crate) source: CredentialSource,
+}
+
+/// What an admission is offered: the environment its steps draw from
+/// (REQ-GRANT-51, INV-RUNNER-17), and where each provider's credential in it
+/// comes from (REQ-GRANT-92).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct Offer {
     /// The process environment, with each agent login the runner offers
     /// added as the variable its coding agent reads.
     pub(crate) environment: EnvironmentSnapshot,
-    /// The variable of each coding agent whose provider is selected, which
-    /// the runner has no login of to offer and the service has none of its
-    /// own for: an agent step that would have received it fails rather than
-    /// start on the service's own login (INV-ENGINE-35).
-    pub(crate) withheld: Vec<&'static str>,
     /// Each variable added to `environment` whose login the readiness
     /// document records as installed, with that install: the uses an
     /// admission notes (REQ-GRANT-52).
     pub(crate) offered: Vec<OfferedLogin>,
+    /// Each provider that has a source, in `AgentLoginProvider::ALL`'s
+    /// order, as `credential_source` settles it from the process
+    /// environment, the directory and the grant tokens the offer is built
+    /// from (INV-RUNNER-31).
+    pub(crate) sources: Vec<ProviderSource>,
 }
 
 /// A login the runner added to an admission's environment, as the
@@ -205,32 +324,61 @@ pub(crate) struct OfferedLogin {
 }
 
 /// What the admission is offered with the agent logins the runner keeps in
-/// `directory`: `process`, with each login added as the variable its coding
-/// agent reads (`CODEX_HOME`, `CLAUDE_CODE_OAUTH_TOKEN`) where the service
-/// has no login of that agent's own, and the variable withheld instead where
-/// the runner keeps none of a selected provider's login (REQ-GRANT-51).
-/// The grant token names (`GH_TOKEN`, `USEFUL_LINEAR_ACCESS_TOKEN`,
-/// `USEFUL_LINEAR_ACCESS_TOKEN_FILE`) are never offered from the process
-/// environment, since a workflow may pass them to its steps and the service's
-/// own values of them stay private (REQ-WORKSPACE-18); an admission is offered
-/// its grant tokens through `offer_with_grant_tokens`. Any other variable the
-/// process environment carries is never replaced or withheld, and the process
-/// environment itself is never changed. A missing or unreadable readiness
-/// document selects nothing, and records no install of what is added. Which
-/// steps receive a variable is the workflow's `environmentPassthrough`
-/// (REQ-WFEXEC-71).
+/// `directory` (`with_agent_logins`), and each provider's source as
+/// `credential_source` settles it from the same environment and directory
+/// with no grant token held; an admission is offered its grant tokens
+/// through `offer_with_grant_tokens`.
 pub(crate) fn offer(process: &EnvironmentSnapshot, directory: Option<&LoginDirectory>) -> Offer {
-    let process = &without_grant_token_names(process);
+    let service = ServiceEnvironment::of(process);
+    let (environment, offered) = with_agent_logins(process, &service, directory);
+    Offer {
+        environment,
+        offered,
+        sources: sources(&service, directory, None),
+    }
+}
+
+/// What an assignment's admission is offered: `offer`'s, with the grant
+/// tokens it holds, `grant_tokens`, and their files offered as well
+/// (`grant_token::offer`, REQ-GRANT-87), and each provider's source settled
+/// with them (REQ-GRANT-92, INV-RUNNER-31). The admission holds no token of
+/// a provider the host provides, whose names stay as the process
+/// environment has them, and nothing is withheld. No `OfferedLogin` records
+/// a grant token, whose uses are not noted.
+pub(crate) fn offer_with_grant_tokens(
+    process: &EnvironmentSnapshot,
+    directory: Option<&LoginDirectory>,
+    grant_tokens: Option<&grant_token::AssignmentGrantTokens>,
+) -> Offer {
+    let offered = offer(process, directory);
+    Offer {
+        environment: grant_token::offer(&offered.environment, grant_tokens),
+        sources: sources(&ServiceEnvironment::of(process), directory, grant_tokens),
+        ..offered
+    }
+}
+
+/// `process`, the environment of the service `service` describes, with each
+/// agent login the runner keeps in `directory` added as the variable its
+/// coding agent reads (`CODEX_HOME`, `CLAUDE_CODE_OAUTH_TOKEN`) where the
+/// service has no login of that agent's own (REQ-GRANT-51), and each added
+/// variable whose login the readiness document records as installed. Where
+/// the runner keeps none either, nothing is added and nothing withheld: the
+/// variable is as the process environment has it. A variable the process
+/// environment carries, a grant token name included (REQ-GRANT-87,
+/// REQ-WORKSPACE-18), is never replaced or removed, and the process
+/// environment itself is never changed. A missing or unreadable readiness
+/// document records no install of what is added. Which steps receive a
+/// variable is the workflow's `environmentPassthrough` and its declared
+/// integrations (REQ-WFEXEC-71, REQ-WFEXEC-78).
+fn with_agent_logins(
+    process: &EnvironmentSnapshot,
+    service: &ServiceEnvironment,
+    directory: Option<&LoginDirectory>,
+) -> (EnvironmentSnapshot, Vec<OfferedLogin>) {
     let Some(directory) = directory else {
-        return Offer {
-            environment: process.clone(),
-            withheld: Vec::new(),
-            offered: Vec::new(),
-        };
+        return (process.clone(), Vec::new());
     };
-    let service = ServiceEnvironment::from_lookup(|name| {
-        process.variable(OsStr::new(name)).map(OsStr::to_os_string)
-    });
     let document = recorded_readiness(directory);
     let recorded = |provider| {
         document
@@ -239,45 +387,36 @@ pub(crate) fn offer(process: &EnvironmentSnapshot, directory: Option<&LoginDirec
     };
     let mut added = Vec::new();
     let mut offered = Vec::new();
-    let mut withheld = Vec::new();
     for provider in AgentLoginProvider::INSTALLABLE {
-        let (variable, login, foreign_login): (_, _, fn(&ServiceEnvironment) -> bool) =
-            match provider {
-                AgentLoginProvider::Codex => (
-                    CODEX_LOGIN_VARIABLE,
-                    codex::offered_home(&service, directory),
-                    codex::foreign_login,
-                ),
-                AgentLoginProvider::ClaudeCode => (
-                    CLAUDE_CODE_LOGIN_VARIABLE,
-                    claude_code::offered_token(&service, directory),
-                    claude_code::foreign_login,
-                ),
-                AgentLoginProvider::Github
-                | AgentLoginProvider::Gitlab
-                | AgentLoginProvider::Linear => continue,
-            };
-        match login {
-            Some(login) => {
-                added.push(login);
-                offered.extend(
-                    recorded(provider)
-                        .and_then(readiness::LoginReadiness::installation)
-                        .map(|installation| OfferedLogin {
-                            variable,
-                            provider,
-                            agent_login_id: installation.agent_login_id.clone(),
-                            generation: installation.generation,
-                        }),
-                );
+        let (variable, login) = match provider {
+            AgentLoginProvider::Codex => (
+                CODEX_LOGIN_VARIABLE,
+                codex::offered_home(service, directory),
+            ),
+            AgentLoginProvider::ClaudeCode => (
+                CLAUDE_CODE_LOGIN_VARIABLE,
+                claude_code::offered_token(service, directory),
+            ),
+            AgentLoginProvider::Github
+            | AgentLoginProvider::Gitlab
+            | AgentLoginProvider::Linear => {
+                continue;
             }
-            None if recorded(provider).is_some_and(|login| login.selected)
-                && !foreign_login(&service) =>
-            {
-                withheld.push(variable);
-            }
-            None => {}
-        }
+        };
+        let Some(login) = login else {
+            continue;
+        };
+        added.push(login);
+        offered.extend(
+            recorded(provider)
+                .and_then(readiness::LoginReadiness::installation)
+                .map(|installation| OfferedLogin {
+                    variable,
+                    provider,
+                    agent_login_id: installation.agent_login_id.clone(),
+                    generation: installation.generation,
+                }),
+        );
     }
     let environment = if added.is_empty() {
         process.clone()
@@ -290,44 +429,61 @@ pub(crate) fn offer(process: &EnvironmentSnapshot, directory: Option<&LoginDirec
                 .chain(added),
         )
     };
-    Offer {
-        environment,
-        withheld,
-        offered,
-    }
+    (environment, offered)
 }
 
-/// What an assignment's admission is offered: `offer`'s, with the grant
-/// tokens it holds, `grant_tokens`, and their files offered as well, and the
-/// names of a selected provider it holds no token of withheld
-/// (`grant_token::offer`, REQ-GRANT-87). Unlike an agent login, a grant token
-/// replaces a value the process environment carries, and its withheld names
-/// are only absent: they are not among `Offer::withheld`, and no
-/// `OfferedLogin` records a grant token, whose uses are not noted.
-pub(crate) fn offer_with_grant_tokens(
-    process: &EnvironmentSnapshot,
+/// Each provider's source, in `AgentLoginProvider::ALL`'s order, leaving out
+/// those with none (`credential_source`).
+fn sources(
+    service: &ServiceEnvironment,
     directory: Option<&LoginDirectory>,
     grant_tokens: Option<&grant_token::AssignmentGrantTokens>,
-) -> Offer {
-    let offered = offer(process, directory);
-    let document = directory.and_then(recorded_readiness);
-    Offer {
-        environment: grant_token::offer(&offered.environment, grant_tokens, document.as_ref()),
-        ..offered
-    }
+) -> Vec<ProviderSource> {
+    AgentLoginProvider::ALL
+        .into_iter()
+        .filter_map(|provider| {
+            credential_source(provider, service, directory, grant_tokens)
+                .map(|source| ProviderSource { provider, source })
+        })
+        .collect()
 }
 
-/// `process` without the grant token names, which a step on a runner receives
-/// only from a grant.
-fn without_grant_token_names(process: &EnvironmentSnapshot) -> EnvironmentSnapshot {
-    let grant_names = grant_token_environment_names();
-    EnvironmentSnapshot::new(
-        process
-            .variables()
-            .iter()
-            .filter(|(name, _)| !grant_names.iter().any(|grant| name.as_os_str() == *grant))
-            .map(|(name, value)| (name.clone(), value.clone())),
-    )
+/// What an admission reports to Cloud of its `sources` (REQ-GRANT-93): each
+/// provider that has one, an OAuth grant by the ID of the grant its token in
+/// `grant_tokens` was issued from, and a coding agent's grant by the agent
+/// login the offer's `offered` records for it, absent when the readiness
+/// document records no install. An OAuth grant whose token's grant is not
+/// known is left out, since Cloud records no such entry; `offer` gives it a
+/// source only for a token it holds.
+pub(crate) fn reported_sources(
+    sources: &[ProviderSource],
+    offered: &[OfferedLogin],
+    grant_tokens: Option<&grant_token::AssignmentGrantTokens>,
+) -> Vec<cloud::ReportedSource> {
+    sources
+        .iter()
+        .filter_map(|&ProviderSource { provider, source }| {
+            let (grant_id, agent_login_id) = match source {
+                CredentialSource::Host => (None, None),
+                CredentialSource::Grant if provider.is_brokered() => {
+                    (Some(grant_tokens?.grant_id(provider)?.to_owned()), None)
+                }
+                CredentialSource::Grant => (
+                    None,
+                    offered
+                        .iter()
+                        .find(|login| login.provider == provider)
+                        .map(|login| login.agent_login_id.clone()),
+                ),
+            };
+            Some(cloud::ReportedSource {
+                provider,
+                source,
+                grant_id,
+                agent_login_id,
+            })
+        })
+        .collect()
 }
 
 /// The readiness document beside `directory`; none when there is none or it

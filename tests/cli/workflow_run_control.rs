@@ -17,6 +17,8 @@ use super::workflow_run::{
     RunBundle, TreeBundle, assert_usage_error, isolated_command, progress_position,
     progress_records, run_record, tree_rejection, workflow_run_schema,
 };
+#[cfg(target_os = "linux")]
+use super::workflow_run::{open_tui_pty, spawn_tui_run};
 use super::workflow_run_list::shown_plain;
 
 /// The login name every control command in these tests runs as (REQ-LOCALRUN-181).
@@ -864,6 +866,40 @@ fn a_withdraw_while_a_command_prepares_an_attempt_reads_only_what_it_honors() {
     assert_eq!(record["state"], "waiting", "{record}");
     assert_eq!(record["attempts"], 3, "{record}");
     assert_eq!(control_count(&run), 2);
+}
+
+// REQ-RUNNERENROLL-123, REQ-LOCALRUN-212, REQ-LOCALRUN-186: a withdrawal recorded for a command
+// that held the run and ended without beginning an attempt (an evaluation of a held wait, which
+// this test's own hold of the run lock stands for) stays pending on the waiting run, and does
+// not refuse the next `withdraw`: that one ends the run `withdrawn` at its wait with the
+// outcome's write. The runner relies on this to finish a withdrawal it reported `recorded`.
+#[test]
+fn a_withdraw_ends_a_waiting_run_whose_recorded_withdrawal_no_attempt_honored() {
+    let tree = EngineeringWaitTree::publish();
+    let stub = LinearStub::start();
+    let run = tree.waiting(&stub, "AUTO-1");
+    let wait = read_json(&run.join("wait.json"));
+    let withdraw = || tree.run(&stub, &["withdraw", run.to_str().unwrap(), "--json"]);
+
+    let held = hold_lock(&run);
+    let pending = recorded(&withdraw(), "withdraw", &run);
+    assert_eq!(pending["control"]["wait"], serde_json::Value::Null);
+    drop(held);
+    assert_eq!(run_record(&run)["state"], "waiting");
+    assert_eq!(control_count(&run), 1);
+
+    let ended = recorded_as(&withdraw(), "withdraw", "withdrawn", &run);
+    assert_eq!(ended["control"]["wait"], wait_id(&wait));
+    let record = run_record(&run);
+    assert_eq!(record["state"], "exited", "{record}");
+    assert_eq!(record["outcome"], "withdrawn", "{record}");
+    assert!(!run.join("wait.json").exists());
+    assert_eq!(control_count(&run), 2);
+    let outcomes = super::workflow_mirror::mirror_writes(&run)
+        .into_iter()
+        .filter(|(name, _)| name.ends_with("-outcome.json"))
+        .count();
+    assert_eq!(outcomes, 1);
 }
 
 // REQ-WFEXEC-73, REQ-LOCALRUN-186, REQ-LOCALRUN-191: a live run withdrawn while the stage that
@@ -3255,6 +3291,60 @@ fn stage_tree(root: &str) -> TreeBundle {
     bundle
 }
 
+/// A root whose `design` stage waits for a repair when its child fails, and whose child
+/// fails at `plan`, the step its one export `plan` reads: `route`, which writes the child's
+/// verdict, is blocked behind it. The stage declares `outcome` and `plan` and commits
+/// `outcome` alone.
+fn unexported_stage_tree() -> TreeBundle {
+    let bundle = TreeBundle::new(
+        "schemaVersion: 1
+outcomes: [landed, failed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    on:
+      planned: exit.landed
+      failed:
+        wait: repair
+        then: design
+",
+    );
+    bundle.write_source(
+        "design.yaml",
+        "schemaVersion: 1
+outcomes: [planned, failed]
+outcome:
+  from: outputs.route.verdict
+  onFailure: failed
+steps:
+  plan:
+    kind: cmd
+    command:
+      argv: [sh, -c, exit 1]
+    outputs:
+      text:
+        kind: text
+        from: path
+        path: plan.txt
+  route:
+    kind: cmd
+    dependsOn: [plan]
+    command:
+      argv: [sh, -c, printf planned > verdict.txt]
+    outputs:
+      verdict:
+        kind: text
+        from: path
+        path: verdict.txt
+exports:
+  plan:
+    ref: outputs.plan.text
+",
+    );
+    bundle
+}
+
 /// How often each of `read`, `plan` and `route` ran in `root`.
 fn stage_counts(root: &Path) -> [u32; 3] {
     ["read", "plan", "route"].map(|step| {
@@ -3488,6 +3578,438 @@ fn a_repair_retry_continues_the_failed_fan_out_element_before_the_next() {
     assert_eq!(
         fs::read_to_string(root.join("effects")).unwrap(),
         "effect-a\neffect-b\neffect-c\n"
+    );
+}
+
+/// The `failedChild` of a run of the stage tree that waits for a repair at `design`, whose
+/// child at `child` failed at `route`: the step's entries in the run document's result and in
+/// `state.json`, the wait's payload in the document and in `wait.json`, and the status and
+/// view documents, which validate against their schemas, carry the one record, `succeeded`
+/// beside it.
+fn failed_stage_record(
+    bundle: &TreeBundle,
+    name: &str,
+    args: &[&str],
+    child: &str,
+) -> serde_json::Value {
+    let destination = bundle.result(name);
+    let document = completed(
+        &isolated_command(&bundle.args(&destination))
+            .args(args)
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(document["outcome"], "waiting", "{document}");
+    assert_eq!(document["wait"]["kind"], "repair", "{document}");
+    let run = fs::canonicalize(&destination).unwrap();
+    let wait = &document["wait"];
+    let child = read_json(&run.join(child).join("attempts/000001/result/result.json"));
+    assert_eq!(child["outcome"], "failed", "{child}");
+    assert_eq!(child["primaryIssue"]["node"]["id"], "route", "{child}");
+
+    let entry = step(&document["result"]["steps"], "design");
+    assert_eq!(entry["state"], "succeeded", "{entry}");
+    let record = entry["failedChild"].clone();
+    assert_eq!(record["outcome"], "failed", "{record}");
+    assert_eq!(record["primaryIssue"], child["primaryIssue"], "{record}");
+
+    let state = read_json(&run.join("state.json"));
+    let progress = step(&state["attempts"][0]["progress"]["steps"], "design");
+    assert_eq!(progress["state"], "succeeded", "{progress}");
+    assert_eq!(progress["failedChild"], record, "{progress}");
+    assert_eq!(wait["payload"]["failedChild"], record, "{wait}");
+    assert_eq!(&read_json(&run.join("wait.json")), wait);
+
+    let (_, status) = super::workflow_status::status_json(&run);
+    assert!(
+        super::workflow_status::status_schema().is_valid(&status),
+        "{status}"
+    );
+    assert_eq!(
+        step(
+            &status["state"]["attempts"][0]["progress"]["steps"],
+            "design"
+        )["failedChild"],
+        record
+    );
+    // The schema bounds the closed record to a `succeeded` entry.
+    let position = status["state"]["attempts"][0]["progress"]["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .position(|entry| entry["id"] == "design")
+        .unwrap();
+    let pointer = format!("/state/attempts/0/progress/steps/{position}");
+    for (member, value) in [
+        ("state", serde_json::json!("running")),
+        ("failedChild", {
+            let mut open = record.clone();
+            open["unknown"] = serde_json::json!(1);
+            open
+        }),
+    ] {
+        let mut invalid = status.clone();
+        invalid.pointer_mut(&pointer).unwrap()[member] = value;
+        assert!(
+            !super::workflow_status::status_schema().is_valid(&invalid),
+            "{member}"
+        );
+    }
+    let view = isolated_command(&[
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "view".to_owned(),
+        run.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert!(view.status.success(), "{view:?}");
+    let view: serde_json::Value = serde_json::from_slice(&view.stdout).unwrap();
+    assert!(
+        super::workflow_view::workflow_view_schema().is_valid(&view),
+        "{view}"
+    );
+    assert_eq!(
+        step(&view["result"]["steps"], "design")["failedChild"],
+        record
+    );
+    record
+}
+
+// REQ-WFEXEC-77, REQ-LOCALRUN-219, REQ-WFEXEC-61, INV-ENGINE-42: a stage whose child's
+// result is `failed` stays `succeeded` and records the child's outcome and primary issue; a
+// fan-out's record names the element whose child ended the step, and a plain step's names
+// none.
+#[test]
+fn a_stage_whose_child_failed_records_the_childs_primary_issue() {
+    let bundle = stage_tree(STAGE_TREE_ROOT);
+    fs::write(bundle.execution_root().join("plan.md"), "unfenced").unwrap();
+    let record = failed_stage_record(&bundle, "failed-stage", &[], "children/design/000001");
+    assert!(record.get("item").is_none(), "{record}");
+
+    let bundle = stage_tree(STAGE_FAN_OUT_ROOT);
+    let root = bundle.execution_root();
+    fs::write(root.join("plan-a.md"), "fenced").unwrap();
+    fs::write(root.join("plan-b.md"), "unfenced").unwrap();
+    let record = failed_stage_record(
+        &bundle,
+        "failed-element",
+        &["--input-json", "parts", r#"[{"name":"a"},{"name":"b"}]"#],
+        "children/design/000002/000001",
+    );
+    assert_eq!(record["item"], 2, "{record}");
+}
+
+/// The words of the summary row (REQ-LOCALRUN-122) whose first column is `node` in the human
+/// stream `stream`; progress records, which start with their timestamp, are not rows.
+pub(super) fn summary_row(stream: &[u8], node: &str) -> Vec<String> {
+    let stream = String::from_utf8_lossy(stream);
+    let summary = stream
+        .rsplit_once("── summary")
+        .unwrap_or_else(|| panic!("no summary in {stream}"))
+        .1;
+    summary
+        .lines()
+        .map(|line| {
+            line.split_whitespace()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .find(|words| words.first().is_some_and(|word| word == node))
+        .unwrap_or_else(|| panic!("no {node} row in {summary}"))
+}
+
+/// The words of the summary's `wait:` line in the human stream `stream`.
+pub(super) fn summary_wait_line(stream: &[u8]) -> Vec<String> {
+    let stream = String::from_utf8_lossy(stream);
+    stream
+        .lines()
+        .find(|line| line.starts_with("wait:"))
+        .unwrap_or_else(|| panic!("no wait line in {stream}"))
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect()
+}
+
+// REQ-LOCALRUN-220, REQ-WFEXEC-41: a stage whose child's result is `failed` completes with a
+// `failed` record naming the child's failing node after that node's own `failed` record, its
+// summary row reads `failed`, and the wait line names the failed stage's failing node; a
+// fan-out names the element.
+#[test]
+fn a_stage_whose_child_failed_is_shown_failed_in_the_stream_and_summary() {
+    let bundle = stage_tree(STAGE_TREE_ROOT);
+    fs::write(bundle.execution_root().join("plan.md"), "unfenced").unwrap();
+    let destination = bundle.result("failed-stage");
+    let output = isolated_command(&bundle.args(&destination))
+        .output()
+        .unwrap();
+    let document = completed(&output);
+    assert_eq!(document["wait"]["kind"], "repair", "{document}");
+    let records = progress_records(&output.stderr);
+    assert!(
+        !records
+            .iter()
+            .any(|record| record.scope == "design" && record.token == "done"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let child = progress_position(&records, "design.route", "failed");
+    let stage = progress_position(&records, "design", "failed");
+    assert!(child < stage, "{child} {stage}");
+    assert!(
+        records[stage]
+            .detail
+            .iter()
+            .any(|word| word == "design.route"),
+        "{:?}",
+        records[stage].detail
+    );
+    let row = summary_row(&output.stderr, "design");
+    assert_eq!(row.get(2).map(String::as_str), Some("failed"), "{row:?}");
+    let wait = summary_wait_line(&output.stderr);
+    for word in ["repair", "design.route"] {
+        assert!(wait.iter().any(|seen| seen == word), "{word} {wait:?}");
+    }
+
+    let bundle = stage_tree(STAGE_FAN_OUT_ROOT);
+    let root = bundle.execution_root();
+    fs::write(root.join("plan-a.md"), "fenced").unwrap();
+    fs::write(root.join("plan-b.md"), "unfenced").unwrap();
+    let destination = bundle.result("failed-element");
+    let output = isolated_command(&bundle.args(&destination))
+        .args(["--input-json", "parts", r#"[{"name":"a"},{"name":"b"}]"#])
+        .output()
+        .unwrap();
+    completed(&output);
+    let records = progress_records(&output.stderr);
+    let stage = progress_position(&records, "design", "failed");
+    assert!(
+        records[stage]
+            .detail
+            .iter()
+            .any(|word| word == "design[2].route"),
+        "{:?}",
+        records[stage].detail
+    );
+    let row = summary_row(&output.stderr, "design");
+    assert_eq!(row.get(2).map(String::as_str), Some("failed"), "{row:?}");
+    let wait = summary_wait_line(&output.stderr);
+    assert!(
+        wait.iter().any(|seen| seen == "design[2].route"),
+        "{wait:?}"
+    );
+}
+
+/// The plain output of `useful workflow run status` of the run at `run`, which exits 0.
+pub(super) fn plain_status(run: &Path) -> String {
+    let status = isolated_command(&[
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "status".to_owned(),
+        run.to_string_lossy().into_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert_eq!(status.status.code(), Some(0), "{status:?}");
+    String::from_utf8(status.stdout).unwrap()
+}
+
+/// The words of the line directly under the `wait:` line of the plain status `status`, which
+/// starts with the key `failed stage:`.
+pub(super) fn failed_stage_line(status: &str) -> Vec<String> {
+    let mut lines = status.lines().skip_while(|line| !line.starts_with("wait:"));
+    assert!(lines.next().is_some(), "no wait line in {status}");
+    let line = lines.next().unwrap_or_default();
+    assert!(line.starts_with("failed stage:"), "{status}");
+    line.split_whitespace().map(str::to_owned).collect()
+}
+
+// REQ-LOCALRUN-221, REQ-LOCALRUN-145: the plain status of a run waiting at a stage whose
+// child failed names, under its wait line, the stage, the child's outcome and its failing
+// node with the node's phase and code; a fan-out names the element.
+#[test]
+fn run_status_names_the_failed_stage_under_its_wait_line() {
+    let bundle = stage_tree(STAGE_TREE_ROOT);
+    fs::write(bundle.execution_root().join("plan.md"), "unfenced").unwrap();
+    let (run, _) = repair_waiting_stage(&bundle, "failed-stage-status", &[]);
+    let line = failed_stage_line(&plain_status(&run));
+    for word in ["design", "design.route", "execution", "command_exit"] {
+        assert!(line.iter().any(|seen| seen == word), "{word} {line:?}");
+    }
+
+    let bundle = stage_tree(STAGE_FAN_OUT_ROOT);
+    let root = bundle.execution_root();
+    fs::write(root.join("plan-a.md"), "fenced").unwrap();
+    fs::write(root.join("plan-b.md"), "unfenced").unwrap();
+    let (run, _) = repair_waiting_stage(
+        &bundle,
+        "failed-element-status",
+        &["--input-json", "parts", r#"[{"name":"a"},{"name":"b"}]"#],
+    );
+    let line = failed_stage_line(&plain_status(&run));
+    assert!(
+        line.iter().any(|seen| seen == "design[2].route"),
+        "{line:?}"
+    );
+}
+
+/// The plain output of `useful workflow run view` of the run at `run`, which exits 0.
+pub(super) fn plain_view(run: &Path) -> String {
+    let view = isolated_command(&[
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "view".to_owned(),
+        run.to_string_lossy().into_owned(),
+        "--plain".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert_eq!(view.status.code(), Some(0), "{view:?}");
+    String::from_utf8(view.stdout).unwrap()
+}
+
+/// The fields, split on ` · `, of the plain view's row for the node `node`.
+pub(super) fn view_row(view: &str, node: &str) -> Vec<String> {
+    let prefix = format!("- node {node} ·");
+    view.lines()
+        .find(|line| line.starts_with(&prefix))
+        .unwrap_or_else(|| panic!("no {node} row in {view}"))
+        .split(" · ")
+        .map(str::to_owned)
+        .collect()
+}
+
+/// The count of the state `state` on the plain view's `terminal counts:` line.
+fn terminal_count(view: &str, state: &str) -> usize {
+    let line = view
+        .lines()
+        .find_map(|line| line.strip_prefix("terminal counts: "))
+        .unwrap_or_else(|| panic!("no terminal counts in {view}"));
+    line.split(" · ")
+        .find_map(|field| {
+            let (count, name) = field.split_once(' ')?;
+            (name == state).then(|| count.parse().unwrap())
+        })
+        .unwrap_or_else(|| panic!("no {state} count in {line}"))
+}
+
+/// Whether some field of the view row `row` has the word `word`.
+fn row_names(row: &[String], word: &str) -> bool {
+    row.iter()
+        .any(|field| field.split_whitespace().any(|seen| seen == word))
+}
+
+// REQ-LOCALRUN-221: the plain view of a run waiting at a stage whose child failed shows the
+// stage `failed`, names the child's failing node in its detail and counts the stage failed,
+// not succeeded; a fan-out names the element.
+#[test]
+fn run_view_shows_a_stage_whose_child_failed_as_failed() {
+    let bundle = stage_tree(STAGE_TREE_ROOT);
+    fs::write(bundle.execution_root().join("plan.md"), "unfenced").unwrap();
+    let (run, _) = repair_waiting_stage(&bundle, "failed-stage-view", &[]);
+    let view = plain_view(&run);
+    let row = view_row(&view, "design");
+    assert!(row.iter().any(|field| field == "state failed"), "{row:?}");
+    assert!(row_names(&row, "design.route"), "{row:?}");
+    assert_eq!(terminal_count(&view, "failed"), 1, "{view}");
+    assert_eq!(terminal_count(&view, "succeeded"), 0, "{view}");
+
+    let bundle = stage_tree(STAGE_FAN_OUT_ROOT);
+    let root = bundle.execution_root();
+    fs::write(root.join("plan-a.md"), "fenced").unwrap();
+    fs::write(root.join("plan-b.md"), "unfenced").unwrap();
+    let (run, _) = repair_waiting_stage(
+        &bundle,
+        "failed-element-view",
+        &["--input-json", "parts", r#"[{"name":"a"},{"name":"b"}]"#],
+    );
+    let row = view_row(&plain_view(&run), "design");
+    assert!(row.iter().any(|field| field == "state failed"), "{row:?}");
+    assert!(row_names(&row, "design[2].route"), "{row:?}");
+}
+
+// REQ-OUTPUTS-17, REQ-LOCALRUN-221: the plain view counts the outputs a stage committed, not
+// the ones it declares: a stage whose child failed at the step its one export reads committed
+// its outcome alone.
+#[test]
+fn run_view_counts_the_outputs_a_stage_committed() {
+    let bundle = unexported_stage_tree();
+    let (run, _) = repair_waiting_stage(&bundle, "unexported-stage-view", &[]);
+    let row = view_row(&plain_view(&run), "design");
+    assert!(row.iter().any(|field| field == "state failed"), "{row:?}");
+    assert!(
+        row.iter().any(|field| field == "1 output committed"),
+        "{row:?}"
+    );
+}
+
+// REQ-LOCALRUN-57, REQ-WFEXEC-60: the terminal interface finishes a run whose stage committed
+// its outcome and left its declared export unavailable: the result is published, the run is
+// released and `q` ends the command with 0 and the plain summary.
+#[cfg(target_os = "linux")]
+#[test]
+fn terminal_interface_finishes_a_run_whose_stage_left_an_export_uncommitted() {
+    use std::io::Write as _;
+
+    let bundle = unexported_stage_tree();
+    let destination = bundle.result("unexported-stage-tui");
+    let args = bundle
+        .args(&destination)
+        .into_iter()
+        .filter(|arg| arg != "--json")
+        .collect::<Vec<_>>();
+    let (master, slave) = open_tui_pty();
+    let mut process = spawn_tui_run(&args, master, slave);
+
+    let status_args = [
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "status".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ];
+    let settled = poll_until(
+        "the result to be published and the run released, or the interface to exit",
+        || {
+            if let Some(exit) = process.child_mut().try_wait().unwrap() {
+                return Err(format!("the interface exited on its own with {exit}"));
+            }
+            let output = isolated_command(&status_args).output().unwrap();
+            Ok(output
+                .status
+                .success()
+                .then(|| serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap())
+                .is_some_and(|status| {
+                    status["recovery"] == serde_json::json!({"status": "settled"})
+                }))
+        },
+        |observation| !matches!(observation, Ok(false)),
+    );
+    if let Err(exit) = settled {
+        let (_, transcript) = process.wait_and_finish();
+        panic!("{exit}: {}", String::from_utf8_lossy(&transcript));
+    }
+
+    process.master_writer().write_all(b"q").unwrap();
+    process.master_writer().flush().unwrap();
+    poll_until(
+        "the interface to exit after q",
+        || process.child_mut().try_wait().unwrap(),
+        Option::is_some,
+    );
+    let (exit, transcript) = process.wait_and_finish();
+    let transcript = String::from_utf8_lossy(&transcript);
+    assert_eq!(exit.code(), Some(0), "{transcript}");
+    let restored = transcript
+        .rfind("\u{1b}[?1049l")
+        .expect("the interface must leave the alternate screen");
+    let row = summary_row(transcript[restored..].as_bytes(), "design");
+    assert_eq!(row.get(2).map(String::as_str), Some("failed"), "{row:?}");
+    assert!(
+        destination
+            .join("attempts/000001/result/result.json")
+            .is_file()
     );
 }
 
@@ -3996,7 +4518,23 @@ impl EngineeringWaitTree {
     /// The wait tree with `root`, a root of its children, as its `workflow.yaml`, published
     /// as `publish` does.
     fn publish_root(root: &str) -> Self {
-        let (_, blocks) = ENGINEERING_ROOT.split_once("\nbindings:").unwrap();
+        Self::publish_under(root, ENGINEERING_ROOT)
+    }
+
+    /// `publish` with the `release` control trigger's conditional action replaced by the
+    /// bare `action`.
+    fn publish_releasing(action: &str) -> Self {
+        let conditional = "action: {when: \"event.to == $canceled\", then: cancel, else: withdraw}";
+        assert!(ENGINEERING_ROOT.contains(conditional));
+        Self::publish_under(
+            WAIT_TREE_ROOT,
+            &ENGINEERING_ROOT.replacen(conditional, &format!("action: {action}"), 1),
+        )
+    }
+
+    /// `publish_root` with the header built from `engineering`'s blocks.
+    fn publish_under(root: &str, engineering: &str) -> Self {
+        let (_, blocks) = engineering.split_once("\nbindings:").unwrap();
         let (blocks, _) = blocks.split_once("\ninputs:").unwrap();
         let header = format!(
             "schemaVersion: 1\nname: engineering\nsubject: ticket\nbindings:{blocks}\ninputs:\n  ticket:\n    kind: text\n  baseBranch:\n    kind: text\n    default: main\n"
@@ -4399,6 +4937,29 @@ fn an_unreadable_revision_refuses_the_event_with_the_class_of_its_cause() {
     assert_eq!(stub.operations(), Vec::<String>::new());
     assert_eq!(control_count(&run), controls);
     assert_eq!(run_record(&run)["state"], "waiting");
+}
+
+// REQ-LOCALRUN-208: a control trigger whose action is the bare `release`, not `cancel` or
+// `withdraw`, refuses a departure `control_unavailable` and writes nothing.
+#[test]
+fn a_bare_release_action_refuses_the_event_control_unavailable_and_changes_nothing() {
+    let tree = EngineeringWaitTree::publish_releasing("release");
+    let stub = LinearStub::start();
+    let run = tree.waiting(&stub, "AUTO-1");
+    let controls = control_count(&run);
+    let record = fs::read(run.join("run.json")).unwrap();
+    let wait = fs::read(run.join("wait.json")).unwrap();
+    // The issue has left the owned state, so the departure reaches the action.
+    stub.issue_state("Backlog");
+
+    refused(
+        &tree.event(&stub, &run, "2026-11-10T10:00:01Z", "state-backlog"),
+        "event",
+        "control_unavailable",
+    );
+    assert_eq!(control_count(&run), controls);
+    assert_eq!(fs::read(run.join("run.json")).unwrap(), record);
+    assert_eq!(fs::read(run.join("wait.json")).unwrap(), wait);
 }
 
 /// A root whose `build` stage child runs `prepare` and then the long-running `work`, and whose

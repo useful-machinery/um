@@ -6,12 +6,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use super::*;
+use crate::agent_login::ProviderSource;
 use crate::agent_login::check::LoginCheckOutcome;
 use crate::agent_login::cloud::{
-    CloudFailure, GrantTokenFailure, GrantTokenRequest, IssuedToken, LoginStatus, ProviderLogin,
+    CloudFailure, CredentialSourcesFailure, GrantProvidersFailure, GrantProvidersRequest,
+    GrantTokenFailure, GrantTokenRequest, IssuedToken, ListedProvider, LoginStatus, ProviderLogin,
+    ReportedSource,
 };
 use crate::agent_login::readiness::readiness_path;
-use crate::control_protocol::AgentLoginCheckCause;
+use crate::control_protocol::{AgentLoginCheckCause, CredentialSource};
 use crate::service::{
     CountedGate, FAKE_AGENT_LOGIN_ID, FAKE_AGENT_LOGIN_SENTINEL, FakeAgentLoginCloud,
     FakeLoginCheck, fake_agent_login_material, fake_codex_authorized,
@@ -63,11 +66,10 @@ impl Fixture {
         let elapsed = Arc::clone(&clock);
         let home = OsString::from(root.path().join("home"));
         let service_codex = OsString::from(root.path().join("service-codex"));
-        let environment = ServiceEnvironment::from_lookup(|name| match name {
-            "HOME" => Some(home.clone()),
-            "CODEX_HOME" if codex_home => Some(service_codex.clone()),
-            _ => None,
-        });
+        let environment = ServiceEnvironment::from_variables(
+            std::iter::once((OsString::from("HOME"), home))
+                .chain(codex_home.then(|| (OsString::from("CODEX_HOME"), service_codex))),
+        );
         let setup = Arc::new(AgentLoginSetup::new(
             SetupDependencies::new(
                 Arc::clone(&cloud) as Arc<dyn AgentLoginCloud>,
@@ -95,7 +97,7 @@ impl Fixture {
     /// `CODEX_HOME`.
     fn service(&self) -> ServiceEnvironment {
         let home = OsString::from(self.root.path().join("home"));
-        ServiceEnvironment::from_lookup(|name| (name == "HOME").then(|| home.clone()))
+        ServiceEnvironment::from_variables([("HOME", home)])
     }
 
     fn directory(&self) -> LoginDirectory {
@@ -284,9 +286,7 @@ async fn a_codex_login_the_runner_holds_is_removed_once_the_service_sets_codex_h
         SetupDependencies::new(
             Arc::clone(&fixture.cloud) as Arc<dyn AgentLoginCloud>,
             Arc::clone(&fixture.check) as Arc<dyn LoginCheck>,
-            ServiceEnvironment::from_lookup(|name| {
-                (name == "CODEX_HOME").then(|| service_codex.clone())
-            }),
+            ServiceEnvironment::from_variables([("CODEX_HOME", service_codex)]),
             &fixture.root.path().join("state/runner-state.json"),
             recorder,
         ),
@@ -305,25 +305,184 @@ async fn a_codex_login_the_runner_holds_is_removed_once_the_service_sets_codex_h
     assert_eq!(fixture.service_entries(), 0);
 }
 
-// REQ-GRANT-36, REQ-GRANT-37
+impl Fixture {
+    /// The `CODEX_HOME` an admission is offered from a process environment
+    /// that carries only the service's `HOME`.
+    fn offered_codex_home(&self) -> Option<OsString> {
+        let process = useful_execution::EnvironmentSnapshot::new([(
+            OsString::from("HOME"),
+            OsString::from(self.root.path().join("home")),
+        )]);
+        crate::agent_login::offer(&process, Some(&self.directory()))
+            .environment
+            .variable(std::ffi::OsStr::new(useful_execution::CODEX_LOGIN_VARIABLE))
+            .map(std::ffi::OsStr::to_os_string)
+    }
+}
+
+// REQ-GRANT-51, REQ-GRANT-37, REQ-GRANT-40
 #[tokio::test]
-async fn a_codex_login_under_the_service_home_changes_nothing() {
+async fn a_codex_login_in_the_default_home_under_the_service_home_is_the_services_own() {
+    // With no Codex login of the service's own, the runner's is installed
+    // and offered.
     let fixture = Fixture::new(fake_codex_authorized(1));
-    let own = fixture.root.path().join("home/.codex/auth.json");
-    fs::create_dir(own.parent().unwrap()).unwrap();
-    write_private(&own, b"{\"operator\":true}");
-
     let document = fixture.pass().await;
-
     assert_eq!(
         state_of(&document, AgentLoginProvider::Codex),
         AgentLoginState::Ready
     );
     assert_eq!(
-        fs::read(fixture.auth_path()).unwrap(),
-        fake_agent_login_material(1)
+        fixture.offered_codex_home(),
+        Some(fixture.directory().codex_home().into_os_string())
     );
+
+    // The service is signed in to Codex in its default home.
+    let own = fixture.root.path().join("home/.codex/auth.json");
+    fs::create_dir(own.parent().unwrap()).unwrap();
+    write_private(&own, b"{\"operator\":true}");
+    let deliveries = fixture.cloud.deliveries();
+
+    for _pass in 0..2 {
+        let document = fixture.pass().await;
+        let codex = document.login(AgentLoginProvider::Codex).unwrap();
+        assert_eq!(codex.state, AgentLoginState::ForeignLogin);
+        assert_eq!(codex.installation(), None);
+    }
+
+    assert_eq!(fixture.cloud.deliveries(), deliveries);
+    assert!(!fixture.directory().codex_home().exists());
+    assert_eq!(fixture.offered_codex_home(), None);
     assert_eq!(fs::read(&own).unwrap(), b"{\"operator\":true}");
+}
+
+impl Fixture {
+    /// Signs the service in to Claude Code: a credentials file in `.claude`
+    /// under its `HOME`.
+    fn sign_in_to_claude_code(&self) {
+        let own = self.root.path().join("home/.claude/.credentials.json");
+        fs::create_dir(own.parent().unwrap()).unwrap();
+        write_private(&own, b"{\"operator\":true}");
+    }
+
+    /// Each installable provider's state and source as the pass's document
+    /// and the recorded one hold them, which must agree.
+    fn sources(
+        &self,
+        document: &ReadinessDocument,
+    ) -> Vec<(AgentLoginState, Option<CredentialSource>)> {
+        let recorded = self.recorded().expect("the pass recorded readiness");
+        AgentLoginProvider::INSTALLABLE
+            .into_iter()
+            .map(|provider| {
+                let entry = document.login(provider).expect("provider readiness");
+                assert_eq!(recorded.login(provider), Some(entry), "{provider:?}");
+                (entry.state, entry.source)
+            })
+            .collect()
+    }
+}
+
+// REQ-GRANT-92, REQ-GRANT-51, REQ-GRANT-45
+#[tokio::test]
+async fn a_pass_records_the_hosts_claude_code_login_as_its_source_whatever_cloud_answers() {
+    for (answer, state) in [
+        (
+            Ok(vec![authorized(AgentLoginProvider::ClaudeCode, 1)]),
+            AgentLoginState::ForeignLogin,
+        ),
+        (Ok(Vec::new()), AgentLoginState::NotAuthorized),
+    ] {
+        let fixture = Fixture::new(answer);
+        fixture.sign_in_to_claude_code();
+
+        let document = fixture.pass().await;
+
+        // Codex has neither a login of the service's nor one the runner
+        // keeps: it records no source.
+        assert_eq!(
+            fixture.sources(&document),
+            [
+                (AgentLoginState::NotAuthorized, None),
+                (state, Some(CredentialSource::Host)),
+            ],
+            "{state:?}"
+        );
+        assert_eq!(fixture.cloud.deliveries(), 0, "{state:?}");
+    }
+}
+
+// REQ-GRANT-92, REQ-GRANT-51, INV-RUNNER-31
+#[tokio::test]
+async fn a_pass_that_installs_a_login_the_service_lacks_records_the_grant_as_its_source() {
+    let fixture = Fixture::new(fake_codex_authorized(1));
+
+    let document = fixture.pass().await;
+
+    assert_eq!(
+        fixture.sources(&document),
+        [
+            (AgentLoginState::Ready, Some(CredentialSource::Grant)),
+            (AgentLoginState::NotAuthorized, None),
+        ]
+    );
+    // The offer settles the same sources from the same directory.
+    let process = useful_execution::EnvironmentSnapshot::new([(
+        OsString::from("HOME"),
+        OsString::from(fixture.root.path().join("home")),
+    )]);
+    let offered = crate::agent_login::offer(&process, Some(&fixture.directory()));
+    assert_eq!(
+        offered.sources,
+        [ProviderSource {
+            provider: AgentLoginProvider::Codex,
+            source: CredentialSource::Grant,
+        }]
+    );
+
+    // Once the owner revokes it the runner keeps nothing: no source.
+    fixture.cloud.answer(Ok(vec![ProviderLogin {
+        status: LoginStatus::Revoked,
+        ..authorized(AgentLoginProvider::Codex, 1)
+    }]));
+    let document = fixture.pass().await;
+    assert_eq!(
+        fixture.sources(&document),
+        [
+            (AgentLoginState::Revoked, None),
+            (AgentLoginState::NotAuthorized, None),
+        ]
+    );
+}
+
+// REQ-GRANT-92, INV-RUNNER-31
+#[tokio::test]
+async fn an_admission_that_makes_no_pass_records_each_coding_agents_source_as_it_now_stands() {
+    // Cloud names no authorization, so an admission makes no pass of its own.
+    let fixture = Fixture::new(Ok(Vec::new()));
+    let document = fixture.pass().await;
+    assert_eq!(
+        fixture.sources(&document),
+        [
+            (AgentLoginState::NotAuthorized, None),
+            (AgentLoginState::NotAuthorized, None),
+        ]
+    );
+
+    // The service signs in to Claude Code after that pass: the admission's
+    // offer and its report settle `host`, and so must the document.
+    fixture.sign_in_to_claude_code();
+    let admitted = fixture.setup.set_up_admission(BOOT, RUN, ASSIGNMENT);
+
+    assert!(admitted.agent_logins.is_none());
+    let recorded = fixture
+        .recorded()
+        .expect("the admission recorded readiness");
+    let source = |provider| recorded.login(provider).and_then(|login| login.source);
+    assert_eq!(
+        source(AgentLoginProvider::ClaudeCode),
+        Some(CredentialSource::Host)
+    );
+    assert_eq!(source(AgentLoginProvider::Codex), None);
 }
 
 // REQ-GRANT-36, REQ-GRANT-45
@@ -489,8 +648,8 @@ fn earlier(provider: AgentLoginProvider, state: AgentLoginState, named: bool) ->
         state,
         checked_at: Some(now() - time::Duration::minutes(5)),
         login: named.then(|| RecordedLogin::Named(FAKE_AGENT_LOGIN_ID.to_owned())),
-        selected: readiness::selected_by_state(state),
         last_use: None,
+        source: None,
     }
 }
 
@@ -573,63 +732,6 @@ async fn a_failed_status_request_marks_a_provider_cloud_authorized_cloud_unavail
             document.login(AgentLoginProvider::ClaudeCode),
             Some(&not_authorized)
         );
-    }
-}
-
-// REQ-GRANT-38
-#[tokio::test]
-async fn a_pass_records_whether_cloud_names_an_authorization_in_force() {
-    for (answer, selected) in [
-        (
-            codex_answer(authorized(AgentLoginProvider::Codex, 1).status),
-            true,
-        ),
-        (codex_answer(LoginStatus::Unauthorized), true),
-        (codex_answer(LoginStatus::UnsupportedTarget), true),
-        (codex_answer(LoginStatus::Revoked), false),
-        (Ok(Vec::new()), false),
-    ] {
-        let fixture = Fixture::new(answer.clone());
-        let document = fixture.pass().await;
-        let codex = document.login(AgentLoginProvider::Codex).unwrap();
-        assert_eq!(codex.selected, selected, "{answer:?}");
-        assert_eq!(fixture.recorded(), Some(document), "{answer:?}");
-    }
-
-    // A delivery refused as `revoked` ends the authorization Cloud named;
-    // one refused as `unauthorized` does not.
-    for (refusal, selected) in [
-        (DeliveryRefusal::Revoked, false),
-        (DeliveryRefusal::Unauthorized, true),
-    ] {
-        let fixture = Fixture::new(codex_answer(
-            authorized(AgentLoginProvider::Codex, 1).status,
-        ));
-        let cloud = fixture.observing(Vec::new(), Some(DeliveryFailure::Refused(refusal)));
-        let document = fixture.pass_asking(cloud).await;
-        let codex = document.login(AgentLoginProvider::Codex).unwrap();
-        assert_eq!(codex.selected, selected, "{refusal:?}");
-    }
-}
-
-// REQ-GRANT-38
-#[tokio::test]
-async fn a_pass_that_cloud_does_not_answer_keeps_whether_the_provider_is_selected() {
-    for state in [
-        AgentLoginState::NotAuthorized,
-        AgentLoginState::InstallFailed,
-    ] {
-        for selected in [true, false] {
-            let fixture = Fixture::new(Err(CloudFailure::Transport));
-            fixture.record(vec![LoginReadiness {
-                selected,
-                ..earlier(AgentLoginProvider::Codex, state, true)
-            }]);
-            let document = fixture.pass().await;
-            let codex = document.login(AgentLoginProvider::Codex).unwrap();
-            assert_eq!(codex.selected, selected, "{state:?}");
-            assert_eq!(fixture.recorded(), Some(document), "{state:?}");
-        }
     }
 }
 
@@ -927,6 +1029,20 @@ impl AgentLoginCloud for ObservingCloud {
         self.inner.grant_token(request)
     }
 
+    fn grant_providers(
+        &self,
+        request: &GrantProvidersRequest,
+    ) -> Result<Vec<ListedProvider>, GrantProvidersFailure> {
+        self.inner.grant_providers(request)
+    }
+
+    fn credential_sources(
+        &self,
+        request: &CredentialSourcesRequest,
+    ) -> Result<(), CredentialSourcesFailure> {
+        self.inner.credential_sources(request)
+    }
+
     fn follow_credential(&self, _endpoint: &Url, _runner_credential: &Credential) {}
 }
 
@@ -967,7 +1083,7 @@ impl Fixture {
             SetupDependencies::new(
                 cloud,
                 Arc::clone(&self.check) as Arc<dyn LoginCheck>,
-                ServiceEnvironment::from_lookup(|name| (name == "HOME").then(|| home.clone())),
+                ServiceEnvironment::from_variables([("HOME", home)]),
                 &self.root.path().join("state/runner-state.json"),
                 Arc::clone(&self.recorder),
             ),
@@ -2384,4 +2500,84 @@ async fn a_step_that_failed_in_the_setup_is_named_before_its_unanswered_check() 
     assert_eq!(record["um.agent_login.codex.state"], "ready");
     assert_eq!(record["um.agent_login.codex.failure_stage"], "status");
     assert_eq!(record["um.agent_login.codex.failure_cause"], "transport");
+}
+
+/// The `runner.credential_sources` records written so far.
+fn credential_source_records(
+    capture: &TestCapture,
+) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    capture
+        .events()
+        .into_iter()
+        .filter(|event| event["event.name"] == CREDENTIAL_SOURCES_EVENT)
+        .collect()
+}
+
+// REQ-GRANT-93, REQ-TELEMETRY-48
+#[test]
+fn a_credential_source_report_cloud_does_not_take_is_recorded_unless_cloud_lacks_the_route() {
+    let fixture = Fixture::new(Ok(Vec::new()));
+    let request = CredentialSourcesRequest {
+        boot_id: BOOT.to_owned(),
+        assignment_id: ASSIGNMENT.to_owned(),
+        sources: vec![ReportedSource {
+            provider: AgentLoginProvider::Linear,
+            source: CredentialSource::Grant,
+            grant_id: Some(crate::service::FAKE_GRANT_ID.to_owned()),
+            agent_login_id: None,
+        }],
+    };
+
+    // A report Cloud records, and one a Cloud without the route answers,
+    // write nothing.
+    for answer in [Ok(()), Err(CredentialSourcesFailure::NoRoute)] {
+        fixture.cloud.answer_credential_sources(answer);
+        fixture.setup.report_credential_sources(&request);
+    }
+    assert_eq!(
+        fixture.cloud.credential_source_reports(),
+        [request.clone(), request.clone()]
+    );
+    assert!(credential_source_records(&fixture.capture).is_empty());
+
+    // Each other failure writes one record with the assignment and the
+    // closed cause, and nothing of the report.
+    for (failure, cause, status) in [
+        (CloudFailure::Status(409), "http_status", Some(409)),
+        (CloudFailure::Status(503), "http_status", Some(503)),
+        (CloudFailure::Transport, "transport", None),
+        (CloudFailure::InvalidResponse, "invalid_response", None),
+    ] {
+        fixture
+            .cloud
+            .answer_credential_sources(Err(CredentialSourcesFailure::Cloud(failure)));
+        let before = credential_source_records(&fixture.capture).len();
+
+        fixture.setup.report_credential_sources(&request);
+
+        let records = credential_source_records(&fixture.capture);
+        assert_eq!(records.len(), before + 1, "{failure:?}");
+        let record = &records[before];
+        let mut expected = serde_json::json!({
+            "um.assignment.id": ASSIGNMENT,
+            "um.credential_sources.failure_cause": cause,
+        });
+        if let Some(status) = status {
+            expected["um.credential_sources.http_status"] = status.into();
+        }
+        let attributes: serde_json::Map<_, _> = record
+            .iter()
+            .filter(|(key, _)| {
+                key.starts_with("um.credential_sources.") || *key == "um.assignment.id"
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        assert_eq!(&attributes, expected.as_object().unwrap(), "{failure:?}");
+        assert_eq!(record["um.outcome"], "failure");
+        let written = serde_json::to_string(record).unwrap();
+        assert!(
+            !written.contains("pgr_") && !written.contains("linear"),
+            "{written}"
+        );
+    }
 }

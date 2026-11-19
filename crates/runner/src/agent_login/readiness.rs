@@ -4,15 +4,20 @@
 //! (REQ-GRANT-38). A missing document means the
 //! runner has installed nothing. An entry for a provider this build does not
 //! know, which a newer `useful` may have written, is kept as it was read.
-//! A coding agent's entry records whether its provider is selected; one an
-//! earlier `useful` wrote without it reads as selected by its state. Beside an
-//! install it records how the provider answered the login's last use
-//! (REQ-GRANT-52). Each OAuth provider's entry records what the last
+//! Beside an install, a coding agent's entry records how the provider
+//! answered the login's last use (REQ-GRANT-52). Each OAuth provider's entry records what the last
 //! assignment the runner admitted was issued, the run of that assignment and,
 //! once it has ended, when (REQ-GRANT-88): never the token or the path of its
-//! file. One the runner has asked for no token of is written as
-//! `not_delivered`, which is how a document written before these entries
-//! lists all three.
+//! file. One the runner has asked for no token of, the host's own provider's
+//! included (REQ-GRANT-87), is written as `not_delivered`, which is how a
+//! document written before these entries lists all three. Whether a provider
+//! was selected, which an earlier `useful` wrote on its entry, is read and
+//! dropped: no provider is selected (REQ-GRANT-51), and no entry this build
+//! writes, one it keeps as read included, carries it.
+//! Each entry may also record where the provider's credential comes from,
+//! `host` or `grant` (REQ-GRANT-92): a coding agent's as each pass settles
+//! it, an OAuth provider's as the admission of its run did, and only beside
+//! that run.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -22,7 +27,8 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use crate::control_protocol::{
-    AgentLoginProvider, AgentLoginReadiness, AgentLoginState, ProviderReadiness,
+    AgentLoginProvider, AgentLoginReadiness, AgentLoginState, CredentialSource, EarlierSelection,
+    ProviderReadiness,
 };
 use crate::enrollment::{parse_rfc3339, read_private_document, write_private_json};
 
@@ -91,15 +97,15 @@ pub(crate) struct GrantReadiness {
     pub(crate) checked_at: Option<OffsetDateTime>,
     /// The grant the token was issued from, exactly when `ready`.
     pub(crate) issued: Option<IssuedGrant>,
-    /// Whether Cloud's last answer for the provider named a grant in force:
-    /// an issued token or `reconnect_required`.
-    pub(crate) selected: bool,
     /// The `run_` ID of the assignment the entry was recorded for; `None`
     /// for one recorded before runs were. Only beside a check time.
     pub(crate) run_id: Option<String>,
     /// When that assignment ended on this runner, by the setup's clock;
     /// `None` while it runs (INV-RUNNER-30). Only beside a check time.
     pub(crate) ended_at: Option<OffsetDateTime>,
+    /// Where the provider's credential came from for that assignment, as its
+    /// admission settled it (REQ-GRANT-92); only beside its run.
+    pub(crate) source: Option<CredentialSource>,
 }
 
 /// The grant a `ready` OAuth provider's token was issued from.
@@ -129,6 +135,7 @@ impl GrantReadiness {
                 .as_deref()
                 .is_none_or(|run_id| useful_support::valid_typed_id(run_id, "run_"))
             && (self.checked_at.is_some() || (self.run_id.is_none() && self.ended_at.is_none()))
+            && (self.source.is_none() || self.run_id.is_some())
     }
 
     /// Marks the entry ended at `at` when it has a check time and no end
@@ -156,17 +163,18 @@ impl GrantReadiness {
                 .transpose()
                 .ok()?,
             checked_at: self.checked_at.map(format_time).transpose().ok()?,
-            selected: Some(self.selected),
             run_id: self.run_id.clone(),
             ended_at: self.ended_at.map(format_time).transpose().ok()?,
+            source: self.source,
             ..WireEntry::bare(self.provider)
         })
     }
 
     /// The OAuth provider's entry `entry` records; `None` for one the
     /// document does not admit. A `not_delivered` entry with no grant and
-    /// none of a check time, a selection, a run or an end, as every document
-    /// written before these entries lists, records nothing.
+    /// none of a check time, a run or an end, as every document written
+    /// before these entries lists, records nothing. Whether the provider was
+    /// selected, which an earlier `useful` wrote, is not read.
     fn from_wire(provider: AgentLoginProvider, entry: WireEntry) -> Option<Option<Self>> {
         let EntryState::Login(state) = entry.state else {
             return None;
@@ -199,9 +207,9 @@ impl GrantReadiness {
         if state == AgentLoginState::NotDelivered
             && issued.is_none()
             && checked_at.is_none()
-            && entry.selected.is_none()
             && entry.run_id.is_none()
             && ended_at.is_none()
+            && entry.source.is_none()
         {
             return Some(None);
         }
@@ -210,9 +218,9 @@ impl GrantReadiness {
             state,
             checked_at,
             issued,
-            selected: entry.selected.unwrap_or(false),
             run_id: entry.run_id,
             ended_at,
+            source: entry.source,
         };
         grant.valid().then_some(Some(grant))
     }
@@ -225,13 +233,12 @@ pub(crate) struct LoginReadiness {
     pub(crate) state: AgentLoginState,
     pub(crate) checked_at: Option<OffsetDateTime>,
     pub(crate) login: Option<RecordedLogin>,
-    /// Whether Cloud's last answer named an authorization in force for the
-    /// provider: `authorized`, `unauthorized` or `unsupported_target`
-    /// (REQ-GRANT-38).
-    pub(crate) selected: bool,
     /// How the provider answered the last use of the login installed, and
     /// when; only ever beside an install (REQ-GRANT-52).
     pub(crate) last_use: Option<LastUse>,
+    /// Where the coding agent's login comes from, as the pass that wrote the
+    /// entry settled it (REQ-GRANT-92).
+    pub(crate) source: Option<CredentialSource>,
 }
 
 /// How the provider answered an agent step that received the login's
@@ -244,13 +251,6 @@ pub(crate) use crate::control_protocol::AgentLoginUse as UseOutcome;
 pub(crate) struct LastUse {
     pub(crate) outcome: UseOutcome,
     pub(crate) at: OffsetDateTime,
-}
-
-/// Whether an entry written before selection was recorded reads as
-/// selected: exactly when its state is one only an authorized login has
-/// (REQ-GRANT-38).
-pub(crate) const fn selected_by_state(state: AgentLoginState) -> bool {
-    state.selected_by_state()
 }
 
 /// The agent login an entry concerns.
@@ -437,12 +437,12 @@ impl ReadinessDocument {
                     })
                     .transpose()
                     .ok()?,
-                selected: Some(login.selected),
                 last_use: last_use.map(|last_use| last_use.outcome),
                 last_use_at: last_use
                     .map(|last_use| format_time(last_use.at))
                     .transpose()
                     .ok()?,
+                source: login.source,
                 ..WireEntry::bare(login.provider)
             });
         }
@@ -490,19 +490,19 @@ impl ReadinessDocument {
                 if logins.iter().any(|login| login.provider == provider) {
                     return None;
                 }
-                let selected = entry.selected.unwrap_or(selected_by_state(state));
                 let Recorded {
                     checked_at,
                     login,
                     last_use,
+                    source,
                 } = recorded_from_wire(entry)?;
                 logins.push(LoginReadiness {
                     provider,
                     state,
                     checked_at,
                     login,
-                    selected,
                     last_use,
+                    source,
                 });
             } else {
                 // Kept only as the schema admits it, so the document this
@@ -543,16 +543,16 @@ fn wire_name(name: &str) -> bool {
         && bytes.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
 }
 
-/// What an installable entry records besides its provider, state and
-/// selection.
+/// What an installable entry records besides its provider and state.
 struct Recorded {
     checked_at: Option<OffsetDateTime>,
     login: Option<RecordedLogin>,
     last_use: Option<LastUse>,
+    source: Option<CredentialSource>,
 }
 
-/// An installable entry's check time, the agent login it records and, only
-/// beside an install, its last use.
+/// An installable entry's check time, the agent login it records, only
+/// beside an install its last use, and its source.
 fn recorded_from_wire(entry: WireEntry) -> Option<Recorded> {
     if entry
         .agent_login_id
@@ -603,6 +603,7 @@ fn recorded_from_wire(entry: WireEntry) -> Option<Recorded> {
         checked_at,
         login,
         last_use,
+        source: entry.source,
     })
 }
 
@@ -637,8 +638,8 @@ struct WireEntry {
     grant_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     expires_at: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    selected: Option<bool>,
+    #[serde(default, skip_serializing)]
+    selected: EarlierSelection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_use: Option<UseOutcome>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -647,6 +648,8 @@ struct WireEntry {
     run_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ended_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<CredentialSource>,
 }
 
 impl WireEntry {
@@ -663,11 +666,12 @@ impl WireEntry {
             installed_path: None,
             grant_id: None,
             expires_at: None,
-            selected: None,
+            selected: EarlierSelection,
             last_use: None,
             last_use_at: None,
             run_id: None,
             ended_at: None,
+            source: None,
         }
     }
 
@@ -686,11 +690,12 @@ impl WireEntry {
             installed_at: self.installed_at,
             grant_id: self.grant_id,
             expires_at: self.expires_at,
-            selected: self.selected,
+            earlier_selection: EarlierSelection,
             last_use: self.last_use,
             last_use_at: self.last_use_at,
             run_id: self.run_id,
             ended_at: self.ended_at,
+            source: self.source,
         })
     }
 }

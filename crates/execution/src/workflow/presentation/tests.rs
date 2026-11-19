@@ -323,6 +323,7 @@ impl Fixture {
                     command_output: Some(empty_command_output()),
                     recovery: None,
                     invocations: Vec::new(),
+                    failed_child: None,
                 })
                 .collect(),
             finalization: None,
@@ -994,6 +995,7 @@ steps:
             StepStateKind::Succeeded,
             Some(ObservedStepTransition::OutputsCommitted {
                 outputs: vec!["report".to_owned()],
+                failed_child: None,
             }),
         ))
         .await;
@@ -1064,6 +1066,7 @@ steps:
             StepStateKind::Succeeded,
             Some(ObservedStepTransition::OutputsCommitted {
                 outputs: vec!["plan".to_owned()],
+                failed_child: None,
             }),
         ))
         .await;
@@ -1088,6 +1091,7 @@ steps:
         command_output: None,
         recovery: None,
         invocations: Vec::new(),
+        failed_child: None,
     };
     let (_, summary_detail, _) = summary_step(&step, StepSuccessPresentation::Agent).unwrap();
     assert_eq!(summary_detail, "1 output committed");
@@ -1983,6 +1987,7 @@ steps:
             StepStateKind::Succeeded,
             Some(ObservedStepTransition::OutputsCommitted {
                 outputs: vec!["report".to_owned()],
+                failed_child: None,
             }),
         ))
         .await;
@@ -2156,4 +2161,176 @@ async fn a_failed_write_of_a_childs_record_is_the_parents_presentation_failure()
 
     let failure = failures.borrow().clone().unwrap();
     assert_eq!(failure.error_kind, Some(io::ErrorKind::BrokenPipe));
+}
+
+/// A root whose `design` stage runs `NESTED_STAGE` and waits for a repair when it fails.
+fn failed_stage_fixture() -> Fixture {
+    Fixture::with_files(
+        "schemaVersion: 1
+outcomes: [landed, failed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    on:
+      worked: exit.landed
+      failed:
+        wait: repair
+        then: design
+",
+        &[("design.yaml", NESTED_STAGE)],
+    )
+}
+
+/// The failure of a child whose `decide` the interruption stopped (REQ-WFEXEC-77).
+fn failed_child_record() -> crate::workflow::evidence::FailedChild {
+    crate::workflow::evidence::FailedChild {
+        outcome: "failed".to_owned(),
+        item: None,
+        primary_issue: Box::new(crate::workflow::evidence::PrimaryIssue::failed(
+            crate::workflow::validated::WorkflowNode {
+                id: "decide".to_owned(),
+                role: WorkflowNodeRole::Step,
+            },
+            crate::workflow::evidence::FailureDetail::interrupted_in_execution(),
+        )),
+    }
+}
+
+// REQ-LOCALRUN-220, REQ-OUTPUTS-16, REQ-OUTPUTS-17: a stage that succeeded on a failed child
+// writes its `output` records and then one `failed` record naming the child's failing node by
+// its path under the stage, in place of `done`; without the record the stage reads `done`.
+#[tokio::test]
+async fn a_stage_whose_child_failed_completes_with_a_failed_record() {
+    let fixture = failed_stage_fixture();
+    for (failed_child, last) in [(Some(failed_child_record()), "failed"), (None, "done")] {
+        let stdout = SharedWriter::default();
+        let presentation = WorkflowRunOutput::new(
+            config(RequestedPresentationMode::Plain, ColorChoice::Never),
+            stdout.clone(),
+            SharedWriter::default(),
+        )
+        .start(
+            &fixture.workflow,
+            1,
+            TestClock::fixed("2026-08-02T12:01:44Z"),
+        )
+        .unwrap();
+        presentation
+            .observe(step_transition(
+                "design",
+                StepStateKind::Succeeded,
+                Some(ObservedStepTransition::OutputsCommitted {
+                    outputs: vec!["plan".to_owned()],
+                    failed_child,
+                }),
+            ))
+            .await;
+        presentation.flush_pending().await;
+
+        let records = step_records(&stdout)
+            .into_iter()
+            .map(|record| record.split(' ').take(2).collect::<Vec<_>>().join(" "))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            records,
+            ["design output".to_owned(), format!("design {last}")],
+            "{}",
+            stdout.text()
+        );
+        let completion = stdout.text().lines().last().unwrap().to_owned();
+        assert_eq!(
+            completion
+                .split_whitespace()
+                .any(|word| word == "design.decide"),
+            last == "failed",
+            "{completion}"
+        );
+    }
+}
+
+// REQ-LOCALRUN-220, REQ-WFEXEC-41, REQ-OUTPUTS-17: the summary's row of a stage that waits on
+// its failed child reads `failed`, the outcome line counts it failed and not succeeded, and
+// the wait line names the failing node from the step's own record when publication failed;
+// without the record the stage's summary is what an agent's success renders.
+#[tokio::test]
+async fn a_waiting_stage_whose_child_failed_is_summarized_as_failed() {
+    let fixture = failed_stage_fixture();
+    let destination = fixture.destination("exists");
+    std::fs::create_dir(&destination).unwrap();
+    let failure =
+        publish_workflow_result(&destination, &fixture.artifacts, &fixture.succeeded_run())
+            .unwrap_err();
+    let mut run = fixture.succeeded_run();
+    run.outcome = RunOutcome::Waiting {
+        wait: crate::workflow::runtime::EnteredWait {
+            step: "design".to_owned(),
+            outcome: Some("failed".to_owned()),
+            kind: crate::workflow::document::WaitKind::Repair,
+            then: "design".to_owned(),
+            on_hand_back: None,
+            rule: None,
+            interrupted: None,
+            kept: None,
+        },
+    };
+    let step = &mut run.steps[0];
+    step.kind = WorkflowRunStepKind::Workflow;
+    step.command_output = None;
+    step.state = StepState::Succeeded {
+        outputs: BTreeMap::from([(
+            "plan".to_owned(),
+            CapturedValue::json_fixture(Arc::new(Value::Object(serde_json::Map::new()))),
+        )]),
+    };
+    let without = step.clone();
+    step.failed_child = Some(failed_child_record());
+    let stdout = SharedWriter::default();
+    let presentation = WorkflowRunOutput::new(
+        config(RequestedPresentationMode::Plain, ColorChoice::Never),
+        stdout.clone(),
+        SharedWriter::default(),
+    )
+    .start(
+        &fixture.workflow,
+        1,
+        TestClock::fixed("2026-08-02T12:01:44Z"),
+    )
+    .unwrap();
+
+    presentation
+        .finish(&run, PublicationPresentation::Failed(&failure))
+        .await;
+
+    let text = stdout.text();
+    let row = text
+        .lines()
+        .map(|line| line.split_whitespace().collect::<Vec<_>>())
+        .find(|words| words.first() == Some(&"design"))
+        .unwrap();
+    assert_eq!(row.get(2), Some(&"failed"), "{text}");
+    let outcome = text
+        .lines()
+        .find(|line| line.starts_with("workflow waiting"))
+        .unwrap();
+    let counts = outcome.split(" · ").collect::<Vec<_>>();
+    assert!(counts.contains(&"1 failed"), "{outcome}");
+    assert!(
+        !counts.iter().any(|count| count.ends_with("succeeded")),
+        "{outcome}"
+    );
+    let wait = text.lines().find(|line| line.starts_with("wait:")).unwrap();
+    assert!(
+        wait.split_whitespace().any(|word| word == "design.decide"),
+        "{wait}"
+    );
+
+    assert_eq!(
+        summary_step(&without, StepSuccessPresentation::Agent).unwrap(),
+        (
+            "succeeded",
+            "1 output committed".to_owned(),
+            TokenRole::Success
+        )
+    );
 }

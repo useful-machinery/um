@@ -214,6 +214,9 @@ pub(in crate::workflow) fn live_step_detail(step: &WorkflowRunStepView) -> Optio
     if let Some(detail) = &step.inherited {
         return Some(crate::workflow::render_style::inherited_detail(detail));
     }
+    if let Some(detail) = live_failed_stage_detail(step) {
+        return Some(detail);
+    }
     match &step.fact {
         Some(ObservedStepTransition::Recovery {
             active,
@@ -229,7 +232,7 @@ pub(in crate::workflow) fn live_step_detail(step: &WorkflowRunStepView) -> Optio
             *handler_state,
             *decision,
         )),
-        Some(ObservedStepTransition::OutputsCommitted { outputs }) => {
+        Some(ObservedStepTransition::OutputsCommitted { outputs, .. }) => {
             Some(output_count_detail(outputs.len()))
         }
         Some(ObservedStepTransition::Failed { detail }) => Some(issue_detail_for_step(
@@ -253,18 +256,32 @@ pub(in crate::workflow) fn live_step_detail(step: &WorkflowRunStepView) -> Optio
             Some(cancellation_reason(detail.code).to_owned())
         }
         None if step.state == StepStateKind::Succeeded => {
-            let committed_outputs = step
-                .outputs
-                .values()
-                .filter(|disposition| **disposition == WorkflowRunOutputDisposition::Committed)
-                .count();
             Some(crate::workflow::render_style::success_detail(
                 matches!(step.definition, WorkflowPresentationStep::Command { .. }),
-                committed_outputs,
+                committed_output_count(step),
             ))
         }
         None => None,
     }
+}
+
+/// The failed child of a stage whose child failed, with the outputs it committed
+/// (REQ-LOCALRUN-221); `None` for any other step. A failed stage is not an advisory issue.
+pub(super) fn live_failed_stage_detail(step: &WorkflowRunStepView) -> Option<String> {
+    step.failed_child.as_ref().map(|failed_child| {
+        crate::workflow::presentation::failed_stage_detail(
+            &step.id,
+            failed_child,
+            committed_output_count(step),
+        )
+    })
+}
+
+fn committed_output_count(step: &WorkflowRunStepView) -> usize {
+    step.outputs
+        .values()
+        .filter(|disposition| **disposition == WorkflowRunOutputDisposition::Committed)
+        .count()
 }
 
 pub(super) fn failure_policy_name(policy: FailurePolicy) -> &'static str {

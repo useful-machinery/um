@@ -14,6 +14,6 @@ Options:
       --allow-insecure-http            Allow this command's Useful Machinery requests over insecure HTTP connections
   -h, --help                           Print help
 
-With --cloud ORGANIZATION, RUN is a Cloud run ID: the command reads that run with its definition, subject claim, workflow state and outcome, latest progress, exits and newest trigger deliveries. It reads and writes no local run.
+With --cloud ORGANIZATION, RUN is a Cloud run ID: the command reads that run with its definition, subject claim, workflow state and outcome, cancellation, latest progress, exits, newest controls and newest trigger deliveries. It reads and writes no local run.
 
 ```

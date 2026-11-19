@@ -23,7 +23,7 @@ pub struct OidcIdentityLinkGrant {
     pub id: String,
     /// The provider the grant authorizes.
     #[serde(rename = "provider")]
-    pub provider: Provider,
+    pub provider: String,
     /// The grant's lifecycle state.
     #[serde(rename = "state")]
     pub state: State,
@@ -31,28 +31,12 @@ pub struct OidcIdentityLinkGrant {
 
 impl OidcIdentityLinkGrant {
     /// The provider grant bound to this identity, when one exists, with its state (REQ-GRANT-3).
-    pub fn new(id: String, provider: Provider, state: State) -> OidcIdentityLinkGrant {
+    pub fn new(id: String, provider: String, state: State) -> OidcIdentityLinkGrant {
         OidcIdentityLinkGrant {
             id,
             provider,
             state,
         }
-    }
-}
-/// The provider the grant authorizes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Provider {
-    #[serde(rename = "github")]
-    OIDCIdentityLinkGrantProviderGithub,
-    #[serde(rename = "gitlab.com")]
-    OIDCIdentityLinkGrantProviderGitlabCom,
-    #[serde(rename = "linear")]
-    OIDCIdentityLinkGrantProviderLinear,
-}
-
-impl Default for Provider {
-    fn default() -> Provider {
-        Self::OIDCIdentityLinkGrantProviderGithub
     }
 }
 /// The grant's lifecycle state.

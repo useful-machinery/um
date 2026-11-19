@@ -1,11 +1,12 @@
 //! `useful workflow run show RUN --cloud ORGANIZATION`, `useful workflow run release RUN --cloud
-//! ORGANIZATION` (REQ-LOCALRUN-189, REQ-LOCALRUN-187) and the control leaves `answer`,
-//! `approve`, `hand-back`, `lift`, `stop` and `retry` with `--cloud` (REQ-LOCALRUN-210): the
-//! Cloud run `RUN` names, as typed, read with its identity, observations and trigger
-//! deliveries (REQ-RUN-96, REQ-RUN-87 and REQ-RUN-88), its subject claim released by an owner
-//! (REQ-CLOUDDEF-19), or a control for its current wait carried to its runner (REQ-RUN-91),
-//! through the public API under the CLI's session handling. Nothing under the `useful` home is
-//! read or written.
+//! ORGANIZATION` (REQ-LOCALRUN-189, REQ-LOCALRUN-187), `withdraw` and `cancel` with `--cloud`
+//! (REQ-LOCALRUN-218) and the control leaves `answer`, `approve`, `hand-back`, `lift`, `stop` and
+//! `retry` with `--cloud` (REQ-LOCALRUN-210): the Cloud run `RUN` names, as typed, read with its
+//! identity, observations, trigger deliveries and controls (REQ-RUN-96, REQ-RUN-87, REQ-RUN-88 and
+//! REQ-RUN-110), its subject claim released by an owner (REQ-CLOUDDEF-19), a control carried to
+//! its runner (REQ-RUN-91), or a graceful cancellation requested (REQ-CANCEL-1), through the
+//! public API under the CLI's session handling. Nothing under the `useful` home is read or
+//! written.
 
 use std::io::{self, Write};
 
@@ -13,12 +14,15 @@ use anyhow::{Context, anyhow};
 use serde::Serialize;
 use serde_json::Value;
 use useful_api::{
-    HttpClient, Run, RunApi, RunClaimRelease, RunControl, RunControlAnswer, RunControlKind,
-    RunControlRequest, RunControlSubmission, RunControlWait, RunFailure, RunRead, RunSubjectClaim,
-    RunTriggerDelivery,
+    HttpClient, Run, RunApi, RunCancellationMode, RunCancellationReceipt, RunClaimRelease,
+    RunControl, RunControlAnswer, RunControlKind, RunControlRequest, RunControlSubmission,
+    RunControlWait, RunFailure, RunRead, RunSubjectClaim, RunTriggerDelivery,
 };
 use useful_human_auth::Deployment;
 
+use super::super::super::run::{
+    reported_field as field, reported_text as text, step_path as path, wait_phrase,
+};
 use super::super::super::{
     self as cli, CommandFailure, HttpOptions, OrganizationArg, PrincipalAuthenticationArgs,
 };
@@ -26,8 +30,12 @@ use crate::exit_code::ExitCode;
 
 const SHOW_COMMAND: &str = "useful workflow run show";
 const RELEASE_COMMAND: &str = "useful workflow run release";
+const CANCEL_COMMAND: &str = "useful workflow run cancel";
+const WITHDRAW_COMMAND: &str = "useful workflow run withdraw";
 /// The most deliveries `show` reads, the API's page bound.
 const SHOWN_DELIVERIES: u32 = 100;
+/// The most controls `show` reads, the API's page bound.
+const SHOWN_CONTROLS: u32 = 100;
 /// The run fields a definition-backed run's read carries and a run by `workflowPath` may
 /// leave out; `show` reports an absent one as null.
 const OBSERVED_FIELDS: [&str; 6] = [
@@ -51,6 +59,7 @@ pub(super) enum Control {
     Lift { before: Option<String> },
     Stop { before: String, reason: String },
     Retry,
+    Withdraw,
 }
 
 /// Why a control leaf sent nothing: the run does not wait on the wait its control resolves.
@@ -68,6 +77,7 @@ impl Control {
             Self::Lift { .. } => "lift",
             Self::Stop { .. } => "stop",
             Self::Retry => "retry",
+            Self::Withdraw => "withdraw",
         }
     }
 
@@ -79,17 +89,19 @@ impl Control {
             Self::Lift { .. } => "useful workflow run lift",
             Self::Stop { .. } => "useful workflow run stop",
             Self::Retry => "useful workflow run retry",
+            Self::Withdraw => WITHDRAW_COMMAND,
         }
     }
 
     /// The kind of wait the control resolves, which the run must currently wait on; a `lift`
-    /// names the run's `stop` wait when it waits on one, and a `stop` names none.
+    /// names the run's `stop` wait when it waits on one, and a `stop` and a `withdraw` name
+    /// none.
     fn resolves(&self) -> Option<&'static str> {
         match self {
             Self::Answer { .. } => Some("answer"),
             Self::Approve | Self::HandBack { .. } => Some("approval"),
             Self::Retry => Some("repair"),
-            Self::Lift { .. } | Self::Stop { .. } => None,
+            Self::Lift { .. } | Self::Stop { .. } | Self::Withdraw => None,
         }
     }
 
@@ -113,6 +125,7 @@ impl Control {
             Self::Lift { .. } => RunControlKind::RunControlKindLift,
             Self::Stop { .. } => RunControlKind::RunControlKindStop,
             Self::Retry => RunControlKind::RunControlKindRetry,
+            Self::Withdraw => RunControlKind::RunControlKindWithdraw,
         };
         let mut request = RunControlRequest::new(kind);
         request.wait = wait.map(|wait| Some(Box::new(wait)));
@@ -126,7 +139,7 @@ impl Control {
                 request.before = Some(before.clone());
                 request.reason = Some(reason.clone());
             }
-            Self::Approve | Self::Retry => {}
+            Self::Approve | Self::Retry | Self::Withdraw => {}
         }
         Ok(request)
     }
@@ -174,8 +187,8 @@ impl CloudRun {
         })
     }
 
-    /// Reads the run and, for a definition-backed run holding a claim, the newest page of
-    /// its trigger deliveries.
+    /// Reads the run, for a definition-backed run holding a claim the newest page of its
+    /// trigger deliveries, and for any definition-backed run the newest page of its controls.
     pub(super) fn show(self) -> cli::CommandResult {
         cli::execute_deployment_command(
             Some(self),
@@ -187,8 +200,8 @@ impl CloudRun {
                         RunRead::Materialized(run) => run,
                         RunRead::Pending(_) => return Ok(None),
                     };
-                    let claimed = matches!(run.definition, Some(Some(_)))
-                        && matches!(run.subject_claim, Some(Some(_)));
+                    let defined = matches!(run.definition, Some(Some(_)));
+                    let claimed = defined && matches!(run.subject_claim, Some(Some(_)));
                     let deliveries = if claimed {
                         Some(api.list_trigger_deliveries(
                             &cloud.organization,
@@ -199,15 +212,31 @@ impl CloudRun {
                     } else {
                         None
                     };
+                    // A run by `workflowPath` has no controls: Cloud answers it 404.
+                    let controls = if defined {
+                        Some(api.list_run_controls(
+                            &cloud.organization,
+                            &cloud.run_id,
+                            Some(SHOWN_CONTROLS),
+                            None,
+                        )?)
+                    } else {
+                        None
+                    };
                     let value = serde_json::to_value(&*run).map_err(|_| RunFailure::Protocol {
                         credential_rejected: false,
                     })?;
-                    Ok(Some((run, value, deliveries)))
+                    Ok(Some((
+                        run,
+                        value,
+                        Listings {
+                            deliveries,
+                            controls,
+                        },
+                    )))
                 })?;
                 match read {
-                    Ok(Some((run, value, deliveries))) => {
-                        cloud.write_shown(&run, value, deliveries)
-                    }
+                    Ok(Some((run, value, listings))) => cloud.write_shown(&run, value, listings),
                     Ok(None) => cloud.write_pending(),
                     Err(failure) => cloud.write_failure(SHOW_COMMAND, &failure),
                 }
@@ -253,8 +282,37 @@ impl CloudRun {
         )
     }
 
-    /// Reads the run for its current wait, unless the control is a `stop`, and asks Cloud to
-    /// carry the control naming that wait to the run's runner under one fresh key.
+    /// Asks Cloud for a graceful cancellation of the run under one fresh key, sent again when
+    /// the response is lost, and reports the cancellation request Cloud answers
+    /// (REQ-LOCALRUN-218, REQ-CANCEL-1).
+    pub(super) fn cancel(self) -> cli::CommandResult {
+        let key = useful_support::generate_idempotency_key()
+            .context("generate Cloud run cancellation request identity")?;
+        cli::execute_deployment_command(
+            Some(self),
+            &["workflow", "run", "cancel"],
+            "configure Useful Machinery runs",
+            |cloud, deployment| {
+                let cancelled = cloud.with_api(deployment, |api| {
+                    api.cancel(
+                        &cloud.organization,
+                        &cloud.run_id,
+                        &key,
+                        RunCancellationMode::Graceful,
+                        || true,
+                    )
+                })?;
+                match cancelled {
+                    Ok(envelope) => cloud.write_cancellation(&envelope.request),
+                    Err(failure) => cloud.write_failure(CANCEL_COMMAND, &failure),
+                }
+            },
+        )
+    }
+
+    /// Reads the run for its current wait, unless the control is a `stop` or a `withdraw`,
+    /// which name none, and asks Cloud to carry the control naming that wait to the run's
+    /// runner under one fresh key.
     pub(super) fn control(self, control: Control) -> cli::CommandResult {
         let key = useful_support::generate_idempotency_key()
             .context("generate Cloud run control request identity")?;
@@ -265,7 +323,7 @@ impl CloudRun {
             "configure Useful Machinery runs",
             |cloud, deployment| {
                 let sent = cloud.with_api(deployment, |api| {
-                    let wait = if matches!(control, Control::Stop { .. }) {
+                    let wait = if matches!(control, Control::Stop { .. } | Control::Withdraw) {
                         None
                     } else {
                         current_wait(api.get(&cloud.organization, &cloud.run_id)?)
@@ -290,7 +348,17 @@ impl CloudRun {
                     Ok(Ok(RunControlSubmission::RunNotLive)) => cloud.write_refusal(
                         command,
                         "run_not_live",
-                        "No runner is executing the run's current attempt; nothing was sent.",
+                        if matches!(control, Control::Withdraw) {
+                            "No runner is executing the run's current attempt; nothing was sent. End the run with useful workflow run cancel RUN --cloud ORGANIZATION."
+                        } else {
+                            "No runner is executing the run's current attempt; nothing was sent."
+                        },
+                        ExitCode::GeneralFailure,
+                    ),
+                    Ok(Ok(RunControlSubmission::ControlUnsupported)) => cloud.write_refusal(
+                        command,
+                        "control_unsupported",
+                        "The runner executing the run runs a useful that does not apply a withdrawal; nothing was sent. End the run with useful workflow run cancel RUN --cloud ORGANIZATION.",
                         ExitCode::GeneralFailure,
                     ),
                     Ok(Ok(RunControlSubmission::TooLarge)) => cloud.write_refusal(
@@ -353,21 +421,14 @@ impl CloudRun {
         )
     }
 
-    fn write_shown(
-        &self,
-        typed: &Run,
-        mut run: Value,
-        deliveries: Option<(Vec<RunTriggerDelivery>, Option<String>)>,
-    ) -> cli::CommandResult {
+    fn write_shown(&self, typed: &Run, mut run: Value, listings: Listings) -> cli::CommandResult {
         if let Some(fields) = run.as_object_mut() {
             for field in OBSERVED_FIELDS {
                 fields.entry(field).or_insert(Value::Null);
             }
         }
-        let (deliveries, more_deliveries) = match deliveries {
-            Some((deliveries, cursor)) => (Some(deliveries), cursor.is_some()),
-            None => (None, false),
-        };
+        let (deliveries, more_deliveries) = paged(listings.deliveries);
+        let (controls, more_controls) = paged(listings.controls);
         let written = if self.json {
             cli::write_pretty_json(&ShowDocument {
                 schema_version: 1,
@@ -379,14 +440,17 @@ impl CloudRun {
                 run: Some(&run),
                 deliveries: deliveries.as_deref(),
                 more_deliveries,
+                controls: controls.as_deref(),
+                more_controls,
             })
         } else {
             write_plain(
                 &self.organization,
+                &self.run_id,
                 typed,
                 &run,
-                deliveries.as_deref(),
-                more_deliveries,
+                (deliveries.as_deref(), more_deliveries),
+                (controls.as_deref(), more_controls),
             )
         };
         written.with_context(|| format!("write {SHOW_COMMAND} output"))?;
@@ -406,6 +470,8 @@ impl CloudRun {
                 run: None,
                 deliveries: None,
                 more_deliveries: false,
+                controls: None,
+                more_controls: false,
             })
         } else {
             let mut stdout = io::stdout().lock();
@@ -476,6 +542,32 @@ impl CloudRun {
         Ok(ExitCode::Success)
     }
 
+    fn write_cancellation(&self, request: &RunCancellationReceipt) -> cli::CommandResult {
+        let written = if self.json {
+            cli::write_pretty_json(&CancellationDocument {
+                schema_version: 1,
+                command: CANCEL_COMMAND,
+                outcome: "accepted",
+                exit_status: ExitCode::Success.as_u8(),
+                organization_ref: &self.organization,
+                run_id: &self.run_id,
+                cancellation_request: request,
+            })
+        } else {
+            let mut stdout = io::stdout().lock();
+            writeln!(
+                stdout,
+                "✓ Cloud accepted cancellation request {} for run {} (state {}).",
+                text(&request.id),
+                text(&self.run_id),
+                wire(request.state),
+            )
+            .and_then(|()| stdout.flush())
+        };
+        written.with_context(|| format!("write {CANCEL_COMMAND} output"))?;
+        Ok(ExitCode::Success)
+    }
+
     /// Reports `failure` as a refusal under [`failure_diagnostic`].
     fn write_failure(&self, command: &'static str, failure: &RunFailure) -> cli::CommandResult {
         let (code, message, exit) = failure_diagnostic(command, failure);
@@ -543,6 +635,23 @@ fn failure_diagnostic(
     (code, message, exit)
 }
 
+/// One page of a listing `show` read and the next page's cursor.
+type Page<T> = (Vec<T>, Option<String>);
+
+/// The listings `show` read beside the run; `None` for one it did not read.
+struct Listings {
+    deliveries: Option<Page<RunTriggerDelivery>>,
+    controls: Option<Page<Value>>,
+}
+
+/// A listing's items, if it was read, and whether more remain.
+fn paged<T>(page: Option<Page<T>>) -> (Option<Vec<T>>, bool) {
+    match page {
+        Some((items, cursor)) => (Some(items), cursor.is_some()),
+        None => (None, false),
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ShowDocument<'a> {
@@ -555,6 +664,8 @@ struct ShowDocument<'a> {
     run: Option<&'a Value>,
     deliveries: Option<&'a [RunTriggerDelivery]>,
     more_deliveries: bool,
+    controls: Option<&'a [Value]>,
+    more_controls: bool,
 }
 
 #[derive(Serialize)]
@@ -583,6 +694,18 @@ struct AcceptedDocument<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct CancellationDocument<'a> {
+    schema_version: u8,
+    command: &'static str,
+    outcome: &'static str,
+    exit_status: u8,
+    organization_ref: &'a str,
+    run_id: &'a str,
+    cancellation_request: &'a RunCancellationReceipt,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RefusedDocument<'a> {
     schema_version: u8,
     command: &'static str,
@@ -599,48 +722,25 @@ struct Diagnostic {
     message: &'static str,
 }
 
-fn text(value: &str) -> String {
-    useful_execution::normalize_terminal_scalar(value.as_bytes())
-}
-
-/// The string at `key` of `object`, or `-` when it is absent, null or not a string.
-fn field(object: &Value, key: &str) -> String {
-    object[key].as_str().map_or_else(|| "-".to_owned(), text)
-}
-
-/// A position or wait step path as its elements joined by `.`, an item by its number.
-fn path(elements: &Value) -> String {
-    elements.as_array().map_or_else(
-        || "-".to_owned(),
-        |elements| {
-            elements
-                .iter()
-                .map(|element| match element {
-                    Value::String(step) => text(step),
-                    other => other["item"]
-                        .as_i64()
-                        .map_or_else(|| "?".to_owned(), |item| item.to_string()),
-                })
-                .collect::<Vec<_>>()
-                .join(".")
-        },
-    )
-}
-
 fn wire(value: impl Serialize) -> String {
     useful_support::wire_name(value).unwrap_or_else(|| "-".to_owned())
 }
 
 /// The run as `show` prints it without `--json`: its identity, owner, route and what it
-/// waits for, workspace, claim, workflow state and outcome, its rejection as `useful run show`
-/// prints it (REQ-RUN-105), latest progress, exits with their mirror results and its
-/// deliveries, acceptance apart from the runner's application.
+/// waits for, workspace, claim, workflow state and outcome, its cancellation's mode, its
+/// rejection as `useful run show` prints it (REQ-RUN-105), latest progress, exits with their
+/// mirror results, its controls (REQ-RUN-110) and its deliveries, acceptance apart from the
+/// runner's application. `deliveries` and `controls` are each a listing, if read, and
+/// whether more remain.
+/// A held claim of an exited run adds what it holds and the release command for `run_id`
+/// in `organization` (REQ-RUN-96).
 fn write_plain(
     organization: &str,
+    run_id: &str,
     typed: &Run,
     run: &Value,
-    deliveries: Option<&[RunTriggerDelivery]>,
-    more_deliveries: bool,
+    deliveries: (Option<&[RunTriggerDelivery]>, bool),
+    controls: (Option<&[Value]>, bool),
 ) -> io::Result<()> {
     let mut out = io::stdout().lock();
     writeln!(out, "run: {}", field(run, "id"))?;
@@ -689,15 +789,33 @@ fn write_plain(
             write!(out, " ({})", text(cause))?;
         }
         writeln!(out)?;
+        if claim["state"] == "held" && run["workflowState"] == "exited" {
+            let subject = field(claim, "subject");
+            writeln!(
+                out,
+                "  this exited run still holds the slot of {subject}; a start Cloud refuses for {subject} reads subject-settled and names this run"
+            )?;
+            writeln!(
+                out,
+                "  an organization owner releases the claim with: useful workflow run release {} --cloud {}",
+                text(run_id),
+                text(organization)
+            )?;
+        }
     } else {
         writeln!(out, "subject claim: none")?;
     }
     writeln!(out, "workflow state: {}", field(run, "workflowState"))?;
     writeln!(out, "workflow outcome: {}", field(run, "workflowOutcome"))?;
+    let cancellation = &run["cancellation"];
+    if cancellation.is_object() {
+        writeln!(out, "cancellation: {}", field(cancellation, "mode"))?;
+    }
     cli::run::write_rejection(&mut out, typed)?;
     write_progress(&mut out, &run["workflowProgress"])?;
     write_exits(&mut out, &run["exits"])?;
-    write_deliveries(&mut out, deliveries, more_deliveries)?;
+    write_controls(&mut out, controls.0, controls.1)?;
+    write_deliveries(&mut out, deliveries.0, deliveries.1)?;
     out.flush()
 }
 
@@ -713,21 +831,42 @@ fn write_progress(out: &mut impl Write, progress: &Value) -> io::Result<()> {
     )?;
     let wait = &progress["wait"];
     if wait.is_object() {
-        write!(
-            out,
-            " · waiting {} at {} since {}",
-            field(wait, "kind"),
-            path(&wait["step"]),
-            field(wait, "since")
-        )?;
+        write!(out, " · waiting {}", wait_phrase(wait))?;
     } else {
         write!(out, " · running")?;
     }
     writeln!(out, " · reported {}", field(progress, "reportedAt"))?;
+    write_failed_stage(out, wait)?;
     if wait["kind"] == "answer" {
         write_questions(out, &wait["questions"])?;
     }
     Ok(())
+}
+
+/// The failed stage the runner reported for a wait of any kind (REQ-RUN-112), in the order
+/// `useful workflow run status` prints its own: the stage's path, the outcome, the failing
+/// node by its path under the stage with its state, then the phase and the code when each is
+/// a string. A null or absent `failedChild` prints nothing, since it never says the stage
+/// succeeded.
+fn write_failed_stage(out: &mut impl Write, wait: &Value) -> io::Result<()> {
+    let failed_child = &wait["failedChild"];
+    if !failed_child.is_object() {
+        return Ok(());
+    }
+    let stage = path(&wait["step"]);
+    write!(
+        out,
+        "failed stage: {stage} · child outcome {} · {stage}.{} {}",
+        field(failed_child, "outcome"),
+        field(&failed_child["node"], "id"),
+        field(failed_child, "state")
+    )?;
+    for key in ["phase", "code"] {
+        if let Some(value) = failed_child[key].as_str() {
+            write!(out, " · {}", text(value))?;
+        }
+    }
+    writeln!(out)
 }
 
 /// An answer wait's questions, one indented line each as `<id>: <text>` or the id alone,
@@ -804,6 +943,40 @@ fn mirror_text(result: &Value) -> String {
         }
     }
     line
+}
+
+/// The run's controls as Cloud listed them, newest first, one indented line each as
+/// `<id> · <kind> · <state> [<actionOutcome>|<code>] · attempt <n> · accepted <time>`.
+fn write_controls(out: &mut impl Write, controls: Option<&[Value]>, more: bool) -> io::Result<()> {
+    let Some(controls) = controls.filter(|controls| !controls.is_empty()) else {
+        return writeln!(out, "controls: none");
+    };
+    writeln!(out, "controls:")?;
+    for control in controls {
+        write!(
+            out,
+            "  {} · {} · {}",
+            field(control, "id"),
+            field(control, "kind"),
+            field(control, "state")
+        )?;
+        if let Some(settled) = control["actionOutcome"]
+            .as_str()
+            .or_else(|| control["code"].as_str())
+        {
+            write!(out, " {}", text(settled))?;
+        }
+        writeln!(
+            out,
+            " · attempt {} · accepted {}",
+            control["attemptNumber"],
+            field(control, "acceptedAt")
+        )?;
+    }
+    if more {
+        writeln!(out, "older controls: not shown")?;
+    }
+    Ok(())
 }
 
 fn write_deliveries(

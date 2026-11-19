@@ -214,6 +214,10 @@ impl Command {
         if let Some(tree) = tree {
             context = context.with_tree(tree);
         }
+        // REQ-LOCALRUN-217: the revision the run was created with.
+        if let Some(source_revision) = pending.source_revision() {
+            context = context.with_source_revision(source_revision.clone());
+        }
         let untested_advisories = context.untested_harness_advisories();
         let workflow_for_admission = workflow.clone();
         let admitted = match super::create::blocking_operation(move || {

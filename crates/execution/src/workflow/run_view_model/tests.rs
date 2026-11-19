@@ -85,10 +85,94 @@ steps:
 }
 
 fn resolve_workflow(source: &str) -> (tempfile::TempDir, ResolvedWorkflow) {
+    resolve_tree(&[("workflow.yaml", source)])
+}
+
+/// Resolves `workflow.yaml` of a tree holding `files`, each a path and its source.
+fn resolve_tree(files: &[(&str, &str)]) -> (tempfile::TempDir, ResolvedWorkflow) {
     let temporary = tempfile::tempdir().unwrap();
-    std::fs::write(temporary.path().join("workflow.yaml"), source).unwrap();
+    for (path, source) in files {
+        std::fs::write(temporary.path().join(path), source).unwrap();
+    }
     let workflow = resolution::resolve(temporary.path(), Path::new("workflow.yaml")).unwrap();
     (temporary, workflow)
+}
+
+/// A tree whose one step `design` runs a child that declares the export `plan`, so the step
+/// declares `outcome` and `plan` (REQ-WFEXEC-60).
+fn stage_workflow() -> (tempfile::TempDir, ResolvedWorkflow) {
+    resolve_tree(&[
+        (
+            "workflow.yaml",
+            "schemaVersion: 1
+outcomes: [landed, failed]
+steps:
+  design:
+    kind: workflow
+    workflow: design.yaml
+    on:
+      planned: exit.landed
+      failed: exit.failed
+",
+        ),
+        (
+            "design.yaml",
+            "schemaVersion: 1
+outcomes: [planned, failed]
+outcome:
+  from: outputs.route.verdict
+  onFailure: failed
+steps:
+  plan:
+    kind: cmd
+    command:
+      argv: [\"plan\"]
+    outputs:
+      text:
+        kind: text
+        from: path
+        path: plan.txt
+  route:
+    kind: cmd
+    dependsOn: [plan]
+    command:
+      argv: [\"route\"]
+    outputs:
+      verdict:
+        kind: text
+        from: path
+        path: verdict.txt
+exports:
+  plan:
+    ref: outputs.plan.text
+",
+        ),
+    ])
+}
+
+/// The terminal result of `stage_workflow()` whose `design` succeeded with `outputs`.
+fn stage_run_result(
+    workflow: &ResolvedWorkflow,
+    base: Instant,
+    outputs: &[&str],
+) -> WorkflowRunResult {
+    let mut run = succeeded_run_result(workflow, base);
+    run.steps.truncate(1);
+    let step = &mut run.steps[0];
+    step.id = "design".to_owned();
+    step.kind = super::super::publication::WorkflowRunStepKind::Workflow;
+    step.state = StepState::Succeeded {
+        outputs: outputs
+            .iter()
+            .map(|name| {
+                (
+                    (*name).to_owned(),
+                    CapturedValue::text(Arc::from("planned")),
+                )
+            })
+            .collect(),
+    };
+    run
 }
 
 fn model(
@@ -280,6 +364,7 @@ async fn transitions_project_definition_output_cancellation_and_frozen_timing() 
         StepStateKind::Succeeded,
         Some(ObservedStepTransition::OutputsCommitted {
             outputs: vec!["report".to_owned()],
+            failed_child: None,
         }),
     ))
     .await;
@@ -956,6 +1041,8 @@ steps:
             command_output: None,
             recovery: None,
             invocations: Vec::new(),
+            failed_child: None,
+            committed_outputs: None,
         };
         assert_eq!(
             crate::workflow::terminal_host::live_step_detail(step).as_deref(),
@@ -1038,6 +1125,7 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
                 command_output: None,
                 recovery: None,
                 invocations: Vec::new(),
+                failed_child: None,
             },
             super::super::publication::WorkflowRunStep {
                 id: "consume".to_owned(),
@@ -1057,6 +1145,7 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
                 command_output: None,
                 recovery: None,
                 invocations: Vec::new(),
+                failed_child: None,
             },
         ],
         finalization: None,
@@ -1064,4 +1153,171 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
         export_sources: BTreeMap::new(),
         export_presentation: BTreeMap::new(),
     }
+}
+
+// REQ-LOCALRUN-28, REQ-WFEXEC-60: a `workflow` step commits the exports its child left
+// available, a subset of the ones it declares; the result is accepted and an output the
+// succeeded step did not commit reads unavailable, not pending.
+#[test]
+fn terminal_reconciliation_accepts_a_workflow_steps_committed_output_subset() {
+    let (_temporary, workflow) = stage_workflow();
+    let base = useful_support::monotonic_now();
+    let clock = ControlledClock::new(point(base, 0));
+    let view = model(&workflow, clock.clone());
+    assert_eq!(
+        step(&view.snapshot(), "design")
+            .outputs
+            .keys()
+            .collect::<Vec<_>>(),
+        ["outcome", "plan"]
+    );
+
+    view.reconcile_terminal_result(&stage_run_result(&workflow, base, &["outcome"]))
+        .unwrap();
+    let snapshot = view.snapshot();
+    let design = step(&snapshot, "design");
+    assert_eq!(design.state, StepStateKind::Succeeded);
+    assert_eq!(
+        design.outputs["outcome"],
+        WorkflowRunOutputDisposition::Committed
+    );
+    assert_eq!(
+        design.outputs["plan"],
+        WorkflowRunOutputDisposition::Unavailable(WorkflowRunOutputUnavailableReason::NotCommitted)
+    );
+
+    let undeclared = model(&workflow, clock.clone());
+    assert_eq!(
+        undeclared.reconcile_terminal_result(&stage_run_result(
+            &workflow,
+            base,
+            &["outcome", "undeclared"]
+        )),
+        Err(WorkflowRunViewModelError::InvalidTerminalResult)
+    );
+
+    let (_temporary, commands) = resolved_workflow();
+    let mut missing = succeeded_run_result(&commands, base);
+    let StepState::Succeeded { outputs } = &mut missing.steps[0].state else {
+        panic!("fixture must remain succeeded");
+    };
+    outputs.clear();
+    assert_eq!(
+        model(&commands, clock).reconcile_terminal_result(&missing),
+        Err(WorkflowRunViewModelError::InvalidTerminalResult)
+    );
+}
+
+// REQ-LOCALRUN-28, REQ-WFEXEC-60: an observed success that commits one of a step's two
+// declared outputs leaves the other unavailable, not pending.
+#[tokio::test]
+async fn an_observed_success_leaves_an_output_it_did_not_commit_unavailable() {
+    let (_temporary, workflow) = stage_workflow();
+    let base = useful_support::monotonic_now();
+    let view = model(&workflow, ControlledClock::new(point(base, 0)));
+    view.observe(step_transition(
+        "design",
+        StepStateKind::Running,
+        StepStateKind::Succeeded,
+        Some(ObservedStepTransition::OutputsCommitted {
+            outputs: vec!["outcome".to_owned()],
+            failed_child: None,
+        }),
+    ))
+    .await;
+    let snapshot = view.snapshot();
+    let design = step(&snapshot, "design");
+    assert_eq!(
+        design.outputs["outcome"],
+        WorkflowRunOutputDisposition::Committed
+    );
+    assert_eq!(
+        design.outputs["plan"],
+        WorkflowRunOutputDisposition::Unavailable(WorkflowRunOutputUnavailableReason::NotCommitted)
+    );
+}
+
+/// The record of a child that failed at its node `decide`.
+fn failed_child_record() -> crate::workflow::evidence::FailedChild {
+    crate::workflow::evidence::FailedChild {
+        outcome: "failed".to_owned(),
+        item: None,
+        primary_issue: Box::new(crate::workflow::evidence::PrimaryIssue::failed(
+            crate::workflow::validated::WorkflowNode {
+                id: "decide".to_owned(),
+                role: WorkflowNodeRole::Step,
+            },
+            crate::workflow::evidence::FailureDetail::interrupted_in_execution(),
+        )),
+    }
+}
+
+// REQ-LOCALRUN-221, INV-ENGINE-42: a stage that succeeded on a failed child keeps the record
+// its commit carried beside the state `succeeded` and is presented failed; a later
+// transition drops the record, and a stage observed without one snapshots as before.
+#[tokio::test]
+async fn an_observed_stage_whose_child_failed_keeps_its_record_and_presents_failed() {
+    let (_temporary, workflow) = stage_workflow();
+    let base = useful_support::monotonic_now();
+    let clock = ControlledClock::new(point(base, 0));
+    let committed = |failed_child| {
+        step_transition(
+            "design",
+            StepStateKind::Running,
+            StepStateKind::Succeeded,
+            Some(ObservedStepTransition::OutputsCommitted {
+                outputs: vec!["outcome".to_owned()],
+                failed_child,
+            }),
+        )
+    };
+
+    let failed = model(&workflow, clock.clone());
+    failed.observe(committed(Some(failed_child_record()))).await;
+    let snapshot = failed.snapshot();
+    let design = step(&snapshot, "design");
+    assert_eq!(design.state, StepStateKind::Succeeded);
+    assert_eq!(design.failed_child, Some(failed_child_record()));
+    assert_eq!(design.presented_state(), StepStateKind::Failed);
+
+    let plain = model(&workflow, clock.clone());
+    plain.observe(committed(None)).await;
+    let plain_snapshot = plain.snapshot();
+    let plain_design = step(&plain_snapshot, "design");
+    let mut expected = design.clone();
+    expected.failed_child = None;
+    assert_eq!(plain_design, &expected);
+    assert_eq!(plain_design.presented_state(), StepStateKind::Succeeded);
+
+    failed
+        .observe(step_transition(
+            "design",
+            StepStateKind::Succeeded,
+            StepStateKind::Running,
+            None,
+        ))
+        .await;
+    let snapshot = failed.snapshot();
+    let design = step(&snapshot, "design");
+    assert_eq!(design.failed_child, None);
+    assert_eq!(design.presented_state(), StepStateKind::Running);
+}
+
+// REQ-LOCALRUN-221, INV-ENGINE-42: the terminal result's record on a succeeded stage is kept
+// beside the state `succeeded`, and the stage is presented failed.
+#[test]
+fn terminal_reconciliation_keeps_a_stages_failed_child() {
+    let (_temporary, workflow) = stage_workflow();
+    let base = useful_support::monotonic_now();
+    let clock = ControlledClock::new(point(base, 0));
+    let mut result = stage_run_result(&workflow, base, &["outcome"]);
+    result.steps[0].failed_child = Some(failed_child_record());
+
+    let view = model(&workflow, clock);
+    view.reconcile_terminal_result(&result).unwrap();
+    let snapshot = view.snapshot();
+    let design = step(&snapshot, "design");
+    assert_eq!(design.state, StepStateKind::Succeeded);
+    assert_eq!(design.failed_child, Some(failed_child_record()));
+    assert_eq!(design.presented_state(), StepStateKind::Failed);
 }

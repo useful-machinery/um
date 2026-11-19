@@ -7,7 +7,9 @@ use ring::digest::{SHA256, digest};
 use tempfile::TempDir;
 
 use super::*;
-use crate::workflow::document::{BindingValue, OwnerDeclaration, OwnerSource, StopBefore};
+use crate::workflow::document::{
+    BindingValue, BusyBehavior, OwnerDeclaration, OwnerSource, StopBefore,
+};
 
 const ROOT_WORKFLOW: &str = r#"schemaVersion: 1
 exclude: [tests/, "**/__pycache__/"]
@@ -781,5 +783,48 @@ fn a_schedule_trigger_reads_no_event_and_has_a_timetable_of_the_right_shape() {
         let tree = trigger_tree(&timing(schedule, timezone));
         validate_workflow_tree(tree.path())
             .unwrap_or_else(|diagnostics| panic!("{schedule} {timezone}: {diagnostics:?}"));
+    }
+}
+
+// REQ-WFDEF-33: `queueLatest` needs the root's subject slot, on an event or a schedule
+// trigger; `skip` needs none; the tree keeps a declared setting and none when undeclared.
+#[test]
+fn queue_latest_needs_a_root_subject_and_the_tree_keeps_the_busy_behavior() {
+    let declare = |root: &str, trigger: &str, behavior: &str| {
+        let line = format!("  {trigger}:\n");
+        assert!(root.contains(&line), "{trigger}");
+        root.replacen(&line, &format!("{line}    busyBehavior: {behavior}\n"), 1)
+    };
+    let kept = |root: &str, trigger: &str| {
+        let tree = trigger_tree(root);
+        let validated = validate_workflow_tree(tree.path())
+            .unwrap_or_else(|diagnostics| panic!("tree should be valid: {diagnostics:?}"));
+        validated.triggers[trigger].busy_behavior
+    };
+    let with_subject = TRIGGER_ROOT.replacen("inputs:\n", "subject: ticket\ninputs:\n", 1);
+
+    for (trigger, other) in [("nightly", "start"), ("start", "nightly")] {
+        assert_eq!(
+            trigger_rejections(&declare(TRIGGER_ROOT, trigger, "queueLatest")),
+            [(
+                "busy_behavior_subject_missing",
+                Some(trigger.to_owned()),
+                Some("busyBehavior"),
+                None
+            )],
+            "{trigger}"
+        );
+        assert_eq!(
+            kept(&declare(TRIGGER_ROOT, trigger, "skip"), trigger),
+            Some(BusyBehavior::Skip),
+            "{trigger}"
+        );
+        let queued = declare(&with_subject, trigger, "queueLatest");
+        assert_eq!(
+            kept(&queued, trigger),
+            Some(BusyBehavior::QueueLatest),
+            "{trigger}"
+        );
+        assert_eq!(kept(&queued, other), None, "{other}");
     }
 }

@@ -17,24 +17,19 @@ struct UseView<'a> {
     run_id: &'a str,
     assignment_id: &'a str,
     organization_id: &'a str,
-    provider: &'static str,
+    provider: &'a str,
     issued_at: &'a str,
 }
 
 impl<'a> UseView<'a> {
     fn new(value: &'a GrantUse) -> Self {
-        use useful_api::provider_grant_use::Provider;
         Self {
             id: &value.id,
             grant_id: &value.grant_id,
             run_id: &value.run_id,
             assignment_id: &value.assignment_id,
             organization_id: &value.organization_id,
-            provider: match value.provider {
-                Provider::ProviderGrantUseProviderGithub => "github",
-                Provider::ProviderGrantUseProviderGitlabCom => "gitlab.com",
-                Provider::ProviderGrantUseProviderLinear => "linear",
-            },
+            provider: &value.provider,
             issued_at: &value.issued_at,
         }
     }

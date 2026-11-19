@@ -192,8 +192,10 @@ fn control_failure(error: ControlError) -> CommandFailure {
 /// as of, the run left out where the entry names none (REQ-GRANT-88), for a
 /// login the runner installed or a token it was issued the generation, its
 /// availability with the next action and the step it names (REQ-GRANT-53,
-/// REQ-GRANT-88) and, for a login with one, its last use and when, the time
-/// left out where the serving process states none (REQ-GRANT-41).
+/// REQ-GRANT-88), for a login with one, its last use and when, the time
+/// left out where the serving process states none (REQ-GRANT-41), and,
+/// where the entry records one, where the provider's credential comes from,
+/// `host` or `grant` (REQ-GRANT-92).
 pub(super) fn write_readiness(
     output: &mut impl Write,
     readiness: &AgentLoginReadiness,
@@ -226,9 +228,13 @@ pub(super) fn write_readiness(
             }
             None => String::new(),
         };
+        let source = match entry.source {
+            Some(source) => format!(" · source: {}", source.as_str()),
+            None => String::new(),
+        };
         writeln!(
             output,
-            "{label:<19}{state}{as_of}{generation}, {}{last_use}",
+            "{label:<19}{state}{as_of}{generation}, {}{last_use}{source}",
             status.text(step.as_deref())
         )?;
     }
@@ -298,8 +304,8 @@ pub(super) struct Login<'a> {
 
 /// The command or step a runner's next action names, each command a
 /// `useful grant` or `useful runner grant` one (REQ-GRANT-77). Reconnecting a login
-/// and restoring its owner's membership are the agent login's owner's to do,
-/// not the runner operator's, so those name the agent login.
+/// is the agent login's owner's to do, not the runner operator's, so that
+/// names the agent login.
 pub(super) fn runner_step(status: CredentialStatus, login: Option<Login<'_>>) -> Option<String> {
     let id = login.as_ref().and_then(|login| login.id);
     let agent_login = id.map_or_else(
@@ -311,9 +317,6 @@ pub(super) fn runner_step(status: CredentialStatus, login: Option<Login<'_>>) ->
             "the owner of {agent_login} stores a new sign-in with `useful grant create {} --replace`; only they can",
             login.as_ref().map_or("PROVIDER", |login| login.provider)
         )),
-        NextAction::RestoreMembership => Some(format!(
-            "the owner of {agent_login} must be an active member of the organization again; it is theirs to settle, not the runner's"
-        )),
         NextAction::SyncRunner => {
             Some("set grants up again with `useful runner grant sync`".to_owned())
         }
@@ -322,7 +325,7 @@ pub(super) fn runner_step(status: CredentialStatus, login: Option<Login<'_>>) ->
                 .to_owned(),
         ),
         NextAction::ResolveServiceLogin => Some(
-            "the service's own login is in use; remove it from the service environment to use the agent login"
+            "the service's own login is in use; remove it from the service's environment or home to use the agent login"
                 .to_owned(),
         ),
         NextAction::None

@@ -940,6 +940,7 @@ async fn workflow_execution_dispatches_start_actions_to_the_step_runtime() {
                 recovery: None,
                 condition_passed: false,
                 failure_kind: None,
+                failed_child: None,
             }
         );
         assert_eq!(
@@ -5232,6 +5233,7 @@ async fn an_exited_child_commits_its_outcome_and_available_exports() {
                     CapturedValue::text(Arc::from("plan: AUTO-1")),
                 )]),
                 interruption: None,
+                failure: None,
             },
             true,
         );
@@ -5269,6 +5271,55 @@ async fn an_exited_child_commits_its_outcome_and_available_exports() {
                 ]),
             }
         );
+    })
+    .await;
+}
+
+// REQ-WFEXEC-77, INV-ENGINE-42: a child that exits with a failure settles its step `succeeded` on its
+// outcome's edge with the failure recorded as the step's failed child; one that exits with
+// the outcome `failed` and no failure records none.
+#[tokio::test]
+async fn an_exited_childs_failure_is_recorded_as_its_steps_failed_child() {
+    with_watchdog(async {
+        let primary_issue = Box::new(crate::workflow::evidence::PrimaryIssue::failed(
+            crate::workflow::validated::WorkflowNode {
+                id: "decide".to_owned(),
+                role: crate::workflow::validated::WorkflowNodeRole::Step,
+            },
+            crate::workflow::evidence::FailureDetail::interrupted_in_execution(),
+        ));
+        for failure in [Some(primary_issue), None] {
+            let fixture = admit_child_fixture();
+            let (dispatcher, _requests) = scripted_child(
+                ChildRunOutcome::Exited {
+                    outcome: "failed".to_owned(),
+                    exports: BTreeMap::new(),
+                    interruption: None,
+                    failure: failure.clone(),
+                },
+                true,
+            );
+            let result = execute_with_children(
+                fixture.admitted,
+                ChildRuns::Enabled {
+                    dispatcher,
+                    controls: ControlContext::default(),
+                },
+            )
+            .await;
+
+            assert_eq!(result.state.workflow, WorkflowState::Succeeded);
+            let design = &result.state.steps["design"];
+            assert!(matches!(design.state, StepState::Succeeded { .. }));
+            assert_eq!(
+                design.failed_child,
+                failure.map(|primary_issue| FailedChild {
+                    outcome: "failed".to_owned(),
+                    item: None,
+                    primary_issue,
+                })
+            );
+        }
     })
     .await;
 }
@@ -5439,6 +5490,7 @@ fn exited(outcome: &str) -> ChildRunOutcome {
         outcome: outcome.to_owned(),
         exports: BTreeMap::new(),
         interruption: None,
+        failure: None,
     }
 }
 
@@ -5457,6 +5509,7 @@ fn planned_with_parts(parts: serde_json::Value) -> ChildRunOutcome {
             ),
         ]),
         interruption: None,
+        failure: None,
     }
 }
 
@@ -5894,6 +5947,7 @@ fn interrupted_exit(outcome: &str, step: &str) -> ChildRunOutcome {
             reason: CancellationReason::UserRequest,
             step: step.to_owned(),
         }),
+        failure: None,
     }
 }
 
@@ -6118,8 +6172,13 @@ async fn an_interrupted_child_routes_its_step_to_the_repair_wait() {
             .iter()
             .map(|(id, runtime)| (id.clone(), runtime.state.clone()))
             .collect::<BTreeMap<_, _>>();
-        let payload =
-            crate::workflow::wait::wait_payload(wait, &steps, Some("children/design/000000"), None);
+        let payload = crate::workflow::wait::wait_payload(
+            wait,
+            &steps,
+            Some("children/design/000000"),
+            None,
+            None,
+        );
         assert_eq!(payload["child"], "children/design/000000");
         assert_eq!(payload["outcome"], "failed");
         assert_eq!(
@@ -6372,6 +6431,7 @@ async fn a_stop_in_force_enters_a_stop_wait_and_runs_no_child() {
                 outcome: "planned".to_owned(),
                 exports: BTreeMap::new(),
                 interruption: None,
+                failure: None,
             },
             true,
         );
@@ -6523,6 +6583,7 @@ async fn control_values_reach_only_the_step_they_name() {
                 outcome: "done".to_owned(),
                 exports: BTreeMap::new(),
                 interruption: None,
+                failure: None,
             },
             true,
         );

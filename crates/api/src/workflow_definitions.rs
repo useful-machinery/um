@@ -44,6 +44,13 @@ const STORAGE_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PROBLEM_TYPE_PREFIX: &str = "https://api.usefulmachinery.com/problems/";
 const DEFINITION_ID_PREFIX: &str = "def_";
 const EVALUATION_ID_PREFIX: &str = "wev_";
+/// The evaluation vocabulary this release decodes (REQ-TRIGGER-166): its evaluation models
+/// hold the push event beside the Linear issue events and the schedule's due time. A request
+/// that named none would be answered in the vocabulary of releases before the parameter.
+const EVALUATION_VOCABULARY: &str = "2";
+/// The evaluation representation whose members this release's generated model knows: 2
+/// adds `observations.project` (REQ-TRIGGER-165).
+const EVALUATION_REPRESENTATION: (&str, &str) = ("representation", "2");
 
 /// One file of a tree to upload: its tree-relative path, bytes and owner-execute bit.
 #[derive(Clone, Copy)]
@@ -549,7 +556,8 @@ impl<'a> WorkflowDefinitionApi<'a> {
     }
 
     /// One page of definition `id`'s retained start evaluations, newest first, with the next
-    /// page's cursor (REQ-TRIGGER-132); `filter`, `limit` and `cursor` select the page.
+    /// page's cursor (REQ-TRIGGER-132), in representation 2 (REQ-TRIGGER-165); `filter`,
+    /// `limit` and `cursor` select the page, and the request asks for `EVALUATION_VOCABULARY`.
     pub fn evaluations(
         &self,
         organization: &str,
@@ -561,7 +569,10 @@ impl<'a> WorkflowDefinitionApi<'a> {
     ) -> Result<(Vec<WorkflowDefinitionEvaluation>, Option<String>), WorkflowDefinitionFailure>
     {
         let endpoint = self.definitions_endpoint(organization, project, &[id, "evaluations"]);
-        let mut request = self.page_request(&endpoint, limit, cursor);
+        let mut request = self.page_request(&endpoint, limit, cursor).query(&[
+            EVALUATION_REPRESENTATION,
+            ("vocabulary", EVALUATION_VOCABULARY),
+        ]);
         if let Some(state) = filter.state {
             request = request.query(&[("state", state)]);
         }
@@ -577,7 +588,8 @@ impl<'a> WorkflowDefinitionApi<'a> {
         Ok((list.items, list.next_cursor))
     }
 
-    /// The start evaluation `evaluation` of definition `id` (REQ-TRIGGER-132).
+    /// The start evaluation `evaluation` of definition `id` (REQ-TRIGGER-132), in
+    /// representation 2 (REQ-TRIGGER-165) and asked for in `EVALUATION_VOCABULARY`.
     pub fn evaluation(
         &self,
         organization: &str,
@@ -587,7 +599,11 @@ impl<'a> WorkflowDefinitionApi<'a> {
     ) -> Result<WorkflowDefinitionEvaluation, WorkflowDefinitionFailure> {
         let endpoint =
             self.definitions_endpoint(organization, project, &[id, "evaluations", evaluation]);
-        let request = super::generated_api_request(&self.configuration, Method::GET, &endpoint);
+        let request = super::generated_api_request(&self.configuration, Method::GET, &endpoint)
+            .query(&[
+                EVALUATION_REPRESENTATION,
+                ("vocabulary", EVALUATION_VOCABULARY),
+            ]);
         let stage = Stage::EvaluationRead;
         let read: WorkflowDefinitionEvaluation = receive(request, StatusCode::OK, None, stage)?;
         validate_evaluation(&read, id, Some(evaluation), stage)?;

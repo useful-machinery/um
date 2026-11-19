@@ -8,16 +8,17 @@ use std::sync::{Arc, Mutex};
 use time::OffsetDateTime;
 
 use super::*;
-use crate::agent_login::ServiceEnvironment;
 use crate::agent_login::check::LoginCheck;
 use crate::agent_login::cloud::{
-    AgentLoginCloud, CloudFailure, GrantTokenFailure, GrantTokenRefusal,
+    AgentLoginCloud, CloudFailure, GrantProvidersFailure, GrantProvidersRequest, GrantTokenFailure,
+    GrantTokenRefusal, ListedProvider,
 };
 use crate::agent_login::readiness::{ReadinessDocument, readiness_path};
 use crate::agent_login::setup::{
     AdmissionSetup, AgentLoginSetup, AssignmentGate, SetupDependencies, SetupOutcome,
 };
-use crate::control_protocol::{AgentLoginProvider, AgentLoginState};
+use crate::agent_login::{ProviderSource, ServiceEnvironment};
+use crate::control_protocol::{AgentLoginProvider, AgentLoginState, CredentialSource};
 use crate::service::{
     CountedGate, FAKE_GRANT_ID, FAKE_GRANT_TOKEN_SENTINEL, FakeAgentLoginCloud, FakeGrantToken,
     FakeLoginCheck, SleepRelease, controlled_sleeper, fake_grant_expiry, fake_grant_token,
@@ -58,6 +59,11 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::serving(&[])
+    }
+
+    /// `new`, for a service whose environment also carries `variables`.
+    fn serving(variables: &[(&str, &str)]) -> Self {
         let root = tempfile::tempdir().unwrap();
         for directory in ["home", "state"] {
             fs::create_dir(root.path().join(directory)).unwrap();
@@ -73,7 +79,12 @@ impl Fixture {
             SetupDependencies::new(
                 Arc::clone(&cloud) as Arc<dyn AgentLoginCloud>,
                 FakeLoginCheck::new() as Arc<dyn LoginCheck>,
-                ServiceEnvironment::from_lookup(|name| (name == "HOME").then(|| home.clone())),
+                ServiceEnvironment::from_variables(
+                    variables
+                        .iter()
+                        .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+                        .chain([(OsString::from("HOME"), home)]),
+                ),
                 &state.join("runner-state.json"),
                 recorder,
             ),
@@ -151,10 +162,168 @@ impl Fixture {
             self.cloud.answer_grant_token(provider, answer);
         }
     }
+
+    /// Lets Cloud list the providers of Cloud's `ids` for each assignment.
+    fn list(&self, ids: &[&str]) {
+        self.cloud.answer_grant_providers(Ok(ids
+            .iter()
+            .map(|id| ListedProvider {
+                provider: (*id).to_owned(),
+                token: "LISTED_TOKEN".to_owned(),
+                token_file: "LISTED_TOKEN_FILE".to_owned(),
+            })
+            .collect()));
+    }
+
+    /// The providers Cloud was asked for the token of, in the document's
+    /// order.
+    fn asked(&self) -> Vec<AgentLoginProvider> {
+        let asked: Vec<_> = self
+            .cloud
+            .grant_requests()
+            .iter()
+            .filter_map(|request| request.provider.agent_login_provider())
+            .collect();
+        brokered_providers()
+            .filter(|provider| asked.contains(provider))
+            .collect()
+    }
+
+    /// Asserts that Cloud was asked for the assignment's providers once,
+    /// before any token.
+    fn assert_listed_once_first(&self) {
+        assert_eq!(
+            self.cloud.grant_providers_requests(),
+            [(
+                0,
+                GrantProvidersRequest {
+                    boot_id: BOOT.to_owned(),
+                    assignment_id: ASSIGNMENT.to_owned(),
+                }
+            )]
+        );
+    }
+
+    /// The attributes of the admission's record of `provider`.
+    fn admission_record(&self, provider: &str) -> serde_json::Map<String, serde_json::Value> {
+        self.records()
+            .iter()
+            .map(grant_attributes)
+            .find(|record| record["um.grant_token.provider"] == provider)
+            .unwrap()
+    }
+
+    /// Lets Cloud list each of `entries`, a provider's id with the names its
+    /// token and the path of its file are to be offered under, for each
+    /// assignment.
+    fn list_named(&self, entries: &[(&str, &str, &str)]) {
+        self.cloud.answer_grant_providers(Ok(entries
+            .iter()
+            .map(|(id, token, token_file)| ListedProvider {
+                provider: (*id).to_owned(),
+                token: (*token).to_owned(),
+                token_file: (*token_file).to_owned(),
+            })
+            .collect()));
+    }
+
+    /// Where the runner keeps the token of the configured provider `id`.
+    fn configured_file(&self, id: &str) -> PathBuf {
+        LoginDirectory::beside(&self.state_path())
+            .path()
+            .join(format!("grant-tokens/{id}.token"))
+    }
+
+    /// Cloud's id of each provider Cloud was asked for the token of, in
+    /// order of the id.
+    fn asked_ids(&self) -> Vec<String> {
+        let mut asked: Vec<String> = self
+            .cloud
+            .grant_requests()
+            .iter()
+            .map(|request| request.provider.cloud_id().to_owned())
+            .collect();
+        asked.sort();
+        asked
+    }
+
+    /// The attributes of each record that names `provider`.
+    fn records_naming(&self, provider: &str) -> Vec<serde_json::Map<String, serde_json::Value>> {
+        self.records()
+            .iter()
+            .map(grant_attributes)
+            .filter(|record| record["um.grant_token.provider"] == provider)
+            .collect()
+    }
+}
+
+/// The list entry of `github`, with the names the runner offers it under.
+const GITHUB_ENTRY: (&str, &str, &str) = ("github", "GH_TOKEN", "GH_TOKEN_FILE");
+
+/// The list entry of a provider of Cloud's configuration.
+const EXAMPLE_ENTRY: (&str, &str, &str) = (
+    "example",
+    "EXAMPLE_ACCESS_TOKEN",
+    "EXAMPLE_ACCESS_TOKEN_FILE",
+);
+
+/// The configured provider Cloud lists as `id`.
+fn configured(id: &str) -> GrantProvider {
+    GrantProvider::listed(id).unwrap()
+}
+
+/// What an admission holding `tokens` offers a step where the service
+/// carries nothing.
+fn offered_alone(tokens: &AssignmentGrantTokens) -> EnvironmentSnapshot {
+    offer(
+        &EnvironmentSnapshot::new(Vec::<(OsString, OsString)>::new()),
+        Some(tokens),
+    )
+}
+
+fn variable<'a>(environment: &'a EnvironmentSnapshot, name: &str) -> Option<&'a std::ffi::OsStr> {
+    environment.variable(std::ffi::OsStr::new(name))
+}
+
+/// `record` as the attributes a test compares.
+fn attributes(record: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    record.as_object().unwrap().clone()
 }
 
 fn mode(path: &Path) -> u32 {
     fs::symlink_metadata(path).unwrap().permissions().mode() & 0o777
+}
+
+// INV-ENGINE-43
+#[test]
+fn a_declared_integration_names_exactly_the_variables_the_runner_offers_it_under() {
+    use useful_execution::IntegrationProvider;
+
+    assert_eq!(
+        OFFERED_VARIABLES.map(|(_, variable, file_variable)| [variable, file_variable]),
+        [
+            IntegrationProvider::Github,
+            IntegrationProvider::GitlabCom,
+            IntegrationProvider::Linear,
+        ]
+        .map(|provider| <[&str; 2]>::try_from(provider.environment_names()).unwrap())
+    );
+    assert_eq!(
+        OFFERED_VARIABLES.map(|(provider, _, _)| provider),
+        [
+            AgentLoginProvider::Github,
+            AgentLoginProvider::Gitlab,
+            AgentLoginProvider::Linear,
+        ]
+    );
+    assert_eq!(
+        IntegrationProvider::ClaudeCode.environment_names(),
+        [CLAUDE_CODE_LOGIN_VARIABLE]
+    );
+    assert_eq!(
+        IntegrationProvider::Codex.environment_names(),
+        [CODEX_LOGIN_VARIABLE]
+    );
 }
 
 // REQ-GRANT-86, REQ-GRANT-88
@@ -175,20 +344,20 @@ fn an_admission_asks_for_each_provider_and_keeps_each_issued_token_in_its_own_pr
     let admitted = fixture.admit(ASSIGNMENT);
 
     let mut requests = fixture.cloud.grant_requests();
-    requests.sort_by_key(|request| request.provider.as_str());
+    requests.sort_by_key(|request| request.provider.agent_login_provider());
     assert_eq!(
         requests
             .iter()
             .map(|request| (
                 request.boot_id.as_str(),
                 request.assignment_id.as_str(),
-                request.provider
+                request.provider.agent_login_provider()
             ))
             .collect::<Vec<_>>(),
         [
-            (BOOT, ASSIGNMENT, AgentLoginProvider::Github),
-            (BOOT, ASSIGNMENT, AgentLoginProvider::Gitlab),
-            (BOOT, ASSIGNMENT, AgentLoginProvider::Linear),
+            (BOOT, ASSIGNMENT, Some(AgentLoginProvider::Github)),
+            (BOOT, ASSIGNMENT, Some(AgentLoginProvider::Gitlab)),
+            (BOOT, ASSIGNMENT, Some(AgentLoginProvider::Linear)),
         ]
     );
     for (provider, generation) in [
@@ -212,9 +381,9 @@ fn an_admission_asks_for_each_provider_and_keeps_each_issued_token_in_its_own_pr
                     generation,
                     expires_at: expiry(),
                 }),
-                selected: true,
                 run_id: Some(RUN.to_owned()),
                 ended_at: None,
+                source: Some(CredentialSource::Grant),
             })
         );
     }
@@ -229,9 +398,9 @@ fn an_admission_asks_for_each_provider_and_keeps_each_issued_token_in_its_own_pr
             state: AgentLoginState::NotAuthorized,
             checked_at: Some(now()),
             issued: None,
-            selected: false,
             run_id: Some(RUN.to_owned()),
             ended_at: None,
+            source: None,
         })
     );
     // What the admission recorded is what it publishes.
@@ -239,67 +408,367 @@ fn an_admission_asks_for_each_provider_and_keeps_each_issued_token_in_its_own_pr
     assert_eq!(admitted.agent_logins, None);
 }
 
+// REQ-GRANT-87, REQ-GRANT-86, REQ-GRANT-88
+#[test]
+fn an_admission_asks_for_no_token_of_a_provider_the_host_provides() {
+    // Either of a provider's two names is the host's providing it.
+    let service = [
+        ("GH_TOKEN_FILE", "/service/gh-token"),
+        ("USEFUL_LINEAR_ACCESS_TOKEN", "service-linear-token"),
+    ];
+    let fixture = Fixture::serving(&service);
+    fixture.answer_all(FakeGrantToken::Issue(2));
+    // An earlier release's admission was issued a `github` token.
+    let mut earlier = ReadinessDocument {
+        updated_at: now(),
+        logins: Vec::new(),
+        unknown: Vec::new(),
+    };
+    earlier.record_grant(GrantReadiness {
+        run_id: Some(NEXT_RUN.to_owned()),
+        ..ready(1, expiry())
+    });
+    earlier
+        .write(&readiness_path(&fixture.state_path()))
+        .unwrap();
+
+    let admitted = fixture.admit(ASSIGNMENT);
+
+    assert_eq!(
+        fixture
+            .cloud
+            .grant_requests()
+            .iter()
+            .map(|request| request.provider.agent_login_provider())
+            .collect::<Vec<_>>(),
+        [Some(AgentLoginProvider::Gitlab)]
+    );
+    for provider in [AgentLoginProvider::Github, AgentLoginProvider::Linear] {
+        assert!(!fixture.token_file(provider).exists(), "{provider:?}");
+        assert_eq!(
+            fixture.recorded().grant(provider).cloned(),
+            Some(GrantReadiness {
+                provider,
+                source: Some(CredentialSource::Host),
+                ..not_ready(AgentLoginState::NotDelivered)
+            }),
+            "{provider:?}"
+        );
+    }
+    assert_eq!(
+        fixture
+            .recorded()
+            .grant(AgentLoginProvider::Gitlab)
+            .map(|grant| grant.state),
+        Some(AgentLoginState::Ready)
+    );
+    // The provider whose state changed is recorded.
+    let github = fixture
+        .records()
+        .iter()
+        .map(grant_attributes)
+        .find(|record| record["um.grant_token.provider"] == "github")
+        .unwrap();
+    assert_eq!(github["um.grant_token.state"], "not_delivered");
+    // The service's names stay as it has them; only `gitlab` is offered.
+    let environment = EnvironmentSnapshot::new(service);
+    let offered = offer(&environment, Some(&admitted.tokens));
+    for (name, value) in service {
+        assert_eq!(
+            offered.variable(std::ffi::OsStr::new(name)),
+            Some(std::ffi::OsStr::new(value))
+        );
+    }
+    for name in ["GH_TOKEN", "USEFUL_LINEAR_ACCESS_TOKEN_FILE"] {
+        assert_eq!(offered.variable(std::ffi::OsStr::new(name)), None, "{name}");
+    }
+    assert_eq!(
+        offered.variable(std::ffi::OsStr::new("GITLAB_TOKEN")),
+        Some(std::ffi::OsStr::new(&fake_grant_token(
+            AgentLoginProvider::Gitlab,
+            2
+        )))
+    );
+}
+
+// REQ-GRANT-86, REQ-GRANT-88, REQ-TELEMETRY-46
+#[test]
+fn an_admission_lists_the_assignments_providers_first_and_asks_for_the_token_of_each_listed() {
+    let fixture = Fixture::new();
+    fixture.answer_all(FakeGrantToken::Issue(1));
+    // Cloud lists the runner's GitLab by its id `gitlab.com`; `gitlab` and
+    // `example` are providers of Cloud's configuration.
+    fixture.list(&["linear", "gitlab", "example", "github"]);
+
+    let admitted = fixture.admit(ASSIGNMENT);
+
+    fixture.assert_listed_once_first();
+    assert_eq!(
+        fixture.asked(),
+        [AgentLoginProvider::Github, AgentLoginProvider::Linear]
+    );
+    for provider in [AgentLoginProvider::Github, AgentLoginProvider::Linear] {
+        assert!(admitted.tokens.holds(provider), "{provider:?}");
+    }
+    assert!(!fixture.token_file(AgentLoginProvider::Gitlab).exists());
+    assert_eq!(
+        fixture
+            .recorded()
+            .grant(AgentLoginProvider::Gitlab)
+            .cloned(),
+        Some(GrantReadiness {
+            provider: AgentLoginProvider::Gitlab,
+            ..not_ready(AgentLoginState::NotAuthorized)
+        })
+    );
+    assert_eq!(
+        fixture.admission_record("gitlab"),
+        serde_json::json!({
+            "um.grant_token.provider": "gitlab",
+            "um.grant_token.phase": "admission",
+            "um.grant_token.state": "not_authorized",
+            "um.assignment.id": ASSIGNMENT,
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    );
+
+    // An empty list asks for no token.
+    let fixture = Fixture::new();
+    fixture.answer_all(FakeGrantToken::Issue(1));
+    fixture.list(&[]);
+
+    drop(fixture.admit(ASSIGNMENT));
+
+    fixture.assert_listed_once_first();
+    assert_eq!(fixture.asked(), []);
+    for grant in fixture.grants() {
+        assert_eq!(grant.state, AgentLoginState::NotAuthorized, "{grant:?}");
+        assert!(!fixture.token_file(grant.provider).exists());
+    }
+}
+
+// REQ-GRANT-86, REQ-GRANT-88, REQ-TELEMETRY-46
+#[test]
+fn a_list_cloud_did_not_answer_usefully_asks_for_no_token_and_is_a_failure_of_stage_list() {
+    for (failure, cause, status) in [
+        (
+            GrantProvidersFailure::Cloud(CloudFailure::Transport),
+            "transport",
+            None,
+        ),
+        (
+            GrantProvidersFailure::Cloud(CloudFailure::Status(500)),
+            "http_status",
+            Some(500),
+        ),
+        (
+            GrantProvidersFailure::Cloud(CloudFailure::InvalidResponse),
+            "invalid_response",
+            None,
+        ),
+        (
+            GrantProvidersFailure::AssignmentNotCurrent,
+            "http_status",
+            Some(409),
+        ),
+    ] {
+        // The host provides GitHub.
+        let fixture = Fixture::serving(&[("GH_TOKEN", "service-github-token")]);
+        fixture.answer_all(FakeGrantToken::Issue(1));
+        fixture.cloud.answer_grant_providers(Err(failure));
+
+        let _admitted = fixture.admit(ASSIGNMENT);
+
+        fixture.assert_listed_once_first();
+        assert_eq!(fixture.asked(), [], "{failure:?}");
+        for provider in ["gitlab", "linear"] {
+            let mut expected = serde_json::json!({
+                "um.grant_token.provider": provider,
+                "um.grant_token.phase": "admission",
+                "um.grant_token.state": "cloud_unavailable",
+                "um.grant_token.failure_stage": "list",
+                "um.grant_token.failure_cause": cause,
+                "um.assignment.id": ASSIGNMENT,
+            });
+            if let Some(status) = status {
+                expected["um.grant_token.http_status"] = status.into();
+            }
+            assert_eq!(
+                serde_json::Value::Object(fixture.admission_record(provider)),
+                expected,
+                "{failure:?}"
+            );
+        }
+        for provider in [AgentLoginProvider::Gitlab, AgentLoginProvider::Linear] {
+            assert_eq!(
+                fixture.recorded().grant(provider).map(|grant| grant.state),
+                Some(AgentLoginState::CloudUnavailable),
+                "{failure:?}"
+            );
+        }
+        assert_eq!(
+            fixture
+                .recorded()
+                .grant(AgentLoginProvider::Github)
+                .cloned(),
+            Some(GrantReadiness {
+                source: Some(CredentialSource::Host),
+                ..not_ready(AgentLoginState::NotDelivered)
+            }),
+            "{failure:?}"
+        );
+        // The host's provider is not a failure of the list.
+        assert!(
+            fixture
+                .records()
+                .iter()
+                .all(|record| record["um.grant_token.provider"] != "github"),
+            "{failure:?}"
+        );
+    }
+}
+
+// REQ-GRANT-86
+#[test]
+fn a_cloud_without_the_list_is_asked_for_each_of_the_three_as_before() {
+    let fixture = Fixture::new();
+    fixture.answer_all(FakeGrantToken::Issue(1));
+
+    let admitted = fixture.admit(ASSIGNMENT);
+
+    fixture.assert_listed_once_first();
+    assert_eq!(fixture.asked(), brokered_providers().collect::<Vec<_>>());
+    for provider in brokered_providers() {
+        assert!(admitted.tokens.holds(provider), "{provider:?}");
+    }
+}
+
+// REQ-GRANT-92, REQ-GRANT-87, REQ-GRANT-88, INV-RUNNER-31
+#[test]
+fn an_admission_records_each_oauth_providers_source_with_its_run() {
+    let service = [("GH_TOKEN", "service-github-token")];
+    let fixture = Fixture::serving(&service);
+    fixture
+        .cloud
+        .answer_grant_token(AgentLoginProvider::Linear, FakeGrantToken::Issue(1));
+    fixture.cloud.answer_grant_token(
+        AgentLoginProvider::Gitlab,
+        FakeGrantToken::Fail(GrantTokenFailure::Refused(GrantTokenRefusal::Unauthorized)),
+    );
+
+    let admitted = fixture.admit(ASSIGNMENT);
+
+    // The host's `github` is its source whatever the runner asked, a token
+    // issued and kept is the grant's, and a refused one has none.
+    let expected = [
+        (
+            AgentLoginProvider::Github,
+            AgentLoginState::NotDelivered,
+            Some(CredentialSource::Host),
+        ),
+        (
+            AgentLoginProvider::Gitlab,
+            AgentLoginState::NotAuthorized,
+            None,
+        ),
+        (
+            AgentLoginProvider::Linear,
+            AgentLoginState::Ready,
+            Some(CredentialSource::Grant),
+        ),
+    ];
+    let grants = fixture.grants();
+    assert_eq!(
+        grants
+            .iter()
+            .map(|grant| (grant.provider, grant.state, grant.source))
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert!(
+        grants
+            .iter()
+            .all(|grant| grant.run_id.as_deref() == Some(RUN)),
+        "{grants:?}"
+    );
+    // What the admission is offered settles the same sources.
+    let offered = crate::agent_login::offer_with_grant_tokens(
+        &EnvironmentSnapshot::new(service),
+        Some(&LoginDirectory::beside(&fixture.state_path())),
+        Some(&admitted.tokens),
+    );
+    assert_eq!(
+        offered.sources,
+        expected
+            .into_iter()
+            .filter_map(|(provider, _, source)| Some(ProviderSource {
+                provider,
+                source: source?,
+            }))
+            .collect::<Vec<_>>()
+    );
+    // The control socket reports each source beside its state.
+    let reported = fixture.recorded().reported().unwrap();
+    assert_eq!(
+        reported
+            .providers
+            .iter()
+            .map(|entry| (entry.provider, entry.state, entry.source))
+            .collect::<Vec<_>>(),
+        expected
+    );
+}
+
 // REQ-GRANT-86, REQ-GRANT-88
 #[test]
 fn each_answer_without_a_token_writes_no_file_and_records_its_state() {
     let unavailable = |failure| FakeGrantToken::Fail(GrantTokenFailure::Cloud(failure));
     let refused = |refusal| FakeGrantToken::Fail(GrantTokenFailure::Refused(refusal));
-    // Each answer with the state it records and whether the provider is
-    // selected after it when it was not selected before, and when it was.
-    for (answer, state, selected) in [
+    // Each answer with the state it records, whatever the answer before it.
+    for (answer, state) in [
         (
             refused(GrantTokenRefusal::Unauthorized),
             AgentLoginState::NotAuthorized,
-            [false, false],
         ),
         (
             FakeGrantToken::Fail(GrantTokenFailure::NoRoute),
             AgentLoginState::NotAuthorized,
-            [false, false],
         ),
         (
             refused(GrantTokenRefusal::Revoked),
             AgentLoginState::Revoked,
-            [false, false],
         ),
         (
             refused(GrantTokenRefusal::ReconnectRequired),
             AgentLoginState::ReconnectRequired,
-            [true, true],
         ),
         (
             refused(GrantTokenRefusal::ProviderUnavailable),
             AgentLoginState::UnsupportedTarget,
-            [false, false],
         ),
         (
             refused(GrantTokenRefusal::AssignmentNotCurrent),
             AgentLoginState::CloudUnavailable,
-            [false, true],
         ),
         (
             unavailable(CloudFailure::Status(503)),
             AgentLoginState::CloudUnavailable,
-            [false, true],
         ),
         (
             unavailable(CloudFailure::Transport),
             AgentLoginState::CloudUnavailable,
-            [false, true],
         ),
         (
             unavailable(CloudFailure::InvalidResponse),
             AgentLoginState::CloudUnavailable,
-            [false, true],
         ),
     ] {
-        for (before, selected) in [
+        for before in [
             FakeGrantToken::Fail(GrantTokenFailure::NoRoute),
             FakeGrantToken::Issue(1),
-        ]
-        .into_iter()
-        .zip(selected)
-        {
+        ] {
             let fixture = Fixture::new();
             fixture.answer_all(before);
             drop(fixture.admit(ASSIGNMENT));
@@ -316,9 +785,9 @@ fn each_answer_without_a_token_writes_no_file_and_records_its_state() {
                         state,
                         checked_at: Some(now()),
                         issued: None,
-                        selected,
                         run_id: Some(RUN.to_owned()),
                         ended_at: None,
+                        source: None,
                     }),
                     "{answer:?} after {before:?}"
                 );
@@ -524,8 +993,8 @@ fn an_idle_pass_marks_ended_each_entry_an_interrupted_runner_left_and_asks_cloud
     };
     for (provider, entry) in brokered_providers().zip([
         ready(3, expiry()),
-        not_ready(AgentLoginState::ReconnectRequired, true),
-        not_ready(AgentLoginState::NotAuthorized, false),
+        not_ready(AgentLoginState::ReconnectRequired),
+        not_ready(AgentLoginState::NotAuthorized),
     ]) {
         interrupted.record_grant(GrantReadiness { provider, ..entry });
     }
@@ -555,14 +1024,28 @@ fn an_idle_pass_marks_ended_each_entry_an_interrupted_runner_left_and_asks_cloud
     assert_eq!(fixture.records(), []);
 }
 
-// REQ-GRANT-86, REQ-TELEMETRY-46
+// REQ-GRANT-86, REQ-TELEMETRY-46, INV-RUNNER-32
 #[test]
 fn no_token_is_in_the_readiness_document_its_report_or_any_record() {
     let fixture = Fixture::new();
     fixture.answer_all(FakeGrantToken::Issue(5));
+    fixture
+        .cloud
+        .answer_grant_token(configured("example"), FakeGrantToken::Issue(5));
+    fixture.list_named(&[
+        GITHUB_ENTRY,
+        ("gitlab.com", "GITLAB_TOKEN", "GITLAB_TOKEN_FILE"),
+        (
+            "linear",
+            "USEFUL_LINEAR_ACCESS_TOKEN",
+            "USEFUL_LINEAR_ACCESS_TOKEN_FILE",
+        ),
+        EXAMPLE_ENTRY,
+    ]);
 
     let admitted = fixture.admit(ASSIGNMENT);
 
+    assert!(fixture.configured_file("example").exists());
     let document = fs::read_to_string(readiness_path(&fixture.state_path())).unwrap();
     let reported = serde_json::to_string(&admitted.grants.unwrap().reported().unwrap()).unwrap();
     let records = serde_json::to_string(&fixture.capture.events()).unwrap();
@@ -576,7 +1059,14 @@ fn no_token_is_in_the_readiness_document_its_report_or_any_record() {
             !text.contains(".token"),
             "{name} names a token file: {text}"
         );
+        assert!(
+            !text.contains("EXAMPLE_ACCESS_TOKEN"),
+            "{name} names an offered variable: {text}"
+        );
     }
+    // The hold names its files and their names, never a token.
+    let hold = format!("{:?}", admitted.tokens);
+    assert!(!hold.contains(FAKE_GRANT_TOKEN_SENTINEL), "{hold}");
 }
 
 /// The record's attributes other than those every record carries.
@@ -644,8 +1134,7 @@ fn one_record_is_written_per_changed_state_or_failed_request() {
     assert_eq!(records[3]["um.grant_token.failure_cause"], "http_status");
     assert_eq!(records[3]["um.assignment.id"], NEXT_ASSIGNMENT);
 
-    // A token that cannot be kept is a failed write of the provider, which is
-    // selected all the same.
+    // A token that cannot be kept is a failed write of the provider.
     fixture
         .cloud
         .answer_grant_token(AgentLoginProvider::Linear, FakeGrantToken::Issue(1));
@@ -658,8 +1147,8 @@ fn one_record_is_written_per_changed_state_or_failed_request() {
         fixture
             .recorded()
             .grant(AgentLoginProvider::Linear)
-            .map(|grant| (grant.state, grant.selected)),
-        Some((AgentLoginState::InstallFailed, true))
+            .map(|grant| grant.state),
+        Some(AgentLoginState::InstallFailed)
     );
     let linear = fixture
         .records()
@@ -672,46 +1161,524 @@ fn one_record_is_written_per_changed_state_or_failed_request() {
     assert!(linear.contains_key("um.grant_token.failure_cause"));
 }
 
-// REQ-GRANT-87, REQ-GRANT-10
+// REQ-GRANT-87, INV-RUNNER-17
 #[test]
-fn a_kept_token_whose_file_no_longer_holds_one_is_withheld_with_its_file() {
+fn a_kept_token_never_replaces_a_name_the_offers_own_environment_carries() {
+    // The setup's service environment carries none of the names, so the
+    // admission holds a token of each provider.
     let fixture = Fixture::new();
     fixture.answer_all(FakeGrantToken::Issue(3));
     let admitted = fixture.admit(ASSIGNMENT);
+    // The environment the offer is built from carries one name of `github`
+    // and the other of `linear`.
     let service = EnvironmentSnapshot::new([
-        ("GITLAB_TOKEN", "service-gitlab-token"),
-        ("GITLAB_TOKEN_FILE", "/service/gitlab-token"),
+        ("GH_TOKEN", "service-github-token"),
+        ("USEFUL_LINEAR_ACCESS_TOKEN_FILE", "/srv/linear-token"),
     ]);
+
+    let offered = offer(&service, Some(&admitted.tokens));
+
+    let variable = |name: &str| offered.variable(std::ffi::OsStr::new(name));
+    assert_eq!(
+        variable("GH_TOKEN"),
+        Some(std::ffi::OsStr::new("service-github-token"))
+    );
+    assert_eq!(
+        variable("USEFUL_LINEAR_ACCESS_TOKEN_FILE"),
+        Some(std::ffi::OsStr::new("/srv/linear-token"))
+    );
+    for name in ["GH_TOKEN_FILE", "USEFUL_LINEAR_ACCESS_TOKEN"] {
+        assert_eq!(variable(name), None, "{name}");
+    }
+    let gitlab = fake_grant_token(AgentLoginProvider::Gitlab, 3);
+    assert_eq!(
+        variable("GITLAB_TOKEN"),
+        Some(std::ffi::OsStr::new(&gitlab))
+    );
+}
+
+// REQ-GRANT-87
+#[test]
+fn a_kept_token_whose_file_no_longer_holds_one_is_not_offered() {
+    let fixture = Fixture::new();
+    fixture.answer_all(FakeGrantToken::Issue(3));
+    let admitted = fixture.admit(ASSIGNMENT);
+    let service = EnvironmentSnapshot::new([("OTHER_NAME", "kept")]);
     // The file of `gitlab` is replaced by one that is not a token's.
     fixture.leave_token_file(AgentLoginProvider::Gitlab, "two\nlines");
 
-    // Whatever the readiness document records, or when there is none.
-    for document in [None, Some(&fixture.recorded())] {
-        let offered = offer(&service, Some(&admitted.tokens), document);
+    let offered = offer(&service, Some(&admitted.tokens));
 
-        let variable = |name: &str| offered.variable(std::ffi::OsStr::new(name));
-        for name in ["GITLAB_TOKEN", "GITLAB_TOKEN_FILE"] {
-            assert_eq!(variable(name), None, "{name}");
-        }
-        let github = fake_grant_token(AgentLoginProvider::Github, 3);
-        assert_eq!(variable("GH_TOKEN"), Some(std::ffi::OsStr::new(&github)));
+    let variable = |name: &str| offered.variable(std::ffi::OsStr::new(name));
+    for name in ["GITLAB_TOKEN", "GITLAB_TOKEN_FILE"] {
+        assert_eq!(variable(name), None, "{name}");
+    }
+    let github = fake_grant_token(AgentLoginProvider::Github, 3);
+    assert_eq!(variable("GH_TOKEN"), Some(std::ffi::OsStr::new(&github)));
+    assert_eq!(
+        variable("GH_TOKEN_FILE"),
+        Some(fixture.token_file(AgentLoginProvider::Github).as_os_str())
+    );
+    assert_eq!(variable("OTHER_NAME"), Some(std::ffi::OsStr::new("kept")));
+}
+
+// REQ-GRANT-86, REQ-GRANT-87, INV-RUNNER-28, INV-RUNNER-32
+#[test]
+fn a_listed_configured_providers_token_is_kept_in_a_file_of_its_own_and_offered_under_its_names() {
+    let fixture = Fixture::new();
+    fixture.list_named(&[GITHUB_ENTRY, EXAMPLE_ENTRY]);
+    fixture
+        .cloud
+        .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(1));
+    fixture
+        .cloud
+        .answer_grant_token(configured("example"), FakeGrantToken::Issue(3));
+
+    let admitted = fixture.admit(ASSIGNMENT);
+
+    fixture.assert_listed_once_first();
+    let mut requests: Vec<_> = fixture
+        .cloud
+        .grant_requests()
+        .iter()
+        .map(|request| {
+            (
+                request.boot_id.clone(),
+                request.assignment_id.clone(),
+                request.provider.cloud_id().to_owned(),
+            )
+        })
+        .collect();
+    requests.sort();
+    assert_eq!(
+        requests,
+        ["example", "github"].map(|id| (BOOT.to_owned(), ASSIGNMENT.to_owned(), id.to_owned()))
+    );
+    let file = fixture.configured_file("example");
+    let token = fake_grant_token(configured("example"), 3);
+    assert_eq!(fs::read_to_string(&file).unwrap(), token);
+    assert_eq!(mode(&file), 0o600);
+    assert_eq!(mode(file.parent().unwrap()), 0o700);
+    let offered = offered_alone(&admitted.tokens);
+    assert_eq!(
+        variable(&offered, "EXAMPLE_ACCESS_TOKEN"),
+        Some(std::ffi::OsStr::new(&token))
+    );
+    assert_eq!(
+        variable(&offered, "EXAMPLE_ACCESS_TOKEN_FILE"),
+        Some(file.as_os_str())
+    );
+    let github = fake_grant_token(AgentLoginProvider::Github, 1);
+    assert_eq!(
+        variable(&offered, "GH_TOKEN"),
+        Some(std::ffi::OsStr::new(&github))
+    );
+    assert_eq!(
+        variable(&offered, "GH_TOKEN_FILE"),
+        Some(fixture.token_file(AgentLoginProvider::Github).as_os_str())
+    );
+    assert_eq!(
+        fixture.records_naming("example"),
+        [attributes(&serde_json::json!({
+            "um.grant_token.provider": "example",
+            "um.grant_token.phase": "admission",
+            "um.grant_token.state": "ready",
+            "um.grant_token.generation": 3,
+            "um.assignment.id": ASSIGNMENT,
+        }))]
+    );
+    // The readiness document holds an entry of the runner's own providers
+    // alone, and the offer settles no source of `example`.
+    let document: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(readiness_path(&fixture.state_path())).unwrap())
+            .unwrap();
+    assert!(
+        document["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["provider"] != "example"),
+        "{document}"
+    );
+    let sources = crate::agent_login::offer_with_grant_tokens(
+        &EnvironmentSnapshot::new(Vec::<(OsString, OsString)>::new()),
+        Some(&LoginDirectory::beside(&fixture.state_path())),
+        Some(&admitted.tokens),
+    )
+    .sources;
+    assert_eq!(
+        sources,
+        [ProviderSource {
+            provider: AgentLoginProvider::Github,
+            source: CredentialSource::Grant,
+        }]
+    );
+}
+
+// REQ-GRANT-87, INV-RUNNER-17, INV-RUNNER-32
+#[test]
+fn a_configured_provider_the_host_provides_is_asked_for_nothing_and_keeps_the_services_names() {
+    let service = [("EXAMPLE_ACCESS_TOKEN_FILE", "/srv/example-token")];
+    let fixture = Fixture::serving(&service);
+    fixture.list_named(&[GITHUB_ENTRY, EXAMPLE_ENTRY]);
+    fixture
+        .cloud
+        .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(1));
+    fixture
+        .cloud
+        .answer_grant_token(configured("example"), FakeGrantToken::Issue(1));
+
+    let admitted = fixture.admit(ASSIGNMENT);
+
+    assert_eq!(fixture.asked_ids(), ["github"]);
+    assert!(!fixture.configured_file("example").exists());
+    assert_eq!(fixture.records_naming("example"), []);
+    let offered = offer(&EnvironmentSnapshot::new(service), Some(&admitted.tokens));
+    assert_eq!(
+        variable(&offered, "EXAMPLE_ACCESS_TOKEN_FILE"),
+        Some(std::ffi::OsStr::new("/srv/example-token"))
+    );
+    assert_eq!(variable(&offered, "EXAMPLE_ACCESS_TOKEN"), None);
+}
+
+// REQ-GRANT-87, INV-RUNNER-17, INV-RUNNER-32
+#[test]
+fn a_kept_configured_token_never_replaces_a_name_the_offers_own_environment_carries() {
+    // The setup's service environment carries neither name, so the
+    // admission holds a token of `example`.
+    let fixture = Fixture::new();
+    fixture.list_named(&[EXAMPLE_ENTRY]);
+    fixture
+        .cloud
+        .answer_grant_token(configured("example"), FakeGrantToken::Issue(3));
+    let admitted = fixture.admit(ASSIGNMENT);
+    assert!(fixture.configured_file("example").exists());
+
+    // The environment the offer is built from carries one of the names.
+    for (carried, value, other) in [
+        (
+            "EXAMPLE_ACCESS_TOKEN",
+            "service-example-token",
+            "EXAMPLE_ACCESS_TOKEN_FILE",
+        ),
+        (
+            "EXAMPLE_ACCESS_TOKEN_FILE",
+            "/srv/example-token",
+            "EXAMPLE_ACCESS_TOKEN",
+        ),
+    ] {
+        let offered = offer(
+            &EnvironmentSnapshot::new([(carried, value)]),
+            Some(&admitted.tokens),
+        );
+
         assert_eq!(
-            variable("GH_TOKEN_FILE"),
-            Some(fixture.token_file(AgentLoginProvider::Github).as_os_str())
+            variable(&offered, carried),
+            Some(std::ffi::OsStr::new(value))
+        );
+        assert_eq!(variable(&offered, other), None, "{carried}");
+    }
+}
+
+// REQ-GRANT-87, INV-RUNNER-32, REQ-TELEMETRY-46
+#[test]
+fn a_listed_entry_whose_names_the_runner_does_not_use_is_asked_for_nothing_and_recorded() {
+    let refused = |token, token_file| vec![GITHUB_ENTRY, ("example", token, token_file)];
+    for entries in [
+        refused("EXAMPLE_ACCESS_TOKEN", "EXAMPLE_ACCESS_TOKEN"),
+        refused("PATH", "EXAMPLE_ACCESS_TOKEN_FILE"),
+        refused("EXAMPLE_ACCESS_TOKEN", "TMPDIR"),
+        refused("USEFUL_HOME", "EXAMPLE_ACCESS_TOKEN_FILE"),
+        refused("GITHUB_TOKEN", "EXAMPLE_ACCESS_TOKEN_FILE"),
+        refused("EXAMPLE_ACCESS_TOKEN", "GIT_CONFIG_KEY_0"),
+        refused("CODEX_HOME", "EXAMPLE_ACCESS_TOKEN_FILE"),
+        refused("EXAMPLE_ACCESS_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
+        refused("", "EXAMPLE_ACCESS_TOKEN_FILE"),
+        refused("A-B", "EXAMPLE_ACCESS_TOKEN_FILE"),
+        refused("GH_TOKEN", "EXAMPLE_ACCESS_TOKEN_FILE"),
+        refused("EXAMPLE_ACCESS_TOKEN", "GITLAB_TOKEN_FILE"),
+        refused("USEFUL_LINEAR_ACCESS_TOKEN", "EXAMPLE_ACCESS_TOKEN_FILE"),
+        // A name of the configured entry before it: the first is used.
+        vec![
+            GITHUB_ENTRY,
+            ("first", "FIRST_TOKEN", "SHARED_TOKEN_FILE"),
+            ("example", "EXAMPLE_ACCESS_TOKEN", "SHARED_TOKEN_FILE"),
+        ],
+    ] {
+        let fixture = Fixture::new();
+        fixture.list_named(&entries);
+        fixture
+            .cloud
+            .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(1));
+        for id in ["first", "example"] {
+            fixture
+                .cloud
+                .answer_grant_token(configured(id), FakeGrantToken::Issue(2));
+        }
+        let first_listed = entries.iter().any(|(id, _, _)| *id == "first");
+
+        let admitted = fixture.admit(ASSIGNMENT);
+
+        let mut asked = vec!["github"];
+        if first_listed {
+            asked.insert(0, "first");
+        }
+        assert_eq!(fixture.asked_ids(), asked, "{entries:?}");
+        assert!(!fixture.configured_file("example").exists(), "{entries:?}");
+        // The token `example` would have had is offered under no name; the
+        // runner's `github`, and a configured entry it used, are offered.
+        let offered = offered_alone(&admitted.tokens);
+        let mut names = vec!["GH_TOKEN", "GH_TOKEN_FILE"];
+        if first_listed {
+            names.extend(["FIRST_TOKEN", "SHARED_TOKEN_FILE"]);
+        }
+        names.sort_unstable();
+        assert_eq!(
+            offered.variables().keys().collect::<Vec<_>>(),
+            names
+                .iter()
+                .map(OsString::from)
+                .collect::<Vec<_>>()
+                .iter()
+                .collect::<Vec<_>>(),
+            "{entries:?}"
+        );
+        assert_eq!(
+            fixture.records_naming("example"),
+            [attributes(&serde_json::json!({
+                "um.grant_token.provider": "example",
+                "um.grant_token.phase": "admission",
+                "um.grant_token.state": "cloud_unavailable",
+                "um.grant_token.failure_stage": "list",
+                "um.grant_token.failure_cause": "invalid_response",
+                "um.assignment.id": ASSIGNMENT,
+            }))],
+            "{entries:?}"
+        );
+        assert_eq!(
+            fixture
+                .recorded()
+                .grant(AgentLoginProvider::Github)
+                .map(|grant| grant.state),
+            Some(AgentLoginState::Ready),
+            "{entries:?}"
         );
     }
+}
+
+// REQ-GRANT-87, INV-RUNNER-32
+#[test]
+fn the_runners_own_providers_keep_their_names_whatever_the_list_gives_them() {
+    let fixture = Fixture::new();
+    fixture.list_named(&[("github", "OTHER", "OTHER_FILE")]);
+    fixture
+        .cloud
+        .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(2));
+
+    let admitted = fixture.admit(ASSIGNMENT);
+
+    let file = fixture.token_file(AgentLoginProvider::Github);
+    assert!(file.ends_with(".runner-agent-login/github.token"));
+    let token = fake_grant_token(AgentLoginProvider::Github, 2);
+    assert_eq!(fs::read_to_string(&file).unwrap(), token);
+    let offered = offered_alone(&admitted.tokens);
+    assert_eq!(
+        variable(&offered, "GH_TOKEN"),
+        Some(std::ffi::OsStr::new(&token))
+    );
+    assert_eq!(variable(&offered, "GH_TOKEN_FILE"), Some(file.as_os_str()));
+    for name in ["OTHER", "OTHER_FILE"] {
+        assert_eq!(variable(&offered, name), None, "{name}");
+    }
+}
+
+// REQ-GRANT-86, REQ-GRANT-87, INV-RUNNER-32
+#[test]
+fn a_listed_gitlab_is_a_configured_provider_apart_from_the_runners_gitlab() {
+    let fixture = Fixture::new();
+    fixture.list_named(&[("gitlab", "ACME_TOKEN", "ACME_TOKEN_FILE")]);
+    fixture
+        .cloud
+        .answer_grant_token(configured("gitlab"), FakeGrantToken::Issue(1));
+    fixture
+        .cloud
+        .answer_grant_token(AgentLoginProvider::Gitlab, FakeGrantToken::Issue(1));
+
+    let admitted = fixture.admit(ASSIGNMENT);
+
+    assert_eq!(fixture.asked_ids(), ["gitlab"]);
+    let file = fixture.configured_file("gitlab");
+    let token = fake_grant_token(configured("gitlab"), 1);
+    assert_eq!(fs::read_to_string(&file).unwrap(), token);
+    assert!(!fixture.token_file(AgentLoginProvider::Gitlab).exists());
+    assert_eq!(
+        fixture
+            .recorded()
+            .grant(AgentLoginProvider::Gitlab)
+            .map(|grant| grant.state),
+        Some(AgentLoginState::NotAuthorized)
+    );
+    let offered = offered_alone(&admitted.tokens);
+    assert_eq!(
+        variable(&offered, "ACME_TOKEN"),
+        Some(std::ffi::OsStr::new(&token))
+    );
+    assert_eq!(
+        variable(&offered, "ACME_TOKEN_FILE"),
+        Some(file.as_os_str())
+    );
+    for name in ["GITLAB_TOKEN", "GITLAB_TOKEN_FILE"] {
+        assert_eq!(variable(&offered, name), None, "{name}");
+    }
+}
+
+// REQ-GRANT-86, INV-RUNNER-28
+#[test]
+fn a_configured_file_an_earlier_assignment_left_is_gone_before_any_answer_is_used() {
+    let fixture = Fixture::new();
+    let left = fixture.configured_file("old");
+    crate::agent_login::directory::ensure_private_directory(
+        LoginDirectory::beside(&fixture.state_path()).path(),
+    )
+    .unwrap();
+    crate::agent_login::directory::ensure_private_directory(left.parent().unwrap()).unwrap();
+    fs::write(&left, "earlier-assignment-token").unwrap();
+    let present_when_asked = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&present_when_asked);
+    let watched = left.clone();
+    fixture.cloud.on_grant_request(Box::new(move |request| {
+        seen.lock()
+            .unwrap()
+            .push((request.provider.cloud_id().to_owned(), watched.exists()));
+    }));
+    fixture.list_named(&[GITHUB_ENTRY, EXAMPLE_ENTRY]);
+    fixture
+        .cloud
+        .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(1));
+    fixture
+        .cloud
+        .answer_grant_token(configured("example"), FakeGrantToken::Issue(1));
+
+    let admitted = fixture.admit(ASSIGNMENT);
+
+    let mut seen = present_when_asked.lock().unwrap().clone();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [("example".to_owned(), false), ("github".to_owned(), false)]
+    );
+    assert!(!left.exists());
+    assert!(fixture.configured_file("example").exists());
+
+    // When the assignment ends its file is gone.
+    drop(admitted.tokens);
+    assert!(!fixture.configured_file("example").exists());
+    assert!(!fixture.token_file(AgentLoginProvider::Github).exists());
+}
+
+// REQ-GRANT-86, INV-RUNNER-28
+#[test]
+fn an_idle_pass_removes_a_leftover_configured_token_file_and_asks_cloud_for_none() {
+    let fixture = Fixture::new();
+    let left = fixture.configured_file("old");
+    let directory = left.parent().unwrap().to_owned();
+    crate::agent_login::directory::ensure_private_directory(
+        LoginDirectory::beside(&fixture.state_path()).path(),
+    )
+    .unwrap();
+    crate::agent_login::directory::ensure_private_directory(&directory).unwrap();
+    fs::write(&left, "interrupted-runner-token").unwrap();
+    let temporary = directory.join(".useful-grant-token.tmp.4242.1");
+    fs::write(&temporary, "interrupted-write").unwrap();
+
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(fixture.setup.run_pass());
+
+    assert!(matches!(outcome, SetupOutcome::Recorded(_)), "{outcome:?}");
+    assert!(!left.exists());
+    assert!(!temporary.exists());
+    assert!(!directory.exists());
+    assert_eq!(fixture.cloud.grant_requests(), []);
+    assert_eq!(fixture.records(), []);
+}
+
+// REQ-GRANT-86, REQ-TELEMETRY-46, INV-RUNNER-28
+#[test]
+fn a_configured_providers_directory_that_cannot_be_removed_asks_for_none_of_them() {
+    let fixture = Fixture::new();
+    let left = fixture.configured_file("old");
+    let directory = left.parent().unwrap().to_owned();
+    crate::agent_login::directory::ensure_private_directory(
+        LoginDirectory::beside(&fixture.state_path()).path(),
+    )
+    .unwrap();
+    crate::agent_login::directory::ensure_private_directory(&directory).unwrap();
+    fs::write(&left, "earlier-assignment-token").unwrap();
+    // A file in a directory that cannot be written cannot be removed.
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o500)).unwrap();
+    fixture.list_named(&[GITHUB_ENTRY, EXAMPLE_ENTRY]);
+    fixture
+        .cloud
+        .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(1));
+    fixture
+        .cloud
+        .answer_grant_token(configured("example"), FakeGrantToken::Issue(1));
+
+    let admitted = fixture.admit(ASSIGNMENT);
+
+    assert_eq!(fixture.asked_ids(), ["github"]);
+    assert!(admitted.tokens.holds(AgentLoginProvider::Github));
+    assert_eq!(
+        fixture.records_naming("example"),
+        [attributes(&serde_json::json!({
+            "um.grant_token.provider": "example",
+            "um.grant_token.phase": "admission",
+            "um.grant_token.state": "install_failed",
+            "um.grant_token.failure_stage": "remove",
+            "um.grant_token.failure_cause": "permission_denied",
+            "um.assignment.id": ASSIGNMENT,
+        }))]
+    );
+    drop(admitted.tokens);
+
+    // A setup made while no assignment is held names no provider.
+    let records = fixture.records().len();
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(fixture.setup.run_pass());
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(matches!(outcome, SetupOutcome::Recorded(_)), "{outcome:?}");
+    let removal: Vec<_> = fixture.records()[records..]
+        .iter()
+        .map(grant_attributes)
+        .collect();
+    assert_eq!(
+        removal,
+        [attributes(&serde_json::json!({
+            "um.grant_token.failure_stage": "remove",
+            "um.grant_token.failure_cause": "permission_denied",
+        }))]
+    );
 }
 
 /// The wait the fake Cloud names with each token in the refresh tests.
 const WAIT: Duration = Duration::from_secs(60);
 
-/// An assignment admitted with the `github` token of generation 1, whose
-/// hold keeps it current on a controlled sleeper: the sleeps the task asks
-/// for, the environment its steps were offered at admission, and each
-/// readiness a refresh published. The test keeps no sleeper of its own, so
-/// once the task has stopped no sleep can be asked for.
+/// An assignment admitted with the token of generation 1 of `provider`,
+/// `github` unless a test lists another, whose hold keeps it current on a
+/// controlled sleeper: the sleeps the task asks for, the environment its
+/// steps were offered at admission, and each readiness a refresh published.
+/// The test keeps no sleeper of its own, so once the task has stopped no
+/// sleep can be asked for.
 struct Refreshing {
     fixture: Fixture,
+    /// The provider whose answer `pass` sets.
+    provider: GrantProvider,
+    /// How many token requests the admission made.
+    admitted: usize,
     tokens: Option<AssignmentGrantTokens>,
     offered: EnvironmentSnapshot,
     sleeps: tokio::sync::mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
@@ -724,19 +1691,41 @@ impl Refreshing {
     /// Admits the assignment with a token that expires `lifetime` after
     /// the sleeper's start, and starts keeping it current.
     fn start(lifetime: time::Duration) -> Self {
+        Self::listing(
+            lifetime,
+            GrantProvider::try_from(AgentLoginProvider::Github).unwrap(),
+            &[],
+        )
+    }
+
+    /// `start` for `provider`, where Cloud lists `entries`, if any, and
+    /// issues generation 1 of each provider it lists.
+    fn listing(
+        lifetime: time::Duration,
+        provider: GrantProvider,
+        entries: &[(&str, &str, &str)],
+    ) -> Self {
         let fixture = Fixture::new();
         let (sleeper, sleeps) = controlled_sleeper();
         fixture
             .cloud
             .issue_grant_tokens_with(WAIT, sleeper.utc_now() + lifetime);
+        if !entries.is_empty() {
+            fixture.list_named(entries);
+        }
+        for (id, _, _) in entries {
+            fixture
+                .cloud
+                .answer_grant_token(GrantProvider::listed(id).unwrap(), FakeGrantToken::Issue(1));
+        }
         fixture
             .cloud
-            .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(1));
+            .answer_grant_token(provider.clone(), FakeGrantToken::Issue(1));
         let mut admitted = fixture.admit(ASSIGNMENT);
+        let requests = fixture.cloud.grant_requests().len();
         let offered = offer(
             &EnvironmentSnapshot::new(Vec::<(OsString, OsString)>::new()),
             Some(&admitted.tokens),
-            admitted.grants.as_ref(),
         );
         let published = Arc::new(Mutex::new(Vec::new()));
         let publishing = Arc::clone(&published);
@@ -746,6 +1735,8 @@ impl Refreshing {
         admitted.tokens.keep_current(sleeper);
         Self {
             fixture,
+            provider,
+            admitted: requests,
             tokens: Some(admitted.tokens),
             offered,
             sleeps,
@@ -757,6 +1748,12 @@ impl Refreshing {
     /// `start` with a token that outlives every test.
     fn started() -> Self {
         Self::start(time::Duration::days(1))
+    }
+
+    /// `start` for `example`, the one provider Cloud lists, with a token
+    /// that expires `lifetime` after the sleeper's start.
+    fn example(lifetime: time::Duration) -> Self {
+        Self::listing(lifetime, configured("example"), &[EXAMPLE_ENTRY])
     }
 
     /// The wait of the sleep the task asks for once it has done everything
@@ -777,13 +1774,17 @@ impl Refreshing {
         let (_, release) = self.pending.take().unwrap();
         self.fixture
             .cloud
-            .answer_grant_token(AgentLoginProvider::Github, answer);
+            .answer_grant_token(self.provider.clone(), answer);
         release.release();
         self.wait().await
     }
 
+    /// The file of `provider`'s token.
     fn file(&self) -> PathBuf {
-        self.fixture.token_file(AgentLoginProvider::Github)
+        match self.provider.agent_login_provider() {
+            Some(provider) => self.fixture.token_file(provider),
+            None => self.fixture.configured_file(self.provider.cloud_id()),
+        }
     }
 
     fn token(&self) -> String {
@@ -804,7 +1805,7 @@ impl Refreshing {
             .cloud
             .grant_requests()
             .into_iter()
-            .skip(brokered_providers().count())
+            .skip(self.admitted)
             .collect()
     }
 
@@ -829,21 +1830,30 @@ fn ready(generation: u64, expires_at: OffsetDateTime) -> GrantReadiness {
             generation,
             expires_at,
         }),
-        selected: true,
         run_id: Some(RUN.to_owned()),
         ended_at: None,
+        source: Some(CredentialSource::Grant),
     }
 }
 
-fn not_ready(state: AgentLoginState, selected: bool) -> GrantReadiness {
+/// `not_ready(state)` for a provider whose token the admission kept, whose
+/// source a refresh leaves as the admission settled it.
+fn held_then(state: AgentLoginState) -> GrantReadiness {
+    GrantReadiness {
+        source: Some(CredentialSource::Grant),
+        ..not_ready(state)
+    }
+}
+
+fn not_ready(state: AgentLoginState) -> GrantReadiness {
     GrantReadiness {
         provider: AgentLoginProvider::Github,
         state,
         checked_at: Some(now()),
         issued: None,
-        selected,
         run_id: Some(RUN.to_owned()),
         ended_at: None,
+        source: None,
     }
 }
 
@@ -917,7 +1927,7 @@ async fn when_the_wait_passes_the_file_is_replaced_in_place_with_the_newer_gener
         [GrantTokenRequest {
             boot_id: BOOT.to_owned(),
             assignment_id: ASSIGNMENT.to_owned(),
-            provider: AgentLoginProvider::Github,
+            provider: GrantProvider::try_from(AgentLoginProvider::Github).unwrap(),
         }]
     );
     assert_eq!(run.file(), file);
@@ -952,6 +1962,18 @@ async fn when_the_wait_passes_the_file_is_replaced_in_place_with_the_newer_gener
     assert_eq!(run.refresh_records().len(), 1);
     assert_eq!(run.refresh_records()[0]["um.grant_token.state"], "ready");
     assert_eq!(run.refresh_records()[0]["um.grant_token.generation"], 2);
+}
+
+// REQ-GRANT-89, REQ-GRANT-86
+#[tokio::test]
+async fn a_refresh_asks_cloud_for_no_list() {
+    let mut run = Refreshing::started();
+
+    assert_eq!(run.pass(FakeGrantToken::Issue(2)).await, Some(WAIT));
+    assert_eq!(run.pass(FakeGrantToken::Issue(3)).await, Some(WAIT));
+
+    assert_eq!(run.refresh_requests().len(), 2);
+    run.fixture.assert_listed_once_first();
 }
 
 // REQ-GRANT-89
@@ -1016,10 +2038,7 @@ async fn a_failed_refresh_keeps_the_file_is_recorded_and_retried_with_backoff() 
 
         assert_eq!(next, Some(Duration::from_secs(5)), "{failure:?}");
         assert_eq!(run.token(), held);
-        assert_eq!(
-            run.github(),
-            not_ready(AgentLoginState::CloudUnavailable, true)
-        );
+        assert_eq!(run.github(), held_then(AgentLoginState::CloudUnavailable));
         let mut expected = serde_json::json!({
             "um.grant_token.provider": "github",
             "um.grant_token.phase": "refresh",
@@ -1087,10 +2106,7 @@ async fn once_the_held_token_expires_unrefreshed_its_file_is_removed_and_the_ask
     assert_eq!(run.pass(unavailable).await, Some(Duration::from_secs(20)));
 
     assert!(!run.file().exists());
-    assert_eq!(
-        run.github(),
-        not_ready(AgentLoginState::CloudUnavailable, true)
-    );
+    assert_eq!(run.github(), held_then(AgentLoginState::CloudUnavailable));
     // The asking goes on. A token of the generation the runner held is kept
     // again, since its file no longer holds it, and so is one issued later.
     assert_eq!(run.pass(FakeGrantToken::Issue(1)).await, Some(WAIT));
@@ -1103,33 +2119,25 @@ async fn once_the_held_token_expires_unrefreshed_its_file_is_removed_and_the_ask
 #[tokio::test]
 async fn a_refusal_removes_the_file_at_once_and_ends_the_asking() {
     let refused = GrantTokenFailure::Refused;
-    for (refusal, state, selected) in [
+    for (refusal, state) in [
         (
             refused(GrantTokenRefusal::Revoked),
             AgentLoginState::Revoked,
-            false,
         ),
         (
             refused(GrantTokenRefusal::Unauthorized),
             AgentLoginState::NotAuthorized,
-            false,
         ),
         (
             refused(GrantTokenRefusal::ReconnectRequired),
             AgentLoginState::ReconnectRequired,
-            true,
         ),
         (
             refused(GrantTokenRefusal::ProviderUnavailable),
             AgentLoginState::UnsupportedTarget,
-            false,
         ),
         // A Cloud that no longer has the route authorizes nothing.
-        (
-            GrantTokenFailure::NoRoute,
-            AgentLoginState::NotAuthorized,
-            false,
-        ),
+        (GrantTokenFailure::NoRoute, AgentLoginState::NotAuthorized),
     ] {
         let mut run = Refreshing::started();
 
@@ -1137,7 +2145,7 @@ async fn a_refusal_removes_the_file_at_once_and_ends_the_asking() {
 
         assert_eq!(next, None, "{refusal:?}");
         assert!(!run.file().exists(), "{refusal:?}");
-        assert_eq!(run.github(), not_ready(state, selected), "{refusal:?}");
+        assert_eq!(run.github(), held_then(state), "{refusal:?}");
         assert_eq!(
             run.published.lock().unwrap().last().cloned(),
             Some(run.fixture.recorded())
@@ -1160,6 +2168,215 @@ async fn when_the_assignment_ends_nothing_more_is_asked() {
     drop(run.tokens.take());
 
     // The task stopped: its sleep is gone with it, and none follows.
+    let (_, release) = run.pending.take().unwrap();
+    release.release();
+    assert!(run.wait().await.is_none());
+    assert_eq!(run.refresh_requests(), []);
+}
+
+/// What the fake Cloud answers for a token request it does not answer.
+const UNANSWERED: FakeGrantToken =
+    FakeGrantToken::Fail(GrantTokenFailure::Cloud(CloudFailure::Transport));
+
+// REQ-GRANT-89, REQ-TELEMETRY-46
+#[tokio::test]
+async fn a_configured_providers_file_is_replaced_in_place_when_the_wait_passes() {
+    let mut run = Refreshing::example(time::Duration::days(1));
+    let file = run.fixture.configured_file("example");
+    let admitted = fake_grant_token(configured("example"), 1);
+    assert_eq!(fs::read_to_string(&file).unwrap(), admitted);
+    assert_eq!(run.wait().await, Some(WAIT));
+    assert_eq!(run.refresh_requests(), []);
+
+    assert_eq!(run.pass(FakeGrantToken::Issue(2)).await, Some(WAIT));
+
+    assert_eq!(
+        run.refresh_requests(),
+        [GrantTokenRequest {
+            boot_id: BOOT.to_owned(),
+            assignment_id: ASSIGNMENT.to_owned(),
+            provider: configured("example"),
+        }]
+    );
+    let token = fake_grant_token(configured("example"), 2);
+    assert_eq!(fs::read_to_string(&file).unwrap(), token);
+    assert_eq!(mode(&file), 0o600);
+    // A command started now with the step's environment reads the new token
+    // through the file; the variable is still the token as admitted.
+    let offered = run.offered.clone();
+    assert_eq!(
+        run_with(
+            &offered,
+            r#"read -r token < "$EXAMPLE_ACCESS_TOKEN_FILE"; printf %s "$token""#
+        ),
+        token
+    );
+    assert_eq!(
+        run_with(&offered, r#"printf %s "$EXAMPLE_ACCESS_TOKEN""#),
+        admitted
+    );
+    assert_eq!(
+        run.refresh_records(),
+        [attributes(&serde_json::json!({
+            "um.grant_token.provider": "example",
+            "um.grant_token.phase": "refresh",
+            "um.grant_token.state": "ready",
+            "um.grant_token.generation": 2,
+            "um.assignment.id": ASSIGNMENT,
+        }))]
+    );
+}
+
+// REQ-GRANT-89, REQ-TELEMETRY-46
+#[tokio::test]
+async fn an_answer_of_a_configured_providers_held_generation_writes_no_record() {
+    let mut run = Refreshing::example(time::Duration::days(1));
+
+    assert_eq!(run.pass(FakeGrantToken::Issue(1)).await, Some(WAIT));
+
+    assert_eq!(run.token(), fake_grant_token(configured("example"), 1));
+    assert_eq!(run.refresh_records(), []);
+    // The next wait is the one Cloud names with it.
+    run.fixture
+        .cloud
+        .issue_grant_tokens_with(Duration::from_secs(30), fake_grant_expiry());
+    assert_eq!(
+        run.pass(FakeGrantToken::Issue(1)).await,
+        Some(Duration::from_secs(30))
+    );
+    assert_eq!(run.refresh_records(), []);
+    assert_eq!(run.refresh_requests().len(), 2);
+}
+
+// REQ-GRANT-89, REQ-TELEMETRY-46
+#[tokio::test]
+async fn a_configured_provider_cloud_does_not_answer_keeps_its_file_is_recorded_and_retried() {
+    let mut run = Refreshing::example(time::Duration::days(1));
+    let held = fake_grant_token(configured("example"), 1);
+    let unavailable = attributes(&serde_json::json!({
+        "um.grant_token.provider": "example",
+        "um.grant_token.phase": "refresh",
+        "um.grant_token.state": "cloud_unavailable",
+        "um.grant_token.failure_stage": "issue",
+        "um.grant_token.failure_cause": "transport",
+        "um.assignment.id": ASSIGNMENT,
+    }));
+
+    assert_eq!(run.pass(UNANSWERED).await, Some(Duration::from_secs(5)));
+
+    assert_eq!(run.token(), held);
+    assert_eq!(run.refresh_records(), std::slice::from_ref(&unavailable));
+    assert_eq!(run.pass(UNANSWERED).await, Some(Duration::from_secs(10)));
+    assert_eq!(run.token(), held);
+    assert_eq!(run.refresh_records(), [unavailable.clone(), unavailable]);
+
+    // The answer that follows, of the token the file still holds, is
+    // `ready` again, since the state the refresh last recorded was not.
+    assert_eq!(run.pass(FakeGrantToken::Issue(1)).await, Some(WAIT));
+    assert_eq!(run.token(), held);
+    assert_eq!(
+        run.refresh_records().last().cloned(),
+        Some(attributes(&serde_json::json!({
+            "um.grant_token.provider": "example",
+            "um.grant_token.phase": "refresh",
+            "um.grant_token.state": "ready",
+            "um.grant_token.generation": 1,
+            "um.assignment.id": ASSIGNMENT,
+        })))
+    );
+    assert_eq!(run.pass(UNANSWERED).await, Some(Duration::from_secs(5)));
+}
+
+// REQ-GRANT-89
+#[tokio::test]
+async fn once_a_configured_providers_token_expires_unrefreshed_its_file_is_removed() {
+    // The token expires 70 seconds after the start: the refresh at 60
+    // seconds and the retry at 65 keep it, the retry at 75 removes it.
+    let mut run = Refreshing::example(time::Duration::seconds(70));
+
+    assert_eq!(run.pass(UNANSWERED).await, Some(Duration::from_secs(5)));
+    assert_eq!(run.pass(UNANSWERED).await, Some(Duration::from_secs(10)));
+    assert!(run.file().exists());
+
+    assert_eq!(run.pass(UNANSWERED).await, Some(Duration::from_secs(20)));
+
+    assert!(!run.file().exists());
+    // The asking goes on, and keeps the token of the held generation again.
+    assert_eq!(run.pass(FakeGrantToken::Issue(1)).await, Some(WAIT));
+    assert_eq!(run.token(), fake_grant_token(configured("example"), 1));
+}
+
+// REQ-GRANT-89, REQ-TELEMETRY-46
+#[tokio::test]
+async fn a_refusal_removes_a_configured_providers_file_and_ends_its_asking_alone() {
+    let mut run = Refreshing::listing(
+        time::Duration::days(1),
+        configured("example"),
+        &[GITHUB_ENTRY, EXAMPLE_ENTRY],
+    );
+    let revoked = FakeGrantToken::Fail(GrantTokenFailure::Refused(GrantTokenRefusal::Revoked));
+
+    assert_eq!(run.pass(revoked).await, Some(WAIT));
+
+    assert!(!run.file().exists());
+    assert_eq!(
+        run.refresh_records(),
+        [attributes(&serde_json::json!({
+            "um.grant_token.provider": "example",
+            "um.grant_token.phase": "refresh",
+            "um.grant_token.state": "revoked",
+            "um.assignment.id": ASSIGNMENT,
+        }))]
+    );
+    // `github` is still asked for when its wait passes, and `example` no
+    // more.
+    run.fixture
+        .cloud
+        .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(2));
+    assert_eq!(run.pass(revoked).await, Some(WAIT));
+    assert_eq!(
+        fs::read_to_string(run.fixture.token_file(AgentLoginProvider::Github)).unwrap(),
+        fake_grant_token(AgentLoginProvider::Github, 2)
+    );
+    assert_eq!(
+        run.refresh_requests()
+            .iter()
+            .map(|request| request.provider.cloud_id())
+            .collect::<Vec<_>>(),
+        ["github", "example", "github"]
+    );
+}
+
+// REQ-GRANT-89, REQ-GRANT-88
+#[tokio::test]
+async fn no_refresh_of_a_configured_provider_writes_or_publishes_the_readiness_document() {
+    let mut run = Refreshing::example(time::Duration::days(1));
+    let readiness = readiness_path(&run.fixture.state_path());
+    let admitted = fs::read(&readiness).unwrap();
+
+    assert_eq!(run.pass(FakeGrantToken::Issue(2)).await, Some(WAIT));
+    assert_eq!(run.pass(UNANSWERED).await, Some(Duration::from_secs(5)));
+    assert_eq!(
+        run.pass(FakeGrantToken::Fail(GrantTokenFailure::Refused(
+            GrantTokenRefusal::Revoked
+        )))
+        .await,
+        None
+    );
+
+    assert_eq!(run.refresh_records().len(), 3);
+    assert_eq!(fs::read(&readiness).unwrap(), admitted);
+    assert!(run.published.lock().unwrap().is_empty());
+}
+
+// REQ-GRANT-89, INV-RUNNER-28
+#[tokio::test]
+async fn when_the_assignment_ends_a_configured_provider_is_asked_no_more() {
+    let mut run = Refreshing::example(time::Duration::days(1));
+    assert_eq!(run.wait().await, Some(WAIT));
+
+    drop(run.tokens.take());
+
     let (_, release) = run.pending.take().unwrap();
     release.release();
     assert!(run.wait().await.is_none());

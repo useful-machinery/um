@@ -27,7 +27,8 @@
       "properties": {
         "joinUrl": { "type": "string", "format": "uri", "pattern": "^https?://[^#]+/v1/runner-join-keys/rjk_[0-7][0-9a-hjkmnp-tv-z]{25}/join$" },
         "joinKeyId": { "type": "string", "pattern": "^rjk_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
-        "expiresAt": { "type": "string", "format": "date-time" }
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "previousRunnerId": { "type": "string", "pattern": "^rnr_[0-7][0-9a-hjkmnp-tv-z]{25}$" }
       }
     },
     "credentialSecret": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },

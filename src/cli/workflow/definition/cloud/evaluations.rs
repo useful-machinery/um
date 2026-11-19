@@ -1,6 +1,8 @@
 //! `useful workflow definition cloud evaluation list` and `show` (REQ-CLOUDDEF-15): a Cloud
-//! definition's retained start evaluations (REQ-TRIGGER-132), listed with the exact `state`
-//! and `runId` filters and read one at a time, each with its stored reason.
+//! definition's retained start evaluations (REQ-TRIGGER-132) in evaluation vocabulary 2
+//! (REQ-TRIGGER-166), listed with the exact `state` and `runId` filters and read one at a
+//! time, each with its stored reason and what its event names: a Linear issue, or a push's
+//! branch and commit.
 
 use std::io::{self, Write};
 
@@ -176,20 +178,26 @@ impl Show {
     }
 }
 
-/// One evaluation on a line: id, state with its reason, trigger, revision, event and run.
+/// One evaluation on a line: id, state with its reason, trigger, revision, event, run, the
+/// run blocking it and, when Cloud observed any, its project's readiness blockers.
 fn summary(evaluation: &WorkflowDefinitionEvaluation) -> String {
-    format!(
-        "{} · {} · reason {} · trigger {} · revision {} · {} {} · accepted {} · run {}",
+    let line = format!(
+        "{} · {} · reason {} · trigger {} · revision {} · {} {} · accepted {} · run {} · blocking run {}",
         display(&evaluation.id),
         report::wire(evaluation.state),
         or_dash(evaluation.reason.as_deref()),
         display(&evaluation.trigger_name),
         evaluation.revision,
         report::wire(evaluation.event_name),
-        issue(evaluation),
+        event_subject(evaluation),
         display(&evaluation.accepted_at),
         or_dash(evaluation.run_id.as_deref()),
-    )
+        or_dash(evaluation.blocking_run_id.as_deref()),
+    );
+    match project_blockers(evaluation) {
+        Some(blockers) => format!("{line} · project blockers {blockers}"),
+        None => line,
+    }
 }
 
 fn write_evaluation(
@@ -204,7 +212,7 @@ fn write_evaluation(
         out,
         "event: {} {}",
         report::wire(evaluation.event_name),
-        issue(evaluation)
+        event_subject(evaluation)
     )?;
     writeln!(
         out,
@@ -223,6 +231,11 @@ fn write_evaluation(
         out,
         "blocking run: {}",
         or_dash(evaluation.blocking_run_id.as_deref())
+    )?;
+    writeln!(
+        out,
+        "project blockers: {}",
+        project_blockers(evaluation).unwrap_or_else(|| "-".to_owned())
     )?;
     writeln!(
         out,
@@ -246,10 +259,27 @@ fn write_evaluation(
     writeln!(out, "expires: {}", display(&evaluation.expires_at))
 }
 
-/// The issue identifier the evaluation's event names, `-` for a schedule's event.
-fn issue(evaluation: &WorkflowDefinitionEvaluation) -> String {
+/// What the evaluation's event names: a push's branch and commit as `<branch> <commit>`, a
+/// Linear event's issue identifier, `-` for a schedule's event.
+fn event_subject(evaluation: &WorkflowDefinitionEvaluation) -> String {
     let event = serde_json::to_value(&evaluation.event).unwrap_or(Value::Null);
+    if let (Some(branch), Some(commit)) = (event["branch"].as_str(), event["commit"].as_str()) {
+        return format!("{} {}", display(branch), display(commit));
+    }
     or_dash(event["issue"]["identifier"].as_str())
+}
+
+/// The readiness blockers Cloud observed on the evaluation's project, joined with `, `;
+/// `None` when it observed none (REQ-TRIGGER-164).
+fn project_blockers(evaluation: &WorkflowDefinitionEvaluation) -> Option<String> {
+    let blockers = &evaluation.observations.as_ref()?.project.as_ref()?.blockers;
+    (!blockers.is_empty()).then(|| {
+        blockers
+            .iter()
+            .map(|blocker| display(blocker))
+            .collect::<Vec<_>>()
+            .join(", ")
+    })
 }
 
 fn or_dash(value: Option<&str>) -> String {

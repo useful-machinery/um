@@ -23,7 +23,7 @@ pub struct ProviderGrantSession {
     pub id: String,
     /// The provider the consent asks.
     #[serde(rename = "provider")]
-    pub provider: Provider,
+    pub provider: String,
     /// The identity link an identity-bound consent names; omitted for a link-creating consent.
     #[serde(rename = "identityId", skip_serializing_if = "Option::is_none")]
     pub identity_id: Option<String>,
@@ -52,7 +52,7 @@ impl ProviderGrantSession {
     /// One of the member's provider-grant consents; it never carries the consent's state, verifier or grant material (REQ-GRANT-4).
     pub fn new(
         id: String,
-        provider: Provider,
+        provider: String,
         status: Status,
         created_at: String,
         expires_at: String,
@@ -70,22 +70,6 @@ impl ProviderGrantSession {
             retained_until: None,
             result_grant: None,
         }
-    }
-}
-/// The provider the consent asks.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
-pub enum Provider {
-    #[serde(rename = "github")]
-    ProviderGrantSessionProviderGithub,
-    #[serde(rename = "gitlab.com")]
-    ProviderGrantSessionProviderGitlabCom,
-    #[serde(rename = "linear")]
-    ProviderGrantSessionProviderLinear,
-}
-
-impl Default for Provider {
-    fn default() -> Provider {
-        Self::ProviderGrantSessionProviderGithub
     }
 }
 /// The consent's status.

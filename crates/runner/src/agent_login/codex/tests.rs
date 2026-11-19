@@ -226,13 +226,53 @@ fn the_runners_codex_home_is_offered_only_when_it_keeps_a_login_and_the_service_
         ))
     );
 
-    let own_home = ServiceEnvironment::from_lookup(|name| {
-        (name == CODEX_LOGIN_VARIABLE).then(|| OsString::from("/srv/codex"))
-    });
+    let own_home = ServiceEnvironment::from_variables([(CODEX_LOGIN_VARIABLE, "/srv/codex")]);
     assert!(foreign_login(&own_home));
     assert_eq!(offered_home(&own_home, &directory), None);
 
     fs::remove_file(auth_path(&directory)).unwrap();
     fs::create_dir(auth_path(&directory)).unwrap();
     assert_eq!(offered_home(&service, &directory), None);
+}
+
+/// The service environment of a service whose `HOME` is `home`.
+fn service_at(home: &Path) -> ServiceEnvironment {
+    let home = home.as_os_str().to_owned();
+    ServiceEnvironment::from_variables([("HOME", home)])
+}
+
+// REQ-GRANT-51, REQ-GRANT-37
+#[test]
+fn a_codex_login_in_the_default_home_under_the_services_home_is_its_own() {
+    let (state, directory) = state();
+    installed(&directory, None, 1, b"{}");
+    let home = state.path().join("service-home");
+    fs::create_dir(&home).unwrap();
+    let service = service_at(&home);
+    assert!(!foreign_login(&service));
+    assert!(offered_home(&service, &directory).is_some());
+
+    let own = home.join(".codex");
+    fs::create_dir(&own).unwrap();
+    assert!(!foreign_login(&service));
+    fs::write(own.join(AUTH_FILE), b"{\"operator\":true}").unwrap();
+    assert!(foreign_login(&service));
+    assert_eq!(offered_home(&service, &directory), None);
+    // It is only looked at: a link counts as present, whatever it names.
+    fs::remove_file(own.join(AUTH_FILE)).unwrap();
+    symlink(state.path().join("absent"), own.join(AUTH_FILE)).unwrap();
+    assert!(foreign_login(&service));
+
+    // A file the runner cannot tell is absent counts as present.
+    fs::remove_file(own.join(AUTH_FILE)).unwrap();
+    fs::remove_dir(&own).unwrap();
+    fs::write(&own, b"").unwrap();
+    assert!(foreign_login(&service));
+
+    // An unset `HOME` names no login, and neither does one that is not
+    // absolute: this one is a file of the package the tests run in, under
+    // which a login could not be told absent.
+    assert!(!foreign_login(&ServiceEnvironment::default()));
+    assert!(Path::new("Cargo.toml").is_file());
+    assert!(!foreign_login(&service_at(Path::new("Cargo.toml"))));
 }

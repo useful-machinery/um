@@ -6,10 +6,13 @@
 //! changes a provider's readiness, or cannot record it, writes one
 //! `runner.agent_login_setup` record (REQ-TELEMETRY-45). Each admission makes
 //! a pass of its own before the assignment is offered anything
-//! (REQ-GRANT-49), then asks Cloud for its assignment's grant tokens
-//! (REQ-GRANT-86), whose files each refresh while it runs replaces or removes
-//! under the same lock as a pass (REQ-GRANT-89). How the provider
-//! answered each use of an offered login is noted in memory while the
+//! (REQ-GRANT-49), then asks Cloud for its assignment's grant tokens of the
+//! providers the service's environment does not provide (REQ-GRANT-86,
+//! REQ-GRANT-87), whose files each refresh while it runs replaces or removes
+//! under the same lock as a pass (REQ-GRANT-89); the admission then reports
+//! the sources it settled to Cloud, a report Cloud does not take writing one
+//! `runner.credential_sources` record (REQ-GRANT-93, REQ-TELEMETRY-48). How
+//! the provider answered each use of an offered login is noted in memory while the
 //! assignment runs and folded into the readiness by the next pass
 //! (REQ-GRANT-52). A pass made while the runner holds no assignment removes
 //! the grant token files an earlier assignment or an interrupted runner left
@@ -34,8 +37,9 @@ use useful_execution::{HarnessLoginObserver, HarnessLoginOutcome};
 use super::check::{CHECK_ALLOWANCE, LoginCheck, LoginCheckOutcome};
 use super::claude_code;
 use super::cloud::{
-    AgentLoginCloud, Delivery, DeliveryFailure, DeliveryRefusal, DeliveryRequest,
-    HttpAgentLoginCloud, InstalledLogin, LoginStatus, ProviderLogin, ProviderReport, StatusRequest,
+    AgentLoginCloud, CredentialSourcesFailure, CredentialSourcesRequest, Delivery, DeliveryFailure,
+    DeliveryRefusal, DeliveryRequest, HttpAgentLoginCloud, InstalledLogin, LoginStatus,
+    ProviderLogin, ProviderReport, StatusRequest,
 };
 use super::codex;
 use super::directory::{self, LoginDirectory};
@@ -46,7 +50,7 @@ use super::readiness::{
 };
 use super::{
     FailureCause, FailureStage, InstallRefusal, OfferedLogin, OperatingSystem, ServiceEnvironment,
-    StepFailure,
+    StepFailure, credential_source,
 };
 use crate::control_protocol::{AgentLoginProvider, AgentLoginState, UnansweredCheck};
 use crate::credential::Credential;
@@ -56,6 +60,10 @@ use crate::telemetry::{self, Outcome, Recorder, attribute};
 
 /// The record a pass writes when it changes a provider's readiness or fails.
 pub(crate) const SETUP_EVENT: &str = "runner.agent_login_setup";
+
+/// The record of a credential-source report Cloud did not take
+/// (REQ-TELEMETRY-48).
+pub(crate) const CREDENTIAL_SOURCES_EVENT: &str = "runner.credential_sources";
 
 /// The longest one pass's requests take: at most a status request, one
 /// delivery per installable provider and a closing status request, each
@@ -180,7 +188,7 @@ impl SetupDependencies {
         Some(Self::new(
             Arc::new(cloud),
             check,
-            ServiceEnvironment::from_lookup(|name| std::env::var_os(name)),
+            ServiceEnvironment::from_variables(std::env::vars_os()),
             runner_state_path,
             recorder,
         ))
@@ -457,10 +465,8 @@ impl AgentLoginSetup {
     /// one whose installs and removals run at once, for the assignment holds
     /// the slot and has been offered nothing. It makes none, and asks Cloud
     /// nothing, unless the readiness document names an installable provider's
-    /// login as installed, as authorized without being ready, or as selected:
-    /// a selected provider that holds none is withheld from the assignment
-    /// (REQ-GRANT-51), so the admission asks whether Cloud authorizes it
-    /// again. A document it cannot read names none. Its `agent_logins` is
+    /// login as installed or as authorized without being ready. A document
+    /// it cannot read names none. Its `agent_logins` is
     /// `None` when it made no pass; a pass never answers `Busy`. Then,
     /// whatever the pass did, it asks Cloud for the grant tokens of the
     /// assignment `assignment_id` of the run `run_id` and the boot `boot_id`
@@ -483,9 +489,11 @@ impl AgentLoginSetup {
         }
     }
 
-    /// Asks Cloud for the assignment's grant tokens and records each
+    /// Asks Cloud for the assignment's grant tokens of each provider the
+    /// service's environment does not provide (REQ-GRANT-87) and records each
     /// provider's entry for the run in the readiness document
-    /// (REQ-GRANT-88); the caller holds the pass lock, whose `recording` it
+    /// (REQ-GRANT-88), with each coding agent's source as it stands at this
+    /// admission (REQ-GRANT-92); the caller holds the pass lock, whose `recording` it
     /// sets to the assignment, so the end of an earlier one no longer marks
     /// the entries (INV-RUNNER-30). A document that cannot be read is
     /// neither replaced nor written, its failure recorded as a pass's is,
@@ -502,9 +510,14 @@ impl AgentLoginSetup {
         let (previous, mut document) = self.grant_document(now);
         let tokens = self.asking(boot_id, run_id, assignment_id, now).admit(
             Arc::downgrade(self),
+            &self.dependencies.environment,
             previous.as_ref().ok().and_then(Option::as_ref),
             &mut document,
         );
+        // An admission that made no pass still offers and reports each
+        // coding agent's source as it now stands, so the document records
+        // the same (INV-RUNNER-31).
+        self.record_sources(&mut document);
         let recorded = previous.is_ok() && self.write(&document);
         (recorded.then_some(document), tokens)
     }
@@ -512,29 +525,35 @@ impl AgentLoginSetup {
     /// Asks Cloud again for the token of the provider `step` names, for the
     /// assignment `assignment_id` of the run `run_id` and the boot `boot_id`
     /// whose token files the runner holds, keeps or removes its file and
-    /// records its entry
+    /// records its entry, which only the runner's three have
     /// (REQ-GRANT-89), under the pass lock, so that a refresh never
     /// interleaves with a pass's or an admission's writes to the directory
     /// or the readiness document. Answers what the refresh task does next,
-    /// and the readiness it recorded when it changed the entry and could
-    /// read and write the document.
+    /// the state and generation it recorded for the task to carry on, and
+    /// the readiness it recorded when it changed the entry and could read
+    /// and write the document; a provider with no entry changes none, so
+    /// nothing is written or published for it.
     pub(crate) fn refresh_grant_token(
         &self,
         boot_id: &str,
         run_id: &str,
         assignment_id: &str,
         step: &grant_token::RefreshStep,
-    ) -> (grant_token::Next, Option<ReadinessDocument>) {
+    ) -> (
+        grant_token::Next,
+        grant_token::Recorded,
+        Option<ReadinessDocument>,
+    ) {
         let _pass = self.pass.lock().unwrap_or_else(PoisonError::into_inner);
         let now = (self.clock)();
         let (previous, mut document) = self.grant_document(now);
-        let (next, changed) = self.asking(boot_id, run_id, assignment_id, now).refresh(
+        let (next, recorded, changed) = self.asking(boot_id, run_id, assignment_id, now).refresh(
             step,
             previous.as_ref().ok().and_then(Option::as_ref),
             &mut document,
         );
-        let recorded = changed && previous.is_ok() && self.write(&document);
-        (next, recorded.then_some(document))
+        let written = changed && previous.is_ok() && self.write(&document);
+        (next, recorded, written.then_some(document))
     }
 
     /// Marks ended, at the setup's time, each OAuth entry without an end,
@@ -556,6 +575,38 @@ impl AgentLoginSetup {
         let (previous, mut document) = self.grant_document(now);
         let marked = matches!(previous, Ok(Some(_))) && document.end_grants(now);
         (marked && self.write(&document)).then_some(document)
+    }
+
+    /// Reports to Cloud where the credentials of the assignment `request`
+    /// names come from (REQ-GRANT-93), in one bounded request, on the
+    /// admission's preparation task. It never fails: a report Cloud does
+    /// not take leaves the run with no recorded source, and each such
+    /// failure but a Cloud without the route writes one
+    /// `runner.credential_sources` record with the assignment and the
+    /// closed cause, never a source, a grant or an agent login
+    /// (REQ-TELEMETRY-48). It changes nothing the runner keeps, so it takes
+    /// no lock.
+    pub(crate) fn report_credential_sources(&self, request: &CredentialSourcesRequest) {
+        let Err(CredentialSourcesFailure::Cloud(failure)) =
+            self.dependencies.cloud.credential_sources(request)
+        else {
+            return;
+        };
+        let cause = failure.cause();
+        let mut attributes = vec![
+            KeyValue::new(attribute::ASSIGNMENT_ID, request.assignment_id.clone()),
+            KeyValue::new(attribute::CREDENTIAL_SOURCES_FAILURE_CAUSE, cause.as_str()),
+        ];
+        if let FailureCause::HttpStatus(status) = cause {
+            attributes.push(KeyValue::new(
+                attribute::CREDENTIAL_SOURCES_HTTP_STATUS,
+                i64::from(status),
+            ));
+        }
+        self.dependencies
+            .recorder
+            .start(CREDENTIAL_SOURCES_EVENT, attributes)
+            .finish(Outcome::Failure);
     }
 
     /// What a grant-token request of the assignment `assignment_id` of the
@@ -613,7 +664,7 @@ impl AgentLoginSetup {
                 AgentLoginProvider::INSTALLABLE
                     .into_iter()
                     .filter_map(|provider| document.login(provider))
-                    .any(|entry| authorized_or_installed(entry) || entry.selected)
+                    .any(authorized_or_installed)
             });
         named.then(|| self.pass_under(&Admitting))
     }
@@ -680,20 +731,27 @@ impl AgentLoginSetup {
         let cloud = self.dependencies.cloud.as_ref();
         let answer = cloud.status(&self.status_request(previous));
         // The providers settled so far, in order, then what was last
-        // recorded for the rest.
-        let document = |settled: &[LoginReadiness]| ReadinessDocument {
-            updated_at: now,
-            logins: settled
-                .iter()
-                .cloned()
-                .chain(
-                    AgentLoginProvider::INSTALLABLE
-                        .into_iter()
-                        .filter(|provider| settled.iter().all(|login| login.provider != *provider))
-                        .filter_map(|provider| recorded(provider).cloned().map(with_last_use)),
-                )
-                .collect(),
-            unknown: carried.clone(),
+        // recorded for the rest, each with its source as the directory
+        // stands when the document is written.
+        let document = |settled: &[LoginReadiness]| {
+            let mut document = ReadinessDocument {
+                updated_at: now,
+                logins: settled
+                    .iter()
+                    .cloned()
+                    .chain(
+                        AgentLoginProvider::INSTALLABLE
+                            .into_iter()
+                            .filter(|provider| {
+                                settled.iter().all(|login| login.provider != *provider)
+                            })
+                            .filter_map(|provider| recorded(provider).cloned().map(with_last_use)),
+                    )
+                    .collect(),
+                unknown: carried.clone(),
+            };
+            self.record_sources(&mut document);
+            document
         };
         let mut settled = Vec::with_capacity(AgentLoginProvider::INSTALLABLE.len());
         let mut failures = Vec::new();
@@ -713,12 +771,6 @@ impl AgentLoginSetup {
                 .as_ref()
                 .ok()
                 .and_then(|answer| answer.iter().find(|login| login.provider == provider));
-            // Whether the provider is selected once it is in `state`: as
-            // Cloud answered, or as last recorded when Cloud did not answer.
-            let selected_in = |state| match &answer {
-                Ok(_) => selected(named, state),
-                Err(_) => entry.is_some_and(|entry| entry.selected),
-            };
             // What the pass recorded for the provider on the way, if anything.
             let mut ended = None;
             let outcome = match &answer {
@@ -755,8 +807,8 @@ impl AgentLoginSetup {
                                     state,
                                     checked_at: Some(now),
                                     login,
-                                    selected: selected_in(state),
                                     last_use: None,
+                                    source: None,
                                 };
                                 let mut recorded = settled.clone();
                                 recorded.push(entry.clone());
@@ -790,8 +842,8 @@ impl AgentLoginSetup {
                 state,
                 checked_at: Some(now),
                 login,
-                selected: selected_in(state),
                 last_use: None,
+                source: None,
             });
             let changed = login.installation() != installed;
             settled.push(login);
@@ -846,6 +898,7 @@ impl AgentLoginSetup {
                     ) {
                         Some(false) => {}
                         ended => {
+                            self.record_sources(&mut document);
                             if !self.write(&document) {
                                 return (SetupOutcome::Failed, None);
                             }
@@ -945,12 +998,27 @@ impl AgentLoginSetup {
             } = self.end(gate, provider, Some(&installation), state, login)?;
             entry.state = state;
             entry.login = login;
-            entry.selected = selected(named, state);
             entry.last_use = None;
             failures.extend(failure.map(|failure| (provider, failure)));
             ended = true;
         }
         Some(ended)
+    }
+
+    /// Records on each coding agent's entry in `document` its source, as
+    /// `credential_source` settles it from the service's environment and
+    /// what the runner's directory holds now, whatever Cloud answered
+    /// (REQ-GRANT-92): each pass and each admission writes it.
+    fn record_sources(&self, document: &mut ReadinessDocument) {
+        let dependencies = &self.dependencies;
+        for login in &mut document.logins {
+            login.source = credential_source(
+                login.provider,
+                &dependencies.environment,
+                Some(&dependencies.directory),
+                None,
+            );
+        }
     }
 
     /// Replaces the readiness document with `document`; on failure records
@@ -1070,8 +1138,8 @@ impl AgentLoginSetup {
         };
         // While the service has a login of its own the runner keeps and
         // asks for none: a kept token would outrank the service's Claude
-        // Code login (REQ-GRANT-45), and the service's `CODEX_HOME` is
-        // never replaced (REQ-GRANT-37).
+        // Code login (REQ-GRANT-45), and the service's own Codex login is
+        // never replaced (REQ-GRANT-37, REQ-GRANT-51).
         if self.foreign_login(provider) {
             return self.end(
                 gate,
@@ -1465,20 +1533,12 @@ impl HarnessLoginObserver for UseObserver {
 }
 
 /// Whether the runner last knew the provider's login as installed, or as
-/// authorized by Cloud without being ready: the entries a pass that cannot
-/// reach Cloud records as `cloud_unavailable`, so that state only ever marks a
-/// provider Cloud did authorize (REQ-GRANT-38, REQ-GRANT-41).
+/// authorized by Cloud without being ready, `foreign_login` included: the
+/// entries a pass that cannot reach Cloud records as `cloud_unavailable`, so
+/// that state only ever marks a provider Cloud did authorize, and those an
+/// admission makes a pass for (REQ-GRANT-38, REQ-GRANT-49).
 fn authorized_or_installed(entry: &LoginReadiness) -> bool {
-    entry.installation().is_some() || entry.state.fails_readiness()
-}
-
-/// Whether a provider Cloud answered `named` for, and that a pass left in
-/// `state`, is selected: Cloud named an authorization in force for it,
-/// `authorized`, `unauthorized` or `unsupported_target`, and no delivery
-/// refused as `revoked` since (REQ-GRANT-38).
-fn selected(named: Option<&ProviderLogin>, state: AgentLoginState) -> bool {
-    named.is_some_and(|named| named.status != LoginStatus::Revoked)
-        && state != AgentLoginState::Revoked
+    entry.installation().is_some() || entry.state.authorized_not_ready()
 }
 
 /// Runs `change` under `gate`; `None` while an assignment is held.

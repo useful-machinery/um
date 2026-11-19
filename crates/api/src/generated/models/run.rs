@@ -81,6 +81,17 @@ pub struct Run {
         skip_serializing_if = "Option::is_none"
     )]
     pub routing: Option<Option<Box<models::RunRouting>>>,
+    /// The newest credential-source report Cloud recorded for the run: the runner that made it, when, and where each provider it named took its credential from. Null for a run no runner has reported for: one not yet prepared, one whose runner's release reports none, and one that ran before sources were recorded.
+    #[serde(
+        rename = "credentialSources",
+        default,
+        with = "crate::nullable::double_option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub credential_sources: Option<Option<Box<models::RunCredentialSources>>>,
+    /// The integration records of the newest credential-source report Cloud recorded for the run: one entry for each integration the run's workflow declares, in bytewise order of `integration`. Absent, never null or empty, for every other run: one whose workflow declares no integrations, one no runner has reported for, one by `workflowPath`, and one whose workflow tree was sealed before Cloud kept its declaration.
+    #[serde(rename = "integrationSources", skip_serializing_if = "Option::is_none")]
+    pub integration_sources: Option<Vec<models::RunIntegrationSource>>,
     /// The outcome the runner reported the current attempt's workflow chose when it exited, distinct from `state`; null until one is recorded, when the runner reported none, and for a run by `workflowPath`.
     #[serde(
         rename = "workflowOutcome",
@@ -208,6 +219,8 @@ impl Run {
             subject_claim: None,
             owner: None,
             routing: None,
+            credential_sources: None,
+            integration_sources: None,
             workflow_outcome: None,
             workflow_state: None,
             workflow_progress: None,

@@ -5,8 +5,13 @@ use std::fs;
 use std::path::Path;
 
 use super::workflow_continue::{attempt_count, completed, ordinals_of, read_json};
-use super::workflow_run::{TreeBundle, isolated_command, run_record};
-use super::workflow_run_control::attempt_result;
+use super::workflow_run::{
+    INHERITED_SOURCE_COMMIT, TreeBundle, given_source_revision, isolated_command, progress_records,
+    run_record, source_revision_options,
+};
+use super::workflow_run_control::{
+    attempt_result, failed_stage_line, plain_status, summary_row, summary_wait_line,
+};
 
 /// The root of the nested tree: `outer` fans out over the `parts` input into the nested
 /// workflow `part.yaml`, and `finish` follows it. The root admits both test variables.
@@ -101,9 +106,10 @@ steps:
     )
 }
 
-/// `stage NAME` appends `NAME PART` to the execution root's `stages.log` and the values of
-/// both test variables it sees to `seen-NAME-PART`; `check` decides `again` the first time it
-/// runs for a part and `done` after that.
+/// `stage NAME` appends `NAME PART` to the execution root's `stages.log`, the values of
+/// both test variables it sees to `seen-NAME-PART` and the four source variables, one per
+/// line, to `source-NAME-PART`; `check` decides `again` the first time it runs for a part and
+/// `done` after that.
 const NESTED_TREE_PROGRAM: &str = "#!/bin/sh
 set -eu
 stage=$1
@@ -113,6 +119,7 @@ if [ -f \"${USEFUL_STEP_INPUTS:-}/values/part\" ]; then
 fi
 printf '%s %s\\n' \"$stage\" \"$part\" >> stages.log
 printf 'visible=%s hidden=%s\\n' \"${NESTED_VISIBLE-unset}\" \"${NESTED_HIDDEN-unset}\" >> \"seen-$stage-$part\"
+printf '%s\\n' \"${USEFUL_SOURCE_COMMIT_OID-unset}\" \"${USEFUL_SOURCE_BRANCH-unset}\" \"${USEFUL_WORKFLOW_SOURCE_BRANCH-unset}\" \"${USEFUL_WORKFLOW_SOURCE_COMMIT_OID-unset}\" >> \"source-$stage-$part\"
 case $stage in
   work) printf worked ;;
   check) if [ -e \"checked-$part\" ]; then printf done; else : > \"checked-$part\"; printf again; fi ;;
@@ -235,6 +242,122 @@ fn a_nested_workflow_runs_its_stages_and_loops_its_edges_inside_the_parents_step
         fs::read_to_string(bundle.execution_root().join("stages.log")).unwrap(),
         "work a\ncheck a\nwork a\ncheck a\nwork b\ncheck b\nwork b\ncheck b\nfinish -\n"
     );
+}
+
+// REQ-LOCALRUN-217: every child run's step, a nested run's stages and the later attempts
+// its edge starts included, sees the revision the root was created with, whatever the
+// launching environment holds.
+#[test]
+fn a_child_runs_steps_see_the_source_revision_the_root_was_created_with() {
+    let bundle = nested_tree();
+    let options = source_revision_options();
+    let options = options.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = isolated_command(&nested_args(&bundle, "source", &options))
+        .env("USEFUL_SOURCE_COMMIT_OID", INHERITED_SOURCE_COMMIT)
+        .output()
+        .unwrap();
+    let terminal = completed(&output);
+    assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+
+    for (stage, part, runs) in [
+        ("work", "a", 2),
+        ("check", "a", 2),
+        ("work", "b", 2),
+        ("check", "b", 2),
+        ("finish", "-", 1),
+    ] {
+        assert_eq!(
+            fs::read_to_string(
+                bundle
+                    .execution_root()
+                    .join(format!("source-{stage}-{part}"))
+            )
+            .unwrap(),
+            given_source_revision().repeat(runs),
+            "{stage} {part}"
+        );
+    }
+}
+
+/// A tree three admissions deep: the root runs `router.yaml`, which runs `stage.yaml`,
+/// whose command writes the four test variables it sees to `seen.txt`. The root lists
+/// only `ROOT_ONLY` and carries `requires`; neither child lists or declares anything.
+fn declaring_tree(requires: &str) -> TreeBundle {
+    let bundle = TreeBundle::new(&format!(
+        "schemaVersion: 1
+environmentPassthrough: [ROOT_ONLY]
+{requires}outcomes: [done, failed]
+steps:
+  route:
+    kind: workflow
+    workflow: router.yaml
+    on:
+      routed: exit.done
+      failed: exit.failed
+"
+    ));
+    bundle.write_source(
+        "router.yaml",
+        "schemaVersion: 1
+outcomes: [routed, failed]
+steps:
+  stage:
+    kind: workflow
+    workflow: stage.yaml
+    on:
+      staged: exit.routed
+      failed: exit.failed
+",
+    );
+    bundle.write_source(
+        "stage.yaml",
+        "schemaVersion: 1
+outcomes: [staged, failed]
+outcome:
+  from: outputs.observe.verdict
+  onFailure: failed
+steps:
+  observe:
+    kind: cmd
+    command:
+      argv: [sh, -c, 'printf \"%s %s %s %s\" \"${GH_TOKEN-unset}\" \"${GH_TOKEN_FILE-unset}\" \"${GITLAB_TOKEN-unset}\" \"${ROOT_ONLY-unset}\" > seen.txt && printf staged > verdict.txt']
+    outputs:
+      verdict:
+        kind: text
+        from: path
+        path: verdict.txt
+",
+    );
+    bundle
+}
+
+// REQ-WFEXEC-78, REQ-WFEXEC-59: a stage two child runs below a root that declares `github`
+// sees its names although neither child file lists them, and none of the root's own list.
+#[test]
+fn a_stage_of_a_tree_receives_the_names_of_the_roots_declared_integrations() {
+    for (requires, expected) in [
+        (
+            "requires:\n  integrations:\n    github: {}\n",
+            "local-gh-token /local/gh-token unset unset",
+        ),
+        ("", "unset unset unset unset"),
+    ] {
+        let bundle = declaring_tree(requires);
+        let output = isolated_command(&bundle.args(&bundle.result("declared")))
+            .env("GH_TOKEN", "local-gh-token")
+            .env("GH_TOKEN_FILE", "/local/gh-token")
+            .env("GITLAB_TOKEN", "local-gitlab-token")
+            .env("ROOT_ONLY", "root-only")
+            .output()
+            .unwrap();
+        let terminal = completed(&output);
+        assert_eq!(terminal["outcome"], "succeeded", "{terminal}");
+        assert_eq!(
+            fs::read_to_string(bundle.execution_root().join("seen.txt")).unwrap(),
+            expected,
+            "{requires:?}"
+        );
+    }
 }
 
 /// The nested workflow of the asking tree: `ask` waits for answers when it is blocked, and
@@ -628,18 +751,14 @@ fn show_lists_a_nested_runs_stages_and_edges_and_prints_full_paths() {
         "{plain}"
     );
 
-    let status = isolated_command(&[
-        "workflow".to_owned(),
-        "run".to_owned(),
-        "status".to_owned(),
-        run.to_string_lossy().into_owned(),
-    ])
-    .output()
-    .unwrap();
-    assert_eq!(status.status.code(), Some(0), "{status:?}");
-    let status = String::from_utf8(status.stdout).unwrap();
+    let status = plain_status(&run);
     assert!(
         status.contains("\nwait: answer at step outer[2].ask since "),
+        "{status}"
+    );
+    // REQ-LOCALRUN-221: a wait without a failed child names no failed stage.
+    assert!(
+        !status.lines().any(|line| line.starts_with("failed stage:")),
         "{status}"
     );
 }
@@ -710,6 +829,68 @@ fn an_interrupted_nested_stage_leaves_the_root_in_the_carried_repair_wait() {
     });
     assert_eq!(run_record(&nested_run(&run, 1))["state"], "waiting");
     assert!(!run.join("children/outer/000002").exists());
+}
+
+// REQ-WFEXEC-75, REQ-WFEXEC-77: a nested stage whose child failed enters the nested run's
+// `repair` wait with the child's failure in its payload, and the root carries that payload,
+// so the root's wait names the failed stage's failing step.
+#[test]
+fn a_carried_repair_wait_names_the_nested_stages_failed_child() {
+    let bundle = asking_tree();
+    fs::write(bundle.execution_root().join("fail-work-a"), "").unwrap();
+    let terminal = completed(&create_nested(&bundle, "failed-stage"));
+    assert_eq!(terminal["outcome"], "waiting", "{terminal}");
+    let run = fs::canonicalize(bundle.result("failed-stage")).unwrap();
+
+    let (wait, nested) = carried_waits(&run, 1);
+    assert_eq!(terminal["wait"], wait, "{terminal}");
+    assert_eq!(wait["kind"], "repair", "{wait}");
+    assert_eq!(
+        wait["step"],
+        serde_json::json!(["outer", {"item": 1}, "work"]),
+        "{wait}"
+    );
+    let child = read_json(
+        &nested_run(&run, 1).join("children/work/000001/attempts/000001/result/result.json"),
+    );
+    assert_eq!(child["outcome"], "failed", "{child}");
+    let record = &wait["payload"]["failedChild"];
+    assert_eq!(record["outcome"], "failed", "{wait}");
+    assert_eq!(record["primaryIssue"]["node"]["id"], "decide", "{wait}");
+    assert_eq!(record["primaryIssue"], child["primaryIssue"], "{wait}");
+    assert_eq!(&nested["payload"]["failedChild"], record, "{nested}");
+}
+
+// REQ-LOCALRUN-220, REQ-LOCALRUN-221, REQ-WFEXEC-75: the root's wait line, in the summary and
+// in the plain status, names a nested run's failed stage and its failing step from the
+// carried wait's payload; the nested stage has no row and no record of its own in the root's
+// stream, and the root's `outer` row is as before.
+#[test]
+fn a_carried_repair_waits_summary_names_the_nested_failed_stage() {
+    let bundle = asking_tree();
+    fs::write(bundle.execution_root().join("fail-work-a"), "").unwrap();
+    let output = create_nested(&bundle, "failed-stage-summary");
+    assert_eq!(completed(&output)["outcome"], "waiting");
+    let row = summary_row(&output.stderr, "outer");
+    assert_eq!(row.get(2).map(String::as_str), Some("not-run"), "{row:?}");
+    let wait = summary_wait_line(&output.stderr);
+    assert!(
+        wait.iter().any(|word| word == "outer[1].work.decide"),
+        "{wait:?}"
+    );
+    assert!(
+        !progress_records(&output.stderr)
+            .iter()
+            .any(|record| record.scope == "outer[1].work" && record.token == "failed"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let run = fs::canonicalize(bundle.result("failed-stage-summary")).unwrap();
+    let line = failed_stage_line(&plain_status(&run));
+    assert!(
+        line.iter().any(|word| word == "outer[1].work.decide"),
+        "{line:?}"
+    );
 }
 
 /// The last JSON document `output` wrote to stdout.

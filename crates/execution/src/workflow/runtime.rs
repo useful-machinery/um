@@ -13,8 +13,8 @@ use super::document::{FailurePolicy, FinalizationTrigger, WaitKind, WaitRule};
 pub(crate) use super::evidence::FailurePhase;
 use super::evidence::{
     BlockedDetail, CancellationDetail, ConditionFalseDetail, EvaluatedPredicateEvidence,
-    FailureDetail, InheritedDetail, NodeFailureSource, NonExecutionCode, NonExecutionDetail,
-    Prerequisite, PrimaryIssue, PrimaryIssueDetail,
+    FailedChild, FailureDetail, InheritedDetail, NodeFailureSource, NonExecutionCode,
+    NonExecutionDetail, Prerequisite, PrimaryIssue, PrimaryIssueDetail,
 };
 use super::finalization_context::{
     self, FinalizationContext, OrdinaryIssue, OrdinaryIssueDisposition,
@@ -71,6 +71,7 @@ impl ProvisionalStepResources for String {
         Some(ChildEnding::Exited {
             outcome: parts.next()?.to_owned(),
             interruption: parts.next().map(interruption),
+            failed_child: None,
         })
     }
 }
@@ -86,11 +87,13 @@ pub struct ChildInterruption {
 /// What a `workflow` step's child reported with the step's completion.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ChildEnding {
-    /// The child exited with the outcome it recorded and, when an interruption failed it,
-    /// that interruption (REQ-WFEXEC-60, REQ-WFEXEC-70).
+    /// The child exited with the outcome it recorded, when an interruption failed it, that
+    /// interruption (REQ-WFEXEC-60, REQ-WFEXEC-70), and, when its result is `failed`, the
+    /// failure the step records (REQ-WFEXEC-77).
     Exited {
         outcome: String,
         interruption: Option<ChildInterruption>,
+        failed_child: Option<FailedChild>,
     },
     /// The nested run entered a wait of `kind`, which the root carries (REQ-WFEXEC-75): with
     /// the interruption that failed its stage when the wait is the `repair` that
@@ -792,6 +795,10 @@ pub(crate) struct StepRuntimeState<Cause, Output> {
     // The kind of the failure that settled the target without a recovery round, which the
     // terminal transition reports once the cause itself is no longer retained.
     pub(crate) failure_kind: Option<StepFailureKind>,
+    /// The failed child a `workflow` step's accepted completion carried, kept while the step
+    /// captures its outputs and once it is `succeeded`, and dropped when it moves to any
+    /// other state (REQ-WFEXEC-77, INV-ENGINE-42).
+    pub(crate) failed_child: Option<FailedChild>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1610,6 +1617,7 @@ where
                         }),
                     condition_passed: false,
                     failure_kind: None,
+                    failed_child: None,
                 },
             )
         })
@@ -1803,6 +1811,14 @@ where
                 return false;
             }
             let sequence = transition_step(reduction, &step, StepState::CapturingOutputs, None);
+            // REQ-WFEXEC-77: the accepted completion's failed child, which a later transition
+            // to any state but `succeeded` drops.
+            if let Some(runtime) = reduction.state.steps.get_mut(&step) {
+                runtime.failed_child = match provisional.child_ending() {
+                    Some(ChildEnding::Exited { failed_child, .. }) => failed_child,
+                    Some(ChildEnding::Waiting { .. }) | None => None,
+                };
+            }
             if step_declares_outputs(&reduction.state, &step) {
                 let capture_action = ActionId::for_transition(sequence);
                 set_current_action(&mut reduction.state, &step, capture_action);
@@ -2909,6 +2925,7 @@ where
     let Some(ChildEnding::Exited {
         outcome,
         interruption,
+        ..
     }) = provisional.child_ending()
     else {
         return InterruptedCompletion::Ordinary;
@@ -5203,6 +5220,14 @@ fn transition_step<Provisional, Cause, Output, Deadline>(
         let to_kind = to.kind();
         runtime.state = to;
         runtime.current_action = current_action;
+        // Only a step that captures its outputs or has succeeded keeps a failed child
+        // (REQ-WFEXEC-77).
+        if !matches!(
+            to_kind,
+            StepStateKind::CapturingOutputs | StepStateKind::Succeeded
+        ) {
+            runtime.failed_child = None;
+        }
         reduction.events.push(TransitionEvent::Step {
             sequence,
             step: step.to_owned(),

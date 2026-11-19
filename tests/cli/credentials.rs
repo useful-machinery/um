@@ -176,7 +176,7 @@ fn codex_row(runner_id: &str, availability: &str, next_action: &str) -> serde_js
 }
 
 // Both lists, each over two pages: the agent logins, then a `reconnect_required` GitHub grant
-// and a revoked Linear one.
+// and a revoked Linear one, then the answer of a deployment that predates the served read.
 fn two_page_lists() -> Vec<Vec<u8>> {
     vec![
         page(serde_json::json!([codex_login()]), Some("agent-logins-2")),
@@ -189,6 +189,7 @@ fn two_page_lists() -> Vec<Vec<u8>> {
             serde_json::json!([grant(REVOKED_GRANT_ID, "linear", "revoked")]),
             None,
         ),
+        predating_served(),
     ]
 }
 
@@ -202,8 +203,9 @@ fn assert_reads_both_lists_to_their_last_page(requests: &[String]) {
         [
             "GET /api/v1/me/agent-logins?limit=200 HTTP/1.1",
             "GET /api/v1/me/agent-logins?limit=200&cursor=agent-logins-2 HTTP/1.1",
-            "GET /api/v1/me/grants?limit=200 HTTP/1.1",
-            "GET /api/v1/me/grants?limit=200&cursor=grants-2 HTTP/1.1",
+            "GET /api/v1/me/grants?limit=200&vocabulary=2 HTTP/1.1",
+            "GET /api/v1/me/grants?limit=200&cursor=grants-2&vocabulary=2 HTTP/1.1",
+            READ_SERVED,
         ]
     );
     for request in requests {
@@ -287,7 +289,7 @@ fn status_reports_every_grant_and_authorization_and_each_provider_not_connected(
     }
 
     let requests = server.finish();
-    let (json_requests, human_requests) = requests.split_at(4);
+    let (json_requests, human_requests) = requests.split_at(5);
     assert_reads_both_lists_to_their_last_page(json_requests);
     assert_reads_both_lists_to_their_last_page(human_requests);
 }
@@ -318,8 +320,10 @@ fn organization_keeps_only_that_organizations_agent_logins() {
         ),
         logins(),
         no_grants(),
+        predating_served(),
         logins(),
         no_grants(),
+        predating_served(),
     ]);
     let by_slug = run_auth(
         &server,
@@ -380,8 +384,8 @@ fn organization_keeps_only_that_organizations_agent_logins() {
     let requests = server.finish();
     assert!(requests[0].starts_with("GET /api/v1/organizations/acme HTTP/1.1\r\n"));
     // An organization ID is used as it is, with no lookup.
-    assert!(requests[3].starts_with("GET /api/v1/me/agent-logins?limit=200 HTTP/1.1\r\n"));
-    assert_eq!(requests.len(), 5);
+    assert!(requests[4].starts_with("GET /api/v1/me/agent-logins?limit=200 HTTP/1.1\r\n"));
+    assert_eq!(requests.len(), 7);
 }
 
 // REQ-GRANT-53
@@ -396,6 +400,7 @@ fn the_hidden_status_keeps_the_earlier_projection_for_an_active_oauth_grant_with
     let (server, _directory, credential) = prepared(vec![
         page(serde_json::json!([]), None),
         page(serde_json::json!([unauthorized]), None),
+        predating_served(),
     ]);
     let output = run_auth(&server, &credential, &["credential", "status", "--json"]);
 
@@ -416,7 +421,72 @@ fn the_hidden_status_keeps_the_earlier_projection_for_an_active_oauth_grant_with
     assert_eq!(github[0]["id"], GRANT_ID);
     assert_eq!(github[0]["availability"], "available");
     assert_eq!(github[0]["nextAction"], "none");
-    assert_eq!(server.finish().len(), 2);
+    assert_eq!(server.finish().len(), 3);
+}
+
+const EXAMPLE_GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abe";
+const OTHER_GRANT_ID: &str = "pgr_01k0z6r1w8f4jy2m7q9v3x5abf";
+
+// The row of an active grant with no next action.
+fn active_row(id: &str, provider: &str) -> serde_json::Value {
+    serde_json::json!({
+        "provider": provider,
+        "kind": "grant",
+        "id": id,
+        "identityId": IDENTITY_ID,
+        "availability": "available",
+        "nextAction": "none"
+    })
+}
+
+// REQ-GRANT-55
+// REQ-GRANT-96: a grant of a provider outside the built-in five has its row, after the OAuth
+// providers', whatever order Cloud lists it in.
+#[test]
+fn status_reports_a_grant_of_any_provider_after_the_oauth_providers_rows() {
+    let (server, _directory, credential) = prepared(vec![
+        page(serde_json::json!([]), None),
+        page(
+            serde_json::json!([
+                grant(EXAMPLE_GRANT_ID, "example", "active"),
+                grant(GRANT_ID, "github", "active"),
+            ]),
+            None,
+        ),
+        predating_served(),
+    ]);
+    let output = run_auth(&server, &credential, &["credential", "status", "--json"]);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let document = json_output(&output);
+    assert_eq!(
+        document["credentials"],
+        serde_json::json!([
+            active_row(GRANT_ID, "github"),
+            not_connected("gitlab.com"),
+            not_connected("linear"),
+            active_row(EXAMPLE_GRANT_ID, "example"),
+            not_connected("claude_code"),
+            not_connected("codex"),
+        ])
+    );
+    let requests = server.finish();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.lines().next().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "GET /api/v1/me/agent-logins?limit=200 HTTP/1.1",
+            "GET /api/v1/me/grants?limit=200&vocabulary=2 HTTP/1.1",
+            READ_SERVED,
+        ]
+    );
 }
 
 fn problem(status: &str, code: u16, slug: &str) -> Vec<u8> {
@@ -428,6 +498,98 @@ fn problem(status: &str, code: u16, slug: &str) -> Vec<u8> {
             "status": code
         }),
     )
+}
+
+// The answer of a deployment that serves `example` between `github` and `gitlab.com`, each
+// provider with its kind (REQ-GRANT-78).
+fn serving_example() -> Vec<u8> {
+    let items: Vec<_> = [
+        ("github", "oauth"),
+        ("example", "oauth"),
+        ("gitlab.com", "oauth"),
+        ("linear", "oauth"),
+        ("claude_code", "native"),
+        ("codex", "native"),
+    ]
+    .into_iter()
+    .map(|(provider, kind)| serde_json::json!({"provider": provider, "kind": kind}))
+    .collect();
+    json_http_response("200 OK", serde_json::json!({"items": items}))
+}
+
+// REQ-GRANT-55
+// REQ-GRANT-96: each other OAuth provider the deployment serves has a row after the built-in
+// OAuth providers', and a grant of a provider it does not serve follows those rows.
+#[test]
+fn status_names_each_other_oauth_provider_served_after_the_built_in_ones() {
+    let github = || grant(GRANT_ID, "github", "active");
+    let (server, _directory, credential) = prepared(vec![
+        page(serde_json::json!([]), None),
+        page(serde_json::json!([github()]), None),
+        serving_example(),
+        page(serde_json::json!([]), None),
+        page(
+            serde_json::json!([grant(OTHER_GRANT_ID, "other", "active"), github()]),
+            None,
+        ),
+        serving_example(),
+    ]);
+    let served = run_auth(&server, &credential, &["credential", "status", "--json"]);
+    let other = run_auth(&server, &credential, &["credential", "status", "--json"]);
+
+    assert_eq!(
+        served.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&served.stderr)
+    );
+    assert_eq!(
+        json_output(&served)["credentials"],
+        serde_json::json!([
+            active_row(GRANT_ID, "github"),
+            not_connected("gitlab.com"),
+            not_connected("linear"),
+            not_connected("example"),
+            not_connected("claude_code"),
+            not_connected("codex"),
+        ])
+    );
+    assert_eq!(
+        other.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&other.stderr)
+    );
+    assert_eq!(
+        json_output(&other)["credentials"],
+        serde_json::json!([
+            active_row(GRANT_ID, "github"),
+            not_connected("gitlab.com"),
+            not_connected("linear"),
+            not_connected("example"),
+            active_row(OTHER_GRANT_ID, "other"),
+            not_connected("claude_code"),
+            not_connected("codex"),
+        ])
+    );
+    let requests = server.finish();
+    let lines: Vec<_> = requests
+        .iter()
+        .map(|request| request.lines().next().unwrap())
+        .collect();
+    let expected = [
+        "GET /api/v1/me/agent-logins?limit=200 HTTP/1.1",
+        "GET /api/v1/me/grants?limit=200&vocabulary=2 HTTP/1.1",
+        READ_SERVED,
+    ];
+    assert_eq!(lines, [expected, expected].concat());
+}
+
+const READ_SERVED: &str = "GET /api/v1/me/grant-providers HTTP/1.1";
+
+// The answer of a deployment that predates the read of the providers it serves.
+fn predating_served() -> Vec<u8> {
+    problem("404 Not Found", 404, "not-found")
 }
 
 // REQ-GRANT-55

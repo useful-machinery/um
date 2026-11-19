@@ -37,6 +37,8 @@ pub struct WorkflowDefinitionEvaluationObservations {
     pub requester: Option<Box<models::WorkflowDefinitionEvaluationObservationsRequester>>,
     #[serde(rename = "admissionFailure", skip_serializing_if = "Option::is_none")]
     pub admission_failure: Option<Box<models::LinearEvaluationObservationsAdmissionFailure>>,
+    #[serde(rename = "project", skip_serializing_if = "Option::is_none")]
+    pub project: Option<Box<models::WorkflowDefinitionEvaluationObservationsProject>>,
 }
 
 impl WorkflowDefinitionEvaluationObservations {
@@ -51,6 +53,7 @@ impl WorkflowDefinitionEvaluationObservations {
             stop_before: None,
             requester: None,
             admission_failure: None,
+            project: None,
         }
     }
 }

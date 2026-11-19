@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
+use super::admission::{CLAUDE_CODE_LOGIN_VARIABLE, CODEX_LOGIN_VARIABLE};
 use super::condition::TerminalDisposition;
 use super::mirror::MirrorBlock;
 use super::validated::{ValidatedHarness, WorkflowValueType};
@@ -33,8 +34,8 @@ pub(crate) struct WorkflowDocument {
 }
 
 /// The root-only blocks of a workflow file (REQ-WFFORMAT-82). A run acts on none of them
-/// but `mirror` (REQ-WFFORMAT-86); an absent block is empty, since the schema admits no
-/// empty block.
+/// but `mirror` (REQ-WFFORMAT-86) and, through admission, `requires` (REQ-WFEXEC-55,
+/// REQ-WFEXEC-78); an absent block is empty, since the schema admits no empty block.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RootBlocks {
     pub programs: Vec<String>,
@@ -45,9 +46,105 @@ pub struct RootBlocks {
     pub mirror: Option<MirrorBlock>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+impl RootBlocks {
+    /// The blocks a workflow file other than a tree's root may not carry: all of these but
+    /// a `requires` that holds no `tools`, the override of REQ-WFDEF-35 (REQ-WFFORMAT-89).
+    pub(crate) fn without_override(&self) -> Self {
+        let mut blocks = self.clone();
+        if blocks
+            .requires
+            .as_ref()
+            .is_some_and(|requires| requires.tools.is_empty())
+        {
+            blocks.requires = None;
+        }
+        blocks
+    }
+}
+
+/// The `requires` block: the tools admission probes, and the integrations the workflow
+/// declares with whose credentials act for them, kept as declared (REQ-WFDEF-34).
+/// Admission probes `tools` alone and keeps the environment names of each declared
+/// integration's id for every step (REQ-WFEXEC-78); no run reads an `as` or `bindings`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RootRequires {
     pub tools: Vec<String>,
+    /// The block's `as`, the default for every integration; `None` when not written.
+    pub acting_as: Option<IntegrationAs>,
+    /// The declared integrations by provider id; empty when the block names none.
+    pub integrations: BTreeMap<IntegrationProvider, Integration>,
+}
+
+/// A provider id of `requires.integrations`: the schema's closed list (REQ-WFDEF-34). The
+/// variants are declared in the bytewise order of their ids, so a map keyed by them iterates
+/// as the ids sort.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+pub enum IntegrationProvider {
+    #[serde(rename = "claude_code")]
+    ClaudeCode,
+    #[serde(rename = "codex")]
+    Codex,
+    #[serde(rename = "github")]
+    Github,
+    #[serde(rename = "gitlab.com")]
+    GitlabCom,
+    #[serde(rename = "linear")]
+    Linear,
+}
+
+impl IntegrationProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude_code",
+            Self::Codex => "codex",
+            Self::Github => "github",
+            Self::GitlabCom => "gitlab.com",
+            Self::Linear => "linear",
+        }
+    }
+
+    /// The environment names a run delivers to every step for a declared integration
+    /// (REQ-WFEXEC-78, INV-ENGINE-43): the token and its file a runner offers an OAuth
+    /// provider's grant token under (REQ-GRANT-87), and the variable a runner offers a
+    /// coding agent's login as (REQ-GRANT-44, REQ-GRANT-37). None is a name admission
+    /// strips as runner-private.
+    pub fn environment_names(self) -> &'static [&'static str] {
+        match self {
+            Self::ClaudeCode => &[CLAUDE_CODE_LOGIN_VARIABLE],
+            Self::Codex => &[CODEX_LOGIN_VARIABLE],
+            Self::Github => &["GH_TOKEN", "GH_TOKEN_FILE"],
+            Self::GitlabCom => &["GITLAB_TOKEN", "GITLAB_TOKEN_FILE"],
+            Self::Linear => &[
+                "USEFUL_LINEAR_ACCESS_TOKEN",
+                "USEFUL_LINEAR_ACCESS_TOKEN_FILE",
+            ],
+        }
+    }
+}
+
+/// Whose credentials act for an integration: a member's or the organization's
+/// (REQ-WFDEF-34).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub enum IntegrationAs {
+    #[serde(rename = "member")]
+    Member,
+    #[serde(rename = "org")]
+    Org,
+}
+
+/// One entry of `requires.integrations` (REQ-WFDEF-34).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Integration {
+    /// The entry's own `as`, overriding the block's; `None` when not written.
+    pub acting_as: Option<IntegrationAs>,
+    /// The entry's bindings by name; empty when it declares none.
+    pub bindings: BTreeMap<String, IntegrationBinding>,
+}
+
+/// An integration binding: a kind whose vocabulary is not yet fixed (REQ-WFDEF-34).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IntegrationBinding {
+    pub kind: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -118,14 +215,16 @@ impl BindingValue {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Trigger {
-    /// Starts a run of the workflow. No local command acts on `stop_before`, `owner` or a
-    /// schedule rule (REQ-WFDEF-30, REQ-WFDEF-31).
+    /// Starts a run of the workflow. No local command acts on `stop_before`, `owner`,
+    /// `busy_behavior` or a schedule rule (REQ-WFDEF-30, REQ-WFDEF-31, REQ-WFDEF-33).
     Start {
         on: StartRule,
         subject: Option<String>,
         inputs: BTreeMap<String, String>,
         stop_before: Option<StopBefore>,
         owner: Option<OwnerDeclaration>,
+        /// None when the trigger declares none, which reads as `skip`.
+        busy_behavior: Option<BusyBehavior>,
     },
     /// Acts on the live run for the event's subject.
     Control {
@@ -160,6 +259,24 @@ pub struct StopBefore {
     /// An `event.<path>` as written.
     pub labels: String,
     pub prefix: String,
+}
+
+/// A start trigger's `busyBehavior` (REQ-WFDEF-33): what a start does while the subject's
+/// slot is busy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BusyBehavior {
+    Skip,
+    QueueLatest,
+}
+
+impl BusyBehavior {
+    /// The value as written.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Skip => "skip",
+            Self::QueueLatest => "queueLatest",
+        }
+    }
 }
 
 /// A start trigger's `owner` (REQ-WFDEF-30), the short form read as `from` alone.

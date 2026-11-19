@@ -4,12 +4,14 @@ use anyhow::Context;
 use serde::Serialize;
 
 use crate::exit_code::ExitCode;
-use useful_api::{AgentLogin, AgentLoginAuthorization, AgentLoginState, Grant, GrantState};
+use useful_api::{
+    AgentLogin, AgentLoginAuthorization, AgentLoginState, Grant, GrantState, ServedGrantProvider,
+};
 
 use super::super::agent_logins::{EndedAuthorizationView, ended_authorizations};
 use crate::cli::grant::projection::{
-    MemberStatus, PROVIDERS, Provider, Subject, agent_login_provider, authorization_status,
-    grant_provider, grant_status,
+    MemberStatus, Provider, Subject, agent_login_provider, authorization_status, grant_provider,
+    grant_status, providers,
 };
 
 /// One credential a workflow can use as the member, with its status: a provider grant, an
@@ -18,7 +20,7 @@ use crate::cli::grant::projection::{
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CredentialView<'a> {
-    provider: &'static str,
+    provider: &'a str,
     kind: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<&'a str>,
@@ -76,12 +78,12 @@ impl<'a> CredentialView<'a> {
         }
     }
 
-    fn not_connected(provider: Provider) -> Self {
+    fn not_connected(provider: Provider<'a>) -> Self {
         Self::bare(provider.name(), "none", None, provider.not_connected())
     }
 
     const fn bare(
-        provider: &'static str,
+        provider: &'a str,
         kind: &'static str,
         id: Option<&'a str>,
         status: MemberStatus,
@@ -150,40 +152,73 @@ struct StatusResult<'a> {
 }
 
 /// The member's credentials: for each provider in turn its unrevoked grants, or the rows of its
-/// unrevoked agent logins, or one `not_connected` row.
-fn credentials<'a>(grants: &'a [Grant], logins: &'a [AgentLogin]) -> Vec<CredentialView<'a>> {
+/// unrevoked agent logins, or one `not_connected` row, the providers those the deployment
+/// serves name (REQ-GRANT-55). A grant of a provider neither built in nor served keeps its rows,
+/// after those of the OAuth providers named, each such provider in the order its first grant is
+/// listed, and is never named as `not_connected` (REQ-GRANT-96).
+fn credentials<'a>(
+    grants: &'a [Grant],
+    logins: &'a [AgentLogin],
+    served: &'a [ServedGrantProvider],
+) -> Vec<CredentialView<'a>> {
+    let named = providers(served);
+    let mut others: Vec<&str> = Vec::new();
+    for grant in grants.iter().filter(|grant| unrevoked(grant)) {
+        let name = grant_provider(grant);
+        if !named.iter().any(|provider| provider.name() == name) && !others.contains(&name) {
+            others.push(name);
+        }
+    }
+    let (oauth, agents): (Vec<_>, Vec<_>) = named
+        .into_iter()
+        .partition(|provider| matches!(provider, Provider::Grant(_)));
     let mut rows = Vec::new();
-    for provider in PROVIDERS {
+    for provider in oauth {
         let start = rows.len();
-        match provider {
-            Provider::Grant(name) => rows.extend(
-                grants
-                    .iter()
-                    .filter(|grant| {
-                        grant.state != GrantState::ProviderGrantStateRevoked
-                            && grant_provider(grant) == name
-                    })
-                    .map(CredentialView::grant),
-            ),
-            Provider::CodingAgent(name) => {
-                for login in logins.iter().filter(|login| {
-                    login.state == AgentLoginState::AgentLoginStateActive
-                        && agent_login_provider(login.provider) == name
-                }) {
-                    if login.authorizations.is_empty() {
-                        rows.push(CredentialView::agent_login(login, None));
-                    }
-                    rows.extend(login.authorizations.iter().map(|authorization| {
-                        CredentialView::agent_login(login, Some(authorization))
-                    }));
-                }
+        rows.extend(grant_rows(grants, provider.name()));
+        if rows.len() == start {
+            rows.push(CredentialView::not_connected(provider));
+        }
+    }
+    for name in others {
+        rows.extend(grant_rows(grants, name));
+    }
+    for provider in agents {
+        let start = rows.len();
+        for login in logins.iter().filter(|login| {
+            login.state == AgentLoginState::AgentLoginStateActive
+                && agent_login_provider(login.provider) == provider.name()
+        }) {
+            if login.authorizations.is_empty() {
+                rows.push(CredentialView::agent_login(login, None));
             }
+            rows.extend(
+                login
+                    .authorizations
+                    .iter()
+                    .map(|authorization| CredentialView::agent_login(login, Some(authorization))),
+            );
         }
         if rows.len() == start {
             rows.push(CredentialView::not_connected(provider));
         }
     }
     rows
+}
+
+fn unrevoked(grant: &Grant) -> bool {
+    grant.state != GrantState::ProviderGrantStateRevoked
+}
+
+/// The rows of the member's unrevoked grants of the provider `name` names.
+fn grant_rows<'a>(
+    grants: &'a [Grant],
+    name: &'a str,
+) -> impl Iterator<Item = CredentialView<'a>> + 'a {
+    grants
+        .iter()
+        .filter(move |grant| unrevoked(grant) && grant_provider(grant) == name)
+        .map(CredentialView::grant)
 }
 
 fn ended(logins: &[AgentLogin]) -> Vec<EndedView<'_>> {
@@ -202,14 +237,16 @@ fn ended(logins: &[AgentLogin]) -> Vec<EndedView<'_>> {
         .collect()
 }
 
-/// Writes the member's credentials with their status; it exits 0 whatever they report.
+/// Writes the member's credentials with their status, naming each provider in the order
+/// `served` gives (REQ-GRANT-55); it exits 0 whatever they report.
 pub(super) fn write_status(
     deployment: &str,
     grants: &[Grant],
     logins: &[AgentLogin],
+    served: &[ServedGrantProvider],
     json: bool,
 ) -> anyhow::Result<ExitCode> {
-    let credentials = credentials(grants, logins);
+    let credentials = credentials(grants, logins, served);
     let ended = ended(logins);
     if json {
         super::super::super::write_pretty_json(&StatusResult {

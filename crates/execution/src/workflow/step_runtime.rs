@@ -20,10 +20,10 @@ use super::admission::{
 };
 use super::agent::dispatch::AgentInvocationDispatcher;
 use super::agent::{
-    AGENT_LOGIN_UNAVAILABLE, AgentFailure, AgentFailureCause, AgentInvocation,
-    AgentInvocationIdentity, AgentObservationEnvelope, AgentObservationSink, AgentOutcome,
-    AgentProcessControl, AgentStartReceiveError, CompletedAgentInvocation, WorkflowRunId,
-    agent_start_channel, failed_agent_outcome,
+    AgentFailure, AgentFailureCause, AgentInvocation, AgentInvocationIdentity,
+    AgentObservationEnvelope, AgentObservationSink, AgentOutcome, AgentProcessControl,
+    AgentStartReceiveError, CompletedAgentInvocation, WorkflowRunId, agent_start_channel,
+    failed_agent_outcome,
 };
 use super::agent_diagnostics::AgentDiagnosticSessionStore;
 use super::agent_input::{
@@ -44,6 +44,7 @@ use super::coordinator::{
 };
 use super::diagnostic::{PendingStepDiagnostic, StepDiagnosticLog};
 use super::document::Output;
+use super::evidence::{FailedChild, PrimaryIssue};
 use super::execution_root::{
     AdmittedExecutionRoot, AdmittedWorkingDirectory, ExecutableCandidate,
     WorkingDirectorySelectionFailure,
@@ -419,9 +420,17 @@ impl DriverOccurrenceContent for ProvisionalStepOutputs {
             Some(ChildEnding::Exited {
                 outcome,
                 interruption,
+                failed_child,
             }) => {
                 digest.write_tag(1);
                 digest.write_bytes(outcome.as_bytes());
+                match failed_child {
+                    Some(failed_child) => {
+                        digest.write_tag(1);
+                        digest.write_debug(failed_child);
+                    }
+                    None => digest.write_tag(0),
+                }
                 interruption
             }
             Some(ChildEnding::Waiting { kind, interruption }) => {
@@ -653,12 +662,15 @@ impl ChildRunControl {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ChildRunOutcome {
     /// The child published a result recording `outcome`; `exports` holds its available
-    /// `text` and `json` exports, and `interruption` the interruption that failed it, when
-    /// its primary issue is a step that failed `interrupted` (REQ-WFEXEC-70).
+    /// `text` and `json` exports, `interruption` the interruption that failed it, when
+    /// its primary issue is a step that failed `interrupted` (REQ-WFEXEC-70), and `failure`
+    /// the primary issue of a result that is `failed`, read from the result and never from
+    /// the outcome's name (REQ-WFEXEC-77).
     Exited {
         outcome: String,
         exports: BTreeMap<String, CapturedValue>,
         interruption: Option<ChildInterruption>,
+        failure: Option<Box<PrimaryIssue>>,
     },
     /// The child, a nested run (REQ-WFEXEC-74), entered the wait `wait` records in its own
     /// run directory, which its parent's step carries to the root instead of an outcome
@@ -1355,19 +1367,6 @@ where
                 else {
                     return Err(RecoveryHandlerFailure::AgentInputFailed);
                 };
-                // INV-ENGINE-35: a handler that would have received a withheld login never
-                // runs on the service's own. The closed code is every input failure's, so
-                // the step's diagnostics name what refused this one.
-                if self.admitted.withholds_recovery_handler_login(step) {
-                    self.diagnostics.record_adapter_error(
-                        step.to_owned(),
-                        action,
-                        self.admitted.execution().limits().maximum_step_log_bytes(),
-                        "recovery handler start",
-                        &AGENT_LOGIN_UNAVAILABLE,
-                    );
-                    return Err(RecoveryHandlerFailure::AgentInputFailed);
-                }
                 let identity = AgentInvocationIdentity::new(run.clone(), Arc::from(step), action);
                 let agent = materialize_recovery_agent_invocation(
                     &self.admitted,
@@ -2161,7 +2160,10 @@ where
         };
         // An empty fan-out runs no child and is `running` at once.
         let mut child_task = None;
+        // The fan-out element whose child produced the step's outcome (REQ-WFEXEC-77).
+        let mut item = None;
         if let Some(request) = requests.next() {
+            item = request.item;
             let (started_sender, started) = oneshot::channel();
             let mut task = run_child(request, Some(started_sender));
             tokio::pin!(started);
@@ -2213,6 +2215,7 @@ where
                 outcome: empty.unwrap_or_default(),
                 exports: BTreeMap::new(),
                 interruption: None,
+                failure: None,
             },
         };
         // The last element's outcome ends the step whatever its edge, and an element an
@@ -2225,6 +2228,7 @@ where
                 outcome = ChildRunOutcome::Cancelled;
                 break;
             }
+            item = request.item;
             outcome = run_child(request, None)
                 .await
                 .unwrap_or(ChildRunOutcome::Interrupted);
@@ -2249,7 +2253,7 @@ where
                 return self.finish_cancellation(action, cancellation).await;
             }
         }
-        let outputs = self.child_outputs(&step, outcome);
+        let outputs = self.child_outputs(&step, item, outcome);
         let completed = outputs.is_ok();
         let occurrence = match outputs {
             Ok((values, child)) => DriverOccurrence::step_execution_completed(
@@ -2354,21 +2358,25 @@ where
 
     /// The values a child that exited commits for the step: `outcome` and each declared
     /// `text` or `json` export the child made available, detached from the child's staging,
-    /// with the child's ending the reducer routes on under an interruption (REQ-WFEXEC-70).
+    /// with the child's ending the reducer routes on under an interruption (REQ-WFEXEC-70)
+    /// and, when the child's result is `failed`, records with the step as its failed child
+    /// at the fan-out element `item` (REQ-WFEXEC-77).
     /// A nested run that waits commits nothing and its ending is the wait the reducer ends
     /// the walk on (REQ-WFEXEC-75). An outcome the step routes nowhere, or any other ending,
     /// is an interrupted child.
     fn child_outputs(
         &self,
         step: &str,
+        item: Option<u64>,
         outcome: ChildRunOutcome,
     ) -> Result<(BTreeMap<String, CapturedValue>, ChildEnding), StepExecutionFailure> {
-        let (outcome, exports, interruption) = match outcome {
+        let (outcome, exports, interruption, failure) = match outcome {
             ChildRunOutcome::Exited {
                 outcome,
                 exports,
                 interruption,
-            } => (outcome, exports, interruption),
+                failure,
+            } => (outcome, exports, interruption, failure),
             ChildRunOutcome::Waiting { wait, interruption } => {
                 return Ok((
                     BTreeMap::new(),
@@ -2404,11 +2412,17 @@ where
             CHILD_OUTCOME_OUTPUT.to_owned(),
             CapturedValue::text(Arc::from(outcome.as_str())),
         );
+        let failed_child = failure.map(|primary_issue| FailedChild {
+            outcome: outcome.clone(),
+            item,
+            primary_issue,
+        });
         Ok((
             values,
             ChildEnding::Exited {
                 outcome,
                 interruption,
+                failed_child,
             },
         ))
     }
@@ -2723,11 +2737,6 @@ where
                 else {
                     return Err(StepStartFailure::AgentRuntimeUnavailable);
                 };
-                if self.admitted.withholds_agent_login(step) {
-                    return Err(StepStartFailure::Agent(
-                        AgentFailureCause::AgentLoginUnavailable.into(),
-                    ));
-                }
                 let upstream = resolve_agent_upstream_outputs(agent, action_inputs)?;
                 let finalization_context = action_inputs.values().find_map(|input| match input {
                     ActionInput::FinalizationContext(bytes) => Some(bytes.as_ref()),

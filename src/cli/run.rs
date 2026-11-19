@@ -32,7 +32,10 @@ pub(super) use continuation::{
     Submission as ContinuationSubmission, parse_step as parse_continuation_step,
 };
 use output::{CloudOutput, CloudSnapshot};
-pub(super) use output::{write_rejection, write_route, write_waiting};
+pub(super) use output::{
+    reported_field, reported_text, step_path, wait_phrase, write_rejection, write_route,
+    write_waiting,
+};
 
 // Keep the closed envelope fields grouped at the rendering boundary, without
 // repeating its context at every signal, timeout and completion call site.
@@ -1861,6 +1864,7 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
     writeln!(stdout, "project: {}", run.project_id)?;
     writeln!(stdout, "execution spec: {}", run.execution_spec_id)?;
     writeln!(stdout, "state: {}", enum_text(&run.state)?)?;
+    output::write_workflow_state(&mut stdout, run)?;
     writeln!(stdout, "version: {}", run.version)?;
     writeln!(
         stdout,
@@ -1878,6 +1882,8 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
         Some(principal) => writeln!(stdout, "actor: {actor} {principal}")?,
         None => writeln!(stdout, "actor: {actor}")?,
     }
+    output::write_credential_sources(&mut stdout, run)?;
+    output::write_integration_sources(&mut stdout, run)?;
     write_route(&mut stdout, run)?;
     writeln!(stdout, "\nworkflow source:")?;
     writeln!(

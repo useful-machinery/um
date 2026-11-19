@@ -34,11 +34,12 @@ use tokio::process::ChildStderr;
 
 use super::super::Sleeper;
 use super::super::run_inputs::PreparationDeadline;
+use super::records::{RecordState, read_record};
 use serde_json::Value;
 use useful_execution::{
     CONTROL_ANSWER, CONTROL_APPROVE, CONTROL_HAND_BACK, CONTROL_LIFT, CONTROL_RETRY,
     CancellationReason, CancellationSource, CaptureCancellation, ControlEvent, EnvironmentSnapshot,
-    LocalRunDirectoryError, wait_identity,
+    LocalRunDirectoryError, WITHDRAWN_OUTCOME, wait_identity,
 };
 use useful_runner_protocol::{
     RunControlAction, RunControlAnswer, RunControlOutcome, TriggerDelivery, TriggerDeliveryAction,
@@ -77,8 +78,12 @@ const CONTROL_COMMAND_FAILED: &str = "control_command_failed";
 /// The cause a tree run ends with when the start's own stop or the runner's lift was not
 /// recorded, and the code the run's log names beside its class.
 pub(in crate::service) const PENDING_STOP_UNLIFTED: &str = "tree_run_pending_stop_unlifted";
-/// The outcome a `retry` that printed no outcome reports once its control is recorded.
-const RECORDED: &str = "recorded";
+/// The outcome of a control recorded for the run: what a `retry` that printed no outcome
+/// reports once its control is recorded, and what a `withdraw` a live process holds answers.
+pub(in crate::service) const RECORDED: &str = "recorded";
+/// The code the run's log names when the runner's second `withdraw` of a run left waiting
+/// did not end it (REQ-RUNNERENROLL-123).
+const WITHDRAWAL_UNFINISHED: &str = "tree_run_withdrawal_unfinished";
 /// The most of a control command's stdout read back for its last document.
 const CONTROL_OUTPUT_LIMIT: u64 = 1024 * 1024;
 /// The longest `actionOutcome` the protocol carries, in characters.
@@ -996,10 +1001,10 @@ async fn start_control(
 /// Applies a Cloud control's `action` to the run at `run_directory` with the `useful workflow
 /// run` command it names (REQ-RUNNERENROLL-90): `answer --question ID --text TEXT`, once
 /// per answer in order and ending at the first that is not applied, `approve`, `hand-back
-/// --notes TEXT`, `lift [--before STEP]` or `stop --before STEP --reason TEXT`, each reported
-/// as `control_outcome` says. A `retry` continues the run, so the resume loop supervises it
-/// instead (`retry_arguments`). `None` when the assignment's `cancellation` abandoned a
-/// command, which leaves nothing to report.
+/// --notes TEXT`, `lift [--before STEP]`, `stop --before STEP --reason TEXT` or `withdraw`
+/// (REQ-RUNNERENROLL-123), each reported as `control_outcome` says. A `retry` continues the
+/// run, so the resume loop supervises it instead (`retry_arguments`). `None` when the
+/// assignment's `cancellation` abandoned a command, which leaves nothing to report.
 pub(in crate::service) async fn apply_control(
     useful: &UsefulCommand,
     run_directory: &Path,
@@ -1015,13 +1020,93 @@ pub(in crate::service) async fn apply_control(
             Answered::Abandoned => return None,
             Answered::Ended { document, .. } => document,
         };
-        let recorded = Recorded::of(action, index);
-        outcome = control_outcome(&useful.log, document, run_directory, recorded).await;
+        let evidence = Evidence::of(action, index);
+        outcome = control_outcome(&useful.log, document, run_directory, evidence).await;
         if !matches!(outcome, RunControlOutcome::Applied { .. }) {
             break;
         }
     }
     Some(outcome)
+}
+
+/// `useful workflow run withdraw RUN --json` once more on the run at `run_directory`, for a
+/// withdrawal applied `recorded` that the process holding the run ended without honoring,
+/// leaving the run waiting (REQ-RUNNERENROLL-123). It reports no application: one that did
+/// not end the run has the run's log name `WITHDRAWAL_UNFINISHED` with the application it
+/// would have reported, and the run waits on.
+pub(in crate::service) async fn finish_withdrawal(
+    useful: &UsefulCommand,
+    run_directory: &Path,
+    cancellation: &CancellationSource,
+) {
+    let fields = match apply_control(
+        useful,
+        run_directory,
+        &RunControlAction::Withdraw,
+        cancellation,
+    )
+    .await
+    {
+        None => return,
+        Some(RunControlOutcome::Applied { action_outcome })
+            if action_outcome == WITHDRAWN_OUTCOME =>
+        {
+            return;
+        }
+        Some(RunControlOutcome::Applied { action_outcome }) => format!("outcome={action_outcome}"),
+        Some(RunControlOutcome::Refused { code }) => format!("refusal={code}"),
+        Some(RunControlOutcome::Skipped(_)) => "outcome=skipped".to_owned(),
+    };
+    log_failure(&useful.log, WITHDRAWAL_UNFINISHED, fields).await;
+}
+
+/// What tells whether a control command that printed no outcome applied its control: the
+/// control it records for the wait it names, read from the run's controls, or, for a
+/// `withdraw`, the run's record reading `exited` `withdrawn`.
+enum Evidence {
+    Controls(Recorded),
+    Withdrawn,
+}
+
+impl Evidence {
+    /// The evidence for the command of `action`'s `index`-th line; `None` for a control that
+    /// names no wait and records nothing a later read could tell from the run.
+    fn of(action: &RunControlAction, index: usize) -> Option<Self> {
+        match action {
+            RunControlAction::Withdraw => Some(Self::Withdrawn),
+            _ => Recorded::of(action, index).map(Self::Controls),
+        }
+    }
+
+    /// The outcome the control applied with, read on a blocking worker, `None` when the run
+    /// does not show it applied, or why the run's controls could not be read to tell. A
+    /// command that could not be `launched` recorded no control, but a run it ended still
+    /// reads `exited`.
+    async fn applied(
+        self,
+        run_directory: &Path,
+        launched: bool,
+    ) -> Result<Option<&'static str>, ControlsUnread> {
+        match self {
+            Self::Controls(recorded) if launched => {
+                Ok(recorded.held_by(run_directory).await?.then_some(RECORDED))
+            }
+            Self::Controls(_) => Ok(None),
+            Self::Withdrawn => {
+                let run_directory = run_directory.to_owned();
+                let withdrawn = tokio::task::spawn_blocking(move || {
+                    read_record(&run_directory).is_some_and(|record| {
+                        record.state == RecordState::Exited
+                            && record.outcome.as_deref() == Some(WITHDRAWN_OUTCOME)
+                    })
+                })
+                .await
+                // A worker that did not return read nothing: the record does not show it.
+                .unwrap_or(false);
+                Ok(withdrawn.then_some(WITHDRAWN_OUTCOME))
+            }
+        }
+    }
 }
 
 /// The control a command records for the wait its Cloud control names, as the run's
@@ -1047,7 +1132,9 @@ impl Recorded {
                 wait: Some(wait), ..
             } => (CONTROL_LIFT, wait, None),
             RunControlAction::Retry { wait } => (CONTROL_RETRY, wait, None),
-            RunControlAction::Lift { wait: None, .. } | RunControlAction::Stop { .. } => {
+            RunControlAction::Lift { wait: None, .. }
+            | RunControlAction::Stop { .. }
+            | RunControlAction::Withdraw => {
                 return None;
             }
         };
@@ -1188,6 +1275,7 @@ fn control_arguments(run_directory: &Path, action: &RunControlAction) -> Vec<Vec
             reason.as_deref().unwrap_or(CLOUD_STOP_REASON),
         )],
         RunControlAction::Retry { .. } => Vec::new(),
+        RunControlAction::Withdraw => vec![command("withdraw", Vec::new())],
     }
 }
 
@@ -1261,16 +1349,17 @@ fn reported(document: &Value) -> Option<RunControlOutcome> {
 
 /// The application of a control command that ended with `document` on the run at
 /// `run_directory` (REQ-RUNNERENROLL-90): as `reported` reads a document it printed; for a
-/// command that launched and printed no `outcome` or outlived its bound, `applied`
-/// `recorded` once the run's controls hold `recorded`, the control it records for the wait
-/// it names; and otherwise `refused` `control_command_failed`, the run's log naming the
-/// failure's class and, when the run's controls could not be read to tell, the failed
-/// read's class beside it.
+/// command that printed no `outcome` or outlived its bound, as its `evidence` reads the run:
+/// `applied` `recorded` once the run's controls hold `recorded`, the control a launched
+/// command records for the wait it names, or `applied` `withdrawn` once the run's record
+/// reads `exited` `withdrawn` after a `withdraw` (REQ-RUNNERENROLL-123); and otherwise
+/// `refused` `control_command_failed`, the run's log naming the failure's class and, when
+/// the run's controls could not be read to tell, the failed read's class beside it.
 async fn control_outcome(
     log: &RunLog,
     document: Result<Value, Unanswered>,
     run_directory: &Path,
-    recorded: Option<Recorded>,
+    evidence: Option<Evidence>,
 ) -> RunControlOutcome {
     if let Some(outcome) = document.as_ref().ok().and_then(reported) {
         return outcome;
@@ -1279,17 +1368,15 @@ async fn control_outcome(
         .as_ref()
         .is_ok_and(|document| document["outcome"].is_string());
     let mut unread = None;
-    if !printed_outcome
-        && !matches!(document, Err(Unanswered::Launch(_)))
-        && let Some(recorded) = recorded
-    {
-        match recorded.held_by(run_directory).await {
-            Ok(true) => {
+    if !printed_outcome && let Some(evidence) = evidence {
+        let launched = !matches!(document, Err(Unanswered::Launch(_)));
+        match evidence.applied(run_directory, launched).await {
+            Ok(Some(action_outcome)) => {
                 return RunControlOutcome::Applied {
-                    action_outcome: RECORDED.to_owned(),
+                    action_outcome: action_outcome.to_owned(),
                 };
             }
-            Ok(false) => {}
+            Ok(None) => {}
             Err(error) => unread = Some(error),
         }
     }
@@ -1315,7 +1402,7 @@ pub(in crate::service) async fn retry_outcome(
         &useful.log,
         document,
         run_directory,
-        Some(Recorded::retry(wait)),
+        Some(Evidence::Controls(Recorded::retry(wait))),
     )
     .await
 }

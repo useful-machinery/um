@@ -10,7 +10,7 @@ use super::authorization::{
     write_session_note,
 };
 use super::authorize::{MOVE_CODEX_GRANT, Outcome};
-use super::projection::{MemberStatus, PROVIDERS, grant_authorization_status, grant_subject};
+use super::projection::{MemberStatus, Provider, grant_authorization_status, grant_subject};
 use super::runner_choice::{Nothing, Runner};
 use crate::exit_code::{ExitCode, OutcomeClass};
 use useful_api::{GrantUse, MemberGrant, MemberGrantFailure, MemberGrantKind};
@@ -70,7 +70,7 @@ impl<'a> AccountView<'a> {
 #[serde(rename_all = "camelCase")]
 struct GrantView<'a> {
     id: &'a str,
-    provider: &'static str,
+    provider: &'a str,
     kind: &'static str,
     account: AccountView<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -279,8 +279,8 @@ impl<'a> GrantView<'a> {
 /// A provider the member holds no unrevoked grant of, with the status that names how to make
 /// one.
 #[derive(Serialize)]
-struct NotConnectedView {
-    provider: &'static str,
+struct NotConnectedView<'a> {
+    provider: &'a str,
     #[serde(flatten)]
     status: MemberStatus,
 }
@@ -292,14 +292,15 @@ struct ListResult<'a> {
     deployment: &'a str,
     outcome: &'static str,
     grants: &'a [GrantView<'a>],
-    not_connected: &'a [NotConnectedView],
+    not_connected: &'a [NotConnectedView<'a>],
 }
 
-/// Writes the member's unrevoked grants, then each provider they hold none of
-/// (REQ-GRANT-64); it exits 0 whatever they report.
+/// Writes the member's unrevoked grants, then each of `providers`, in its order, they hold none
+/// of (REQ-GRANT-64); it exits 0 whatever they report.
 pub(super) fn write_list(
     deployment: &str,
     grants: &[MemberGrant],
+    providers: &[Provider<'_>],
     accounts: &Accounts,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
@@ -307,7 +308,7 @@ pub(super) fn write_list(
         .iter()
         .map(|grant| GrantView::new(grant, accounts, false))
         .collect();
-    let not_connected: Vec<_> = PROVIDERS
+    let not_connected: Vec<_> = providers
         .iter()
         .filter(|provider| {
             !grants
@@ -534,7 +535,7 @@ struct RevokeResult<'a> {
     deployment: &'a str,
     outcome: &'static str,
     grant_id: &'a str,
-    provider: &'static str,
+    provider: &'a str,
     kind: &'static str,
     // A native grant's, absent when the read after the revocation failed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -593,7 +594,7 @@ pub(super) fn write_revoke(
 #[serde(rename_all = "camelCase")]
 struct AuthorizedGrantView<'a> {
     grant_id: &'a str,
-    provider: &'static str,
+    provider: &'a str,
     kind: &'static str,
     outcome: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -974,8 +975,8 @@ pub(super) fn write_provider_heading(
 
 /// One provider's entry in the summary of `useful grant create` without a provider.
 #[derive(Serialize)]
-struct CreateOutcome {
-    provider: &'static str,
+struct CreateOutcome<'a> {
+    provider: &'a str,
     outcome: &'static str,
 }
 
@@ -988,7 +989,7 @@ struct CreateSummary<'a> {
     event: &'static str,
     deployment: &'a str,
     outcome: &'static str,
-    providers: Vec<CreateOutcome>,
+    providers: Vec<CreateOutcome<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     category: Option<&'static str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1073,7 +1074,7 @@ fn native_remedy(provider: &str) -> Option<&'static str> {
 /// over as `reconnect_required` (REQ-GRANT-79).
 pub(super) fn write_create_summary(
     deployment: &str,
-    outcomes: &[(&'static str, &'static str)],
+    outcomes: &[(&str, &'static str)],
     code: ExitCode,
     scope: Scope,
     json: bool,
@@ -1100,7 +1101,7 @@ pub(super) fn write_create_summary(
         writeln!(stdout, "deployment: {deployment}")?;
         return stdout.flush().map_err(Into::into);
     }
-    let with = |wanted: &str| -> Vec<&'static str> {
+    let with = |wanted: &str| -> Vec<&str> {
         outcomes
             .iter()
             .filter(|(_, outcome)| *outcome == wanted)

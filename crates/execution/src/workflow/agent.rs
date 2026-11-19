@@ -1047,19 +1047,12 @@ pub(crate) enum AgentHarnessSetupStage {
     StartAcknowledgement,
 }
 
-/// The `launchFailure` slug of an agent launch refused because the admission withheld its
-/// harness's login (REQ-DIAG-41).
-pub(crate) const AGENT_LOGIN_UNAVAILABLE: &str = "agent_login_unavailable";
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum AgentFailureCause {
     HarnessStartFailed {
         stage: &'static str,
         error: String,
     },
-    /// The admission withheld the login the step's harness would have received; no harness
-    /// process was started (INV-ENGINE-35, REQ-DIAG-41).
-    AgentLoginUnavailable,
     HarnessSetupFailed {
         stage: AgentHarnessSetupStage,
     },

@@ -556,9 +556,11 @@ fn authorize_and_deauthorize_take_runner_as_an_option_and_refuse_a_malformed_tar
             &["authorize", "codex", "builder"],
             clap::error::ErrorKind::ValueValidation,
         ),
+        // `builder` has a provider id's shape, so beside `--all` it is a `GRANT` that
+        // `--all` excludes (REQ-GRANT-96).
         (
             &["authorize", "--all", "builder"],
-            clap::error::ErrorKind::ValueValidation,
+            clap::error::ErrorKind::ArgumentConflict,
         ),
         (
             &["deauthorize", GRANT, "builder"],
@@ -1088,12 +1090,13 @@ fn resume_takes_cloud_only_without_its_local_options() {
     }
 }
 
-// REQ-LOCALRUN-172, REQ-LOCALRUN-189, REQ-LOCALRUN-187, REQ-CLOUDDEF-19: `show` and `release`
-// select a Cloud run only with `--cloud`, whose authentication and transport options need it;
-// `withdraw` and `cancel` take no `--cloud`, and `useful run` gains no `release`.
+// REQ-LOCALRUN-172, REQ-LOCALRUN-189, REQ-LOCALRUN-187, REQ-LOCALRUN-218, REQ-CLOUDDEF-19:
+// `show`, `release`, `withdraw` and `cancel` select a Cloud run only with `--cloud`, whose
+// authentication and transport options need it; `cancel --cloud` takes none of
+// `useful run cancel`'s forcing, waiting or key, and `useful run` gains no `release`.
 #[test]
-fn show_and_release_take_cloud_and_other_run_leaves_do_not() {
-    for leaf in ["show", "release"] {
+fn show_release_withdraw_and_cancel_take_cloud() {
+    for leaf in ["show", "release", "withdraw", "cancel"] {
         let base = ["useful", "workflow", "run", leaf, "run_1"];
         for accepted in [
             &[][..],
@@ -1119,14 +1122,14 @@ fn show_and_release_take_cloud_and_other_run_leaves_do_not() {
             );
         }
     }
-    for leaf in ["withdraw", "cancel"] {
+    for refused in ["--force", "--wait", "--idempotency-key=k"] {
         let input = [
-            "useful", "workflow", "run", leaf, "run_1", "--cloud", "acme",
+            "useful", "workflow", "run", "cancel", "run_1", "--cloud", "acme", refused,
         ];
         assert_eq!(
             super::parse(input).unwrap_err().kind(),
             clap::error::ErrorKind::UnknownArgument,
-            "{leaf}"
+            "{refused}"
         );
     }
     assert_eq!(

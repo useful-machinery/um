@@ -197,6 +197,70 @@ pub(super) fn assert_provider_lines(stdout: &str, providers: &[(&str, &str, &str
     }
 }
 
+/// The source `stdout` prints on the provider's line: the word after
+/// `source`, or none where the line names no source (REQ-GRANT-92).
+pub(super) fn printed_source<'a>(stdout: &'a str, provider: &str) -> Option<&'a str> {
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with(&format!("{provider} login:")))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    let mut words = line
+        .split([' ', ',', ':'])
+        .filter(|word| !word.is_empty())
+        .skip_while(|word| *word != "source");
+    words
+        .next()
+        .map(|_| words.next().unwrap_or_else(|| panic!("{line}")))
+}
+
+// REQ-GRANT-92, REQ-GRANT-41
+#[test]
+fn sync_prints_each_recorded_source_and_its_json_carries_it() {
+    let codex = READY_CODEX.replace(r#""installedAt""#, r#""source":"grant","installedAt""#);
+    let mut response: serde_json::Value = serde_json::from_slice(&synced_response(&codex)).unwrap();
+    response["agentLogins"]["providers"][1] = serde_json::json!({
+        "provider": "github",
+        "state": "not_delivered",
+        "checkedAt": "2026-11-12T01:00:00Z",
+        "runId": "run_01k0z6r1w8f4jy2m7q9v3x5abp",
+        "source": "host",
+    });
+    let mut response = serde_json::to_vec(&response).unwrap();
+    response.push(b'\n');
+
+    let (output, _) = sync_against(SYNC, response.clone(), &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for (provider, source) in [
+        ("codex", Some("grant")),
+        ("github", Some("host")),
+        ("gitlab", None),
+        ("linear", None),
+    ] {
+        assert_eq!(printed_source(&stdout, provider), source, "{stdout}");
+    }
+
+    let (output, _) = sync_against(SYNC, response, &["--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let sources = document["agentLogins"]["providers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| (entry["provider"].clone(), entry.get("source").cloned()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        sources,
+        [
+            ("codex".into(), Some("grant".into())),
+            ("github".into(), Some("host".into())),
+            ("gitlab".into(), None),
+            ("linear".into(), None),
+        ],
+        "{document}"
+    );
+}
+
 // REQ-GRANT-41
 #[test]
 fn sync_json_prints_the_readiness_as_a_document() {
@@ -229,7 +293,7 @@ fn sync_json_prints_the_readiness_as_a_document() {
     assert_eq!(document["agentLogins"], expected);
 }
 
-// REQ-GRANT-41, REQ-GRANT-53
+// REQ-GRANT-41, REQ-GRANT-53, REQ-GRANT-38
 #[test]
 fn sync_reports_each_providers_availability_and_fails_a_login_refused_at_its_last_use() {
     let used = |last_use: &str| {
@@ -242,11 +306,13 @@ fn sync_reports_each_providers_availability_and_fails_a_login_refused_at_its_las
         (used("refused"), 1, "reconnect_required", "reconnect"),
         (used("accepted"), 0, "available", "none"),
         (READY_CODEX.to_owned(), 0, "unverified", "none"),
+        // An earlier serving process may still say the provider was
+        // selected, which changes nothing (REQ-GRANT-38).
         (
             r#"{"provider":"codex","state":"not_authorized","agentLoginId":"agl_01k0z6r1w8f4jy2m7q9v3x5abc","checkedAt":"2026-11-12T01:00:00Z","selected":true}"#.to_owned(),
-            1,
-            "insufficient_permission",
-            "restore_membership",
+            0,
+            "not_connected",
+            "none",
         ),
     ] {
         let (output, _) = sync_against(SYNC, synced_response(&codex), &["--json"]);
@@ -379,7 +445,7 @@ fn sync_names_each_login_whose_check_gave_no_answer_without_changing_its_exit_st
     assert!(document.get("unansweredChecks").is_none(), "{document}");
 }
 
-// REQ-GRANT-41
+// REQ-GRANT-41, REQ-GRANT-51
 #[test]
 fn sync_exits_1_only_when_an_authorized_provider_is_not_ready() {
     for (codex, code) in [
@@ -391,9 +457,10 @@ fn sync_exits_1_only_when_an_authorized_provider_is_not_ready() {
             r#"{"provider":"codex","state":"revoked","agentLoginId":"agl_01k0z6r1w8f4jy2m7q9v3x5abc","checkedAt":"2026-11-12T01:00:00Z"}"#,
             0,
         ),
+        // The host's own login is in use: nothing fails.
         (
             r#"{"provider":"codex","state":"foreign_login","agentLoginId":"agl_01k0z6r1w8f4jy2m7q9v3x5abc","checkedAt":"2026-11-12T01:00:00Z"}"#,
-            1,
+            0,
         ),
         (
             r#"{"provider":"codex","state":"cloud_unavailable","checkedAt":"2026-11-12T01:00:00Z"}"#,
@@ -808,6 +875,59 @@ fn cloud_issuing_a_github_token(request: &[u8]) -> Vec<u8> {
     }
 }
 
+/// The GitHub token file in the runner's state directory.
+const GITHUB_TOKEN_FILE: &str = ".runner-agent-login/github.token";
+
+/// The token Cloud issues for `example`, a provider of its configuration,
+/// which no output may carry either.
+const EXAMPLE_GRANT_TOKEN: &str = "example_grant-token-sentinel-7b4d2f";
+
+/// The token file of `example` in the runner's state directory.
+const EXAMPLE_TOKEN_FILE: &str = ".runner-agent-login/grant-tokens/example.token";
+
+/// Cloud's grant routes for an assignment whose providers are `github` and
+/// `example`, a provider of its configuration, each with the names its row
+/// gives it: it lists both and issues the token of each.
+fn cloud_listing_github_and_example(request: &[u8]) -> Vec<u8> {
+    let text = String::from_utf8_lossy(request);
+    if request.starts_with(b"POST /v1/runner/grants/providers ") {
+        assert!(
+            text.contains(&format!(r#""assignmentId":"{GRANT_ASSIGNMENT}""#)),
+            "{text}"
+        );
+        private_json_answer(&serde_json::json!({
+            "schemaVersion": 1,
+            "providers": [
+                {
+                    "provider": "github",
+                    "environment": {"token": "GH_TOKEN", "tokenFile": "GH_TOKEN_FILE"}
+                },
+                {
+                    "provider": "example",
+                    "environment": {
+                        "token": "EXAMPLE_ACCESS_TOKEN",
+                        "tokenFile": "EXAMPLE_ACCESS_TOKEN_FILE"
+                    }
+                }
+            ]
+        }))
+    } else if request.starts_with(b"POST /v1/runner/grants/token ")
+        && text.contains(r#""provider":"example""#)
+    {
+        private_json_answer(&serde_json::json!({
+            "schemaVersion": 1,
+            "provider": "example",
+            "grantId": "pgr_01k0z6r1w8f4jy2m7q9v3x5abd",
+            "generation": 1,
+            "accessToken": EXAMPLE_GRANT_TOKEN,
+            "expiresAt": "2099-01-01T00:00:00.5Z",
+            "refreshAfterSeconds": 600
+        }))
+    } else {
+        cloud_issuing_a_github_token(request)
+    }
+}
+
 /// Serves the runner's connection: a welcome, an acknowledgement of each
 /// frame, the pinned offer and, once the runner is preparing, its prepare;
 /// sends the payload of the rejection that follows to `rejected`.
@@ -847,9 +967,9 @@ async fn serve_one_assignment(
     }
 }
 
-/// A live `useful runner serve` that admits the pinned assignment and is issued
-/// its GitHub token, once that assignment has ended: the source route has no
-/// credential, so the admission is rejected.
+/// A live `useful runner serve` that admits the pinned assignment against a
+/// Cloud whose routes answer as `routes` does, once that assignment has
+/// ended: the source route has no credential, so the admission is rejected.
 struct EndedGrantAssignment {
     fixture: ServeStatusFixture,
     _home: tempfile::TempDir,
@@ -863,18 +983,19 @@ struct EndedGrantAssignment {
 }
 
 impl EndedGrantAssignment {
-    fn served() -> Self {
+    /// The runner served by `routes`, watching the token file at `watched`
+    /// in its state directory.
+    fn served(routes: fn(&[u8]) -> Vec<u8>, watched: &str) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let endpoint = format!("ws://{}/v1/runner/connect", listener.local_addr().unwrap());
         let fixture = ServeStatusFixture::new(&endpoint);
         let home = tempfile::tempdir().unwrap();
-        let token_file = fixture
-            .state_directory()
-            .join(".runner-agent-login/github.token");
+        let token_file = fixture.state_directory().join(watched);
         let (held_sender, held) = mpsc::sync_channel(1);
         let (rejected_sender, rejected) = mpsc::sync_channel(1);
         let watched = token_file.clone();
+        let cloud = routes;
         let routes = move |request: &[u8]| {
             if request.starts_with(b"POST /v1/runner/source-credentials ") {
                 let _ = held_sender.try_send(
@@ -885,7 +1006,7 @@ impl EndedGrantAssignment {
                     ),
                 );
             }
-            cloud_issuing_a_github_token(request)
+            cloud(request)
         };
         thread::spawn(move || {
             tokio::runtime::Builder::new_current_thread()
@@ -906,6 +1027,8 @@ impl EndedGrantAssignment {
             .args(["runner", "serve", "--config", &fixture.config])
             .env("OTEL_SDK_DISABLED", "true")
             .env("HOME", home.path())
+            .env_remove("EXAMPLE_ACCESS_TOKEN")
+            .env_remove("EXAMPLE_ACCESS_TOKEN_FILE")
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .spawn()
@@ -949,7 +1072,7 @@ impl EndedGrantAssignment {
 // REQ-GRANT-86, REQ-GRANT-88, INV-RUNNER-28
 #[test]
 fn an_admitted_assignment_keeps_its_grant_token_in_its_file_and_prints_it_nowhere() {
-    let served = EndedGrantAssignment::served();
+    let served = EndedGrantAssignment::served(cloud_issuing_a_github_token, GITHUB_TOKEN_FILE);
     let token_file = served.token_file.clone();
     let removed = poll_until(
         "the token file's removal once the assignment ended",
@@ -986,7 +1109,7 @@ fn an_admitted_assignment_keeps_its_grant_token_in_its_file_and_prints_it_nowher
     };
     assert_eq!(entry("github")["state"], "ready", "{readiness}");
     assert_eq!(entry("github")["generation"], 2, "{readiness}");
-    assert_eq!(entry("github")["selected"], true, "{readiness}");
+    assert!(entry("github").get("selected").is_none(), "{readiness}");
     for provider in ["gitlab", "linear"] {
         assert_eq!(entry(provider)["state"], "not_authorized", "{readiness}");
     }
@@ -1013,10 +1136,64 @@ fn an_admitted_assignment_keeps_its_grant_token_in_its_file_and_prints_it_nowher
     }
 }
 
+// REQ-GRANT-86, INV-RUNNER-28
+#[test]
+fn a_configured_providers_token_is_kept_in_its_own_file_and_printed_nowhere() {
+    let served = EndedGrantAssignment::served(cloud_listing_github_and_example, EXAMPLE_TOKEN_FILE);
+    let token_file = served.token_file.clone();
+    let removed = poll_until(
+        "the token file's removal once the assignment ended",
+        || token_file.exists(),
+        |exists| !exists,
+    );
+    let status = run(&["runner", "status", "--config", &served.fixture.config]);
+    let readiness = fs::read(
+        served
+            .fixture
+            .state_directory()
+            .join(".runner-agent-logins.json"),
+    )
+    .unwrap();
+    let held_at_source = served.held_at_source.clone();
+    let serve_stderr = served.stop();
+
+    assert_eq!(
+        held_at_source,
+        Some(Some((EXAMPLE_GRANT_TOKEN.to_owned(), 0o600))),
+        "{serve_stderr}"
+    );
+    assert!(!removed);
+    assert!(status.status.success());
+    let readiness: serde_json::Value = serde_json::from_slice(&readiness).unwrap();
+    assert!(
+        readiness["providers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["provider"] != "example"),
+        "{readiness}"
+    );
+    let text = |bytes: &[u8]| String::from_utf8_lossy(bytes).into_owned();
+    for (name, output) in [
+        ("runner standard error", serve_stderr),
+        ("readiness document", readiness.to_string()),
+        ("runner status", text(&status.stdout)),
+        ("runner status error", text(&status.stderr)),
+    ] {
+        for secret in [EXAMPLE_GRANT_TOKEN, GRANT_TOKEN] {
+            assert!(!output.contains(secret), "{name} carries a grant token");
+        }
+        assert!(
+            !output.contains("example.token"),
+            "{name} names the token file"
+        );
+    }
+}
+
 // REQ-GRANT-88, REQ-GRANT-41, REQ-GRANT-53
 #[test]
 fn sync_shows_an_ended_assignments_grant_token_as_of_its_run_and_not_as_current() {
-    let served = EndedGrantAssignment::served();
+    let served = EndedGrantAssignment::served(cloud_issuing_a_github_token, GITHUB_TOKEN_FILE);
     let config = served.fixture.config.clone();
     // The runner answers a sync only once it is idle (REQ-GRANT-41).
     let sync = poll_until(

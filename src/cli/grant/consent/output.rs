@@ -12,8 +12,7 @@ use super::super::projection::grant_provider;
 use super::Front;
 use crate::exit_code::{ExitCode, OutcomeClass};
 use useful_api::{
-    Grant, GrantFailure, GrantProvider, GrantSession, GrantSessionReason, GrantSessionStatus,
-    GrantState,
+    Grant, GrantFailure, GrantSession, GrantSessionReason, GrantSessionStatus, GrantState,
 };
 
 /// A grant as the CLI presents it: the model's named fields only, enums as their wire
@@ -23,7 +22,7 @@ use useful_api::{
 pub(in crate::cli) struct GrantView<'a> {
     id: &'a str,
     identity_id: &'a str,
-    provider: &'static str,
+    provider: &'a str,
     scopes: &'a [String],
     state: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -118,44 +117,49 @@ pub(in crate::cli) fn report(deployment: &str, failure: &GrantFailure) -> ApiFai
     }
 }
 
-/// The provider a consent asks: as a start request names it, as its wire name and as its name
+/// The provider a consent asks: as its wire name, which a start request names, and as its name
 /// in prose.
 #[derive(Clone, Copy)]
-pub(in crate::cli) struct ConsentProvider {
-    pub(in crate::cli) request: GrantProvider,
-    pub(in crate::cli) name: &'static str,
-    pub(in crate::cli) title: &'static str,
+pub(in crate::cli) struct ConsentProvider<'a> {
+    pub(in crate::cli) name: &'a str,
+    pub(in crate::cli) title: &'a str,
 }
 
-impl ConsentProvider {
-    fn of_session(provider: useful_api::provider_grant_session::Provider) -> Self {
-        use useful_api::provider_grant_session::Provider;
-        match provider {
-            Provider::ProviderGrantSessionProviderGithub => Self::GITHUB,
-            Provider::ProviderGrantSessionProviderGitlabCom => Self::GITLAB_COM,
-            Provider::ProviderGrantSessionProviderLinear => Self::LINEAR,
-        }
+impl<'a> ConsentProvider<'a> {
+    /// The provider of a session `GrantApi` answered: one of the three this client has a title
+    /// for, or any other OAuth provider, named and titled by its id (REQ-GRANT-96).
+    fn of_session(provider: &'a str) -> Self {
+        [
+            ConsentProvider::GITHUB,
+            ConsentProvider::GITLAB_COM,
+            ConsentProvider::LINEAR,
+        ]
+        .into_iter()
+        .find(|known| known.name == provider)
+        .unwrap_or(Self {
+            name: provider,
+            title: provider,
+        })
     }
-
-    pub(in crate::cli) const GITHUB: Self = Self {
-        request: GrantProvider::CreateGrantSessionRequestProviderGithub,
-        name: "github",
-        title: "GitHub",
-    };
-    pub(in crate::cli) const GITLAB_COM: Self = Self {
-        request: GrantProvider::CreateGrantSessionRequestProviderGitlabCom,
-        name: "gitlab.com",
-        title: "GitLab.com",
-    };
-    pub(in crate::cli) const LINEAR: Self = Self {
-        request: GrantProvider::CreateGrantSessionRequestProviderLinear,
-        name: "linear",
-        title: "Linear",
-    };
 
     fn remedy(self, front: Front) -> String {
         format!("Run {} {} again.", front.create, self.name)
     }
+}
+
+impl ConsentProvider<'static> {
+    pub(in crate::cli) const GITHUB: Self = Self {
+        name: "github",
+        title: "GitHub",
+    };
+    pub(in crate::cli) const GITLAB_COM: Self = Self {
+        name: "gitlab.com",
+        title: "GitLab.com",
+    };
+    pub(in crate::cli) const LINEAR: Self = Self {
+        name: "linear",
+        title: "Linear",
+    };
 }
 
 /// One line of a consent's JSON output: the consent it started, or its result.
@@ -169,7 +173,7 @@ struct ConsentEvent<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     session_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    provider: Option<&'static str>,
+    provider: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     authorization_url: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -208,7 +212,7 @@ impl<'a> ConsentEvent<'a> {
 pub(super) struct SessionView<'a> {
     id: &'a str,
     front: Front,
-    provider: ConsentProvider,
+    provider: ConsentProvider<'a>,
     status: GrantSessionStatus,
     authorization_url: Option<&'a str>,
     expires_at: &'a str,
@@ -217,11 +221,22 @@ pub(super) struct SessionView<'a> {
 }
 
 impl<'a> SessionView<'a> {
-    pub(super) fn new(session: &'a GrantSession, front: Front) -> Self {
+    /// The session `consent` started or polled. It keeps the consent's provider, and its title,
+    /// when the session names it, as a consent begun by provider always does; a consent begun
+    /// from an identity names its provider only in the session.
+    pub(super) fn new(
+        session: &'a GrantSession,
+        front: Front,
+        consent: ConsentProvider<'a>,
+    ) -> Self {
         Self {
             id: &session.id,
             front,
-            provider: ConsentProvider::of_session(session.provider),
+            provider: if session.provider == consent.name {
+                consent
+            } else {
+                ConsentProvider::of_session(&session.provider)
+            },
             status: session.status,
             authorization_url: session.authorization_url.as_deref(),
             expires_at: &session.expires_at,
@@ -387,7 +402,7 @@ const fn reason_code(reason: GrantSessionReason) -> &'static str {
 pub(super) fn write_consent_failure(
     deployment: &str,
     front: Front,
-    provider: ConsentProvider,
+    provider: ConsentProvider<'_>,
     session_id: Option<&str>,
     failure: &GrantFailure,
     json: bool,

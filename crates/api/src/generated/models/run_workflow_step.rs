@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// RunWorkflowStep : The latest reported state of one step of a run inside a definition-backed run's tree. It feeds no scheduling, the run's state or its result.
+/// RunWorkflowStep : The latest reported state of one step of a run inside a definition-backed run's tree. It feeds no scheduling, the run's state or its result. A `workflow` step's `succeeded` says that its child exited with an outcome, not that the child's run succeeded; a failed child reads on the wait it routed to.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunWorkflowStep {
     /// The path to the run inside the tree the step belongs to: empty for the root, otherwise one element per level of child workflow.
@@ -33,7 +33,7 @@ pub struct RunWorkflowStep {
 }
 
 impl RunWorkflowStep {
-    /// The latest reported state of one step of a run inside a definition-backed run's tree. It feeds no scheduling, the run's state or its result.
+    /// The latest reported state of one step of a run inside a definition-backed run's tree. It feeds no scheduling, the run's state or its result. A `workflow` step's `succeeded` says that its child exited with an outcome, not that the child's run succeeded; a failed child reads on the wait it routed to.
     pub fn new(
         run: Vec<models::RunWorkflowStepRunElement>,
         run_attempt: i32,

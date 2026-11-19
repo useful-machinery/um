@@ -20,26 +20,21 @@ pub enum Availability {
     Pending,
     /// The runner could not install what Cloud authorized.
     DeliveryFailed,
-    /// Selected, and refused by Cloud because the login's owner is not an
-    /// active member.
-    InsufficientPermission,
     /// Not delivered to the runner: a service login of its own is in use, or
     /// the runner is issued no token for the provider.
     NotDelivered,
-    /// Nothing selected: no authorization in force, a revoked credential, or
-    /// none.
+    /// No authorization in force, a revoked credential, or none.
     NotConnected,
 }
 
 impl Availability {
     /// Every availability, in the order REQ-GRANT-53 states them.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 7] = [
         Self::Available,
         Self::Unverified,
         Self::ReconnectRequired,
         Self::Pending,
         Self::DeliveryFailed,
-        Self::InsufficientPermission,
         Self::NotDelivered,
         Self::NotConnected,
     ];
@@ -52,7 +47,6 @@ impl Availability {
             Self::ReconnectRequired => "reconnect_required",
             Self::Pending => "pending",
             Self::DeliveryFailed => "delivery_failed",
-            Self::InsufficientPermission => "insufficient_permission",
             Self::NotDelivered => "not_delivered",
             Self::NotConnected => "not_connected",
         }
@@ -68,7 +62,6 @@ impl Availability {
             Self::Available | Self::Unverified => Some(NextAction::None),
             Self::ReconnectRequired => Some(NextAction::Reconnect),
             Self::Pending => Some(NextAction::WaitForRunner),
-            Self::InsufficientPermission => Some(NextAction::RestoreMembership),
             Self::DeliveryFailed | Self::NotDelivered | Self::NotConnected => None,
         }
     }
@@ -89,8 +82,6 @@ pub enum NextAction {
     /// Check that the deployment serves the provider for the runner's
     /// operating system.
     CheckTarget,
-    /// Make the login's owner an active member again.
-    RestoreMembership,
     /// Remove the service's own login, or keep using it.
     ResolveServiceLogin,
     /// Authorize a runner for an agent login that has none in force.
@@ -101,13 +92,12 @@ pub enum NextAction {
 
 impl NextAction {
     /// Every next action, in the order REQ-GRANT-53 states them.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 8] = [
         Self::None,
         Self::Reconnect,
         Self::WaitForRunner,
         Self::SyncRunner,
         Self::CheckTarget,
-        Self::RestoreMembership,
         Self::ResolveServiceLogin,
         Self::AuthorizeRunner,
         Self::Connect,
@@ -121,7 +111,6 @@ impl NextAction {
             Self::WaitForRunner => "wait_for_runner",
             Self::SyncRunner => "sync_runner",
             Self::CheckTarget => "check_target",
-            Self::RestoreMembership => "restore_membership",
             Self::ResolveServiceLogin => "resolve_service_login",
             Self::AuthorizeRunner => "authorize_runner",
             Self::Connect => "connect",

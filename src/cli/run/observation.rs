@@ -297,9 +297,14 @@ pub(super) fn wait_run_with_reads(
                 }
             }
             record(current.clone());
+            let waiting = match current.run.as_deref().map(super::output::read_wait) {
+                Some(Ok(Some(Some(wait)))) => format!(" · waiting {wait}"),
+                Some(Ok(Some(None))) => " · waiting".to_owned(),
+                _ => String::new(),
+            };
             let _ = writeln!(
                 io::stderr().lock(),
-                "Run observation: {}",
+                "Run observation: {}{waiting}",
                 current
                     .run
                     .as_ref()

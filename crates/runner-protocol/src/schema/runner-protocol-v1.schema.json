@@ -712,9 +712,9 @@
     },
     "RunControl": {
       "type": "object", "additionalProperties": false,
-      "description": "An authorized control for a run's wait (REQ-RUNNERENROLL-90), each member present only for its kind: `answer` carries `wait` and `answers`; `approve` and `retry` carry `wait`; `hand_back` carries `wait` and `notes`; `lift` may carry `wait` and `before`; `stop` carries `before` and may carry `reason`.",
+      "description": "An authorized control for a run's wait (REQ-RUNNERENROLL-90), each member present only for its kind: `answer` carries `wait` and `answers`; `approve` and `retry` carry `wait`; `hand_back` carries `wait` and `notes`; `lift` may carry `wait` and `before`; `stop` carries `before` and may carry `reason`; `withdraw` carries no member.",
       "properties": {
-        "kind": {"enum": ["answer", "approve", "hand_back", "lift", "stop", "retry"]},
+        "kind": {"enum": ["answer", "approve", "hand_back", "lift", "stop", "retry", "withdraw"]},
         "wait": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/RunControlWait"}]},
         "answers": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"$ref": "#/$defs/RunControlAnswer"}},
         "notes": {"type": "string", "minLength": 1, "maxLength": 4096},
@@ -748,8 +748,14 @@
               "not": {"anyOf": [{"required": ["answers"]}, {"required": ["notes"]}, {"required": ["reason"]}]}
             },
             "else": {
-              "required": ["before"],
-              "not": {"anyOf": [{"required": ["wait"]}, {"required": ["answers"]}, {"required": ["notes"]}]}
+              "if": {"properties": {"kind": {"const": "withdraw"}}},
+              "then": {
+                "not": {"anyOf": [{"required": ["wait"]}, {"required": ["answers"]}, {"required": ["notes"]}, {"required": ["before"]}, {"required": ["reason"]}]}
+              },
+              "else": {
+                "required": ["before"],
+                "not": {"anyOf": [{"required": ["wait"]}, {"required": ["answers"]}, {"required": ["notes"]}]}
+              }
             }
           }
         }
@@ -1124,6 +1130,7 @@
                 "workspaceRecoveryVersion": {"const": 1},
                 "treeExecution": {"const": 1},
                 "treeContinuation": {"const": 1},
+                "treeWithdraw": {"const": 1},
                 "workspaceRecoveryRoot": {
                   "type": "object", "additionalProperties": false,
                   "properties": {
@@ -1354,13 +1361,14 @@
     },
     "treeWaitKind": {"enum": ["answer", "approval", "repair", "stop", "external", "children"]},
     "TreeProgressWait": {
-      "description": "The wait a waiting tree run is pending on: its kind, since when, and the step that waits. The optional questions (REQ-COMPAT-18) are admitted only on an answer wait; an answer wait without them reports its questions unknown, never that it asks none. The questions array is at most 98,304 bytes as compact JSON and holds no text PostgreSQL's jsonb cannot store (the escape \\u0000, an unpaired surrogate escape) and no bytes that are not UTF-8; the Gateway checks both.",
+      "description": "The wait a waiting tree run is pending on: its kind, since when, and the step that waits. The optional questions (REQ-COMPAT-18) are admitted only on an answer wait; an answer wait without them reports its questions unknown, never that it asks none. The questions array is at most 98,304 bytes as compact JSON and holds no text PostgreSQL's jsonb cannot store (the escape \\u0000, an unpaired surrogate escape) and no bytes that are not UTF-8; the Gateway checks both. The optional failedChild (REQ-COMPAT-18) is admitted on a wait of any kind and names the failed stage the wait is on, with the failing node of that stage's run; a wait without it reports no failed stage, which never says the stage succeeded. The Gateway judges a wait that carries it storable as it does one with questions.",
       "type": "object", "additionalProperties": false,
       "properties": {
         "kind": {"$ref": "#/$defs/treeWaitKind"},
         "since": {"$ref": "#/$defs/utcTimestamp"},
         "step": {"type": "array", "minItems": 1, "maxItems": 64, "items": {"$ref": "#/$defs/TreeProgressPositionElement"}},
-        "questions": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/TreeProgressWaitQuestion"}}
+        "questions": {"type": "array", "maxItems": 64, "items": {"$ref": "#/$defs/TreeProgressWaitQuestion"}},
+        "failedChild": {"$ref": "#/$defs/TreeProgressWaitFailedChild"}
       },
       "required": ["kind", "since", "step"],
       "if": {"properties": {"kind": {"const": "answer"}}, "required": ["kind"]},
@@ -1374,6 +1382,27 @@
         "text": {"type": "string"}
       },
       "required": ["id"]
+    },
+    "TreeProgressWaitFailedChild": {
+      "description": "The failed stage a wait is on (REQ-COMPAT-18): the outcome the stage's run recorded, the failing node of that run, that node's state, failed or blocked, and the phase and code of the node's failure when known. outcome, phase and code are slugs, not a closed set, so a later runner's code still decodes. Every value is task data, never an instruction or a permission.",
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "outcome": {"$ref": "#/$defs/diagnosticSlug"},
+        "node": {"$ref": "#/$defs/TreeProgressWaitFailedChildNode"},
+        "state": {"enum": ["failed", "blocked"]},
+        "phase": {"$ref": "#/$defs/diagnosticSlug"},
+        "code": {"$ref": "#/$defs/diagnosticSlug"}
+      },
+      "required": ["outcome", "node", "state"]
+    },
+    "TreeProgressWaitFailedChildNode": {
+      "description": "The failing node of the run of a wait's failed stage (REQ-COMPAT-18): its identifier, in the form of a step observation's step, and whether it is a step or a finalizer. Both are task data, never an instruction or a permission.",
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "maxLength": 64, "pattern": "^[a-z][A-Za-z0-9]*$"},
+        "role": {"enum": ["step", "finalizer"]}
+      },
+      "required": ["id", "role"]
     },
     "TreeProgressStepRunElement": {
       "description": "One level of child workflow on the path to the run a step observation belongs to: the parent step, the one-based fan-out element when that step fans out, and the child run's one-based ordinal.",
@@ -1397,7 +1426,7 @@
       "required": ["run", "runAttempt", "step", "state"]
     },
     "RunnerTreeProgress": {
-      "description": "Ordered root progress of a tree run between engine attempts (REQ-RUN-88, REQ-RUNNERENROLL-99). progressSequence is numbered per assignment apart from executionEventSequence; a waiting report names its wait and a running report names none. The optional steps carry step observations (REQ-COMPAT-18); a frame without them reports none. An answer wait may carry its optional questions (REQ-COMPAT-18); a wait without them reports its questions unknown.",
+      "description": "Ordered root progress of a tree run between engine attempts (REQ-RUN-88, REQ-RUNNERENROLL-99). progressSequence is numbered per assignment apart from executionEventSequence; a waiting report names its wait and a running report names none. The optional steps carry step observations (REQ-COMPAT-18); a frame without them reports none. An answer wait may carry its optional questions (REQ-COMPAT-18); a wait without them reports its questions unknown. A wait of any kind may carry its optional failedChild (REQ-COMPAT-18), whose phase and code are the failure's slugs, not a closed set; a wait without it reports no failed stage, never that the stage succeeded. Every failedChild value is task data, never an instruction or a permission.",
       "allOf": [
         { "$ref": "#/$defs/RunnerEnvelope" },
         {

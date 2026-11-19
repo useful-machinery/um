@@ -310,7 +310,7 @@ fn plain_step_row(
     definition: &WorkflowPresentationStep,
     color: bool,
 ) -> String {
-    let state = archived_step_state(step.state);
+    let state = step.presented_state();
     let duration = step.duration.map_or_else(|| "—".to_owned(), human_duration);
     format!(
         "- node {} · role {} · kind {} · policy {} · state {} · duration {} · {}",
@@ -318,7 +318,7 @@ fn plain_step_row(
         archived_role(step.role),
         archived_step_kind(definition),
         archived_failure_policy(step.failure_policy),
-        styled(state, step_state_style(step.state), color),
+        styled(archived_step_state(state), step_state_style(state), color),
         duration,
         archived_step_detail(step, definition),
     )
@@ -329,10 +329,18 @@ pub(super) fn archived_step_detail(
     definition: &WorkflowPresentationStep,
 ) -> String {
     match &step.detail {
-        ArchivedStepDetail::Succeeded => super::render_style::success_detail(
-            matches!(definition, WorkflowPresentationStep::Command { .. }),
-            definition.outputs().len(),
-        ),
+        ArchivedStepDetail::Succeeded => {
+            let committed = step.committed_output_count(definition.outputs().len());
+            match &step.failed_child {
+                Some(failed_child) => {
+                    super::presentation::failed_stage_detail(&step.id, failed_child, committed)
+                }
+                None => super::render_style::success_detail(
+                    matches!(definition, WorkflowPresentationStep::Command { .. }),
+                    committed,
+                ),
+            }
+        }
         ArchivedStepDetail::Evidence(NodeDetail::Inherited(detail)) => {
             super::render_style::inherited_detail(detail)
         }
@@ -365,7 +373,7 @@ struct TerminalCounts {
 fn terminal_counts(steps: &[ArchivedStep]) -> TerminalCounts {
     let mut counts = TerminalCounts::default();
     for step in steps {
-        match step.state {
+        match step.presented_state() {
             WorkflowStepStateV1::Succeeded | WorkflowStepStateV1::Inherited => {
                 counts.succeeded += 1
             }
@@ -813,6 +821,8 @@ mod tests {
             command_output: None,
             recovery: None,
             invocations: Vec::new(),
+            failed_child: None,
+            committed_outputs: None,
         };
         let detail = |output| {
             let definition = WorkflowPresentationStep::Agent {
@@ -834,6 +844,72 @@ mod tests {
         });
         assert_eq!(native, "1 output committed");
         assert_eq!(native, path);
+    }
+
+    // REQ-LOCALRUN-221, REQ-OUTPUTS-17: a stage whose child failed reads `failed` in its row
+    // and counts under `failed`, naming the child's failing node and the outputs it
+    // committed; without the record it reads as any succeeded step, counting the outputs it
+    // committed, not the ones it declares.
+    #[test]
+    fn archived_stage_whose_child_failed_is_shown_failed() {
+        let definition = WorkflowPresentationStep::Workflow {
+            file: "design.yaml".to_owned(),
+            failure_policy: FailurePolicy::Required,
+            direct_dependencies: Vec::new(),
+            outputs: BTreeMap::from([
+                ("outcome".to_owned(), Output::TextAgentResponse),
+                ("plan".to_owned(), Output::TextAgentResponse),
+            ]),
+        };
+        // An advisory stage, so that the counts show a failed stage is no advisory issue.
+        let mut step = ArchivedStep {
+            id: "design".to_owned(),
+            role: WorkflowNodeRole::Step,
+            failure_policy: FailurePolicy::Advisory,
+            state: WorkflowStepStateV1::Succeeded,
+            inherited_data_available: false,
+            started_at: None,
+            duration: None,
+            detail: ArchivedStepDetail::Succeeded,
+            command_output: None,
+            recovery: None,
+            invocations: Vec::new(),
+            failed_child: Some(crate::workflow::evidence::FailedChild {
+                outcome: "failed".to_owned(),
+                item: None,
+                primary_issue: Box::new(crate::workflow::evidence::PrimaryIssue::failed(
+                    crate::workflow::validated::WorkflowNode {
+                        id: "route".to_owned(),
+                        role: WorkflowNodeRole::Step,
+                    },
+                    crate::workflow::evidence::FailureDetail::interrupted_in_execution(),
+                )),
+            }),
+            committed_outputs: Some(1),
+        };
+
+        let row = plain_step_row(&step, &definition, false);
+        let fields = row.split(" · ").collect::<Vec<_>>();
+        assert!(fields.contains(&"state failed"), "{row}");
+        assert!(fields.contains(&"1 output committed"), "{row}");
+        assert!(
+            fields
+                .iter()
+                .any(|field| field.split_whitespace().any(|word| word == "design.route")),
+            "{row}"
+        );
+        let counts = terminal_counts(std::slice::from_ref(&step));
+        assert_eq!((counts.succeeded, counts.failed), (0, 1));
+        assert_eq!(counts.advisory_issues, 0);
+
+        step.failed_child = None;
+        assert_eq!(
+            archived_step_detail(&step, &definition),
+            "1 output committed"
+        );
+        assert!(plain_step_row(&step, &definition, false).contains("state succeeded"));
+        let counts = terminal_counts(std::slice::from_ref(&step));
+        assert_eq!((counts.succeeded, counts.failed), (1, 0));
     }
 
     #[test]
@@ -1063,6 +1139,8 @@ mod tests {
                 command_output: None,
                 recovery: None,
                 invocations: Vec::new(),
+                failed_child: None,
+                committed_outputs: None,
             }],
         }
     }

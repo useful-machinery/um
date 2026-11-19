@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// RunControlRequest : A member's control for a definition-backed run, each member present only for its kind: `answer` carries `wait` and `answers`; `approve` and `retry` carry `wait`; `hand_back` carries `wait` and `notes`; `lift` may carry `wait`, which may be null, and `before`; `stop` carries `before` and may carry `reason`.
+/// RunControlRequest : A member's control for a definition-backed run, each member present only for its kind: `answer` carries `wait` and `answers`; `approve` and `retry` carry `wait`; `hand_back` carries `wait` and `notes`; `lift` may carry `wait`, which may be null, and `before`; `stop` carries `before` and may carry `reason`; `withdraw` carries no member.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunControlRequest {
     #[serde(rename = "kind")]
@@ -40,7 +40,7 @@ pub struct RunControlRequest {
 }
 
 impl RunControlRequest {
-    /// A member's control for a definition-backed run, each member present only for its kind: `answer` carries `wait` and `answers`; `approve` and `retry` carry `wait`; `hand_back` carries `wait` and `notes`; `lift` may carry `wait`, which may be null, and `before`; `stop` carries `before` and may carry `reason`.
+    /// A member's control for a definition-backed run, each member present only for its kind: `answer` carries `wait` and `answers`; `approve` and `retry` carry `wait`; `hand_back` carries `wait` and `notes`; `lift` may carry `wait`, which may be null, and `before`; `stop` carries `before` and may carry `reason`; `withdraw` carries no member.
     pub fn new(kind: models::RunControlKind) -> RunControlRequest {
         RunControlRequest {
             kind,

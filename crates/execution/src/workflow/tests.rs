@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -5,9 +6,10 @@ use super::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
 use super::codex::CodexConfig;
 use super::document::{
     Binding, BindingKind, BindingValue, EdgeTarget, FailurePolicy, FinalizationTrigger, ForEach,
-    InputDeclaration, JsonDefault, MessageSource, NodeBody, OutcomeDeclaration, Output,
-    OutputReference, RecoveryHandler, StartRule, Trigger, TriggerControlAction, ValueReference,
-    WaitKind, WaitRule, WorkflowNode,
+    InputDeclaration, Integration, IntegrationAs, IntegrationBinding, IntegrationProvider,
+    JsonDefault, MessageSource, NodeBody, OutcomeDeclaration, Output, OutputReference,
+    RecoveryHandler, StartRule, Trigger, TriggerControlAction, ValueReference, WaitKind, WaitRule,
+    WorkflowNode,
 };
 use super::pi::{PiConfig, Thinking};
 use super::validated::ValidatedHarness;
@@ -215,6 +217,49 @@ fn environment_passthrough_admits_only_the_grant_token_names_among_reserved_ones
             decode(source.as_bytes()).unwrap_err().kind(),
             DecodeFailureKind::StructuralContract,
             "accepted {names}"
+        );
+    }
+}
+
+// REQ-WFFORMAT-32, REQ-WFFORMAT-33
+#[test]
+fn declared_only_environment_names_exclude_invalid_reserved_and_inherited_names() {
+    for name in [
+        "EXAMPLE_ACCESS_TOKEN",
+        "EXAMPLE_ACCESS_TOKEN_FILE",
+        "GH_TOKEN",
+        "GITLAB_TOKEN_FILE",
+        "USEFUL_LINEAR_ACCESS_TOKEN",
+    ] {
+        assert!(
+            admission::is_declared_only_environment_name(name),
+            "refused {name:?}"
+        );
+    }
+    for name in [
+        "",
+        "1NAME",
+        "A-B",
+        "A B",
+        "NAMÉ",
+        "USEFUL_HOME",
+        "SCHERZO_CONTINUATION_CONTEXT",
+        "GITHUB_TOKEN",
+        "GIT_CONFIG_KEY_0",
+        "SSH_AUTH_SOCK",
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TERM",
+        "TMPDIR",
+    ] {
+        assert!(
+            !admission::is_declared_only_environment_name(name),
+            "admitted {name:?}"
         );
     }
 }
@@ -611,9 +656,10 @@ fn root_workflow_decodes_name_version_root_blocks_and_input_completion() {
         inputs,
         stop_before: None,
         owner: None,
+        busy_behavior: None,
     } = &root.triggers["start"]
     else {
-        panic!("start must be an event start trigger without stopBefore or owner");
+        panic!("start must be an event start trigger without stopBefore, owner or busyBehavior");
     };
     assert_eq!(on.source, "$connection");
     assert_eq!(on.event, "issue.state_entered");
@@ -721,6 +767,68 @@ fn root_workflow_decodes_name_version_root_blocks_and_input_completion() {
             }
         );
         assert!(workflow.root.is_none());
+    }
+}
+
+// REQ-WFDEF-34, REQ-WFFORMAT-82
+#[test]
+fn root_requires_decodes_as_and_integrations_as_declared() {
+    let workflow =
+        decode(&fs::read(fixture_root().join("valid/root-integrations.yaml")).unwrap()).unwrap();
+    let requires = workflow.root.unwrap().requires.unwrap();
+    assert!(requires.tools.is_empty());
+    assert_eq!(requires.acting_as, Some(IntegrationAs::Member));
+    assert_eq!(
+        requires.integrations,
+        BTreeMap::from([
+            (
+                IntegrationProvider::Linear,
+                Integration {
+                    acting_as: Some(IntegrationAs::Org),
+                    bindings: BTreeMap::from([(
+                        "team".to_owned(),
+                        IntegrationBinding {
+                            kind: "team".to_owned()
+                        }
+                    )]),
+                }
+            ),
+            (IntegrationProvider::Github, Integration::default()),
+            (IntegrationProvider::ClaudeCode, Integration::default()),
+        ])
+    );
+
+    let workflow =
+        decode(&fs::read(fixture_root().join("valid/root-workflow.yaml")).unwrap()).unwrap();
+    let requires = workflow.root.unwrap().requires.unwrap();
+    assert_eq!(requires.tools, ["git", "gh", "python3"]);
+    assert_eq!(requires.acting_as, None);
+    assert!(requires.integrations.is_empty());
+}
+
+// REQ-WFDEF-34
+#[test]
+fn every_schema_integration_provider_decodes_to_its_closed_id() {
+    let schema: Value = serde_json::from_str(STRUCTURAL_SCHEMA).unwrap();
+    let ids = schema["$defs"]["IntegrationProvider"]["enum"]
+        .as_array()
+        .expect("the schema lists the provider ids");
+    assert!(!ids.is_empty());
+    for id in ids {
+        let id = id.as_str().unwrap();
+        let source = format!(
+            "schemaVersion: 1\nrequires:\n  integrations:\n    \"{id}\": {{}}\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n"
+        );
+        let workflow = decode(source.as_bytes()).unwrap_or_else(|error| {
+            panic!("a file declaring {id} decodes: {error:?}");
+        });
+        let integrations = workflow.root.unwrap().requires.unwrap().integrations;
+        let keys: Vec<&str> = integrations
+            .keys()
+            .copied()
+            .map(IntegrationProvider::as_str)
+            .collect();
+        assert_eq!(keys, [id]);
     }
 }
 
@@ -964,7 +1072,7 @@ fn structural_violation(source: &[u8]) -> (Option<String>, String, Option<serde_
     )
 }
 
-// REQ-WFFORMAT-103
+// REQ-WFFORMAT-103, REQ-WFDEF-34
 #[test]
 fn a_structural_failure_names_the_field_and_the_rule() {
     let mut hyphenated = canonical_valid_fixture();
@@ -1046,6 +1154,37 @@ fn a_structural_failure_names_the_field_and_the_rule() {
             "output-unlisted-pair.yaml",
             "steps.produce.outputs.summary",
             "form",
+            None,
+        ),
+        // An unknown provider id or `as` names the allowed values.
+        (
+            "root-integration-unknown-provider.yaml",
+            "requires.integrations.jira",
+            "enum",
+            Some(serde_json::json!([
+                "github",
+                "gitlab.com",
+                "linear",
+                "claude_code",
+                "codex"
+            ])),
+        ),
+        (
+            "root-integration-as-unknown.yaml",
+            "requires.integrations.linear.as",
+            "enum",
+            Some(serde_json::json!(["member", "org"])),
+        ),
+        (
+            "root-requires-as-unknown.yaml",
+            "requires.as",
+            "enum",
+            Some(serde_json::json!(["member", "org"])),
+        ),
+        (
+            "root-integration-unknown-field.yaml",
+            "requires.integrations.linear.scopes",
+            "unknown_field",
             None,
         ),
     ] {

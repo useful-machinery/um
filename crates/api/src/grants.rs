@@ -9,6 +9,7 @@ use serde::Deserialize;
 
 use super::generated::{apis, models};
 use super::http_client::zeroize_generated_bearer_access_token;
+use super::member_grants::{PROVIDER_VOCABULARY, oauth_provider};
 use super::resource::{
     ProblemFailure, ProblemRow, ResourceFailure, classify_problem_error, confirmed_delete,
     expect_problem_status, receive_raw, resource_configuration, validate_json_media_type,
@@ -19,7 +20,6 @@ pub type Grant = models::ProviderGrant;
 pub type GrantUse = models::ProviderGrantUse;
 pub type GrantUseList = models::ProviderGrantUseList;
 pub type GrantSession = models::ProviderGrantSession;
-pub type GrantProvider = models::create_grant_session_request::Provider;
 pub type GrantState = models::provider_grant::State;
 pub type GrantSessionStatus = models::provider_grant_session::Status;
 pub type GrantSessionReason = models::provider_grant_session::ReasonCode;
@@ -167,16 +167,18 @@ impl GrantApi {
         Ok(Self { configuration })
     }
 
-    /// Starts a consent that creates the identity link and the grant together.
-    pub fn start(&self, provider: GrantProvider, key: &str) -> Result<GrantSession, GrantFailure> {
+    /// Starts a consent that creates the identity link and the grant together at the provider
+    /// its wire name names.
+    pub fn start(&self, provider: &str, key: &str) -> Result<GrantSession, GrantFailure> {
         let session = apis::principals_api::create_grant_session(
             &self.configuration,
             key,
-            models::CreateGrantSessionRequest::new(provider),
+            models::CreateGrantSessionRequest::new(provider.to_owned()),
+            Some(PROVIDER_VOCABULARY),
         )
         .map_err(classify_error)?;
         let session = validate_session(session, None)?;
-        if useful_support::wire_name(session.provider) != useful_support::wire_name(provider) {
+        if session.provider != provider {
             return Err(invalid());
         }
         Ok(session)
@@ -196,6 +198,7 @@ impl GrantApi {
             &self.configuration,
             identity_id,
             key,
+            Some(PROVIDER_VOCABULARY),
         )
         .map_err(classify_error)?;
         let session = validate_session(session, None)?;
@@ -214,11 +217,10 @@ impl GrantApi {
             apis::urlencode(id)
         );
         let response = expect_problem_status(
-            receive_raw(super::generated_api_request(
-                &self.configuration,
-                reqwest::Method::GET,
-                &endpoint,
-            ))?,
+            receive_raw(
+                super::generated_api_request(&self.configuration, reqwest::Method::GET, &endpoint)
+                    .query(&[("vocabulary", PROVIDER_VOCABULARY)]),
+            )?,
             StatusCode::OK,
             &PROBLEMS,
         )?;
@@ -244,6 +246,7 @@ impl GrantApi {
         if let Some(cursor) = cursor {
             request = request.query(&[("cursor", cursor)]);
         }
+        request = request.query(&[("vocabulary", PROVIDER_VOCABULARY)]);
         let response = expect_problem_status(receive_raw(request)?, StatusCode::OK, &PROBLEMS)?;
         validate_json_media_type(&response.headers)?;
         let page: GrantList = serde_json::from_slice(&response.body).map_err(|_| invalid())?;
@@ -259,9 +262,14 @@ impl GrantApi {
         limit: Option<i32>,
         cursor: Option<&str>,
     ) -> Result<GrantUseList, GrantFailure> {
-        let page =
-            apis::principals_api::list_grant_uses(&self.configuration, grant_id, limit, cursor)
-                .map_err(classify_error)?;
+        let page = apis::principals_api::list_grant_uses(
+            &self.configuration,
+            grant_id,
+            limit,
+            cursor,
+            Some(PROVIDER_VOCABULARY),
+        )
+        .map_err(classify_error)?;
         if !page.items.iter().all(|item| valid_use(item, grant_id)) {
             return Err(invalid());
         }
@@ -286,6 +294,7 @@ impl Drop for GrantApi {
 
 fn valid_grant(value: &Grant) -> bool {
     useful_support::valid_typed_id(&value.id, "pgr_")
+        && oauth_provider(&value.provider)
         && useful_support::valid_typed_id(&value.identity_id, "idn_")
         && !value.created_at.is_empty()
         && [
@@ -300,6 +309,7 @@ fn valid_grant(value: &Grant) -> bool {
 fn valid_use(value: &GrantUse, grant_id: &str) -> bool {
     useful_support::valid_typed_id(&value.id, "pgu_")
         && value.grant_id == grant_id
+        && oauth_provider(&value.provider)
         && !value.run_id.is_empty()
         && !value.assignment_id.is_empty()
         && !value.organization_id.is_empty()
@@ -311,6 +321,7 @@ fn validate_session(value: GrantSession, id: Option<&str>) -> Result<GrantSessio
     let completed = value.status == GrantSessionStatus::ProviderGrantSessionStatusCompleted;
     if !useful_support::valid_typed_id(&value.id, "pgs_")
         || id.is_some_and(|id| value.id != id)
+        || !oauth_provider(&value.provider)
         || value.created_at.is_empty()
         || value.expires_at.is_empty()
         || (!pending && value.authorization_url.is_some())
@@ -383,7 +394,10 @@ mod tests {
         let result = api.session("pgs_01k0z6r1w8f4jy2m7q9v3x5abc");
         let request = server.finish_one();
         assert!(
-            request.starts_with("GET /api/v1/me/grant-sessions/pgs_01k0z6r1w8f4jy2m7q9v3x5abc ")
+            request.starts_with(
+                "GET /api/v1/me/grant-sessions/pgs_01k0z6r1w8f4jy2m7q9v3x5abc?vocabulary=2 "
+            ),
+            "{request}"
         );
         result
     }
@@ -429,6 +443,7 @@ mod tests {
     }
 
     // REQ-GRANT-1
+    // REQ-GRANT-96
     #[test]
     fn session_polling_keeps_retry_after_and_admits_only_a_pending_https_consent_url() {
         let body = r#"{"type":"https://api.usefulmachinery.com/problems/rate-limit-exceeded","title":"Slow down","status":429}"#;

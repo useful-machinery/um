@@ -11,7 +11,7 @@ use super::document::{
     Agent, AgentProfile, CommonNode, ConditionOperand, ConditionPredicate, EdgeTarget,
     ExportPresentation, FailurePolicy, FinalizerDefinition, ForEach, InputDeclaration, JsonDefault,
     MessageSource, NodeBody, Output, OutputReference, PresentationSource, RecoveryHandler,
-    StepDefinition, StepRecovery, ValueReference, WaitKind, WaitRule, WorkflowDocument,
+    RootBlocks, StepDefinition, StepRecovery, ValueReference, WaitKind, WaitRule, WorkflowDocument,
 };
 use super::evidence::{MAXIMUM_PREREQUISITES, Prerequisite};
 use super::export_presentation::{Field, resolve_text};
@@ -254,7 +254,10 @@ impl ChildWorkflowSummary {
                 })
                 .collect(),
             nesting: nesting_of(child),
-            has_root_blocks: child.root.is_some()
+            has_root_blocks: child
+                .root
+                .as_ref()
+                .is_some_and(|blocks| blocks.without_override() != RootBlocks::default())
                 || child.name.is_some()
                 || child.version.is_some()
                 || child.subject.is_some(),
