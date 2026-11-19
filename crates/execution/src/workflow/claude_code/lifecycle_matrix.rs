@@ -666,7 +666,8 @@ impl LifecycleCell {
     }
 
     /// A messaged subagent whose own backgrounded command outlives it, released in the drain
-    /// and not cancelled: the messaged run settles in the drain and Claude Code's own resume
+    /// once the messaged run is announced and not cancelled: the command finishes while the
+    /// messaged run is outstanding, the run settles in the drain, and Claude Code's own resume
     /// that delivers the command's report follows at once, so two notifications are queued for
     /// the main thread, the messaged run's, which the resume supersedes, and the report run's
     /// (chapter 14's "command outliving it" row). The binary opens the superseded
@@ -1278,6 +1279,58 @@ fn carries_a_notification(request: &ControlledProviderRequest) -> bool {
         .contains("<task-notification>")
 }
 
+/// The results of the `SendMessage` calls in the conversation a request continues, in call
+/// order: each returned call's `tool_result` content parsed as JSON, or as a string when it is
+/// not JSON. A call whose result the conversation does not yet carry is left out.
+fn send_message_results(body: &Value) -> Vec<Value> {
+    let messages = body["messages"]
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let blocks = || {
+        messages
+            .iter()
+            .filter_map(|message| message["content"].as_array())
+            .flatten()
+    };
+    let result = |id: &str| {
+        blocks().find(|block| block["type"] == "tool_result" && block["tool_use_id"] == id)
+    };
+    blocks()
+        .filter(|block| block["type"] == "tool_use" && block["name"] == "SendMessage")
+        .filter_map(|call| result(call["id"].as_str()?))
+        .map(|result| {
+            let text = match &result["content"] {
+                Value::String(text) => text.clone(),
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|part| part["text"].as_str())
+                    .collect(),
+                other => other.to_string(),
+            };
+            serde_json::from_str(&text).unwrap_or(Value::String(text))
+        })
+        .collect()
+}
+
+/// Fails the cell when a `SendMessage` call in the conversation a main-thread request
+/// continues has a result that names no resumed agent (`resumedAgentId`, which every result
+/// of a message that started a run carries on 2.1.321). Claude Code answers a message to a
+/// subagent it is already resuming on its own without starting a run for it (chapter 14's
+/// `SendMessage` row), and a cell's script models the message's run.
+fn assert_every_message_started_a_run(body: &Value) {
+    for result in send_message_results(body) {
+        assert!(
+            result["resumedAgentId"]
+                .as_str()
+                .is_some_and(|agent_id| !agent_id.is_empty()),
+            "the SendMessage started no run: Claude Code was already resuming the subagent on \
+             its own, and answered {}",
+            result.get("message").unwrap_or(&result)
+        );
+    }
+}
+
 impl SubagentThread {
     fn new(prompt: &'static str, calls: impl IntoIterator<Item = (&'static str, Value)>) -> Self {
         Self {
@@ -1402,6 +1455,13 @@ struct Session {
     /// A main-thread request that arrived while the driver awaited the subagent's, kept
     /// unanswered for the next main-thread read.
     deferred_main_request: Option<ControlledProviderRequest>,
+    /// The finished backgrounded subagent's own command, still blocked, which the first
+    /// message releases once the messaged run is announced (`release_once_messaged`).
+    released_once_messaged: Option<BlockedCommand>,
+    /// The count of the backgrounded subagent's `completed` statuses at which Claude Code's
+    /// own resume for that command's report has completed, until `await_the_report_run`
+    /// has awaited it.
+    report_run_completes_at: Option<usize>,
 }
 
 impl Session {
@@ -1436,6 +1496,7 @@ impl Session {
                     if self.first_request_tools.is_none() {
                         self.first_request_tools = Some(tool_names(request.body()));
                     }
+                    assert_every_message_started_a_run(request.body());
                     let nags = enforcement_nags(request.body());
                     self.nags_in_the_last_request = nags.saturating_sub(self.nags_in_conversation);
                     self.nags_in_conversation = nags;
@@ -1497,9 +1558,12 @@ impl Session {
     /// `request`'s turn, ends that turn while the resumed run's first request is held (with
     /// `wakeup`, after scheduling a wakeup, whose turn then runs during the resumed run), and
     /// returns the request of the turn the resumed run's notification wakes, or `None` once
-    /// the invocation has ended instead (a known gap's rejection). The resumed run's
-    /// requests open with the subagent's prompt, and its thread, its calls done, answers
-    /// them with its closing text.
+    /// the invocation has ended instead (a known gap's rejection). A subagent command left
+    /// blocked for the message is released once the resumed run is announced
+    /// (`release_once_messaged`), and that request is returned once the report run that
+    /// follows the resumed run has completed (`await_the_report_run`). The resumed run's
+    /// requests open with the subagent's prompt, and its thread, its calls done, answers them
+    /// with its closing text.
     async fn resume(
         &mut self,
         request: ControlledProviderRequest,
@@ -1510,6 +1574,7 @@ impl Session {
             .clone()
             .expect("the cell launched a backgrounded subagent");
         let turns = self.completed_turns();
+        let resumed = self.subagent_reported("resumed");
         release_second(
             request,
             "messaging the finished subagent",
@@ -1517,6 +1582,7 @@ impl Session {
             send_message(&agent_id),
         );
         self.subagent().hold_its_turn();
+        self.release_once_messaged(resumed).await;
         if wakeup {
             let request = self.next_main_request().await;
             self.schedule_wakeup(request, Round::AnotherRound).await;
@@ -1524,15 +1590,18 @@ impl Session {
             self.wait_out_turn(turns + 1).await;
         }
         self.close_the_subagents_turn();
+        self.await_the_report_run().await;
         self.next_turn_or_end().await
     }
 
     /// The same-round resume: messages the finished backgrounded subagent from `request`'s
     /// turn in the message that answers the turn, the resumed run holding its turn as
-    /// `resume`'s does, and returns the main thread's next request, which `drive` answers
-    /// before the resumed run is closed (`close_its_held_turn_after`). When the answer ended
-    /// the turn instead, the resumed run is closed once held and the request of the turn its
-    /// notification wakes is returned, or `None` once the invocation has ended.
+    /// `resume`'s does and a subagent command left blocked for the message released as
+    /// `resume` releases it, and returns the main thread's next request, which `drive`
+    /// answers before the resumed run is closed (`close_its_held_turn_after`). When the answer
+    /// ended the turn instead, the resumed run is closed once held and the request of the turn
+    /// its notification wakes is returned once any report run has completed
+    /// (`await_the_report_run`), or `None` once the invocation has ended.
     async fn resume_in_the_same_round(
         &mut self,
         request: ControlledProviderRequest,
@@ -1542,6 +1611,7 @@ impl Session {
             .clone()
             .expect("the cell launched a backgrounded subagent");
         let turns = self.completed_turns();
+        let resumed = self.subagent_reported("resumed");
         self.answer_with(
             request,
             "messaging the finished subagent",
@@ -1549,6 +1619,7 @@ impl Session {
             send_message(&agent_id),
         );
         self.subagent().hold_its_turn();
+        self.release_once_messaged(resumed).await;
         let observations = self.observations.clone();
         let ended = wait_for_completed_turns(&observations, turns + 1);
         tokio::pin!(ended);
@@ -1559,15 +1630,17 @@ impl Session {
         self.notes
             .push("the same-round answer ended the turn without another round".into());
         self.close_its_held_turn_after(turns).await;
+        self.await_the_report_run().await;
         self.next_turn_or_end().await
     }
 
     /// The in-drain resume answered before the report (AUTO-64): messages the finished
-    /// backgrounded subagent from `request`'s turn, and while the main thread's next round
-    /// is held, closes the messaged run, whose notification is queued for the main thread
-    /// and superseded when Claude Code resumes the subagent once more for its command's
-    /// report; holds that resumed run and answers the held round with the mode's value while
-    /// it is outstanding. In Result mode the candidate is premature and the adapter's
+    /// backgrounded subagent from `request`'s turn while its own command is blocked, and
+    /// while the main thread's next round is held, releases the command once the messaged run
+    /// is announced (`release_once_messaged`), then closes the messaged run, whose
+    /// notification is queued for the main thread and superseded when Claude Code resumes the
+    /// subagent once more for its command's report; holds that resumed run and answers the
+    /// held round with the mode's value while it is outstanding. In Result mode the candidate is premature and the adapter's
     /// correction prompt joins the queue behind the superseded notification. The resumed run
     /// is closed once the turn has ended (after the rejection in Result mode), and the main
     /// thread's next request is returned once the parser has seen the run complete, or
@@ -1581,6 +1654,7 @@ impl Session {
             .clone()
             .expect("the cell launched a backgrounded subagent");
         let turns = self.completed_turns();
+        let resumed = self.subagent_reported("resumed");
         release_second(
             request,
             "messaging the finished subagent",
@@ -1589,6 +1663,7 @@ impl Session {
         );
         self.subagent().hold_its_turn();
         let held = self.next_main_request().await;
+        self.release_once_messaged(resumed).await;
         self.serve_the_subagent_until_it_holds_a_request(false)
             .await;
         self.close_the_subagents_turn();
@@ -1675,28 +1750,120 @@ impl Session {
     /// (`deferred_main_request`).
     async fn serve_the_subagent_until_it_holds_a_request(&mut self, defer_the_main_thread: bool) {
         while !self.subagent().holds_a_request() {
-            let request = tokio::select! {
-                request = self.provider.next_request() => request,
-                outcome = &mut self.terminal => panic!(
-                    "the invocation ended before the subagent's request was held: {}",
-                    describe(&outcome.unwrap())
-                ),
-            };
-            if defer_the_main_thread && !request.opens_with(self.subagent().prompt) {
-                assert!(
-                    self.deferred_main_request.replace(request).is_none(),
-                    "the main thread asked twice while the subagent's request was awaited"
-                );
-                continue;
-            }
-            let subagent = self.subagent();
-            assert!(
-                request.opens_with(subagent.prompt),
-                "the main thread asked while the subagent's request was awaited: {}",
-                last_message(request.body())
-            );
-            subagent.answer(request);
+            let request = self
+                .next_request_before("the subagent's request was held")
+                .await;
+            self.serve_the_subagent_with(request, defer_the_main_thread);
         }
+    }
+
+    /// The loopback's next request, from either thread, which must arrive before the
+    /// invocation ends: `awaited` names what the driver awaits.
+    async fn next_request_before(&mut self, awaited: &str) -> ControlledProviderRequest {
+        tokio::select! {
+            request = self.provider.next_request() => request,
+            outcome = &mut self.terminal => panic!(
+                "the invocation ended before {awaited}: {}",
+                describe(&outcome.unwrap())
+            ),
+        }
+    }
+
+    /// Answers the subagent's `request` through its thread. A main-thread request must not
+    /// come unless `defer_the_main_thread`, when its one request is kept unanswered
+    /// (`deferred_main_request`).
+    fn serve_the_subagent_with(
+        &mut self,
+        request: ControlledProviderRequest,
+        defer_the_main_thread: bool,
+    ) {
+        if request.opens_with(self.subagent().prompt) {
+            return self.subagent().answer(request);
+        }
+        assert!(
+            defer_the_main_thread,
+            "the main thread asked while the subagent's request was awaited: {}",
+            last_message(request.body())
+        );
+        assert_every_message_started_a_run(request.body());
+        assert!(
+            self.deferred_main_request.replace(request).is_none(),
+            "the main thread asked twice while the driver awaited the subagent"
+        );
+    }
+
+    /// How many times the backgrounded subagent has reported `status`.
+    fn subagent_reported(&self, status: &str) -> usize {
+        backgrounded_subagent_statuses(&self.observations)
+            .iter()
+            .filter(|reported| *reported == status)
+            .count()
+    }
+
+    /// Serves the subagent until `condition` completes, keeping the main thread's one request
+    /// meanwhile unanswered (`deferred_main_request`); `awaited` names the condition.
+    async fn serve_the_subagent_deferring_the_main_thread(
+        &mut self,
+        condition: impl Future<Output = ()>,
+        awaited: &str,
+    ) {
+        tokio::pin!(condition);
+        loop {
+            tokio::select! {
+                () = &mut condition => return,
+                request = self.next_request_before(awaited) => {
+                    self.serve_the_subagent_with(request, true);
+                }
+            }
+        }
+    }
+
+    /// Releases the finished subagent's own command that waits for the cell's first message
+    /// (`released_once_messaged`) once the parser has announced the messaged run, the
+    /// `resumed` run after the `resumed` runs announced before the message, and awaits the
+    /// command's end; a no-op when no command waits. The messaged run's request is held
+    /// meanwhile (`hold_its_turn`), so the command finishes while that run is outstanding and
+    /// Claude Code's own resume that delivers its report follows the run in the drain
+    /// (chapter 14's "command outliving it" row). The main thread's round that returns the
+    /// `SendMessage` result may come before the announcement; it is kept unanswered for the
+    /// next main-thread read.
+    async fn release_once_messaged(&mut self, resumed: usize) {
+        let Some(command) = self.released_once_messaged.take() else {
+            return;
+        };
+        let observations = self.observations.clone();
+        self.serve_the_subagent_deferring_the_main_thread(
+            wait_for_subagent_status(&observations, "resumed", resumed + 1),
+            "the messaged run was announced",
+        )
+        .await;
+        // The messaged run's completion and the report run's follow.
+        self.report_run_completes_at = Some(self.subagent_reported("completed") + 2);
+        assert!(
+            command.release().await,
+            "the harness stopped the subagent's command at the subagent's completion"
+        );
+        command.finished().await;
+    }
+
+    /// Once the messaged run is closed, serves the subagent until Claude Code's own resume for
+    /// the report of the command `release_once_messaged` released has completed, keeping the
+    /// main thread's request meanwhile for the next main-thread read; a no-op after any other
+    /// message. Claude Code enqueues that report for the subagent only after the messaged run
+    /// has ended, so the messaged run's notification can open a turn with a model call before
+    /// the report run begins (chapter 14's "command outliving it" row), and a value answered
+    /// there would race the report run: in Result mode a premature candidate the adapter
+    /// rejects once more, in Response and None modes a step settled before the report.
+    async fn await_the_report_run(&mut self) {
+        let Some(completions) = self.report_run_completes_at.take() else {
+            return;
+        };
+        let observations = self.observations.clone();
+        self.serve_the_subagent_deferring_the_main_thread(
+            wait_for_subagent_status(&observations, "completed", completions),
+            "the report run completed",
+        )
+        .await;
     }
 
     /// A same-round followup: releases the `name` call and the turn's answer as blocks of one
@@ -2038,6 +2205,7 @@ impl Session {
             match &mut self.subagent {
                 Some(subagent) if request.opens_with(subagent.prompt) => subagent.answer(request),
                 _ => {
+                    assert_every_message_started_a_run(request.body());
                     self.notes.push(format!(
                         "the main thread asked again after the final answer: {}",
                         last_message(request.body())
@@ -2241,6 +2409,8 @@ async fn drive(
         nags_refused: 0,
         nags_refused_while_waiting: 0,
         deferred_main_request: None,
+        released_once_messaged: None,
+        report_run_completes_at: None,
     };
     let Handoff {
         request,
@@ -2800,7 +2970,15 @@ async fn drive_background_agent(
             Ending::Settle,
         ) => {
             main_thread.release_text(WAITING);
-            release_after_the_subagent(session, command).await
+            if followup.resumes() == 0 {
+                release_after_the_subagent(session, command).await
+            } else {
+                // The message goes out while the command is blocked, so that Claude Code has
+                // no report to resume the subagent for before the messaged run.
+                let notified = notified_turn_with_the_task_blocked(session, &command).await;
+                session.released_once_messaged = Some(command);
+                Handoff::turn(notified)
+            }
         }
         (
             SubagentWork::BackgroundBash {
@@ -2940,7 +3118,11 @@ async fn notified_turn_with_the_task_blocked(
 /// leaving its own backgrounded `command` blocked, so the subagent's completion alone
 /// pauses the drain. The command is released after that completion, once the notified
 /// turn has begun, so it outlives the subagent; the notified turn's request is handed back
-/// once the command has finished.
+/// once the command has finished. A cell that messages the subagent from that turn keeps the
+/// command blocked for the message instead (`Session::release_once_messaged`): released here,
+/// Claude Code would begin its own resume of the subagent for the command's report as the
+/// message goes out, and answer the message `already waking` without starting a run
+/// (AUTO-792).
 async fn release_after_the_subagent(session: &mut Session, command: BlockedCommand) -> Handoff {
     let notified = notified_turn_with_the_task_blocked(session, &command).await;
     assert!(
