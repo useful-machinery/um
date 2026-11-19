@@ -16,7 +16,7 @@
 //! nothing, keeps the resolution record the first attempt wrote and drives the run directory
 //! the retained home holds, applying its deliveries and controls in the same loop.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::DirBuilder;
 use std::io::Write as _;
@@ -27,8 +27,7 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 use useful_execution::{
-    CancellationPolicy, CancellationSource, CaptureCancellation, EnvironmentSnapshot,
-    ResolvedInput, ResolvedInputs,
+    CancellationPolicy, CancellationSource, CaptureCancellation, ResolvedInput, ResolvedInputs,
 };
 use useful_runner_protocol::{
     AssignmentDecline, ExecutionSpecInvalidReason, ExecutionSpecV1RunnerProjection, RunControl,
@@ -37,7 +36,9 @@ use useful_runner_protocol::{
 
 use super::Sleeper;
 use super::run_inputs::PreparationDeadline;
+use crate::agent_login::CommandEnvironment;
 
+mod activity;
 mod command;
 mod download;
 mod exports;
@@ -47,6 +48,7 @@ mod steps;
 #[cfg(test)]
 mod tests;
 
+pub(super) use activity::{HeldRuns, RunActivity};
 pub(super) use download::{HttpTreeBroker, TreeBroker, is_safe_tree_path};
 pub(super) use records::{TransportResult, TreeConclusion};
 pub(super) use resume_loop::{DriveFailure, ReportSink, TreeEnd};
@@ -104,6 +106,13 @@ impl TreeRunDependencies {
         self.controls.push(assignment_id, control);
     }
 
+    /// Drops the deliveries and controls still queued for `assignment_id`, which has ended,
+    /// so the runner keeps nothing of an ended assignment's for the life of its boot.
+    pub(super) fn forget(&self, assignment_id: &str) {
+        self.deliveries.forget(assignment_id);
+        self.controls.forget(assignment_id);
+    }
+
     /// The executable the workspace's workflow-Git helper runs in its internal helper mode
     /// (REQ-RUNNERENROLL-121).
     pub(super) fn helper_executable(&self) -> std::io::Result<PathBuf> {
@@ -157,46 +166,73 @@ impl Inbound for RunControl {
     }
 }
 
-/// The trigger deliveries, or the controls, the connection received and the tree run of
-/// their assignment has not yet taken, in arrival order and each id once. The runner holds
-/// one assignment at a time, so an item for another assignment drops those still queued
-/// for an earlier one.
+/// The trigger deliveries, or the controls, the connection received for each assignment the
+/// runner holds and its tree run has not yet taken. Each assignment has a queue of its own,
+/// so an item for one neither drops nor wakes another's (INV-RUNNER-40).
 #[derive(Clone)]
 struct Inbox<T> {
-    queued: Arc<Mutex<VecDeque<(String, T)>>>,
-    arrived: Arc<Notify>,
+    queues: Arc<Mutex<BTreeMap<String, Arc<AssignmentInbox<T>>>>>,
 }
 
 impl<T> Default for Inbox<T> {
     fn default() -> Self {
         Self {
-            queued: Arc::default(),
-            arrived: Arc::default(),
+            queues: Arc::default(),
         }
     }
 }
 
 impl<T: Inbound> Inbox<T> {
     fn push(&self, assignment_id: &str, item: T) {
+        self.of(assignment_id).push(item);
+    }
+
+    /// The queue of `assignment_id`, made empty when it has none: an item can arrive
+    /// before the assignment's tree run exists, and it is kept for that run.
+    fn of(&self, assignment_id: &str) -> Arc<AssignmentInbox<T>> {
+        let mut queues = self.queues.lock().unwrap_or_else(PoisonError::into_inner);
+        Arc::clone(queues.entry(assignment_id.to_owned()).or_default())
+    }
+
+    /// Drops the queue of `assignment_id`, which has ended.
+    fn forget(&self, assignment_id: &str) {
+        self.queues
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(assignment_id);
+    }
+}
+
+/// One assignment's trigger deliveries, or its controls, in arrival order and each id once.
+struct AssignmentInbox<T> {
+    queued: Mutex<VecDeque<T>>,
+    arrived: Notify,
+}
+
+impl<T> Default for AssignmentInbox<T> {
+    fn default() -> Self {
+        Self {
+            queued: Mutex::default(),
+            arrived: Notify::new(),
+        }
+    }
+}
+
+impl<T: Inbound> AssignmentInbox<T> {
+    fn push(&self, item: T) {
         {
             let mut queued = self.queued.lock().unwrap_or_else(PoisonError::into_inner);
-            queued.retain(|(queued_for, _)| queued_for == assignment_id);
-            if queued.iter().any(|(_, queued)| queued.id() == item.id()) {
+            if queued.iter().any(|queued| queued.id() == item.id()) {
                 return;
             }
-            queued.push_back((assignment_id.to_owned(), item));
+            queued.push_back(item);
         }
         self.arrived.notify_one();
     }
 
-    /// Removes and returns the items queued for `assignment_id`.
-    fn take(&self, assignment_id: &str) -> Vec<T> {
-        let mut queued = self.queued.lock().unwrap_or_else(PoisonError::into_inner);
-        let (taken, kept) = std::mem::take(&mut *queued)
-            .into_iter()
-            .partition::<VecDeque<_>, _>(|(queued_for, _)| queued_for == assignment_id);
-        *queued = kept;
-        taken.into_iter().map(|(_, item)| item).collect()
+    /// Removes and returns the items queued.
+    fn take(&self) -> Vec<T> {
+        std::mem::take(&mut *self.queued.lock().unwrap_or_else(PoisonError::into_inner)).into()
     }
 
     /// Completes once an item has been queued since the last completion.
@@ -304,11 +340,11 @@ pub(super) struct TreeRun {
     runs: PathBuf,
     documents: PathBuf,
     intervals: ResumeIntervals,
-    assignment_id: String,
-    deliveries: Inbox<TriggerDelivery>,
-    /// The Cloud controls for the run; a wait whose rule source is `useful` is evaluated again
-    /// only once one is applied.
-    controls: Inbox<RunControl>,
+    /// The trigger deliveries for the run's assignment.
+    deliveries: Arc<AssignmentInbox<TriggerDelivery>>,
+    /// The Cloud controls for the run's assignment; a wait whose rule source is `um` is
+    /// evaluated again only once one is applied.
+    controls: Arc<AssignmentInbox<RunControl>>,
     /// The deliveries the offer carried, applied before the run's first step: after
     /// `create`, or before an adopted run's first command.
     pending: Vec<TriggerDelivery>,
@@ -342,9 +378,8 @@ impl TreeRun {
             runs,
             documents,
             intervals: dependencies.intervals,
-            assignment_id: offer.assignment_id.to_owned(),
-            deliveries: dependencies.deliveries.clone(),
-            controls: dependencies.controls.clone(),
+            deliveries: dependencies.deliveries.of(offer.assignment_id),
+            controls: dependencies.controls.of(offer.assignment_id),
             pending: offer.pending.to_vec(),
         }
     }
@@ -353,13 +388,22 @@ impl TreeRun {
         &self.cancellation
     }
 
+    /// Whether the run is working, which the assignment manager shares with it so
+    /// agent-login setup and the offer rule can read it (INV-RUNNER-15, INV-RUNNER-40).
+    pub(super) fn activity(&self) -> &Arc<RunActivity> {
+        &self.useful.activity
+    }
+
     /// Runs `useful workflow run create`, or adopts the home's run, and resumes the run until
     /// its record reads `exited` or the assignment's cancellation ends it, applying the
     /// cancellation to each process and each trigger delivery and control to the run, and
     /// queuing each new root progress and step report and each application through `reports`. The
     /// loop's future is boxed so it does not enlarge the job's stack frame, which in a
-    /// debug build holds the tree job's future before boxing it.
+    /// debug build holds the tree job's future before boxing it. The run is working again
+    /// once the loop returns or is dropped, whatever ended it, so its release and report
+    /// count as work (INV-RUNNER-15).
     pub(super) async fn drive(&self, reports: ReportSink<'_>) -> Result<TreeEnd, DriveFailure> {
+        let _working = self.activity().working_at_end();
         Box::pin(resume_loop::drive(self, reports)).await
     }
 }
@@ -371,7 +415,7 @@ pub(super) struct TreePreparation<'a> {
     pub(super) tree: &'a WorkflowTreeV1RunnerProjection,
     pub(super) private: &'a Path,
     pub(super) workspace: &'a Path,
-    pub(super) environment: &'a EnvironmentSnapshot,
+    pub(super) environment: &'a CommandEnvironment,
     pub(super) deadline: PreparationDeadline,
     pub(super) cancellation: &'a CaptureCancellation,
     pub(super) sleeper: Arc<dyn Sleeper>,
@@ -421,6 +465,7 @@ pub(super) fn prepare(
         executable: (dependencies.executable)()
             .map_err(|_| environment_decline("workflow_tree_publication"))?,
         environment: preparation.environment.clone(),
+        activity: RunActivity::new(),
         home: layout.home.clone(),
         log: RunLog::new(layout.log.clone()),
         sleeper: Arc::clone(&preparation.sleeper),
@@ -539,7 +584,7 @@ pub(super) struct TreeAdoption<'a> {
     pub(super) assignment_id: &'a str,
     pub(super) home: &'a Path,
     pub(super) private: &'a Path,
-    pub(super) environment: &'a EnvironmentSnapshot,
+    pub(super) environment: &'a CommandEnvironment,
     pub(super) execution_spec: &'a ExecutionSpecV1RunnerProjection,
     pub(super) sleeper: Arc<dyn Sleeper>,
     pub(super) steps: &'a [String],
@@ -548,9 +593,10 @@ pub(super) struct TreeAdoption<'a> {
 
 /// Adopts the run in `adoption.home`, on the calling blocking worker: its runs are those
 /// of the home's only definition, which must hold exactly one run, or the offer is
-/// declined `retained_workspace_unavailable`. Its commands run with the adopting
-/// attempt's environment and that home as `USEFUL_HOME`, their output in the adopting
-/// assignment's own log and documents; the runner itself writes nothing in the home.
+/// declined `retained_workspace_unavailable`. Its commands run with the environment the
+/// adopting attempt's offer builds when each starts and that home as `USEFUL_HOME`, their
+/// output in the adopting assignment's own log and documents; the runner itself writes
+/// nothing in the home.
 pub(super) fn adopt(
     dependencies: &TreeRunDependencies,
     adoption: &TreeAdoption<'_>,
@@ -567,6 +613,7 @@ pub(super) fn adopt(
         executable: (dependencies.executable)()
             .map_err(|_| environment_decline("workflow_tree_adoption"))?,
         environment: adoption.environment.clone(),
+        activity: RunActivity::new(),
         home: adoption.home.to_owned(),
         log: RunLog::new(layout.log),
         sleeper: Arc::clone(&adoption.sleeper),

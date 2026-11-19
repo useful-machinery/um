@@ -194,8 +194,8 @@ pub use run_inputs::{
 pub use runners::{
     RunnerActivation, RunnerActivationIssuance, RunnerActivationState, RunnerApi, RunnerCredential,
     RunnerCredentialEffectiveState, RunnerCredentialStoredState, RunnerCurrentAssignment,
-    RunnerDeletionBlocker, RunnerFailure, RunnerPool, RunnerPoolList, RunnerRegistration,
-    RunnerRegistrationList, RunnerRegistrationMode,
+    RunnerDeletionBlocker, RunnerFailure, RunnerHeldAssignment, RunnerPool, RunnerPoolList,
+    RunnerRegistration, RunnerRegistrationList, RunnerRegistrationMode,
 };
 pub use runs::{
     ContinuationAdmissionViolation, CreateRunInput, RetryConflict, Run, RunApi,
@@ -205,11 +205,11 @@ pub use runs::{
     RunContinuationEnvelope, RunContinuationPreparation, RunContinuationReceipt,
     RunContinuationRequest, RunContinuationWorkspaceModified, RunControl, RunControlAnswer,
     RunControlKind, RunControlRequest, RunControlSubmission, RunControlWait, RunCreationAcceptance,
-    RunCreationPending, RunDefinitionSelection, RunFailure, RunInterruption, RunInterruptionPhase,
-    RunLinearLifecycle, RunLinearLifecycleUpdate, RunList, RunListFilter, RunObservation,
-    RunPublicationHandoffState, RunRead, RunRetryFailureCode, RunRetryReceipt, RunRetryRejection,
-    RunRetryState, RunState, RunSubjectClaim, RunSubjectClaimState, RunTriggerDelivery,
-    valid_integration_context,
+    RunCreationPending, RunDefinitionSelection, RunFailure, RunHeldRunState, RunInterruption,
+    RunInterruptionPhase, RunLinearLifecycle, RunLinearLifecycleUpdate, RunList, RunListFilter,
+    RunObservation, RunPublicationHandoffState, RunRead, RunRetryFailureCode, RunRetryReceipt,
+    RunRetryRejection, RunRetryState, RunState, RunSubjectClaim, RunSubjectClaimState,
+    RunTriggerDelivery, valid_integration_context,
 };
 pub use service_principals::{
     CreateServicePrincipalOutcome, IssueServiceCredentialOutcome, IssuedServiceApiKey,

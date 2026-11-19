@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// RunnerCurrentAssignment : The runner's reserved assignment, absent when idle. Assigned at is the offer creation time.
+/// RunnerCurrentAssignment : The run the runner is working on, absent when the runner is idle and while every run it holds waits. Assigned at is the offer creation time.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunnerCurrentAssignment {
     #[serde(rename = "runId")]
@@ -30,7 +30,7 @@ pub struct RunnerCurrentAssignment {
 }
 
 impl RunnerCurrentAssignment {
-    /// The runner's reserved assignment, absent when idle. Assigned at is the offer creation time.
+    /// The run the runner is working on, absent when the runner is idle and while every run it holds waits. Assigned at is the offer creation time.
     pub fn new(run_id: String, project_id: String, assigned_at: String) -> RunnerCurrentAssignment {
         RunnerCurrentAssignment {
             run_id,

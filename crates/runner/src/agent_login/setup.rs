@@ -1,8 +1,10 @@
 //! One agent-login setup pass of the serving runner (REQ-GRANT-39,
 //! REQ-GRANT-40): ask Cloud which agent logins the runner is authorized
 //! for, install what is new, remove what has ended, and record each
-//! provider's readiness. No agent login is installed or removed once an
-//! assignment has been offered its logins (INV-RUNNER-15), and a pass that
+//! provider's readiness. Between admissions a pass asks Cloud for a delivery
+//! only while no run the runner holds is working, and installs or removes a
+//! login only while, in addition, no command of a held run is in flight
+//! (REQ-GRANT-40, INV-RUNNER-15), and a pass that
 //! changes a provider's readiness, or cannot record it, writes one
 //! `runner.agent_login_setup` record (REQ-TELEMETRY-45). Each admission makes
 //! a pass of its own before the assignment is offered anything
@@ -14,11 +16,14 @@
 //! `runner.credential_sources` record (REQ-GRANT-93, REQ-TELEMETRY-48). How
 //! the provider answered each use of an offered login is noted in memory while the
 //! assignment runs and folded into the readiness by the next pass
-//! (REQ-GRANT-52). A pass made while the runner holds no assignment removes
-//! the grant token files an earlier assignment or an interrupted runner left
-//! (INV-RUNNER-28) and marks ended each OAuth entry left without an end; the
+//! (REQ-GRANT-52). Every pass removes the grant token files no assignment
+//! the runner holds owns, which an ended assignment, an interrupted runner or
+//! an earlier release left (INV-RUNNER-28), and a pass made while the runner
+//! holds no assignment marks ended each OAuth entry left without an end; the
 //! end of an assignment marks its admission's entries ended, unless a later
-//! admission has recorded its own (REQ-GRANT-88, INV-RUNNER-30). A setup the
+//! admission has recorded its own, and a refresh records an entry only while
+//! its admission is the last that recorded them (REQ-GRANT-88,
+//! INV-RUNNER-30). A setup the
 //! control socket asks for, or one the schedule makes that installs a login,
 //! then checks logins with their providers outside the pass and the
 //! assignment gate, and a second pass records what they found (REQ-GRANT-90,
@@ -104,22 +109,35 @@ impl PassStage {
     }
 }
 
-/// Whether the runner holds an assignment, as the serving process knows it.
+/// Whether the runs the runner holds let setup act, as the serving process
+/// knows it, at two levels (REQ-GRANT-40, INV-RUNNER-15).
 pub(crate) trait AssignmentGate: Send + Sync {
-    /// Runs `change` only while the runner holds no assignment, keeping one
-    /// from starting until `change` returns; answers false, without running
-    /// it, while one is held.
-    fn while_idle(&self, change: &mut dyn FnMut()) -> bool;
+    /// The read level, which a request for a delivery and a login check
+    /// ask: whether no run the runner holds is working.
+    fn none_working(&self) -> bool;
+
+    /// The write level, which an install and a removal ask: runs `change`
+    /// only while no held run is working and none has a command in flight,
+    /// keeping an assignment from being admitted and a held run from
+    /// starting a command until `change` returns; answers false, without
+    /// running it, otherwise.
+    fn while_still(&self, change: &mut dyn FnMut()) -> bool;
 }
 
-/// The gate of the pass an admission makes for itself: the assignment it is
-/// admitting holds the runner's one slot and has been offered nothing yet,
-/// so each install and removal runs at once, without consulting the
-/// assignment manager (REQ-GRANT-49, INV-RUNNER-15).
-struct Admitting;
+/// The gate of the pass an admission makes for itself while the runner holds
+/// no other run: the assignment it is admitting has been offered nothing yet,
+/// so each request, install and removal runs at once (REQ-GRANT-49,
+/// INV-RUNNER-15).
+#[cfg(test)]
+struct NothingBeside;
 
-impl AssignmentGate for Admitting {
-    fn while_idle(&self, change: &mut dyn FnMut()) -> bool {
+#[cfg(test)]
+impl AssignmentGate for NothingBeside {
+    fn none_working(&self) -> bool {
+        true
+    }
+
+    fn while_still(&self, change: &mut dyn FnMut()) -> bool {
         change();
         true
     }
@@ -148,10 +166,11 @@ pub(crate) struct SetupAnswer {
 /// What a pass did.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum SetupOutcome {
-    /// The runner holds an assignment: the pass installed and removed
-    /// nothing more. What it installed or removed before the assignment
-    /// started is recorded: the readiness it wrote then, or `None` when it
-    /// changed nothing.
+    /// A run the runner holds is working, or has a command in flight where
+    /// the pass had a login to install or remove: the pass installed and
+    /// removed nothing more. What it installed or removed before is
+    /// recorded: the readiness it wrote then, or `None` when it changed
+    /// nothing.
     Busy(Option<ReadinessDocument>),
     /// The pass ran to the end; the readiness it recorded.
     Recorded(ReadinessDocument),
@@ -230,11 +249,12 @@ pub(crate) struct AgentLoginSetup {
     /// Held through every pass, admission, refresh and marking of an
     /// assignment's end, so none interleaves with another's writes. It
     /// holds the assignment whose admission last recorded the OAuth
-    /// entries, the only one whose end marks them (INV-RUNNER-30).
+    /// entries, the only one whose end marks them and whose refresh records
+    /// them (INV-RUNNER-30).
     pass: Mutex<Option<String>>,
     /// The uses noted since a pass last folded them in.
     uses: Arc<NotedUses>,
-    /// The grant token files of the assignment the runner holds.
+    /// The grant token files of each assignment the runner holds.
     grant_files: Arc<TokenFiles>,
 }
 
@@ -298,7 +318,7 @@ impl AgentLoginSetup {
 
     /// Runs one setup for `caller` on a thread of its own, since its
     /// requests, file writes and checks block, and answers what it did:
-    /// `Busy` at once while the runner holds an assignment.
+    /// `Busy` at once while a run the runner holds is working.
     pub(crate) async fn set_up(self: &Arc<Self>, caller: SetupCaller) -> SetupAnswer {
         self.set_up_on(caller, |setup| {
             std::thread::Builder::new()
@@ -381,8 +401,8 @@ impl AgentLoginSetup {
         self.record_changes(Some(&record));
         let outcome = if noted {
             match self.run_pass_blocking() {
-                // An assignment started first: what was noted waits for the
-                // next pass, as a run's use does.
+                // A held run started working first: what was noted waits
+                // for the next pass, as a run's use does.
                 SetupOutcome::Busy(None) => outcome,
                 SetupOutcome::Busy(Some(document)) => SetupOutcome::Recorded(document),
                 second => second,
@@ -399,9 +419,9 @@ impl AgentLoginSetup {
     /// Checks each login that `caller`'s rule names in `document`, the
     /// readiness the setup's pass recorded over `earlier`: every `ready`
     /// install for a sync, and a `ready` install `earlier` did not hold for
-    /// the schedule. Before each check it asks the gate, without holding it,
-    /// whether the runner is idle, and makes no further check once it holds
-    /// an assignment. An answer is noted as the login's last use, as an
+    /// the schedule. Before each check it asks the gate's read level, without
+    /// holding it, whether no held run is working, and makes no further
+    /// check once one is (INV-RUNNER-29). An answer is noted as the login's last use, as an
     /// admission's observer notes one (REQ-GRANT-52). Answers whether it
     /// noted one, and each login whose check gave no answer.
     fn check_logins(
@@ -429,7 +449,7 @@ impl AgentLoginSetup {
             if !named {
                 continue;
             }
-            if while_idle(self.gate.as_ref(), || ()).is_none() {
+            if !self.gate.none_working() {
                 break;
             }
             match self.dependencies.check.check(login.provider, installation) {
@@ -459,28 +479,44 @@ impl AgentLoginSetup {
         self.pass_under(self.gate.as_ref())
     }
 
-    /// Sets agent logins up for an assignment the runner is admitting, on
-    /// the admission's own blocking task and before the assignment is offered
-    /// them (REQ-GRANT-49): waits for a pass already running, then makes
-    /// one whose installs and removals run at once, for the assignment holds
-    /// the slot and has been offered nothing. It makes none, and asks Cloud
-    /// nothing, unless the readiness document names an installable provider's
-    /// login as installed or as authorized without being ready. A document
-    /// it cannot read names none. Its `agent_logins` is
-    /// `None` when it made no pass; a pass never answers `Busy`. Then,
-    /// whatever the pass did, it asks Cloud for the grant tokens of the
-    /// assignment `assignment_id` of the run `run_id` and the boot `boot_id`
-    /// (REQ-GRANT-86), under the same hold of the pass lock; what it holds
-    /// of them refreshes through this setup (REQ-GRANT-89), and marks the
-    /// entries ended when it is dropped (INV-RUNNER-30).
+    /// `set_up_admission_beside` while the runner holds no other run.
+    #[cfg(test)]
     pub(crate) fn set_up_admission(
         self: &Arc<Self>,
         boot_id: &str,
         run_id: &str,
         assignment_id: &str,
     ) -> AdmissionSetup {
+        self.set_up_admission_beside(&NothingBeside, boot_id, run_id, assignment_id)
+    }
+
+    /// Sets agent logins up for an assignment the runner is admitting, on
+    /// the admission's own blocking task and before the assignment is offered
+    /// them (REQ-GRANT-49): waits for a pass already running, then makes
+    /// one under `beside`, the gate over the other runs the runner held when
+    /// the preparation began, since the assignment has been offered nothing:
+    /// it asks Cloud only while each of them waits, and installs or removes
+    /// only while none of them also has a command in flight, at once when
+    /// there is none (INV-RUNNER-15). It makes none, and asks Cloud
+    /// nothing, unless the readiness document names an installable provider's
+    /// login as installed or as authorized without being ready. A document
+    /// it cannot read names none. Its `agent_logins` is `None` when it made
+    /// no pass, and `Busy` when `beside` stopped the pass, which keeps what
+    /// it recorded before that. Then, whatever the pass did, it asks Cloud
+    /// for the grant tokens of the assignment `assignment_id` of the run
+    /// `run_id` and the boot `boot_id` (REQ-GRANT-86), under the same hold
+    /// of the pass lock; what it holds of them refreshes through this setup
+    /// (REQ-GRANT-89), and marks the entries ended when it is dropped
+    /// (INV-RUNNER-30).
+    pub(crate) fn set_up_admission_beside(
+        self: &Arc<Self>,
+        beside: &dyn AssignmentGate,
+        boot_id: &str,
+        run_id: &str,
+        assignment_id: &str,
+    ) -> AdmissionSetup {
         let mut pass = self.pass.lock().unwrap_or_else(PoisonError::into_inner);
-        let agent_logins = self.admission_pass();
+        let agent_logins = self.admission_pass(beside);
         let (grants, tokens) = self.admit_grant_tokens(&mut pass, boot_id, run_id, assignment_id);
         AdmissionSetup {
             agent_logins,
@@ -525,8 +561,9 @@ impl AgentLoginSetup {
     /// Asks Cloud again for the token of the provider `step` names, for the
     /// assignment `assignment_id` of the run `run_id` and the boot `boot_id`
     /// whose token files the runner holds, keeps or removes its file and
-    /// records its entry, which only the runner's three have
-    /// (REQ-GRANT-89), under the pass lock, so that a refresh never
+    /// records its entry, which only the runner's three have, while that
+    /// assignment's admission is the last that recorded the entries
+    /// (REQ-GRANT-89, INV-RUNNER-30), under the pass lock, so that a refresh never
     /// interleaves with a pass's or an admission's writes to the directory
     /// or the readiness document. Answers what the refresh task does next,
     /// the state, grant and generation it recorded for the task to carry
@@ -544,13 +581,22 @@ impl AgentLoginSetup {
         grant_token::Recorded,
         Option<ReadinessDocument>,
     ) {
-        let _pass = self.pass.lock().unwrap_or_else(PoisonError::into_inner);
+        let pass = self.pass.lock().unwrap_or_else(PoisonError::into_inner);
         let now = (self.clock)();
+        let asking = self.asking(boot_id, run_id, assignment_id, now);
+        // The entries are another admission's: the refresh keeps its file
+        // and records none (INV-RUNNER-30).
+        if pass.as_deref() != Some(assignment_id) {
+            let (next, recorded, _) = asking.refresh(step, None);
+            return (next, recorded, None);
+        }
         let (previous, mut document) = self.grant_document(now);
-        let (next, recorded, changed) = self.asking(boot_id, run_id, assignment_id, now).refresh(
+        let (next, recorded, changed) = asking.refresh(
             step,
-            previous.as_ref().ok().and_then(Option::as_ref),
-            &mut document,
+            Some((
+                previous.as_ref().ok().and_then(Option::as_ref),
+                &mut document,
+            )),
         );
         let written = changed && previous.is_ok() && self.write(&document);
         (next, recorded, written.then_some(document))
@@ -654,9 +700,9 @@ impl AgentLoginSetup {
         (previous, document)
     }
 
-    /// The admission's agent-login pass, under the pass lock its caller
-    /// holds.
-    fn admission_pass(&self) -> Option<SetupOutcome> {
+    /// The admission's agent-login pass under `beside`, under the pass lock
+    /// its caller holds.
+    fn admission_pass(&self, beside: &dyn AssignmentGate) -> Option<SetupOutcome> {
         let named = ReadinessDocument::load(&self.dependencies.readiness_path)
             .ok()
             .flatten()
@@ -666,7 +712,7 @@ impl AgentLoginSetup {
                     .filter_map(|provider| document.login(provider))
                     .any(authorized_or_installed)
             });
-        named.then(|| self.pass_under(&Admitting))
+        named.then(|| self.pass_under(beside))
     }
 
     /// One pass, each install and removal under `gate`, writing its record;
@@ -678,17 +724,18 @@ impl AgentLoginSetup {
     }
 
     /// `pass_under`, answering what its record names rather than writing it:
-    /// none for a pass that failed, or that an assignment interrupted
-    /// before it changed anything.
+    /// none for a pass that failed, or that the gate stopped before it
+    /// changed anything.
     fn pass_recording(&self, gate: &dyn AssignmentGate) -> (SetupOutcome, Option<PassRecord>) {
-        // While the runner holds no assignment no grant token file is any
-        // assignment's (INV-RUNNER-28).
-        if !gate.while_idle(&mut || {
-            self.remove_leftover_temporary_files();
-            self.grant_files.remove_leftovers();
-        }) {
+        if !gate.none_working() {
             return (SetupOutcome::Busy(None), None);
         }
+        // What no assignment the runner holds owns is no assignment's
+        // (INV-RUNNER-28). Every writer of these files holds the `pass`
+        // lock, which the caller holds, so no write is in flight and none
+        // needs the assignment manager's lock.
+        self.remove_leftover_temporary_files();
+        self.grant_files.remove_leftovers();
         let now = (self.clock)();
         let path = &self.dependencies.readiness_path;
         let previous = match ReadinessDocument::load(path) {
@@ -718,14 +765,18 @@ impl AgentLoginSetup {
             login.last_use = last_use(&login, recorded(login.provider), &noted);
             login
         };
-        // The entries the pass carries unread: each OAuth entry left without
-        // an end is one no assignment holds, since the runner holds none,
-        // so it is marked ended now (REQ-GRANT-88, INV-RUNNER-30). An
-        // admission's own pass marks the earlier assignment's, which the
-        // admission then replaces.
+        // The entries the pass carries unread: while the runner holds no
+        // assignment, each OAuth entry left without an end is one no
+        // assignment holds, so it is marked ended now; while it holds one,
+        // none is (REQ-GRANT-88, INV-RUNNER-30). An admission's own pass
+        // made while no other is held marks the earlier assignment's, which
+        // the admission then replaces.
+        let holds_none = !self.grant_files.holds_any();
         let carried = previous.map_or_else(Vec::new, |document| {
             let mut carried = document.clone();
-            carried.end_grants(now);
+            if holds_none {
+                carried.end_grants(now);
+            }
             carried.unknown
         });
         let cloud = self.dependencies.cloud.as_ref();
@@ -831,8 +882,9 @@ impl AgentLoginSetup {
                 failure,
             }) = outcome
             else {
-                // An assignment started before an install or removal this
-                // provider needed: the rest waits for the next pass.
+                // A held run was working, or had a command in flight, at an
+                // install or removal this provider needed: the rest waits
+                // for the next pass.
                 settled.extend(ended);
                 interrupted = true;
                 break;
@@ -931,26 +983,52 @@ impl AgentLoginSetup {
 
     /// Removes the temporary files a write of the pass's own left when its
     /// process was killed before the rename, which may hold login material:
-    /// the readiness document's beside the state, and the token files' and
-    /// the Codex home's in the runner's directory while it is a real
-    /// directory. Only the serving runner writes with these prefixes, one
-    /// pass at a time, so every such file is a leftover; enrollment's own
-    /// temporary files beside the state are not touched.
+    /// the readiness document's beside the state; the Claude Code token's,
+    /// and the token files' an earlier release wrote there, in the runner's
+    /// directory; the Codex home's; and the token files' in each held
+    /// assignment's directory and its `grant-tokens`, each while it is a real
+    /// directory. Only the serving runner writes with these prefixes, and
+    /// every writer holds the pass lock, so every such file is a leftover;
+    /// enrollment's own temporary files beside the state are not touched.
+    /// The directory of an assignment the runner does not hold is removed
+    /// whole (`TokenFiles::remove_leftovers`).
     fn remove_leftover_temporary_files(&self) {
         let dependencies = &self.dependencies;
         if let Some(state_directory) = dependencies.readiness_path.parent() {
             remove_leftover_temporary_files(state_directory, &[readiness::TEMPORARY_PREFIX]);
         }
-        let login_directory = dependencies.directory.path();
-        if directory::real_directory(login_directory) {
-            let [github, gitlab, linear] = directory::GRANT_TOKEN_TEMPORARY_PREFIXES;
-            remove_leftover_temporary_files(
-                login_directory,
-                &[claude_code::TEMPORARY_PREFIX, github, gitlab, linear],
-            );
-            let codex_home = dependencies.directory.codex_home();
-            if directory::real_directory(&codex_home) {
-                remove_leftover_temporary_files(&codex_home, &codex::TEMPORARY_PREFIXES);
+        let logins = &dependencies.directory;
+        if !directory::real_directory(logins.path()) {
+            return;
+        }
+        let [github, gitlab, linear] = directory::GRANT_TOKEN_TEMPORARY_PREFIXES;
+        remove_leftover_temporary_files(
+            logins.path(),
+            &[claude_code::TEMPORARY_PREFIX, github, gitlab, linear],
+        );
+        let codex_home = logins.codex_home();
+        if directory::real_directory(&codex_home) {
+            remove_leftover_temporary_files(&codex_home, &codex::TEMPORARY_PREFIXES);
+        }
+        if !directory::real_directory(&logins.assignments()) {
+            return;
+        }
+        for assignment_id in self.grant_files.held_assignments() {
+            let (Some(own), Some(configured)) = (
+                logins.assignment(&assignment_id),
+                logins.configured_grant_tokens(&assignment_id),
+            ) else {
+                continue;
+            };
+            if !directory::real_directory(&own) {
+                continue;
+            }
+            remove_leftover_temporary_files(&own, &directory::GRANT_TOKEN_TEMPORARY_PREFIXES);
+            if directory::real_directory(&configured) {
+                remove_leftover_temporary_files(
+                    &configured,
+                    &[directory::CONFIGURED_GRANT_TOKEN_TEMPORARY_PREFIX],
+                );
             }
         }
     }
@@ -960,7 +1038,7 @@ impl AgentLoginSetup {
     /// Cloud answers `revoked` or `unauthorized`, names another agent login
     /// or no longer names the provider (REQ-GRANT-50). It changes the
     /// provider's entry in `document` and asks for no delivery. Answers
-    /// whether it ended one, or `None` when an assignment started before a
+    /// whether it ended one, or `None` when the gate refused a
     /// removal it needed.
     fn end_unauthorized(
         &self,
@@ -1070,7 +1148,7 @@ impl AgentLoginSetup {
     }
 
     /// One provider's readiness from Cloud's answer about it, each install
-    /// and removal under `gate`; `None` when an assignment started before an
+    /// and removal under `gate`; `None` when the gate refused a request,
     /// install or removal it needed.
     fn settle(
         &self,
@@ -1161,9 +1239,9 @@ impl AgentLoginSetup {
         {
             return Some(Settled::new(AgentLoginState::Ready, Some(kept())));
         }
-        // No request starts once an assignment is held: Cloud would record
+        // No request starts while a held run is working: Cloud would record
         // and audit a delivery the runner then could not install.
-        while_idle(gate, || ())?;
+        gate.none_working().then_some(())?;
         let request = DeliveryRequest {
             os: self.dependencies.os,
             provider,
@@ -1228,7 +1306,7 @@ impl AgentLoginSetup {
             }
         };
         let directory = &self.dependencies.directory;
-        let result = while_idle(gate, || install(directory, installed, delivery, now))?;
+        let result = while_still(gate, || install(directory, installed, delivery, now))?;
         Some(match result {
             Ok(installation) => Settled::new(
                 AgentLoginState::Ready,
@@ -1287,7 +1365,7 @@ impl AgentLoginSetup {
             return Some(Settled::new(state, login));
         }
         Some(
-            match while_idle(gate, || {
+            match while_still(gate, || {
                 present.iter().try_for_each(|path| {
                     if home.as_ref() == Some(path) {
                         // The login itself goes first, so a home whose removal
@@ -1541,11 +1619,11 @@ fn authorized_or_installed(entry: &LoginReadiness) -> bool {
     entry.installation().is_some() || entry.state.authorized_not_ready()
 }
 
-/// Runs `change` under `gate`; `None` while an assignment is held.
-fn while_idle<T>(gate: &dyn AssignmentGate, change: impl FnOnce() -> T) -> Option<T> {
+/// Runs `change` at `gate`'s write level; `None` when the gate refuses it.
+fn while_still<T>(gate: &dyn AssignmentGate, change: impl FnOnce() -> T) -> Option<T> {
     let mut change = Some(change);
     let mut result = None;
-    gate.while_idle(&mut || {
+    gate.while_still(&mut || {
         if let Some(change) = change.take() {
             result = Some(change());
         }

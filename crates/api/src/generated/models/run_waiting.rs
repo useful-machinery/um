@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunWaiting {
-    /// The first of these that applies, in this order: `owner_inactive` (a personal pool of the run's belongs to a member who is not active), `no_runner` (the run's pools hold no runner), `no_fitting_runner` (none of the pools' runners is enabled, holds a valid credential and, for a definition-backed run, last advertised tree execution and, for a run whose revision holds integration bindings or an integration's account, `treeIntegrationBindings`), `runners_offline` (the runners that fit are all disconnected) or `runners_busy` (those connected all hold another run). A later Cloud may add reasons, so a client shows a value it does not recognize as given.
+    /// The first of these that applies, in this order: `owner_inactive` (a personal pool of the run's belongs to a member who is not active), `no_runner` (the run's pools hold no runner), `no_fitting_runner` (none of the pools' runners is enabled, holds a valid credential and, for a definition-backed run, last advertised tree execution and, for a run whose revision holds integration bindings or an integration's account, `treeIntegrationBindings`), `runners_offline` (the runners that fit are all disconnected) or `runners_busy` (those connected are all working on another run). A later Cloud may add reasons, so a client shows a value it does not recognize as given.
     #[serde(rename = "reason")]
     pub reason: String,
     /// For `runners_offline`, the latest time Cloud saw one of the runners that fit; omitted when none was ever seen.

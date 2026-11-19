@@ -327,7 +327,9 @@ impl Progress<'_> {
     /// record is not yet written reports nothing, and an exited one reports only steps.
     /// A report for steps alone that the sink refuses is not a failure
     /// (REQ-RUNNERENROLL-88): its observations and those after it stay unreported, under
-    /// the same sequence, for the next read to offer again.
+    /// the same sequence, for the next read to offer again. Once a report that carries the
+    /// root as news is queued, the run's activity reads waiting exactly when it carries a
+    /// wait.
     fn observe(
         &mut self,
         run: &TreeRun,
@@ -404,6 +406,11 @@ impl Progress<'_> {
                 } else {
                     Err(DriveFailure::ReportUnqueued)
                 };
+            }
+            if !steps_only {
+                // The run's activity follows the report that carries its root as news: a
+                // run is waiting exactly when it was last reported waiting (INV-RUNNER-15).
+                run.activity().reported(root.2.is_some());
             }
             self.sequence = sequence;
             self.last = Some(root.clone());
@@ -933,7 +940,7 @@ impl Driver<'_> {
     fn take_deliveries(&mut self) -> Vec<TriggerDelivery> {
         self.run
             .deliveries
-            .take(&self.run.assignment_id)
+            .take()
             .into_iter()
             .filter(|delivery| self.applied.insert(delivery.delivery_id.clone()))
             .collect()
@@ -942,7 +949,7 @@ impl Driver<'_> {
     /// Moves the controls queued for the assignment, each id once, behind those taken
     /// before.
     fn queue_controls(&mut self) {
-        let taken = self.run.controls.take(&self.run.assignment_id);
+        let taken = self.run.controls.take();
         self.controls.extend(
             taken
                 .into_iter()

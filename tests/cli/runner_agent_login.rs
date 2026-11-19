@@ -502,7 +502,7 @@ fn sync_exits_1_only_when_an_authorized_provider_is_not_ready() {
 
 // REQ-GRANT-41
 #[test]
-fn sync_exits_4_when_no_runner_is_live_or_it_holds_an_assignment() {
+fn sync_exits_4_when_no_runner_is_live_or_a_run_it_holds_is_working() {
     let directory = private_credential_directory();
     let runtime = tempfile::tempdir_in("/tmp").unwrap();
     let config = write_status_config(&directory, &runtime.path().join("runner.sock"));
@@ -900,15 +900,22 @@ fn cloud_issuing_a_github_token(request: &[u8]) -> Vec<u8> {
     }
 }
 
-/// The GitHub token file in the runner's state directory.
-const GITHUB_TOKEN_FILE: &str = ".runner-agent-login/github.token";
+/// The token file named `name` of `GRANT_ASSIGNMENT` in the runner's
+/// state directory.
+fn grant_token_file(name: &str) -> String {
+    format!(".runner-agent-login/assignments/{GRANT_ASSIGNMENT}/{name}")
+}
+
+/// The GitHub token file of `GRANT_ASSIGNMENT`.
+const GITHUB_TOKEN_FILE: &str = "github.token";
 
 /// The token Cloud issues for `example`, a provider of its configuration,
 /// which no output may carry either.
 const EXAMPLE_GRANT_TOKEN: &str = "example_grant-token-sentinel-7b4d2f";
 
-/// The token file of `example` in the runner's state directory.
-const EXAMPLE_TOKEN_FILE: &str = ".runner-agent-login/grant-tokens/example.token";
+/// The token file of `example`, a provider of Cloud's configuration, of
+/// `GRANT_ASSIGNMENT`.
+const EXAMPLE_TOKEN_FILE: &str = "grant-tokens/example.token";
 
 /// Cloud's grant routes for an assignment whose providers are `github` and
 /// `example`, a provider of its configuration, each with the names its row
@@ -1097,7 +1104,10 @@ impl EndedGrantAssignment {
 // REQ-GRANT-86, REQ-GRANT-88, INV-RUNNER-28
 #[test]
 fn an_admitted_assignment_keeps_its_grant_token_in_its_file_and_prints_it_nowhere() {
-    let served = EndedGrantAssignment::served(cloud_issuing_a_github_token, GITHUB_TOKEN_FILE);
+    let served = EndedGrantAssignment::served(
+        cloud_issuing_a_github_token,
+        &grant_token_file(GITHUB_TOKEN_FILE),
+    );
     let token_file = served.token_file.clone();
     let removed = poll_until(
         "the token file's removal once the assignment ended",
@@ -1164,7 +1174,10 @@ fn an_admitted_assignment_keeps_its_grant_token_in_its_file_and_prints_it_nowher
 // REQ-GRANT-86, INV-RUNNER-28
 #[test]
 fn a_configured_providers_token_is_kept_in_its_own_file_and_printed_nowhere() {
-    let served = EndedGrantAssignment::served(cloud_listing_github_and_example, EXAMPLE_TOKEN_FILE);
+    let served = EndedGrantAssignment::served(
+        cloud_listing_github_and_example,
+        &grant_token_file(EXAMPLE_TOKEN_FILE),
+    );
     let token_file = served.token_file.clone();
     let removed = poll_until(
         "the token file's removal once the assignment ended",
@@ -1218,7 +1231,10 @@ fn a_configured_providers_token_is_kept_in_its_own_file_and_printed_nowhere() {
 // REQ-GRANT-88, REQ-GRANT-41, REQ-GRANT-53
 #[test]
 fn sync_shows_an_ended_assignments_grant_token_as_of_its_run_and_not_as_current() {
-    let served = EndedGrantAssignment::served(cloud_issuing_a_github_token, GITHUB_TOKEN_FILE);
+    let served = EndedGrantAssignment::served(
+        cloud_issuing_a_github_token,
+        &grant_token_file(GITHUB_TOKEN_FILE),
+    );
     let config = served.fixture.config.clone();
     // The runner answers a sync only once it is idle (REQ-GRANT-41).
     let sync = poll_until(

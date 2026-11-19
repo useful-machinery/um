@@ -104,6 +104,9 @@ impl Sequence {
 const AGENT_LOGIN_SETUP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 const SHUTDOWN_DELIVERY_RESERVE: std::time::Duration = std::time::Duration::from_secs(10);
 const SHUTDOWN_CLEANUP_RESERVE: std::time::Duration = std::time::Duration::from_secs(5);
+/// A stop interrupts every held run at once, each within its own cancellation grace, so one
+/// bound sized to the largest grace holds however many runs the runner holds
+/// (REQ-RUNNERENROLL-72).
 const SHUTDOWN_CLEANUP_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(
     MAXIMUM_CANCELLATION_GRACE.as_secs() + SHUTDOWN_DELIVERY_RESERVE.as_secs(),
 );
@@ -337,46 +340,54 @@ struct ReloadDependencies {
     live_status: Arc<LiveStatus>,
 }
 
-/// The assignment manager as the periodic and `sync` agent-login passes see
-/// it: idle when it holds no assignment in any state, and kept idle by its
-/// lock while setup installs or removes a login (INV-RUNNER-15). An
-/// admission's own pass does not consult it (REQ-GRANT-49).
-struct IdleAssignmentGate {
+/// The assignment manager as the periodic and `sync` agent-login passes and login checks
+/// see it (INV-RUNNER-15, INV-RUNNER-29): every assignment it holds, read under its lock.
+/// Asking Cloud and checking a login need only that no held run is working; an install or
+/// removal also that none has a command in flight, and runs under the manager's lock
+/// holding each waiting run's activity, so no assignment is admitted and no held run starts
+/// a command during it. An admission's own pass does not consult it: it is gated on the
+/// other runs held when its preparation began, never under the manager's lock (REQ-GRANT-49).
+struct HeldRunGate {
     assignment_manager: Arc<Mutex<AssignmentManager>>,
     // Setup runs on a thread of its own, and reading the manager's state may
     // hand work to the runtime.
     runtime: tokio::runtime::Handle,
 }
 
-impl IdleAssignmentGate {
+impl HeldRunGate {
     fn new(assignment_manager: Arc<Mutex<AssignmentManager>>) -> Self {
         Self {
             assignment_manager,
             runtime: tokio::runtime::Handle::current(),
         }
     }
-}
 
-impl AssignmentGate for IdleAssignmentGate {
-    fn while_idle(&self, change: &mut dyn FnMut()) -> bool {
+    /// Answers `answer` of what the manager holds, under its lock.
+    fn with_held_runs<T>(&self, answer: impl FnOnce(&tree_run::HeldRuns) -> T) -> T {
         let _runtime = self.runtime.enter();
         let mut manager = self
             .assignment_manager
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if manager.status_counts() != AssignmentCounts::default() {
-            return false;
-        }
-        change();
-        true
+        answer(&manager.held_runs())
+    }
+}
+
+impl AssignmentGate for HeldRunGate {
+    fn none_working(&self) -> bool {
+        self.with_held_runs(tree_run::HeldRuns::none_working)
+    }
+
+    fn while_still(&self, change: &mut dyn FnMut()) -> bool {
+        self.with_held_runs(|held| held.while_still(change))
     }
 }
 
 /// The serving process's repeating agent-login setup: a setup at once, then
 /// one every `AGENT_LOGIN_SETUP_INTERVAL` on the service's sleeper, each
 /// checking a login it installed (REQ-GRANT-90) and publishing the
-/// readiness it recorded in the live status. A setup that finds an
-/// assignment held is skipped, not queued. Dropping the schedule stops it.
+/// readiness it recorded in the live status. A setup that finds a held run
+/// working is skipped, not queued. Dropping the schedule stops it.
 struct AgentLoginSchedule {
     task: tokio::task::JoinHandle<()>,
 }
@@ -876,7 +887,7 @@ async fn connection_loop_with_work_root(
         let clock = Arc::clone(&sleeper);
         Arc::new(AgentLoginSetup::new(
             dependencies,
-            Arc::new(IdleAssignmentGate::new(Arc::clone(&assignment_manager))),
+            Arc::new(HeldRunGate::new(Arc::clone(&assignment_manager))),
             move || clock.utc_now(),
         ))
     });
@@ -1279,10 +1290,10 @@ async fn connection_loop_with_work_root(
                     // A runner that holds no assignment answers the refusal by
                     // its start's mode (INV-RUNNER-35); one that holds work
                     // waits for it to be let go and looks again.
-                    let counts = assignment_manager
+                    let (counts, _) = assignment_manager
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .status_counts();
+                        .status_assignments();
                     if refusal_step(&join_key, counts) != RefusalStep::Wait {
                         let answer = Box::pin(answer_refusal(
                             &mut join_key,

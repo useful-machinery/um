@@ -56,6 +56,9 @@ pub enum RunnerFrame {
         /// and an integration's account in a tree block, so Cloud may offer it a run whose
         /// revision holds one (REQ-COMPAT-18).
         tree_integration_bindings: bool,
+        /// Advertises `holdsWaitingRuns: 1`: this runner takes another run while every run it
+        /// holds waits, so Cloud may offer it one (REQ-RUNNERENROLL-64, REQ-COMPAT-22).
+        holds_waiting_runs: bool,
     },
     WorkspaceInventoryComplete {
         envelope: RunnerEnvelope,
@@ -1551,6 +1554,7 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
             tree_continuation,
             tree_withdraw,
             tree_integration_bindings,
+            holds_waiting_runs,
         } => {
             let mut payload = json!({ "runnerVersion": runner_version });
             if *tree_execution {
@@ -1564,6 +1568,9 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
             }
             if *tree_integration_bindings {
                 payload["treeIntegrationBindings"] = json!(1);
+            }
+            if *holds_waiting_runs {
+                payload["holdsWaitingRuns"] = json!(1);
             }
             if let Some(root) = recovery_root {
                 payload["workspaceRecoveryVersion"] = json!(1);
@@ -3471,6 +3478,7 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
             "treeContinuation",
             "treeWithdraw",
             "treeIntegrationBindings",
+            "holdsWaitingRuns",
         ],
         "workspace_inventory" => &["discovery", "diagnostic"],
         "execution_transition" | "execution_interrupted" => &["diagnostic"],
@@ -3849,6 +3857,11 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/hello-tree-integration-bindings.json"
         )),
+        // REQ-COMPAT-22
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/hello-holds-waiting-runs.json"
+        )),
         // REQ-RUNNERENROLL-90
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -4044,6 +4057,11 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/invalid/hello-tree-integration-bindings-unknown.json"
         )),
+        // REQ-COMPAT-22
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/hello-holds-waiting-runs-unknown.json"
+        )),
         // REQ-RUNNERENROLL-90
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -4211,6 +4229,7 @@ mod tests {
             tree_continuation: false,
             tree_withdraw: false,
             tree_integration_bindings: false,
+            holds_waiting_runs: false,
         };
 
         let encoded = encode_runner_frame(&frame).unwrap();
@@ -4229,6 +4248,7 @@ mod tests {
             tree_continuation: true,
             tree_withdraw: false,
             tree_integration_bindings: false,
+            holds_waiting_runs: false,
         };
         let encoded = encode_runner_frame(&continuing).unwrap();
         assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
@@ -4245,6 +4265,7 @@ mod tests {
             tree_continuation: true,
             tree_withdraw: true,
             tree_integration_bindings: false,
+            holds_waiting_runs: false,
         };
         let encoded = encode_runner_frame(&withdrawing).unwrap();
         assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
@@ -4252,8 +4273,26 @@ mod tests {
         assert_eq!(value["payload"]["treeWithdraw"], 1);
         // REQ-RUNNERENROLL-91, REQ-COMPAT-18
         assert!(value["payload"].get("treeIntegrationBindings").is_none());
+        // REQ-RUNNERENROLL-132
+        assert!(value["payload"].get("holdsWaitingRuns").is_none());
 
         let integrating = RunnerFrame::Hello {
+            envelope: envelope.clone(),
+            runner_version: "0.2.0".to_owned(),
+            recovery_root: None,
+            tree_execution: true,
+            tree_continuation: true,
+            tree_withdraw: true,
+            tree_integration_bindings: true,
+            holds_waiting_runs: false,
+        };
+        let encoded = encode_runner_frame(&integrating).unwrap();
+        assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
+        let value: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["payload"]["treeIntegrationBindings"], 1);
+        assert!(value["payload"].get("holdsWaitingRuns").is_none());
+
+        let holding = RunnerFrame::Hello {
             envelope,
             runner_version: "0.2.0".to_owned(),
             recovery_root: None,
@@ -4261,11 +4300,12 @@ mod tests {
             tree_continuation: true,
             tree_withdraw: true,
             tree_integration_bindings: true,
+            holds_waiting_runs: true,
         };
-        let encoded = encode_runner_frame(&integrating).unwrap();
+        let encoded = encode_runner_frame(&holding).unwrap();
         assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
         let value: Value = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(value["payload"]["treeIntegrationBindings"], 1);
+        assert_eq!(value["payload"]["holdsWaitingRuns"], 1);
     }
 
     // REQ-COMPAT-18

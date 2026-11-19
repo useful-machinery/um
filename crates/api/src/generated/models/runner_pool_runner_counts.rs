@@ -27,10 +27,10 @@ pub struct RunnerPoolRunnerCounts {
     /// The runners that are not online, including those never enrolled.
     #[serde(rename = "offline")]
     pub offline: i32,
-    /// The runners holding an assignment, online or not.
+    /// The runners working on a run, online or not.
     #[serde(rename = "busy")]
     pub busy: i32,
-    /// The enabled, online runners with a valid credential and no assignment.
+    /// The enabled, online runners with a valid credential that are working on no run, a runner whose held runs all wait included.
     #[serde(rename = "idle")]
     pub idle: i32,
 }

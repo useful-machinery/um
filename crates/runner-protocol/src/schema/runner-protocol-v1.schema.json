@@ -1223,6 +1223,7 @@
                 "treeContinuation": {"const": 1},
                 "treeWithdraw": {"const": 1},
                 "treeIntegrationBindings": {"const": 1},
+                "holdsWaitingRuns": {"const": 1},
                 "workspaceRecoveryRoot": {
                   "type": "object", "additionalProperties": false,
                   "properties": {

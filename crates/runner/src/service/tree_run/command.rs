@@ -5,8 +5,9 @@
 //! `useful workflow run stop` and `lift` once the offer's deliveries are applied
 //! (REQ-TRIGGER-136), and the `useful workflow run` control command each Cloud control names
 //! (REQ-RUNNERENROLL-90).
-//! Each runs with the daemon's environment whole, with the agent logins offered to the
-//! assignment (REQ-GRANT-37, REQ-GRANT-44), and `USEFUL_HOME` set to the run-scoped
+//! Each runs with the daemon's environment whole, with the agent logins the runner holds when
+//! the command starts (REQ-GRANT-37, REQ-GRANT-44, REQ-GRANT-49) and the grant token variables
+//! of the assignment's admission (REQ-GRANT-87), and `USEFUL_HOME` set to the run-scoped
 //! home; the runtime's own admission applies the root's passthrough to each step
 //! (REQ-WFEXEC-22), so no step sees a runner-private name.
 //!
@@ -34,11 +35,13 @@ use tokio::process::ChildStderr;
 
 use super::super::Sleeper;
 use super::super::run_inputs::PreparationDeadline;
+use super::activity::{CommandInFlight, RunActivity};
 use super::records::{RecordState, read_record};
+use crate::agent_login::CommandEnvironment;
 use serde_json::Value;
 use useful_execution::{
     CONTROL_ANSWER, CONTROL_APPROVE, CONTROL_HAND_BACK, CONTROL_LIFT, CONTROL_RETRY,
-    CancellationReason, CancellationSource, CaptureCancellation, ControlEvent, EnvironmentSnapshot,
+    CancellationReason, CancellationSource, CaptureCancellation, ControlEvent,
     LocalRunDirectoryError, WITHDRAWN_OUTCOME, wait_identity,
 };
 use useful_runner_protocol::{
@@ -97,7 +100,11 @@ const MAXIMUM_OBSERVED_TIME_BYTES: usize = 64;
 #[derive(Clone)]
 pub(in crate::service) struct UsefulCommand {
     pub(in crate::service) executable: PathBuf,
-    pub(in crate::service) environment: EnvironmentSnapshot,
+    /// What each command's environment is built from when it starts.
+    pub(in crate::service) environment: CommandEnvironment,
+    /// The run's activity, which counts each command in flight and which a setup's install
+    /// or removal holds, so no command starts during one (INV-RUNNER-15).
+    pub(in crate::service) activity: Arc<RunActivity>,
     pub(in crate::service) home: PathBuf,
     pub(in crate::service) log: RunLog,
     pub(in crate::service) sleeper: Arc<dyn Sleeper>,
@@ -106,19 +113,33 @@ pub(in crate::service) struct UsefulCommand {
 
 impl UsefulCommand {
     /// Spawns `arguments` in its own process group, stdout to `stdout` and stderr copied to
-    /// the log. The group is killed if the child is dropped before it is reaped.
-    fn spawn(
+    /// the log, with the environment built now (REQ-GRANT-49): once no agent-login install or
+    /// removal holds the run's activity, which then counts the command in flight until its
+    /// child is dropped (INV-RUNNER-15). The group is killed if the child is dropped before
+    /// it is reaped.
+    async fn spawn(
         &self,
         arguments: impl IntoIterator<Item = impl AsRef<OsStr>>,
         stdout: Stdio,
     ) -> io::Result<(SupervisedChild, LogPump)> {
-        // The log exists once a command has run, whether or not it wrote anything.
-        drop(self.log.open()?);
+        let log = self.log.clone();
+        let offered = self.environment.clone();
+        let activity = Arc::clone(&self.activity);
+        // Waiting for an install, building the environment, which reads the agent-login
+        // files, and opening the log block, so they run on a blocking worker.
+        let (in_flight, environment) = tokio::task::spawn_blocking(move || {
+            let in_flight = activity.start_command();
+            // The log exists once a command has run, whether or not it wrote anything.
+            drop(log.open()?);
+            Ok::<_, io::Error>((in_flight, offered.build()))
+        })
+        .await
+        .map_err(io::Error::other)??;
         let mut command = tokio::process::Command::new(&self.executable);
         command
             .args(arguments)
             .env_clear()
-            .envs(self.environment.variables())
+            .envs(environment.variables())
             .env("USEFUL_HOME", &self.home)
             .stdin(Stdio::null())
             .stdout(stdout)
@@ -131,7 +152,14 @@ impl UsefulCommand {
             .id()
             .and_then(|id| i32::try_from(id).ok())
             .and_then(Pid::from_raw);
-        Ok((SupervisedChild { child, group }, pump))
+        Ok((
+            SupervisedChild {
+                child,
+                group,
+                _in_flight: in_flight,
+            },
+            pump,
+        ))
     }
 }
 
@@ -270,7 +298,7 @@ async fn run_short(
         ShortOutput::File(file) => (Stdio::from(file), None),
         ShortOutput::Captured(limit) => (Stdio::piped(), Some(limit)),
     };
-    let (mut child, pump) = useful.spawn(&arguments, stdout)?;
+    let (mut child, pump) = useful.spawn(&arguments, stdout).await?;
     let exited = async {
         let mut captured = Vec::new();
         // The pipe closes once the limit is read, so a command printing more cannot block
@@ -457,6 +485,8 @@ impl CommandFailure {
 struct SupervisedChild {
     child: tokio::process::Child,
     group: Option<Pid>,
+    /// Counts the command in flight in its run's activity while the child is held.
+    _in_flight: CommandInFlight,
 }
 
 impl SupervisedChild {
@@ -541,6 +571,7 @@ pub(in crate::service) async fn supervise(
         .map_err(|_| CommandFailure::Launch)?;
     let (mut child, pump) = useful
         .spawn(&arguments, Stdio::from(stdout))
+        .await
         .map_err(|_| CommandFailure::Launch)?;
     let sleeper = &useful.sleeper;
 

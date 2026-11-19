@@ -45,25 +45,25 @@
       "additionalProperties": false,
       "required": ["preparing", "accepted", "running", "finishing", "reporting"],
       "properties": {
-        "preparing": { "enum": [0, 1] },
-        "accepted": { "enum": [0, 1] },
-        "running": { "enum": [0, 1] },
-        "finishing": { "enum": [0, 1] },
-        "reporting": { "enum": [0, 1] }
-      },
-      "not": {
-        "anyOf": [
-          { "required": ["preparing", "accepted"], "properties": { "preparing": { "const": 1 }, "accepted": { "const": 1 } } },
-          { "required": ["preparing", "running"], "properties": { "preparing": { "const": 1 }, "running": { "const": 1 } } },
-          { "required": ["preparing", "finishing"], "properties": { "preparing": { "const": 1 }, "finishing": { "const": 1 } } },
-          { "required": ["preparing", "reporting"], "properties": { "preparing": { "const": 1 }, "reporting": { "const": 1 } } },
-          { "required": ["accepted", "running"], "properties": { "accepted": { "const": 1 }, "running": { "const": 1 } } },
-          { "required": ["accepted", "finishing"], "properties": { "accepted": { "const": 1 }, "finishing": { "const": 1 } } },
-          { "required": ["accepted", "reporting"], "properties": { "accepted": { "const": 1 }, "reporting": { "const": 1 } } },
-          { "required": ["running", "finishing"], "properties": { "running": { "const": 1 }, "finishing": { "const": 1 } } },
-          { "required": ["running", "reporting"], "properties": { "running": { "const": 1 }, "reporting": { "const": 1 } } },
-          { "required": ["finishing", "reporting"], "properties": { "finishing": { "const": 1 }, "reporting": { "const": 1 } } }
-        ]
+        "preparing": { "type": "integer", "minimum": 0 },
+        "accepted": { "type": "integer", "minimum": 0 },
+        "running": { "type": "integer", "minimum": 0 },
+        "waiting": {
+          "description": "The held runs the runner last reported waiting, which are not counted running; absent when zero, and where a serving process that predates it answers.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "finishing": { "type": "integer", "minimum": 0 },
+        "reporting": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "heldRun": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "state"],
+      "properties": {
+        "runId": { "type": "string", "pattern": "^run_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "state": { "enum": ["working", "waiting"] }
       }
     },
     "status": {
@@ -80,7 +80,13 @@
         "pendingCredentialId": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
         "assignmentCounts": { "$ref": "#/$defs/assignmentCounts" },
         "lastConnectionFailure": { "enum": ["network", "rate_limited", "cloud_unavailable", "authentication", "protocol"] },
-        "agentLogins": { "$ref": "#/$defs/agentLoginReadiness" }
+        "agentLogins": { "$ref": "#/$defs/agentLoginReadiness" },
+        "heldRuns": {
+          "description": "Each run the runner holds that has not ended, the working ones first; absent when it holds none, and where a serving process that predates it answers.",
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/heldRun" }
+        }
       }
     },
     "agentLoginReadiness": {

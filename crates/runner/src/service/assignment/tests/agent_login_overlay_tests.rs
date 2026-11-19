@@ -16,7 +16,7 @@ use crate::agent_login::readiness::{
 };
 use crate::agent_login::setup::{AgentLoginSetup, SetupOutcome};
 use crate::control_protocol::{AgentLoginProvider, AgentLoginState, CredentialSource};
-use crate::service::IdleAssignmentGate;
+use crate::service::HeldRunGate;
 use crate::service::control::{AdmissionAgentLogins, LiveStatus};
 use crate::service::test_support::{
     CountedGate, FAKE_AGENT_LOGIN_ID, FAKE_GRANT_ID, FAKE_INTEGRATION_TOKEN_ID,
@@ -119,8 +119,8 @@ fn keep_codex_login(directory: &LoginDirectory) -> PathBuf {
 }
 
 fn accepted_variable(manager: &AssignmentManager, name: &str) -> Option<OsString> {
-    match &manager.slot {
-        Some(LocalSlot::Accepted(accepted)) => engine_admission(accepted)
+    match held_assignment(manager) {
+        Some(HeldAssignment::Accepted(accepted)) => engine_admission(accepted)
             .execution()
             .environment()
             .variable(OsStr::new(name))
@@ -140,7 +140,7 @@ async fn release_unrun(manager: &mut AssignmentManager, offered: &AssignmentOffe
         .handle_release(release_for(offered, "br", "stale_or_invalid_acceptance"))
         .unwrap();
     settle_cleanup(manager).await;
-    assert!(manager.slot.is_none());
+    assert!(held_assignment(manager).is_none());
 }
 
 // REQ-GRANT-44, REQ-WFEXEC-71
@@ -356,7 +356,7 @@ impl SettingUp {
                 temporary.path(),
                 recorder,
             ),
-            Arc::new(IdleAssignmentGate::new(Arc::clone(&manager))),
+            Arc::new(HeldRunGate::new(Arc::clone(&manager))),
             || time::OffsetDateTime::from_unix_timestamp(1_794_450_000).unwrap(),
         ));
         let status = Arc::new(LiveStatus::new(
@@ -1759,7 +1759,10 @@ async fn a_continuations_admission_reports_its_own_sources() {
 
     super::git_continuation_tests::prepare_retained_continuation(&mut manager, &successor).await;
 
-    assert!(matches!(manager.slot, Some(LocalSlot::Accepted(_))));
+    assert!(matches!(
+        held_assignment(&manager),
+        Some(HeldAssignment::Accepted(_))
+    ));
     // The fixture's own coding-agent logins may add host entries; the
     // continuation's one report is its own assignment's.
     let reports = fixture.cloud.credential_source_reports();

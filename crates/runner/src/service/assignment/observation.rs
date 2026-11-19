@@ -562,8 +562,9 @@ pub(in crate::service) struct AssignmentRunControl {
 }
 
 impl AssignmentManager {
-    /// Hands a delivery for the assignment this manager holds to its tree run, which applies
-    /// it with `useful workflow run event` and reports the application (REQ-TRIGGER-136).
+    /// Hands a delivery for an assignment this manager holds to its tree run, which applies
+    /// it with `useful workflow run event` and reports the application (REQ-TRIGGER-136). It
+    /// is queued for that assignment alone (INV-RUNNER-40).
     pub(in crate::service) fn handle_trigger_delivery(
         &mut self,
         delivery: AssignmentTriggerDelivery,
@@ -579,9 +580,10 @@ impl AssignmentManager {
         Ok(())
     }
 
-    /// Hands a control for the assignment this manager holds to its tree run, which applies
+    /// Hands a control for an assignment this manager holds to its tree run, which applies
     /// it to the run's current wait with the `useful workflow run` control command it names and
-    /// reports the application (REQ-RUNNERENROLL-90).
+    /// reports the application (REQ-RUNNERENROLL-90). It is queued for that assignment alone
+    /// (INV-RUNNER-40).
     pub(in crate::service) fn handle_run_control(
         &mut self,
         control: AssignmentRunControl,
@@ -596,7 +598,8 @@ impl AssignmentManager {
     /// Whether an effect for the tree run of `assignment_id` reaches it. Cloud fences
     /// deliveries and controls by the active assignment, so one for an assignment held no
     /// longer, or never, is acknowledged and applies to nothing here; one naming the held
-    /// assignment with another run or attempt conflicts as a cancellation would.
+    /// assignment with another run or attempt conflicts as a cancellation would. One for an
+    /// assignment still preparing is kept until its tree run takes it.
     fn holds_for_tree_run(
         &mut self,
         assignment_id: &str,
@@ -604,28 +607,21 @@ impl AssignmentManager {
         attempt_id: &str,
     ) -> Result<bool, AssignmentManagerFailure> {
         self.drain_events();
-        let held = match &self.slot {
-            Some(LocalSlot::Preparing(preparing)) => (
-                &preparing.offer.assignment_id,
-                &preparing.offer.run_id,
-                &preparing.offer.attempt_id,
-            ),
-            Some(LocalSlot::Accepted(accepted)) => (
-                &accepted.identity.assignment_id,
-                &accepted.identity.run_id,
-                &accepted.identity.attempt_id,
-            ),
-            Some(LocalSlot::Running(running)) => (
-                &running.identity.assignment_id,
-                &running.identity.run_id,
-                &running.identity.attempt_id,
-            ),
-            Some(LocalSlot::Finishing(_) | LocalSlot::Releasing(_)) | None => return Ok(false),
+        let held = match self.held.get(assignment_id) {
+            Some(HeldAssignment::Preparing(preparing)) => {
+                (&preparing.offer.run_id, &preparing.offer.attempt_id)
+            }
+            Some(HeldAssignment::Accepted(accepted)) => {
+                (&accepted.identity.run_id, &accepted.identity.attempt_id)
+            }
+            Some(HeldAssignment::Running(running)) => {
+                (&running.identity.run_id, &running.identity.attempt_id)
+            }
+            Some(HeldAssignment::Finishing(_) | HeldAssignment::Releasing(_)) | None => {
+                return Ok(false);
+            }
         };
-        if held.0 != assignment_id {
-            return Ok(false);
-        }
-        if held.1 != run_id || held.2 != attempt_id {
+        if held.0 != run_id || held.1 != attempt_id {
             return Err(AssignmentManagerFailure::ConflictingOffer);
         }
         Ok(true)

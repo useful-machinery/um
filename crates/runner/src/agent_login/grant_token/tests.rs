@@ -31,6 +31,9 @@ const ASSIGNMENT: &str = "asn_01k0z6r1w8f4jy2m7q9v3x5abc";
 const NEXT_ASSIGNMENT: &str = "asn_01k0z6r1w8f4jy2m7q9v3x5abd";
 const RUN: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abc";
 const NEXT_RUN: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abd";
+/// An assignment the runner no longer holds, whose directory an
+/// interrupted runner left.
+const ENDED_ASSIGNMENT: &str = "asn_01k0z6r1w8f4jy2m7q9v3x5abf";
 
 /// When the fixture's setup starts, and every time it reads unless a test
 /// moves its clock on.
@@ -109,19 +112,30 @@ impl Fixture {
         self.root.path().join("state/runner-state.json")
     }
 
+    /// The file of `provider`'s token of the assignment `ASSIGNMENT`.
     fn token_file(&self, provider: AgentLoginProvider) -> PathBuf {
+        self.token_file_of(ASSIGNMENT, provider)
+    }
+
+    fn token_file_of(&self, assignment_id: &str, provider: AgentLoginProvider) -> PathBuf {
         LoginDirectory::beside(&self.state_path())
-            .grant_token(provider)
+            .grant_token(assignment_id, provider)
             .unwrap()
             .0
     }
 
-    /// Leaves a token file in the runner's directory, as an earlier
-    /// assignment or an interrupted runner would.
-    fn leave_token_file(&self, provider: AgentLoginProvider, token: &str) {
+    /// Leaves a token file in the directory of the assignment
+    /// `assignment_id`, as its admission would.
+    fn leave_token_file_of(&self, assignment_id: &str, provider: AgentLoginProvider, token: &str) {
         let directory = LoginDirectory::beside(&self.state_path());
-        crate::agent_login::directory::ensure_private_directory(directory.path()).unwrap();
-        let (path, temporary_prefix) = directory.grant_token(provider).unwrap();
+        for private in [
+            directory.path().to_owned(),
+            directory.assignments(),
+            directory.assignment(assignment_id).unwrap(),
+        ] {
+            crate::agent_login::directory::ensure_private_directory(&private).unwrap();
+        }
+        let (path, temporary_prefix) = directory.grant_token(assignment_id, provider).unwrap();
         crate::agent_login::directory::write_file(&path, token.as_bytes(), temporary_prefix)
             .unwrap();
     }
@@ -221,11 +235,13 @@ impl Fixture {
             .answer_grant_providers(Ok(listed_entries(entries)));
     }
 
-    /// Where the runner keeps the token of the configured provider `id`.
+    /// Where the runner keeps the token of the configured provider `id` for
+    /// the assignment `ASSIGNMENT`.
     fn configured_file(&self, id: &str) -> PathBuf {
         LoginDirectory::beside(&self.state_path())
-            .path()
-            .join(format!("grant-tokens/{id}.token"))
+            .configured_grant_token(ASSIGNMENT, id)
+            .unwrap()
+            .0
     }
 
     /// Cloud's id of each provider Cloud was asked for the token of, in
@@ -239,6 +255,40 @@ impl Fixture {
             .collect();
         asked.sort();
         asked
+    }
+
+    /// The directory the runner keeps the grant tokens of the assignment
+    /// `assignment_id` in.
+    fn assignment_directory(&self, assignment_id: &str) -> PathBuf {
+        LoginDirectory::beside(&self.state_path())
+            .path()
+            .join("assignments")
+            .join(assignment_id)
+    }
+
+    /// Leaves what no assignment the runner holds owns: a token file in the
+    /// directory of an assignment an interrupted runner held, and the token
+    /// files an earlier release kept at fixed names. Answers each location.
+    fn leave_leftovers(&self) -> Vec<PathBuf> {
+        let directory = LoginDirectory::beside(&self.state_path()).path().to_owned();
+        let ended = self.assignment_directory(ENDED_ASSIGNMENT);
+        for private in [
+            directory.clone(),
+            directory.join("assignments"),
+            ended.clone(),
+            directory.join("grant-tokens"),
+        ] {
+            crate::agent_login::directory::ensure_private_directory(&private).unwrap();
+        }
+        let left = vec![
+            ended.join("github.token"),
+            directory.join("github.token"),
+            directory.join("grant-tokens/example.token"),
+        ];
+        for file in &left {
+            fs::write(file, "left-token").unwrap();
+        }
+        vec![ended, left[1].clone(), directory.join("grant-tokens")]
     }
 
     /// The attributes of each record that names `provider`.
@@ -858,11 +908,19 @@ fn a_file_an_earlier_assignment_left_is_gone_before_any_answer_is_used() {
         FakeGrantToken::Fail(GrantTokenFailure::Cloud(CloudFailure::Transport)),
     ] {
         let fixture = Fixture::new();
-        for provider in brokered_providers() {
-            fixture.leave_token_file(provider, "earlier-assignment-token");
+        // An earlier assignment's files, and what an interrupted runner left
+        // in the admitted assignment's own directory.
+        for (assignment_id, provider) in [ENDED_ASSIGNMENT, ASSIGNMENT]
+            .into_iter()
+            .flat_map(|assignment_id| brokered_providers().map(move |p| (assignment_id, p)))
+        {
+            fixture.leave_token_file_of(assignment_id, provider, "earlier-assignment-token");
         }
-        let files: Vec<PathBuf> = brokered_providers()
-            .map(|provider| fixture.token_file(provider))
+        let files: Vec<PathBuf> = [ENDED_ASSIGNMENT, ASSIGNMENT]
+            .into_iter()
+            .flat_map(|assignment_id| {
+                brokered_providers().map(|provider| fixture.token_file_of(assignment_id, provider))
+            })
             .collect();
         let present_when_asked = Arc::new(Mutex::new(Vec::new()));
         let seen = Arc::clone(&present_when_asked);
@@ -876,6 +934,7 @@ fn a_file_an_earlier_assignment_left_is_gone_before_any_answer_is_used() {
         let _admitted = fixture.admit(ASSIGNMENT);
 
         assert_eq!(*present_when_asked.lock().unwrap(), Vec::<PathBuf>::new());
+        assert!(!fixture.assignment_directory(ENDED_ASSIGNMENT).exists());
         for provider in brokered_providers() {
             let file = fixture.token_file(provider);
             match answer {
@@ -919,13 +978,13 @@ fn when_the_assignment_ends_its_files_are_gone_and_its_entries_stay() {
     drop(earlier.tokens);
     for provider in brokered_providers() {
         assert_eq!(
-            fs::read_to_string(fixture.token_file(provider)).unwrap(),
+            fs::read_to_string(fixture.token_file_of(NEXT_ASSIGNMENT, provider)).unwrap(),
             fake_grant_token(provider, 4)
         );
     }
     drop(later.tokens);
-    for provider in brokered_providers() {
-        assert!(!fixture.token_file(provider).exists());
+    for assignment_id in [ASSIGNMENT, NEXT_ASSIGNMENT] {
+        assert!(!fixture.assignment_directory(assignment_id).exists());
     }
 }
 
@@ -1009,9 +1068,7 @@ fn an_admissions_entries_name_its_run_and_are_marked_ended_when_its_assignment_e
 #[test]
 fn an_idle_pass_removes_a_leftover_token_file_and_asks_cloud_for_none() {
     let fixture = Fixture::new();
-    for provider in brokered_providers() {
-        fixture.leave_token_file(provider, "interrupted-runner-token");
-    }
+    let left = fixture.leave_leftovers();
     let directory = LoginDirectory::beside(&fixture.state_path());
     let temporaries = crate::agent_login::directory::GRANT_TOKEN_TEMPORARY_PREFIXES
         .map(|prefix| directory.path().join(format!("{prefix}.4242.1")));
@@ -1025,8 +1082,8 @@ fn an_idle_pass_removes_a_leftover_token_file_and_asks_cloud_for_none() {
         .block_on(fixture.setup.run_pass());
 
     assert!(matches!(outcome, SetupOutcome::Recorded(_)), "{outcome:?}");
-    for provider in brokered_providers() {
-        assert!(!fixture.token_file(provider).exists());
+    for path in &left {
+        assert!(fs::symlink_metadata(path).is_err(), "{}", path.display());
     }
     for temporary in &temporaries {
         assert!(!temporary.exists(), "{}", temporary.display());
@@ -1076,6 +1133,100 @@ fn an_idle_pass_marks_ended_each_entry_an_interrupted_runner_left_and_asks_cloud
     );
     assert_eq!(fixture.cloud.grant_requests(), []);
     assert_eq!(fixture.records(), []);
+}
+
+// INV-RUNNER-28, INV-RUNNER-30
+#[test]
+fn a_setup_while_an_assignment_is_held_removes_what_no_held_assignment_owns_and_keeps_its_own() {
+    let fixture = Fixture::new();
+    fixture
+        .cloud
+        .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(1));
+    let held = fixture.admit(ASSIGNMENT);
+    let own = fixture.assignment_directory(ASSIGNMENT);
+    let left = fixture.leave_leftovers();
+    // The temporary files a killed write left in the held assignment's
+    // directory.
+    fs::create_dir(own.join("grant-tokens")).unwrap();
+    let temporaries = [
+        own.join(".useful-github.token.tmp.4242.1"),
+        own.join("grant-tokens/.useful-grant-token.tmp.4242.2"),
+    ];
+    for temporary in &temporaries {
+        fs::write(temporary, "interrupted-write").unwrap();
+    }
+    let entries = fixture.grants();
+    let records = fixture.records().len();
+
+    let outcome = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(fixture.setup.run_pass());
+
+    assert!(matches!(outcome, SetupOutcome::Recorded(_)), "{outcome:?}");
+    for path in left.iter().chain(&temporaries) {
+        assert!(fs::symlink_metadata(path).is_err(), "{}", path.display());
+    }
+    assert_eq!(
+        fs::read_to_string(own.join("github.token")).unwrap(),
+        fake_grant_token(AgentLoginProvider::Github, 1)
+    );
+    assert_eq!(fixture.grants(), entries);
+    for entry in &entries {
+        assert_eq!((entry.run_id.as_deref(), entry.ended_at), (Some(RUN), None));
+    }
+    assert_eq!(fixture.records().len(), records);
+    drop(held.tokens);
+}
+
+// REQ-GRANT-86, INV-RUNNER-28
+#[test]
+fn an_admission_removes_what_no_held_assignment_owns_before_it_asks_cloud() {
+    let fixture = Fixture::new();
+    fixture
+        .cloud
+        .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(1));
+    let held = fixture.admit(ASSIGNMENT);
+    let own = fixture
+        .assignment_directory(ASSIGNMENT)
+        .join("github.token");
+    let left = fixture.leave_leftovers();
+    let watched: Vec<PathBuf> = left.iter().chain([&own]).cloned().collect();
+    let present_when_asked = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&present_when_asked);
+    fixture.cloud.on_grant_request(Box::new(move |_| {
+        seen.lock().unwrap().extend(
+            watched
+                .iter()
+                .filter(|path| fs::symlink_metadata(path).is_ok())
+                .cloned(),
+        );
+    }));
+    fixture
+        .cloud
+        .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(2));
+
+    let next = fixture.admit_of(NEXT_RUN, NEXT_ASSIGNMENT);
+
+    // Each request saw A's file and nothing else.
+    let mut present = present_when_asked.lock().unwrap().clone();
+    present.dedup();
+    assert_eq!(present, std::slice::from_ref(&own));
+    assert_eq!(
+        fs::read_to_string(&own).unwrap(),
+        fake_grant_token(AgentLoginProvider::Github, 1)
+    );
+    assert_eq!(
+        fs::read_to_string(
+            fixture
+                .assignment_directory(NEXT_ASSIGNMENT)
+                .join("github.token")
+        )
+        .unwrap(),
+        fake_grant_token(AgentLoginProvider::Github, 2)
+    );
+    drop(next.tokens);
+    drop(held.tokens);
 }
 
 // REQ-GRANT-86, REQ-TELEMETRY-46, INV-RUNNER-32
@@ -1259,7 +1410,7 @@ fn a_kept_token_whose_file_no_longer_holds_one_is_not_offered() {
     let admitted = fixture.admit(ASSIGNMENT);
     let service = EnvironmentSnapshot::new([("OTHER_NAME", "kept")]);
     // The file of `gitlab` is replaced by one that is not a token's.
-    fixture.leave_token_file(AgentLoginProvider::Gitlab, "two\nlines");
+    fixture.leave_token_file_of(ASSIGNMENT, AgentLoginProvider::Gitlab, "two\nlines");
 
     let offered = offer(&service, Some(&admitted.tokens));
 
@@ -1532,7 +1683,9 @@ fn the_runners_own_providers_keep_their_names_whatever_the_list_gives_them() {
     let admitted = fixture.admit(ASSIGNMENT);
 
     let file = fixture.token_file(AgentLoginProvider::Github);
-    assert!(file.ends_with(".runner-agent-login/github.token"));
+    assert!(file.ends_with(format!(
+        ".runner-agent-login/assignments/{ASSIGNMENT}/github.token"
+    )));
     let token = fake_grant_token(AgentLoginProvider::Github, 2);
     assert_eq!(fs::read_to_string(&file).unwrap(), token);
     let offered = offered_alone(&admitted.tokens);
@@ -1590,12 +1743,18 @@ fn a_listed_gitlab_is_a_configured_provider_apart_from_the_runners_gitlab() {
 #[test]
 fn a_configured_file_an_earlier_assignment_left_is_gone_before_any_answer_is_used() {
     let fixture = Fixture::new();
-    let left = fixture.configured_file("old");
-    crate::agent_login::directory::ensure_private_directory(
-        LoginDirectory::beside(&fixture.state_path()).path(),
-    )
-    .unwrap();
-    crate::agent_login::directory::ensure_private_directory(left.parent().unwrap()).unwrap();
+    let directory = LoginDirectory::beside(&fixture.state_path());
+    let (left, _) = directory
+        .configured_grant_token(ENDED_ASSIGNMENT, "old")
+        .unwrap();
+    for private in [
+        directory.path().to_owned(),
+        directory.assignments(),
+        directory.assignment(ENDED_ASSIGNMENT).unwrap(),
+        directory.configured_grant_tokens(ENDED_ASSIGNMENT).unwrap(),
+    ] {
+        crate::agent_login::directory::ensure_private_directory(&private).unwrap();
+    }
     fs::write(&left, "earlier-assignment-token").unwrap();
     let present_when_asked = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&present_when_asked);
@@ -1621,25 +1780,24 @@ fn a_configured_file_an_earlier_assignment_left_is_gone_before_any_answer_is_use
         seen,
         [("example".to_owned(), false), ("github".to_owned(), false)]
     );
-    assert!(!left.exists());
+    assert!(!fixture.assignment_directory(ENDED_ASSIGNMENT).exists());
     assert!(fixture.configured_file("example").exists());
 
-    // When the assignment ends its file is gone.
+    // When the assignment ends its directory is gone.
     drop(admitted.tokens);
-    assert!(!fixture.configured_file("example").exists());
-    assert!(!fixture.token_file(AgentLoginProvider::Github).exists());
+    assert!(!fixture.assignment_directory(ASSIGNMENT).exists());
 }
 
 // REQ-GRANT-86, INV-RUNNER-28
 #[test]
 fn an_idle_pass_removes_a_leftover_configured_token_file_and_asks_cloud_for_none() {
     let fixture = Fixture::new();
-    let left = fixture.configured_file("old");
-    let directory = left.parent().unwrap().to_owned();
-    crate::agent_login::directory::ensure_private_directory(
-        LoginDirectory::beside(&fixture.state_path()).path(),
-    )
-    .unwrap();
+    // The configured providers' directory an earlier release kept.
+    let directory = LoginDirectory::beside(&fixture.state_path())
+        .path()
+        .join("grant-tokens");
+    let left = directory.join("old.token");
+    crate::agent_login::directory::ensure_private_directory(directory.parent().unwrap()).unwrap();
     crate::agent_login::directory::ensure_private_directory(&directory).unwrap();
     fs::write(&left, "interrupted-runner-token").unwrap();
     let temporary = directory.join(".useful-grant-token.tmp.4242.1");
@@ -1658,19 +1816,25 @@ fn an_idle_pass_removes_a_leftover_configured_token_file_and_asks_cloud_for_none
     assert_eq!(fixture.records(), []);
 }
 
-// REQ-GRANT-86, REQ-TELEMETRY-46, INV-RUNNER-28
+// REQ-GRANT-86, REQ-GRANT-88, REQ-TELEMETRY-46, INV-RUNNER-28
 #[test]
-fn a_configured_providers_directory_that_cannot_be_removed_asks_for_none_of_them() {
+fn an_assignments_directory_that_cannot_be_cleared_asks_for_none_of_its_providers() {
     let fixture = Fixture::new();
+    // What an interrupted runner left in the admitted assignment's own
+    // directory, in a directory that cannot be written, so that it cannot be
+    // removed.
     let left = fixture.configured_file("old");
     let directory = left.parent().unwrap().to_owned();
-    crate::agent_login::directory::ensure_private_directory(
-        LoginDirectory::beside(&fixture.state_path()).path(),
-    )
-    .unwrap();
-    crate::agent_login::directory::ensure_private_directory(&directory).unwrap();
+    let logins = LoginDirectory::beside(&fixture.state_path());
+    for private in [
+        logins.path().to_owned(),
+        logins.assignments(),
+        logins.assignment(ASSIGNMENT).unwrap(),
+        directory.clone(),
+    ] {
+        crate::agent_login::directory::ensure_private_directory(&private).unwrap();
+    }
     fs::write(&left, "earlier-assignment-token").unwrap();
-    // A file in a directory that cannot be written cannot be removed.
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o500)).unwrap();
     fixture.list_named(&[GITHUB_ENTRY, EXAMPLE_ENTRY]);
     fixture
@@ -1682,22 +1846,50 @@ fn a_configured_providers_directory_that_cannot_be_removed_asks_for_none_of_them
 
     let admitted = fixture.admit(ASSIGNMENT);
 
-    assert_eq!(fixture.asked_ids(), ["github"]);
-    assert!(admitted.tokens.holds(AgentLoginProvider::Github));
+    assert_eq!(fixture.asked_ids(), Vec::<String>::new());
+    assert!(!admitted.tokens.holds(AgentLoginProvider::Github));
+    for provider in ["github", "example"] {
+        assert_eq!(
+            fixture.records_naming(provider),
+            [attributes(&serde_json::json!({
+                "um.grant_token.provider": provider,
+                "um.grant_token.phase": "admission",
+                "um.grant_token.state": "install_failed",
+                "um.grant_token.failure_stage": "remove",
+                "um.grant_token.failure_cause": "permission_denied",
+                "um.assignment.id": ASSIGNMENT,
+            }))]
+        );
+    }
     assert_eq!(
-        fixture.records_naming("example"),
+        fixture
+            .recorded()
+            .grant(AgentLoginProvider::Github)
+            .unwrap()
+            .state,
+        AgentLoginState::InstallFailed
+    );
+
+    // The end of the assignment cannot remove its directory either, and
+    // records it with the assignment and no provider.
+    let records = fixture.records().len();
+    drop(admitted.tokens);
+    let removal = |from: usize| -> Vec<_> {
+        fixture.records()[from..]
+            .iter()
+            .map(grant_attributes)
+            .collect()
+    };
+    assert_eq!(
+        removal(records),
         [attributes(&serde_json::json!({
-            "um.grant_token.provider": "example",
-            "um.grant_token.phase": "admission",
-            "um.grant_token.state": "install_failed",
             "um.grant_token.failure_stage": "remove",
             "um.grant_token.failure_cause": "permission_denied",
             "um.assignment.id": ASSIGNMENT,
         }))]
     );
-    drop(admitted.tokens);
 
-    // A setup made while no assignment is held names no provider.
+    // A setup made once it is no longer held names neither.
     let records = fixture.records().len();
     let outcome = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -1705,12 +1897,8 @@ fn a_configured_providers_directory_that_cannot_be_removed_asks_for_none_of_them
         .block_on(fixture.setup.run_pass());
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(matches!(outcome, SetupOutcome::Recorded(_)), "{outcome:?}");
-    let removal: Vec<_> = fixture.records()[records..]
-        .iter()
-        .map(grant_attributes)
-        .collect();
     assert_eq!(
-        removal,
+        removal(records),
         [attributes(&serde_json::json!({
             "um.grant_token.failure_stage": "remove",
             "um.grant_token.failure_cause": "permission_denied",
@@ -1883,7 +2071,8 @@ fn a_cloud_without_the_token_service_list_is_asked_and_recorded_exactly_as_befor
     assert_eq!(fixture.asked_ids(), ["github"]);
     assert!(
         !LoginDirectory::beside(&fixture.state_path())
-            .grant_tokens()
+            .configured_grant_tokens(ASSIGNMENT)
+            .unwrap()
             .exists()
     );
     assert_eq!(
@@ -2876,6 +3065,75 @@ async fn when_the_assignment_ends_a_configured_provider_is_asked_no_more() {
     release.release();
     assert!(run.wait().await.is_none());
     assert_eq!(run.refresh_requests(), []);
+}
+
+/// Drops `tokens` on a thread outside any runtime, so that the end of its
+/// assignment is made before this returns.
+fn end_hold(tokens: AssignmentGrantTokens) {
+    std::thread::spawn(move || drop(tokens)).join().unwrap();
+}
+
+// REQ-GRANT-86, REQ-GRANT-88, INV-RUNNER-28, INV-RUNNER-30
+#[tokio::test]
+async fn each_held_assignments_tokens_are_its_own_until_it_ends() {
+    // Assignment A holds GitHub's token of generation 1 and keeps it current.
+    let mut run = Refreshing::started();
+    run.fixture
+        .cloud
+        .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(2));
+    // Assignment B, of another run, is admitted while A is held.
+    let next = run.fixture.admit_of(NEXT_RUN, NEXT_ASSIGNMENT);
+    let assignments = LoginDirectory::beside(&run.fixture.state_path())
+        .path()
+        .join("assignments");
+    let (own, other) = (
+        assignments.join(ASSIGNMENT),
+        assignments.join(NEXT_ASSIGNMENT),
+    );
+    let (own_file, other_file) = (own.join("github.token"), other.join("github.token"));
+    let token = |generation| fake_grant_token(AgentLoginProvider::Github, generation);
+
+    assert_eq!(fs::read_to_string(&own_file).unwrap(), token(1));
+    assert_eq!(fs::read_to_string(&other_file).unwrap(), token(2));
+    for (directory, file) in [(&own, &own_file), (&other, &other_file)] {
+        assert_eq!((mode(directory), mode(file)), (0o700, 0o600));
+    }
+
+    // A's refresh replaces A's file alone and records no entry: the entries
+    // are B's admission's.
+    assert_eq!(run.pass(FakeGrantToken::Issue(3)).await, Some(WAIT));
+    assert_eq!(fs::read_to_string(&own_file).unwrap(), token(3));
+    assert_eq!(fs::read_to_string(&other_file).unwrap(), token(2));
+    let github = run.github();
+    assert_eq!(
+        (
+            github.run_id.as_deref(),
+            github.issued.map(|issued| issued.generation),
+            github.ended_at
+        ),
+        (Some(NEXT_RUN), Some(2), None)
+    );
+
+    // A's end removes A's directory alone and marks no entry ended.
+    end_hold(run.tokens.take().unwrap());
+    assert!(fs::symlink_metadata(&own).is_err());
+    assert_eq!(fs::read_to_string(&other_file).unwrap(), token(2));
+    for entry in run.fixture.grants() {
+        assert_eq!(
+            (entry.run_id.as_deref(), entry.ended_at),
+            (Some(NEXT_RUN), None)
+        );
+    }
+
+    // B's end removes B's and marks the entries ended.
+    end_hold(next.tokens);
+    assert!(fs::symlink_metadata(&other).is_err());
+    for entry in run.fixture.grants() {
+        assert_eq!(
+            (entry.run_id.as_deref(), entry.ended_at),
+            (Some(NEXT_RUN), Some(now()))
+        );
+    }
 }
 
 // REQ-INTEGRATION-12, REQ-GRANT-89, REQ-TELEMETRY-46

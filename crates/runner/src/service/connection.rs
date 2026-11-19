@@ -3141,6 +3141,8 @@ pub(crate) fn opening_hello(
         tree_withdraw: true,
         // It reads integration bindings and accounts in a tree block (REQ-RUNNERENROLL-91).
         tree_integration_bindings: true,
+        // It takes another run while every run it holds waits (REQ-RUNNERENROLL-132).
+        holds_waiting_runs: true,
     })
     .map_err(|_| {
         ConnectionError::terminal(
@@ -3190,9 +3192,10 @@ mod tests {
         ArtifactRequestKind, AssignmentManager, AssignmentOffer, AssignmentRootPreparer,
         test_support::{
             artifact_delivery, enqueue_finalization_terminal, enqueue_fixture_registration,
-            enqueue_lease_clock_failure_report, enqueue_transitions, install_root_preparer,
-            install_running_renewal_fixture, manager as manager_fixture, manager_with_dependencies,
-            observation_retained,
+            enqueue_lease_clock_failure_report, enqueue_transitions, hold_lease_time,
+            install_root_preparer, install_running_renewal_fixture, manager as manager_fixture,
+            manager_with_dependencies, observation_retained, preparation_expires_at,
+            request_lease_renewal,
         },
     };
     use crate::service::config::Config;
@@ -3206,7 +3209,7 @@ mod tests {
         deterministic_frame_source, effect_acknowledgement, expect_close_frame,
         expect_opening_hello, fixture_lease_clock, fixture_listener, fixture_sleeper,
         observation_acknowledgement, offer_assignment_after_handshake, scripted_duplex,
-        sleep_request, welcome, with_watchdog,
+        sleep_request, tree_fixture::offer_frame, welcome, with_watchdog,
     };
     use crate::service::workspace::{AssignmentRoot, AssignmentRootCreationError};
     use crate::service::{Sequence, Sleeper};
@@ -3288,16 +3291,26 @@ mod tests {
 
         fn with_endpoint(endpoint: &str) -> Self {
             let config = test_config(endpoint);
+            let manager = manager_fixture(&config, BOOT_ID.to_owned(), fixture_lease_clock());
+            Self::serving(config, manager)
+        }
+
+        /// A context whose connection serves `manager`, prepared by the test on a
+        /// configuration of its own.
+        fn with_manager(manager: AssignmentManager) -> Self {
+            Self::serving(
+                test_config("wss://gateway.example.test/v1/runner/connect"),
+                manager,
+            )
+        }
+
+        fn serving(config: ConfigFixture, manager: AssignmentManager) -> Self {
             let frame_source = deterministic_frame_source();
             let opening = test_opening(&config, frame_source.as_ref());
             let (sleeper, sleep_requests) = controlled_sleeper();
             let (recorder, capture) = test_recorder(BOOT_ID);
             let connection_event = recorder.start("runner.gateway_connection", []);
-            let assignment_manager = Mutex::new(manager_fixture(
-                &config,
-                BOOT_ID.to_owned(),
-                fixture_lease_clock(),
-            ));
+            let assignment_manager = Mutex::new(manager);
             Self {
                 config,
                 frame_source,
@@ -5413,6 +5426,8 @@ mod tests {
             assert_eq!(hello["payload"]["treeWithdraw"], 1);
             // REQ-RUNNERENROLL-91, REQ-COMPAT-18
             assert_eq!(hello["payload"]["treeIntegrationBindings"], 1);
+            // REQ-RUNNERENROLL-132
+            assert_eq!(hello["payload"]["holdsWaitingRuns"], 1);
             socket.send(welcome()).await.expect("send welcome");
             socket
                 .send(observation_acknowledgement(OPENING_MESSAGE_ID, 1))
@@ -6352,6 +6367,337 @@ mod tests {
         .await;
         *next_sequence = sequence.peek();
         (result, capture)
+    }
+
+    /// The contract fixture of the Cloud frame `name` (`cloud-<name>.json`), the members of
+    /// `payload` set in its payload.
+    fn cloud_frame(name: &str, payload: serde_json::Value) -> Message {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/runner-protocol/v1/valid")
+            .join(format!("cloud-{name}.json"));
+        let mut frame: serde_json::Value =
+            serde_json::from_slice(&fs::read(path).expect("read the Cloud frame fixture"))
+                .expect("decode the Cloud frame fixture");
+        for (member, value) in payload.as_object().expect("payload members") {
+            frame["payload"][member] = value.clone();
+        }
+        Message::Text(frame.to_string().into())
+    }
+
+    /// Whether `frame` is the runner's `kind` frame for the assignment of `offer`.
+    fn frame_of(frame: &serde_json::Value, kind: &str, offer: &AssignmentOffer) -> bool {
+        frame["type"] == kind && frame["payload"]["assignmentId"] == offer.assignment_id.as_str()
+    }
+
+    /// Whether `frame` ends the execution of `offer`'s assignment.
+    fn ends(frame: &serde_json::Value, offer: &AssignmentOffer) -> bool {
+        matches!(
+            frame["type"].as_str(),
+            Some("execution_finished" | "execution_aborted" | "execution_interrupted")
+        ) && frame["payload"]["assignmentId"] == offer.assignment_id.as_str()
+    }
+
+    /// The Gateway's side of a scripted session: it acknowledges each frame the runner sends,
+    /// in order, sends one effect at a time, and keeps every frame it read.
+    struct ScriptedGateway {
+        inbound: ScriptedInbound,
+        outbound: mpsc::UnboundedReceiver<Message>,
+        frames: Vec<serde_json::Value>,
+    }
+
+    impl ScriptedGateway {
+        /// Reads the opening hello and answers it with the welcome.
+        async fn open(&mut self) {
+            assert!(matches!(
+                with_watchdog(self.outbound.recv())
+                    .await
+                    .expect("opening hello timed out"),
+                Some(Message::Text(_))
+            ));
+            self.inbound.send(welcome());
+            self.inbound
+                .send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
+        }
+
+        /// The first frame the runner sent that satisfies `wanted`, reading on until one
+        /// does. No frame may decline an offer.
+        async fn until(
+            &mut self,
+            wanted: impl Fn(&serde_json::Value) -> bool,
+        ) -> serde_json::Value {
+            if let Some(frame) = self.frames.iter().find(|frame| wanted(frame)) {
+                return frame.clone();
+            }
+            loop {
+                let last = self.frames.last().map(|frame| frame["type"].clone());
+                let message = with_watchdog(self.outbound.recv())
+                    .await
+                    .unwrap_or_else(|expired| {
+                        panic!("the runner sent nothing after {last:?}: {expired}")
+                    })
+                    .unwrap_or_else(|| panic!("the runner closed the session after {last:?}"));
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let frame: serde_json::Value =
+                    serde_json::from_str(&text).expect("decode runner frame");
+                assert_ne!(
+                    frame["type"], "assignment_rejected",
+                    "the runner declined an offer: {frame}"
+                );
+                self.inbound.send(observation_acknowledgement(
+                    frame["messageId"].as_str().expect("runner message ID"),
+                    frame["sequence"].as_u64().expect("runner sequence"),
+                ));
+                let found = wanted(&frame);
+                self.frames.push(frame.clone());
+                if found {
+                    return frame;
+                }
+            }
+        }
+
+        /// Sends `effect` and reads until the runner acknowledges it, as the Gateway sends
+        /// one effect at a time.
+        async fn effect(&mut self, effect: Message) {
+            let Message::Text(text) = &effect else {
+                panic!("an effect is text");
+            };
+            let effect_id = serde_json::from_str::<serde_json::Value>(text).expect("decode effect")
+                ["payload"]["effectId"]
+                .clone();
+            self.inbound.send(effect);
+            self.until(|frame| {
+                frame["type"] == "effect_acknowledged" && frame["payload"]["effectId"] == effect_id
+            })
+            .await;
+        }
+
+        /// Offers, prepares, starts and authorizes `offer` under the prepare, start and
+        /// authorization effects `effects`, the preparation expiring at `expires_at`.
+        async fn admit(&mut self, offer: &AssignmentOffer, effects: [&str; 3], expires_at: &str) {
+            let [prepare, start, authorization] = effects;
+            let ids = |effect_id: &str| {
+                json!({
+                    "effectId": effect_id,
+                    "assignmentId": offer.assignment_id,
+                    "runId": offer.run_id,
+                    "attemptId": offer.attempt_id,
+                })
+            };
+            let spec = |effect_id: &str| {
+                let mut payload = ids(effect_id);
+                payload["executionSpecId"] = json!(offer.execution_spec.execution_spec_id);
+                payload
+            };
+            self.effect(offer_frame(offer)).await;
+            self.until(|frame| frame_of(frame, "assignment_preparing", offer))
+                .await;
+            let mut payload = spec(prepare);
+            payload["preparationExpiresAt"] = json!(expires_at);
+            self.effect(cloud_frame("assignment-prepare", payload))
+                .await;
+            self.until(|frame| frame_of(frame, "assignment_accepted", offer))
+                .await;
+            let mut payload = spec(start);
+            payload["lease"] = json!({ "leaseSequence": 1 });
+            self.effect(cloud_frame("assignment-start", payload)).await;
+            self.effect(cloud_frame(
+                "execution-start-authorized",
+                ids(authorization),
+            ))
+            .await;
+        }
+    }
+
+    // SC-RUNNERENROLL-10: one runner takes two runs through a scripted Gateway. Run A waits on
+    // an external wait, run B is offered beside it and starts, A's lease is renewed while B
+    // works, A's wait resolves and A ends before B, and each run's frames and grant token file
+    // are its own.
+    #[tokio::test]
+    async fn one_runner_takes_a_second_run_while_the_first_waits_and_each_ends_alone() {
+        use crate::control_protocol::AgentLoginProvider;
+        use crate::service::source::test_support::fixture_source_broker;
+        use crate::service::test_support::tree_fixture::{
+            Fixture, TREE_DIGEST, TREE_FILES, fixture_sourced, issue_github_token, other_id,
+            other_offer, per_run_log,
+        };
+        use crate::service::test_support::{FakeGrantToken, fake_grant_token};
+
+        let mut fixture = fixture_sourced(
+            TREE_DIGEST,
+            "waiting",
+            "null",
+            &[
+                ("TREE_TEST_WAIT_KIND", "external"),
+                ("TREE_TEST_WAIT_SOURCE", "github"),
+            ],
+            None,
+            |dependencies| dependencies,
+            fixture_source_broker,
+            TREE_FILES,
+        );
+        let issued = issue_github_token(&mut fixture, &[]);
+        let lease_time = hold_lease_time(&mut fixture.manager);
+        let first = fixture.offer.clone();
+        let second = other_offer(&first, '6');
+        let first_log = per_run_log(&fixture, &first);
+        let second_log = per_run_log(&fixture, &second);
+        // A's first evaluation of its wait holds until the test answers it; B's `create`
+        // holds a running record until the test removes `running`, and B then waits once and
+        // lands.
+        fs::write(first_log.join("answer"), "gated").unwrap();
+        fs::write(first_log.join("gate"), b"").unwrap();
+        for (name, contents) in [("running", ""), ("answer", "continue"), ("proceed", "")] {
+            fs::write(second_log.join(name), contents).unwrap();
+        }
+        let Fixture {
+            _temporary,
+            manager,
+            ..
+        } = fixture;
+        let context = EstablishedTestContext::with_manager(manager);
+        let expires_at = preparation_expires_at(&context.assignment_manager.lock().unwrap());
+        let first_effects = [
+            "eff_01k0z6r1w8f4jy2m7q9v3x5acz",
+            "eff_01k0z6r1w8f4jy2m7q9v3x5abh",
+            "eff_01k0z6r1w8f4jy2m7q9v3x5abk",
+        ];
+        let second_effects = first_effects.map(|effect| other_id(effect, '6'));
+        let renewal = "eff_01k0z6r1w8f4jy2m7q9v3x5arn";
+        let first_token = fake_grant_token(AgentLoginProvider::Github, 3);
+        let second_token = fake_grant_token(AgentLoginProvider::Github, 4);
+
+        let mut next_sequence = 2;
+        let (inbound, outbound, established) = established_fixture(&context, &mut next_sequence);
+        let mut gateway = ScriptedGateway {
+            inbound,
+            outbound,
+            frames: Vec::new(),
+        };
+        let peer = async {
+            gateway.open().await;
+            gateway.admit(&first, first_effects, &expires_at).await;
+            gateway
+                .until(|frame| {
+                    frame_of(frame, "tree_progress", &first)
+                        && frame["payload"]["state"] == "waiting"
+                        && frame["payload"]["wait"]["kind"] == "external"
+                })
+                .await;
+
+            issued
+                .cloud
+                .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(4));
+            gateway
+                .admit(
+                    &second,
+                    [&second_effects[0], &second_effects[1], &second_effects[2]],
+                    &expires_at,
+                )
+                .await;
+            gateway
+                .until(|frame| frame_of(frame, "execution_started", &second))
+                .await;
+            assert_eq!(fs::read_to_string(&issued.file).unwrap(), first_token);
+            assert_eq!(
+                fs::read_to_string(issued.file_for(&second.assignment_id)).unwrap(),
+                second_token
+            );
+
+            lease_time.advance(Duration::from_secs(1));
+            let sequence =
+                request_lease_renewal(&mut context.assignment_manager.lock().unwrap(), &first);
+            gateway
+                .until(|frame| {
+                    frame_of(frame, "execution_lease_renewal_requested", &first)
+                        && frame["payload"]["currentLeaseSequence"] == sequence
+                })
+                .await;
+            gateway
+                .effect(cloud_frame(
+                    "assignment-lease-renewed",
+                    json!({
+                        "effectId": renewal,
+                        "assignmentId": first.assignment_id,
+                        "runId": first.run_id,
+                        "attemptId": first.attempt_id,
+                        "lease": { "leaseSequence": sequence + 1 },
+                    }),
+                ))
+                .await;
+
+            fs::write(first_log.join("answer"), "continue").unwrap();
+            fs::remove_file(first_log.join("gate")).unwrap();
+            gateway
+                .until(|frame| {
+                    frame_of(frame, "tree_progress", &first)
+                        && frame["payload"]["state"] == "running"
+                        && frame["payload"]["attempt"] == 2
+                })
+                .await;
+            fs::write(first_log.join("proceed"), b"").unwrap();
+            let finished = gateway.until(|frame| ends(frame, &first)).await;
+            assert_eq!(finished["type"], "execution_finished");
+            assert_eq!(finished["payload"]["outcome"]["outcome"], "succeeded");
+            assert!(
+                !gateway.frames.iter().any(|frame| ends(frame, &second)),
+                "B ended before A"
+            );
+
+            fs::remove_file(second_log.join("running")).unwrap();
+            let finished = gateway.until(|frame| ends(frame, &second)).await;
+            assert_eq!(finished["type"], "execution_finished");
+            gateway.inbound.send(Message::Close(None));
+        };
+        let (result, ()) = with_watchdog(async { tokio::join!(established, peer) })
+            .await
+            .expect("the two-run session timed out");
+        result.expect("the two-run session failed");
+
+        for frame in &gateway.frames {
+            let Some(assignment_id) = frame["payload"]["assignmentId"].as_str() else {
+                continue;
+            };
+            let offer = [&first, &second]
+                .into_iter()
+                .find(|offer| offer.assignment_id == assignment_id)
+                .unwrap_or_else(|| panic!("a frame names another assignment: {frame}"));
+            for (member, own) in [("runId", &offer.run_id), ("attemptId", &offer.attempt_id)] {
+                let named = &frame["payload"][member];
+                assert!(
+                    named.is_null() || named == own.as_str(),
+                    "a frame of {assignment_id} names another run: {frame}"
+                );
+            }
+        }
+        let renewed = context
+            .capture
+            .events()
+            .into_iter()
+            .find(|event| {
+                event["event.name"] == "runner.effect_acknowledgement"
+                    && event["um.effect.id"] == renewal
+            })
+            .expect("the renewal's acknowledgement was recorded");
+        assert_eq!(renewed["um.lease.disposition"], "applied");
+        for (log, offer, file) in [
+            (&first_log, &first, issued.file.clone()),
+            (&second_log, &second, issued.file_for(&second.assignment_id)),
+        ] {
+            assert!(
+                file.components()
+                    .any(|component| component.as_os_str() == offer.assignment_id.as_str())
+            );
+            let environment = fs::read_to_string(log.join("create.env")).unwrap();
+            assert!(
+                environment
+                    .lines()
+                    .any(|line| line == format!("GH_TOKEN_FILE={}", file.display())),
+                "{} was not offered its own token file",
+                offer.assignment_id
+            );
+        }
     }
 
     async fn abort_fixture_server(server: tokio::task::JoinHandle<()>) {

@@ -19,7 +19,7 @@ use super::execution::{
 use super::lease_clock::{LeaseClock, LeaseClockError, LeaseInstant, LeaseWaitCancellation};
 use super::run_inputs::{HttpRunInputBroker, PreparationDeadline, RunInputBroker, RunInputFailure};
 use super::source::{HttpSourceCredentialBroker, MaterializationFailure, SourceCredentialBroker};
-use super::tree_run::{HttpTreeBroker, TreeRunDependencies};
+use super::tree_run::{HeldRuns, HttpTreeBroker, RunActivity, TreeRunDependencies};
 use super::workflow_git::{WorkflowGitAuthority, WorkflowGitInstall};
 use super::workspace::{
     AssignmentRoot, AssignmentRootCreationError, CleanupResult, ProcessQuiescence, RetentionReason,
@@ -69,6 +69,10 @@ pub(super) use outbox::*;
 use root_preparation::*;
 use spec_validation::*;
 const MAXIMUM_RETAINED_DECISIONS: usize = 256;
+/// The most assignments the runner holds at once; an offer past it is declined
+/// `capacity_unavailable` (REQ-RUNNERENROLL-132). Half the retained decisions, so each held
+/// assignment's decision is kept with room for as many settled ones.
+pub(super) const MAXIMUM_HELD_ASSIGNMENTS: usize = MAXIMUM_RETAINED_DECISIONS / 2;
 pub(super) const MAXIMUM_SERVICE_OBSERVATIONS: usize = 1_344;
 pub(super) const OBSERVATION_RESERVE_BASE: usize = 64;
 const FINAL_ACKNOWLEDGEMENT_GRACE: Duration = Duration::from_secs(10);
@@ -192,8 +196,8 @@ pub(super) struct AcceptedAssignment {
     /// The runner's Git relay for the workspace (REQ-WORKSPACE-19); a tree run on a GitLab
     /// project uses the host's own Git access and has none (REQ-WORKSPACE-42).
     pub(super) workflow_git: Option<WorkflowGitAuthority>,
-    /// The assignment's grant token files, which the slot carries until the
-    /// assignment ends (INV-RUNNER-28).
+    /// The assignment's grant token files, which the manager holds with the
+    /// assignment until it ends (INV-RUNNER-28).
     pub(super) grant_tokens: Option<Arc<AssignmentGrantTokens>>,
 }
 
@@ -544,9 +548,23 @@ struct RunningAssignment {
     workspace_release: Option<CleanupResult>,
     run_event: RunEvent,
     /// The assignment's grant token files, held only to be dropped: they are
-    /// removed when the slot lets go of the running assignment, whatever
+    /// removed when the manager lets go of the running assignment, whatever
     /// ends it (INV-RUNNER-28).
     _grant_tokens: Option<Arc<AssignmentGrantTokens>>,
+    /// Whether a tree run is working, as its loop last reported it, which agent-login setup
+    /// and the offer rule read (INV-RUNNER-15, INV-RUNNER-40); none for a run on the
+    /// embedded engine, which always works.
+    activity: Option<Arc<RunActivity>>,
+}
+
+impl RunningAssignment {
+    /// Whether the run reported a wait, which its end carries on (INV-RUNNER-40); never for
+    /// a run on the embedded engine.
+    fn reported_wait(&self) -> bool {
+        self.activity
+            .as_ref()
+            .is_some_and(|activity| activity.has_reported_wait())
+    }
 }
 
 struct PreparingAssignment {
@@ -624,10 +642,20 @@ struct FinishingAssignment {
     final_observation_id: u64,
     root: Option<AssignmentRoot>,
     workspace_disposition: WorkspaceDisposition,
+    /// Whether the assignment's run reported a wait before it ended (INV-RUNNER-40).
+    reported_wait: bool,
+}
+
+/// An ended assignment that reports until Cloud acknowledges its last report.
+struct ReportingAssignment {
+    identity: AssignmentIdentity,
+    /// Whether the assignment's run reported a wait before it ended, so that a successor's
+    /// offer does not prove Cloud has settled it (INV-RUNNER-40).
+    reported_wait: bool,
 }
 
 // A successor has fenced the predecessor's terminal report, but its grace timer
-// may still deliver an event. Keep these obligations separate from the successor slot.
+// may still deliver an event. Keep these obligations separate from the held assignments.
 #[derive(Eq, Ord, PartialEq, PartialOrd)]
 struct FencedFinalGrace {
     assignment_id: String,
@@ -636,7 +664,7 @@ struct FencedFinalGrace {
 
 enum ReleaseAfter {
     Idle,
-    Reporting(Box<AssignmentIdentity>),
+    Reporting(Box<ReportingAssignment>),
     PreExecutionCancellation(Box<AssignmentIdentity>),
 }
 
@@ -646,12 +674,76 @@ struct ReleasingAssignment {
     retention_report: Option<(String, String, String, String, Option<serde_json::Value>)>,
 }
 
-enum LocalSlot {
+/// An assignment the runner holds, in the state it has reached; the manager keys each by
+/// its assignment ID (INV-RUNNER-40).
+enum HeldAssignment {
     Preparing(Box<PreparingAssignment>),
     Accepted(Box<AcceptedAssignment>),
     Running(Box<RunningAssignment>),
     Finishing(Box<FinishingAssignment>),
-    Releasing(ReleasingAssignment),
+    Releasing(Box<ReleasingAssignment>),
+}
+
+impl HeldAssignment {
+    fn assignment_id(&self) -> &str {
+        match self {
+            Self::Preparing(preparing) => &preparing.offer.assignment_id,
+            Self::Accepted(accepted) => &accepted.identity.assignment_id,
+            Self::Running(running) => &running.identity.assignment_id,
+            Self::Finishing(finishing) => &finishing.identity.assignment_id,
+            Self::Releasing(releasing) => &releasing.assignment_id,
+        }
+    }
+
+    fn preparing(self) -> Result<Box<PreparingAssignment>, Self> {
+        match self {
+            Self::Preparing(preparing) => Ok(preparing),
+            held => Err(held),
+        }
+    }
+
+    fn accepted(self) -> Result<Box<AcceptedAssignment>, Self> {
+        match self {
+            Self::Accepted(accepted) => Ok(accepted),
+            held => Err(held),
+        }
+    }
+
+    fn running(self) -> Result<Box<RunningAssignment>, Self> {
+        match self {
+            Self::Running(running) => Ok(running),
+            held => Err(held),
+        }
+    }
+
+    fn finishing(self) -> Result<Box<FinishingAssignment>, Self> {
+        match self {
+            Self::Finishing(finishing) => Ok(finishing),
+            held => Err(held),
+        }
+    }
+
+    fn releasing(self) -> Result<Box<ReleasingAssignment>, Self> {
+        match self {
+            Self::Releasing(releasing) => Ok(releasing),
+            held => Err(held),
+        }
+    }
+
+    /// Whether the assignment is working, which keeps the runner from taking another offer
+    /// (INV-RUNNER-40): it is being prepared or is accepted, or it runs on the embedded
+    /// engine or as a tree run whose loop did not last report a wait. One that is finishing
+    /// or releasing has ended and works no longer.
+    fn is_working(&self) -> bool {
+        match self {
+            Self::Preparing(_) | Self::Accepted(_) => true,
+            Self::Running(running) => running
+                .activity
+                .as_ref()
+                .is_none_or(|activity| !activity.is_waiting()),
+            Self::Finishing(_) | Self::Releasing(_) => false,
+        }
+    }
 }
 
 pub(super) enum ManagerEvent {
@@ -722,6 +814,10 @@ struct AdmissionRuntime {
     claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
     codex_installation: Option<ValidatedCodexInstallation>,
     environment: EnvironmentSnapshot,
+    /// What each `useful` command of the admission's tree run builds its environment from
+    /// when it starts (REQ-GRANT-49): the process environment until the admission's offer
+    /// replaces it.
+    command_environment: crate::agent_login::CommandEnvironment,
     /// What notes how the provider answered each use of a login the
     /// admission's offer added (REQ-GRANT-52).
     harness_login_observer: Option<Arc<dyn HarnessLoginObserver>>,
@@ -1109,8 +1205,11 @@ pub(super) struct AssignmentManager {
     runner_id: String,
     run_events: BTreeMap<String, RunEvent>,
     lease_policy: Option<ExecutionLeasePolicy>,
-    slot: Option<LocalSlot>,
-    reporting: Option<AssignmentIdentity>,
+    /// The assignments the runner holds, by assignment ID (INV-RUNNER-40).
+    held: BTreeMap<String, HeldAssignment>,
+    /// The assignments that have ended and whose last report Cloud has yet to acknowledge,
+    /// by assignment ID; an assignment is held or reporting, never both.
+    reporting: BTreeMap<String, ReportingAssignment>,
     decisions: VecDeque<RetainedDecision>,
     cancellations: VecDeque<RetainedCancellation>,
     releases: VecDeque<AssignmentRelease>,
@@ -1155,6 +1254,71 @@ impl GrantTokenRefreshing {
             }
         }));
         tokens.keep_current(Arc::clone(&self.sleeper));
+    }
+}
+
+impl AssignmentManager {
+    /// Holds `assignment` under its assignment ID.
+    fn hold(&mut self, assignment: HeldAssignment) {
+        self.held
+            .insert(assignment.assignment_id().to_owned(), assignment);
+    }
+
+    /// Takes the assignment held under `assignment_id` out of the manager when it is in the
+    /// state `state` takes, and leaves it held otherwise.
+    fn take_held<T>(
+        &mut self,
+        assignment_id: &str,
+        state: impl FnOnce(HeldAssignment) -> Result<T, HeldAssignment>,
+    ) -> Option<T> {
+        let held = self.held.remove(assignment_id)?;
+        state(held)
+            .map_err(|held| {
+                self.held.insert(assignment_id.to_owned(), held);
+            })
+            .ok()
+    }
+
+    fn preparing(&self, assignment_id: &str) -> Option<&PreparingAssignment> {
+        match self.held.get(assignment_id) {
+            Some(HeldAssignment::Preparing(preparing)) => Some(preparing),
+            _ => None,
+        }
+    }
+
+    fn preparing_mut(&mut self, assignment_id: &str) -> Option<&mut PreparingAssignment> {
+        match self.held.get_mut(assignment_id) {
+            Some(HeldAssignment::Preparing(preparing)) => Some(preparing),
+            _ => None,
+        }
+    }
+
+    fn running(&self, assignment_id: &str) -> Option<&RunningAssignment> {
+        match self.held.get(assignment_id) {
+            Some(HeldAssignment::Running(running)) => Some(running),
+            _ => None,
+        }
+    }
+
+    fn running_mut(&mut self, assignment_id: &str) -> Option<&mut RunningAssignment> {
+        match self.held.get_mut(assignment_id) {
+            Some(HeldAssignment::Running(running)) => Some(running),
+            _ => None,
+        }
+    }
+
+    /// Whether an assignment the runner holds is releasing its workspace.
+    fn releasing_any(&self) -> bool {
+        self.held
+            .values()
+            .any(|held| matches!(held, HeldAssignment::Releasing(_)))
+    }
+
+    /// Notes that `ended`'s assignment, no longer held, reports until Cloud acknowledges its
+    /// last report.
+    fn report(&mut self, ended: ReportingAssignment) {
+        self.reporting
+            .insert(ended.identity.assignment_id.clone(), ended);
     }
 }
 
@@ -1236,15 +1400,28 @@ pub(super) mod test_support {
     pub(in crate::service) struct RenewalTimingFixture {
         clock: LeaseClock,
         control: super::super::lease_clock::ControlledLeaseClock,
-        waits: tokio::sync::mpsc::UnboundedReceiver<(
-            Duration,
-            super::super::lease_clock::LeaseTimerRelease,
-        )>,
+        /// The clock's timer requests, which only the fixture that made the clock observes.
+        waits: Option<
+            tokio::sync::mpsc::UnboundedReceiver<(
+                Duration,
+                super::super::lease_clock::LeaseTimerRelease,
+            )>,
+        >,
+        bases: FixtureLeaseBases,
         authority: tokio::sync::watch::Receiver<LeaseAuthority>,
         causal_lease: CausalLease,
         cancellation: CancellationSource,
         identity: AssignmentIdentity,
         initial_cancellation_headroom: Duration,
+    }
+
+    /// When a renewal fixture's first lease was based and its renewal requested, and how
+    /// long ago that request was made.
+    #[derive(Clone, Copy)]
+    struct FixtureLeaseBases {
+        initial: LeaseInstant,
+        renewal: LeaseInstant,
+        elapsed_since_request: Duration,
     }
 
     impl RenewalTimingFixture {
@@ -1259,15 +1436,19 @@ pub(super) mod test_support {
                 self.identity.assignment_id.clone(),
                 self.identity.attempt_id.clone(),
             );
+            let waits = self
+                .waits
+                .as_mut()
+                .expect("only the fixture that made the lease clock observes its timers");
             let (renewal_wait, renewal_release) =
-                super::super::test_support::with_watchdog(self.waits.recv())
+                super::super::test_support::with_watchdog(waits.recv())
                     .await
                     .expect("initial renewal timer was not armed")
                     .expect("controlled lease clock closed before initial renewal timer");
             assert_eq!(renewal_wait, Duration::ZERO);
             renewal_release.release();
             let (cancellation_wait, _cancellation_release) =
-                super::super::test_support::with_watchdog(self.waits.recv())
+                super::super::test_support::with_watchdog(waits.recv())
                     .await
                     .expect("initial cancellation timer was not armed")
                     .expect("controlled lease clock closed before initial cancellation timer");
@@ -1282,11 +1463,15 @@ pub(super) mod test_support {
                 .renewal_request
                 .checked_duration_since(self.clock.now().expect("read fixture lease clock"))
                 .expect("renewed authority request remains in the future");
-            let (renewal_wait, _renewal_release) =
-                super::super::test_support::with_watchdog(self.waits.recv())
-                    .await
-                    .expect("renewed authority timer was not armed")
-                    .expect("controlled lease clock closed before renewed authority timer");
+            let (renewal_wait, _renewal_release) = super::super::test_support::with_watchdog(
+                self.waits
+                    .as_mut()
+                    .expect("only the fixture that made the lease clock observes its timers")
+                    .recv(),
+            )
+            .await
+            .expect("renewed authority timer was not armed")
+            .expect("controlled lease clock closed before renewed authority timer");
             assert_eq!(renewal_wait, expected);
         }
 
@@ -1318,56 +1503,115 @@ pub(super) mod test_support {
         install_running_renewal_fixture_after_request(manager, offer, Duration::from_secs(29))
     }
 
-    fn install_running_renewal_fixture_after_request(
+    /// Installs `offer` as a running assignment beside the one `beside` installed, on the
+    /// same controlled lease clock and with the same lease timing, so a test can hold two
+    /// running assignments on one manager (INV-RUNNER-40).
+    pub(in crate::service) fn install_running_renewal_fixture_beside(
         manager: &mut AssignmentManager,
         offer: AssignmentOffer,
-        elapsed_since_request: Duration,
+        beside: &RenewalTimingFixture,
     ) -> RenewalTimingFixture {
-        let policy = ExecutionLeasePolicy {
+        install_running_assignment(
+            manager,
+            offer,
+            beside.clock.clone(),
+            beside.control.clone(),
+            None,
+            beside.bases,
+        )
+    }
+
+    fn renewal_fixture_policy() -> ExecutionLeasePolicy {
+        ExecutionLeasePolicy {
             schema_version: 2,
             force_stop_and_reap_budget_milliseconds: 5000,
             terminal_report_delivery_budget_milliseconds: 5000,
             renewal_delivery_budget_milliseconds: 5000,
             lease_duration_milliseconds: 371_000,
             fencing_margin_milliseconds: 11_000,
-        };
-        manager
-            .retain_lease_policy(&policy)
-            .expect("retain fixture lease policy");
-        let (clock, control, waits) = super::super::lease_clock::controlled_lease_clock();
-        manager.lease_clock = clock.clone();
-        let initial_basis = clock.now().expect("read fixture lease clock");
-        let cancellation_grace = Duration::from_secs(
+        }
+    }
+
+    fn fixture_cancellation_grace(offer: &AssignmentOffer) -> Duration {
+        Duration::from_secs(
             offer
                 .execution_spec
                 .execution_limits
                 .cancellation_grace_seconds,
-        );
-        let initial_authority =
-            LeaseAuthority::derive(1, initial_basis, &policy, cancellation_grace)
-                .expect("derive initial fixture authority");
+        )
+    }
+
+    fn install_running_renewal_fixture_after_request(
+        manager: &mut AssignmentManager,
+        offer: AssignmentOffer,
+        elapsed_since_request: Duration,
+    ) -> RenewalTimingFixture {
+        let (clock, control, waits) = super::super::lease_clock::controlled_lease_clock();
+        manager.lease_clock = clock.clone();
+        let initial = clock.now().expect("read fixture lease clock");
+        let initial_authority = LeaseAuthority::derive(
+            1,
+            initial,
+            &renewal_fixture_policy(),
+            fixture_cancellation_grace(&offer),
+        )
+        .expect("derive initial fixture authority");
         control.advance(
             initial_authority
                 .renewal_request
-                .checked_duration_since(initial_basis)
+                .checked_duration_since(initial)
                 .expect("measure fixture renewal schedule"),
         );
-        let renewal_basis = clock.now().expect("read fixture renewal basis");
-        let causal_lease = CausalLease::new(initial_basis);
+        let renewal = clock.now().expect("read fixture renewal basis");
+        control.advance(elapsed_since_request);
+        install_running_assignment(
+            manager,
+            offer,
+            clock,
+            control,
+            Some(waits),
+            FixtureLeaseBases {
+                initial,
+                renewal,
+                elapsed_since_request,
+            },
+        )
+    }
+
+    fn install_running_assignment(
+        manager: &mut AssignmentManager,
+        offer: AssignmentOffer,
+        clock: LeaseClock,
+        control: super::super::lease_clock::ControlledLeaseClock,
+        waits: Option<
+            tokio::sync::mpsc::UnboundedReceiver<(
+                Duration,
+                super::super::lease_clock::LeaseTimerRelease,
+            )>,
+        >,
+        bases: FixtureLeaseBases,
+    ) -> RenewalTimingFixture {
+        let policy = renewal_fixture_policy();
+        manager
+            .retain_lease_policy(&policy)
+            .expect("retain fixture lease policy");
+        let cancellation_grace = fixture_cancellation_grace(&offer);
+        let initial_authority =
+            LeaseAuthority::derive(1, bases.initial, &policy, cancellation_grace)
+                .expect("derive initial fixture authority");
+        let causal_lease = CausalLease::new(bases.initial);
         {
             let mut state = causal_lease.lock();
-            state.bases.insert(2, renewal_basis);
+            state.bases.insert(2, bases.renewal);
             state.renewal_requests.insert(2);
         }
         let remaining = initial_authority
             .cancellation_start
-            .checked_duration_since(renewal_basis)
+            .checked_duration_since(bases.renewal)
             .expect("measure fixture cancellation headroom");
         let initial_cancellation_headroom = remaining
-            .checked_sub(elapsed_since_request)
+            .checked_sub(bases.elapsed_since_request)
             .expect("fixture delay remains before cancellation");
-        control.advance(elapsed_since_request);
-
         let identity = AssignmentIdentity::from_offer(&offer);
         let response = AssignmentDecision::Accepted {
             effect_id: offer.effect_id.clone(),
@@ -1406,7 +1650,7 @@ pub(super) mod test_support {
             broker,
             Arc::clone(&manager.sleeper),
         );
-        manager.slot = Some(LocalSlot::Running(Box::new(RunningAssignment {
+        manager.hold(HeldAssignment::Running(Box::new(RunningAssignment {
             identity: identity.clone(),
             cancellation: cancellation.clone(),
             cancellation_grace,
@@ -1420,11 +1664,13 @@ pub(super) mod test_support {
             workspace_release: None,
             run_event: RunEvent::default(),
             _grant_tokens: None,
+            activity: None,
         })));
         RenewalTimingFixture {
             clock,
             control,
             waits,
+            bases,
             authority,
             causal_lease,
             cancellation,
@@ -1452,7 +1698,7 @@ pub(super) mod test_support {
 
     pub(in crate::service) fn cleanup_complete(manager: &mut AssignmentManager) -> bool {
         manager.drain_events();
-        !matches!(manager.slot, Some(LocalSlot::Releasing(_)))
+        !manager.releasing_any()
     }
 
     pub(in crate::service) fn enqueue_lease_clock_failure_report(manager: &mut AssignmentManager) {
@@ -1546,9 +1792,35 @@ pub(super) mod test_support {
             .unwrap();
     }
 
+    pub(super) use super::held_assignment;
+
+    /// Takes the one assignment `manager` holds out of it.
+    pub(super) fn take_held_assignment(manager: &mut AssignmentManager) -> Option<HeldAssignment> {
+        let assignment_id = held_assignment(manager)?.assignment_id().to_owned();
+        manager.held.remove(&assignment_id)
+    }
+
+    /// Has `manager` hold `assignment` beside whatever it holds.
+    pub(super) fn hold_assignment(manager: &mut AssignmentManager, assignment: HeldAssignment) {
+        manager.hold(assignment);
+    }
+
+    /// The one assignment `manager` notes as still reporting, or none.
+    pub(super) fn reporting_assignment(manager: &AssignmentManager) -> Option<&AssignmentIdentity> {
+        assert!(
+            manager.reporting.len() <= 1,
+            "more than one assignment is reporting"
+        );
+        manager
+            .reporting
+            .values()
+            .next()
+            .map(|reporting| &reporting.identity)
+    }
+
     pub(in crate::service) fn active_step_count(manager: &AssignmentManager) -> Option<usize> {
-        match &manager.slot {
-            Some(LocalSlot::Accepted(accepted)) => match &accepted.execution {
+        match held_assignment(manager) {
+            Some(HeldAssignment::Accepted(accepted)) => match &accepted.execution {
                 AcceptedExecution::Engine(admitted) => {
                     Some(admitted.workflow().definition.steps.len())
                 }
@@ -1695,8 +1967,8 @@ pub(super) mod test_support {
 
     /// The workspace and private roots of the assignment `manager` has accepted.
     pub(in crate::service) fn accepted_roots(manager: &AssignmentManager) -> (PathBuf, PathBuf) {
-        match &manager.slot {
-            Some(LocalSlot::Accepted(accepted)) => (
+        match held_assignment(manager) {
+            Some(HeldAssignment::Accepted(accepted)) => (
                 accepted.root.workspace.path().to_owned(),
                 accepted.root.private.path().to_owned(),
             ),
@@ -1848,9 +2120,7 @@ pub(super) mod test_support {
             return (rejected, false);
         };
         manager.acknowledge_observation(preparing);
-        let preparation_expires_at = (manager.sleeper.utc_now() + time::Duration::minutes(15))
-            .format(&time::format_description::well_known::Rfc3339)
-            .unwrap();
+        let preparation_expires_at = preparation_expires_at(manager);
         manager
             .handle_prepare(AssignmentPrepare {
                 effect_id: effect_id.to_owned(),
@@ -1864,7 +2134,10 @@ pub(super) mod test_support {
         let mut ready_while_preparing = false;
         wait_until(manager, |manager| {
             manager.drain_events();
-            let preparing = matches!(manager.slot, Some(LocalSlot::Preparing(_)));
+            let preparing = matches!(
+                manager.held.get(&offer.assignment_id),
+                Some(HeldAssignment::Preparing(_))
+            );
             if let Some(ready) = manager
                 .pending_observations(&BTreeSet::new(), 100)
                 .into_iter()
@@ -1896,6 +2169,14 @@ pub(super) mod test_support {
             }
         }
         (decline, ready_while_preparing)
+    }
+
+    /// When a preparation Cloud asks of `manager` now expires, as Cloud sets it: 15 minutes
+    /// on, by the manager's own clock.
+    pub(in crate::service) fn preparation_expires_at(manager: &AssignmentManager) -> String {
+        (manager.sleeper.utc_now() + time::Duration::minutes(15))
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
     }
 
     /// Starts the accepted `offer` with its first lease and authorizes execution.
@@ -1949,7 +2230,7 @@ pub(super) mod test_support {
     ) -> Vec<AssignmentObservation> {
         wait_until(manager, |manager| {
             manager.drain_events();
-            manager.slot.is_none()
+            manager.held.is_empty()
         })
         .await;
         manager
@@ -1965,17 +2246,124 @@ pub(super) mod test_support {
         manager.cleanup_failed
     }
 
-    /// Replaces the manager's lease clock with one whose time passes only as each of
-    /// its timers is released through the returned requests.
+    /// Replaces the manager's lease clock with one whose time passes only as the returned
+    /// control advances it or as each of its timers is released through the returned
+    /// requests.
     pub(in crate::service) fn control_lease_clock(
         manager: &mut AssignmentManager,
-    ) -> tokio::sync::mpsc::UnboundedReceiver<(
-        Duration,
-        super::super::lease_clock::LeaseTimerRelease,
-    )> {
-        let (clock, _control, waits) = super::super::lease_clock::controlled_lease_clock();
+    ) -> (
+        super::super::lease_clock::ControlledLeaseClock,
+        tokio::sync::mpsc::UnboundedReceiver<(
+            Duration,
+            super::super::lease_clock::LeaseTimerRelease,
+        )>,
+    ) {
+        let (clock, control, waits) = super::super::lease_clock::controlled_lease_clock();
         manager.lease_clock = clock;
-        waits
+        (control, waits)
+    }
+
+    /// Puts `manager` on a lease clock whose time passes only as the returned control
+    /// advances it, the runner's own short waits (its containment polls) passing at once.
+    pub(in crate::service) fn hold_lease_time(
+        manager: &mut AssignmentManager,
+    ) -> super::super::lease_clock::ControlledLeaseClock {
+        let (control, mut timers) = control_lease_clock(manager);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Some((duration, release)) = timers.recv().await {
+                if duration <= Duration::from_secs(1) {
+                    release.release();
+                } else {
+                    held.push(release);
+                }
+            }
+        });
+        control
+    }
+
+    /// Requests the next lease of the running `offer` as its lease supervision does when
+    /// the renewal falls due, at the lease clock's time, queuing the request for Cloud,
+    /// and returns the sequence of the lease it holds.
+    pub(in crate::service) fn request_lease_renewal(
+        manager: &mut AssignmentManager,
+        offer: &AssignmentOffer,
+    ) -> u64 {
+        let running = manager
+            .running(&offer.assignment_id)
+            .expect("the renewed assignment runs");
+        let sequence = running.current_grant.sequence;
+        running
+            .causal_lease
+            .request_renewal(
+                sequence,
+                &offer.assignment_id,
+                &offer.attempt_id,
+                &manager.lease_clock,
+                &manager.outbox,
+            )
+            .expect("request the lease renewal");
+        sequence
+    }
+
+    /// Requests the next lease of the running `offer` (`request_lease_renewal`), then
+    /// applies Cloud's renewal of it under the effect `effect_id`, returning the renewal's
+    /// disposition.
+    pub(in crate::service) fn renew_lease(
+        manager: &mut AssignmentManager,
+        offer: &AssignmentOffer,
+        effect_id: &str,
+    ) -> &'static str {
+        let sequence = request_lease_renewal(manager, offer);
+        manager
+            .handle_renewal(AssignmentRenewal {
+                effect_id: effect_id.to_owned(),
+                assignment_id: offer.assignment_id.clone(),
+                run_id: offer.run_id.clone(),
+                attempt_id: offer.attempt_id.clone(),
+                lease: ExecutionLeaseGrant {
+                    sequence: sequence + 1,
+                },
+            })
+            .expect("apply the lease renewal")
+            .disposition
+            .as_str()
+    }
+
+    /// The execution reports queued, in order, with their observation IDs: those of
+    /// `assignment_id` alone, or every assignment's with none.
+    fn queued_reports(
+        manager: &mut AssignmentManager,
+        assignment_id: Option<&str>,
+        limit: usize,
+    ) -> Vec<(u64, ExecutionReport)> {
+        manager
+            .pending_observations(&BTreeSet::new(), limit)
+            .into_iter()
+            .filter_map(|pending| match pending.observation {
+                AssignmentObservation::Execution {
+                    assignment_id: reported,
+                    report,
+                    ..
+                } if assignment_id.is_none_or(|assignment_id| reported == assignment_id) => {
+                    Some((pending.id, report))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The execution reports of the assignment `assignment_id` queued now, in order, left
+    /// queued.
+    pub(in crate::service) fn queued_assignment_reports(
+        manager: &mut AssignmentManager,
+        assignment_id: &str,
+    ) -> Vec<ExecutionReport> {
+        manager.drain_events();
+        queued_reports(manager, Some(assignment_id), MAXIMUM_SERVICE_OBSERVATIONS)
+            .into_iter()
+            .map(|(_, report)| report)
+            .collect()
     }
 
     /// Waits for the running job's terminal report and teardown, acknowledges the
@@ -1983,26 +2371,58 @@ pub(super) mod test_support {
     pub(in crate::service) async fn finished_reports(
         manager: &mut AssignmentManager,
     ) -> Vec<ExecutionReport> {
-        wait_until(manager, |manager| {
-            manager.drain_events();
-            !matches!(manager.slot, Some(LocalSlot::Running(_)))
-                && manager
-                    .pending_observations(&BTreeSet::new(), MAXIMUM_SERVICE_OBSERVATIONS)
-                    .iter()
-                    .any(|pending| pending.observation.is_terminal())
-        })
-        .await;
+        finished_reports_of(manager, None).await
+    }
+
+    /// `finished_reports` for the assignment `assignment_id` alone, whatever else the
+    /// manager holds: waits until it no longer runs and its terminal report is queued,
+    /// acknowledges that report, and returns its execution reports in order.
+    pub(in crate::service) async fn finished_assignment_reports(
+        manager: &mut AssignmentManager,
+        assignment_id: &str,
+    ) -> Vec<ExecutionReport> {
+        finished_reports_of(manager, Some(assignment_id)).await
+    }
+
+    /// Waits until the assignment `assignment_id` no longer runs and its terminal report is
+    /// queued, and returns its execution reports in order, the terminal one left
+    /// unacknowledged, as while Cloud has yet to read it.
+    pub(in crate::service) async fn ended_assignment_reports(
+        manager: &mut AssignmentManager,
+        assignment_id: &str,
+    ) -> Vec<ExecutionReport> {
+        wait_until_ended(manager, Some(assignment_id)).await;
+        queued_assignment_reports(manager, assignment_id)
+    }
+
+    async fn finished_reports_of(
+        manager: &mut AssignmentManager,
+        assignment_id: Option<&str>,
+    ) -> Vec<ExecutionReport> {
+        wait_until_ended(manager, assignment_id).await;
         let mut reports = Vec::new();
-        for pending in manager.pending_observations(&BTreeSet::new(), MAXIMUM_SERVICE_OBSERVATIONS)
-        {
-            if let AssignmentObservation::Execution { report, .. } = pending.observation {
-                if report.is_terminal() {
-                    manager.acknowledge_observation(pending.id);
-                }
-                reports.push(report);
+        for (id, report) in queued_reports(manager, assignment_id, MAXIMUM_SERVICE_OBSERVATIONS) {
+            if report.is_terminal() {
+                manager.acknowledge_observation(id);
             }
+            reports.push(report);
         }
         reports
+    }
+
+    /// Waits until no assignment runs, or with `assignment_id` until that one does not, and
+    /// its terminal report is queued.
+    async fn wait_until_ended(manager: &mut AssignmentManager, assignment_id: Option<&str>) {
+        wait_until(manager, |manager| {
+            manager.drain_events();
+            !manager.held.iter().any(|(held_id, held)| {
+                matches!(held, HeldAssignment::Running(_))
+                    && assignment_id.is_none_or(|assignment_id| held_id == assignment_id)
+            }) && queued_reports(manager, assignment_id, MAXIMUM_SERVICE_OBSERVATIONS)
+                .iter()
+                .any(|(_, report)| report.is_terminal())
+        })
+        .await;
     }
 
     /// Waits until the queued execution reports, in order, satisfy `reached`, leaving
@@ -2011,15 +2431,29 @@ pub(super) mod test_support {
         manager: &mut AssignmentManager,
         reached: impl Fn(&[ExecutionReport]) -> bool,
     ) {
+        wait_for_reports_of(manager, None, reached).await;
+    }
+
+    /// `wait_for_reports` over the execution reports of the assignment `assignment_id`
+    /// alone.
+    pub(in crate::service) async fn wait_for_assignment_reports(
+        manager: &mut AssignmentManager,
+        assignment_id: &str,
+        reached: impl Fn(&[ExecutionReport]) -> bool,
+    ) {
+        wait_for_reports_of(manager, Some(assignment_id), reached).await;
+    }
+
+    async fn wait_for_reports_of(
+        manager: &mut AssignmentManager,
+        assignment_id: Option<&str>,
+        reached: impl Fn(&[ExecutionReport]) -> bool,
+    ) {
         wait_until(manager, |manager| {
             manager.drain_events();
-            let reports = manager
-                .pending_observations(&BTreeSet::new(), 100)
+            let reports = queued_reports(manager, assignment_id, 100)
                 .into_iter()
-                .filter_map(|pending| match pending.observation {
-                    AssignmentObservation::Execution { report, .. } => Some(report),
-                    _ => None,
-                })
+                .map(|(_, report)| report)
                 .collect::<Vec<_>>();
             reached(&reports)
         })
@@ -2382,6 +2816,18 @@ fn start_matches_offer(start: &AssignmentStart, offer: &AssignmentOffer) -> bool
         && start.run_id == offer.run_id
         && start.attempt_id == offer.attempt_id
         && start.execution_spec_id == offer.execution_spec.execution_spec_id
+}
+
+/// The one assignment `manager` holds, or none; a test that holds more than one names each
+/// by its assignment ID instead, and a unit test that asks here fails.
+#[cfg(any(test, feature = "test-fixtures"))]
+fn held_assignment(manager: &AssignmentManager) -> Option<&HeldAssignment> {
+    #[cfg(test)]
+    assert!(
+        manager.held.len() <= 1,
+        "the manager holds more than one assignment"
+    );
+    manager.held.values().next()
 }
 
 #[cfg(feature = "test-fixtures")]

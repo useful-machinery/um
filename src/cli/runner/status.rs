@@ -71,6 +71,14 @@ fn write_status(output: &mut impl Write, status: &StatusSnapshot) -> io::Result<
         "assignments:    {}",
         format_assignments(status.assignment_counts)?
     )?;
+    for held in &status.held_runs {
+        writeln!(
+            output,
+            "run:            {} · {}",
+            held.run_id,
+            enum_json(held.state)?
+        )?;
+    }
     if let Some(failure) = status.last_connection_failure {
         writeln!(output, "last failure:   {}", enum_json(failure)?)?;
     }
@@ -113,6 +121,7 @@ fn format_assignments(counts: AssignmentCounts) -> io::Result<String> {
         ("preparing", counts.preparing),
         ("accepted", counts.accepted),
         ("running", counts.running),
+        ("waiting", counts.waiting),
         ("finishing", counts.finishing),
         ("reporting", counts.reporting),
     ]
@@ -193,6 +202,7 @@ mod tests {
             },
             last_connection_failure: None,
             agent_logins: None,
+            held_runs: Vec::new(),
         };
         let mut output = Vec::new();
         write_status(&mut output, &status).unwrap();

@@ -62,6 +62,12 @@ pub struct AssignmentCounts {
     pub preparing: u64,
     pub accepted: u64,
     pub running: u64,
+    /// The held tree runs whose loops last reported a wait, which are not counted
+    /// `running` (REQ-RUNNERENROLL-80). Omitted when zero, so a `useful runner status`
+    /// that predates it reads a serving process that holds no waiting run, and absent
+    /// from the answer of a serving process that predates it.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub waiting: u64,
     pub finishing: u64,
     pub reporting: u64,
 }
@@ -71,9 +77,31 @@ impl AssignmentCounts {
         self.preparing
             .checked_add(self.accepted)?
             .checked_add(self.running)?
+            .checked_add(self.waiting)?
             .checked_add(self.finishing)?
             .checked_add(self.reporting)
     }
+}
+
+fn is_zero(count: &u64) -> bool {
+    *count == 0
+}
+
+/// Whether a held run is working or waiting, the two words Cloud's reads of a runner's
+/// runs use (REQ-RUNNERENROLL-42).
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HeldRunState {
+    Working,
+    Waiting,
+}
+
+/// A run the runner holds that has not ended (REQ-RUNNERENROLL-42).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct HeldRun {
+    pub run_id: String,
+    pub state: HeldRunState,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -99,6 +127,12 @@ pub struct StatusSnapshot {
     /// documents.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_logins: Option<AgentLoginReadiness>,
+    /// Each run the runner holds that has not ended, the working ones first and then in
+    /// the order the runner took them (REQ-RUNNERENROLL-42). Omitted when empty, so a
+    /// `useful runner status` that predates it reads a serving process that holds no run,
+    /// and absent from the answer of a serving process that predates it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub held_runs: Vec<HeldRun>,
 }
 
 /// A provider in the runner's agent-login readiness.
@@ -673,15 +707,26 @@ fn valid_status(status: &StatusSnapshot) -> bool {
             .pending_credential_id
             .as_deref()
             .is_none_or(|value| super::validation::valid_typed_id(value, "rrc_"))
-        && status
-            .assignment_counts
-            .total()
-            .is_some_and(|total| total <= 1)
+        && status.assignment_counts.total().is_some()
+        && valid_held_runs(&status.held_runs)
         && status
             .last_connected_at
             .as_deref()
             .is_none_or(valid_timestamp)
         && status.agent_logins.as_ref().is_none_or(valid_readiness)
+}
+
+/// The most runs a status may list, the most assignments a runner holds.
+const MAXIMUM_HELD_RUNS: usize = 128;
+
+/// A status's held runs: at most `MAXIMUM_HELD_RUNS`, each a run's ID listed once.
+fn valid_held_runs(held_runs: &[HeldRun]) -> bool {
+    let mut run_ids = BTreeSet::new();
+    held_runs.len() <= MAXIMUM_HELD_RUNS
+        && held_runs.iter().all(|held| {
+            super::validation::valid_typed_id(&held.run_id, "run_")
+                && run_ids.insert(held.run_id.as_str())
+        })
 }
 
 /// The most providers a readiness may list, as in `runner-agent-logins-v1`.
@@ -804,6 +849,7 @@ mod tests {
             assignment_counts: AssignmentCounts::default(),
             last_connection_failure: None,
             agent_logins: None,
+            held_runs: Vec::new(),
         });
         let mut encoded = encode_response(&response).unwrap();
         encoded.splice(
@@ -829,6 +875,62 @@ mod tests {
                     serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
                 assert_eq!(validator.is_valid(&value), expected, "{}", path.display());
             }
+        }
+    }
+
+    // REQ-RUNNERENROLL-42, REQ-RUNNERENROLL-80: a snapshot of several held runs, one
+    // waiting, decodes with each nonzero count and each run's state; a run in a state
+    // other than working or waiting is refused.
+    #[test]
+    fn status_with_held_runs_decodes_and_an_unknown_held_run_state_is_refused() {
+        let cli_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let fixtures = cli_root.join("tests/fixtures/runner-control/v1");
+        let validator = control_validator();
+        let read = |path: &str| std::fs::read(fixtures.join(path)).unwrap();
+
+        let valid = read("valid/status-held-runs-response.json");
+        assert!(validator.is_valid(&serde_json::from_slice(&valid).unwrap()));
+        let Ok(Response::Status(status)) = decode_response(&valid) else {
+            panic!("the held-runs snapshot did not decode");
+        };
+        assert_eq!(
+            status.assignment_counts,
+            AssignmentCounts {
+                preparing: 1,
+                waiting: 1,
+                ..AssignmentCounts::default()
+            }
+        );
+        assert_eq!(
+            status.held_runs,
+            [
+                HeldRun {
+                    run_id: "run_01k0z6r1w8f4jy2m7q9v3x5abp".to_owned(),
+                    state: HeldRunState::Working,
+                },
+                HeldRun {
+                    run_id: "run_01k0z6r1w8f4jy2m7q9v3x5abq".to_owned(),
+                    state: HeldRunState::Waiting,
+                },
+            ]
+        );
+        assert_eq!(
+            encode_response(&Response::Status(status.clone())).unwrap(),
+            valid
+        );
+
+        let invalid = read("invalid/status-held-run-unknown-state.json");
+        assert!(!validator.is_valid(&serde_json::from_slice(&invalid).unwrap()));
+        assert_eq!(decode_response(&invalid), Err(ProtocolFailure::Invalid));
+
+        // The same run listed twice, or a listed ID that is not a run's, is refused.
+        let mut twice = status.clone();
+        twice.held_runs[1].run_id = twice.held_runs[0].run_id.clone();
+        let mut foreign = status;
+        foreign.held_runs[0].run_id = "asn_01k0z6r1w8f4jy2m7q9v3x5abp".to_owned();
+        for refused in [twice, foreign] {
+            let encoded = encode_response(&Response::Status(refused)).unwrap();
+            assert_eq!(decode_response(&encoded), Err(ProtocolFailure::Invalid));
         }
     }
 
@@ -1546,6 +1648,7 @@ mod tests {
             assignment_counts: AssignmentCounts::default(),
             last_connection_failure: None,
             agent_logins: None,
+            held_runs: Vec::new(),
         });
         let encoded = encode_response(&response).unwrap();
         assert_eq!(decode_response(&encoded).unwrap(), response);

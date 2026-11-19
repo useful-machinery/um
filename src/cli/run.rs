@@ -33,8 +33,8 @@ pub(super) use continuation::{
 };
 use output::{CloudOutput, CloudSnapshot};
 pub(super) use output::{
-    reported_field, reported_text, step_path, wait_phrase, write_rejection, write_route,
-    write_waiting,
+    reported_field, reported_text, step_path, wait_phrase, write_held_with, write_rejection,
+    write_route, write_waiting,
 };
 
 // Keep the closed envelope fields grouped at the rendering boundary, without
@@ -1801,6 +1801,7 @@ fn write_observation_human(
     } else {
         writeln!(out, "  no current assignment")?;
     }
+    write_held_with(out, observation)?;
     writeln!(out, "last coordinator-accepted workflow transition:")?;
     if let Some(progress) = observation.last_transition.as_deref() {
         writeln!(

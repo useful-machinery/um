@@ -2394,8 +2394,8 @@ activations and join keys. Creating, renaming and deleting pools and moving runn
 pools stay with owners. Commands taking a pool or runner accept its ID or exact name.
 
 ```sh
-# Show a pool, its member when it is personal, its waiting runs, and how many of its
-# runners are online, busy, idle and offline.
+# Show a pool, its member when it is personal, its waiting runs, how many of its
+# runners are online, busy, idle and offline, and the runs they hold.
 useful runner pool show acme-labs builders
 
 # Register a runner in a named pool, in a member's personal pool by principal ID, or,
@@ -2406,10 +2406,12 @@ useful runner create acme-labs --member prn_01k0z6r1w8f4jy2m7q9v3x5abc \
 useful runner create acme-labs --activation-file ./runner.activation.json
 ```
 
-`useful runner pool show` counts a runner busy while it holds unfinished work and idle while it
-is enabled, connected and free, from one snapshot; `--json` carries the counts and waiting
-runs as `status`. Against a Cloud release that does not report pool status, it shows the
-pool alone. `--pool-id` and `--member` cannot be combined, and a service actor must name one
+`useful runner pool show` counts a runner busy while it is working on a run and idle while it
+is enabled, connected and working on none, a runner whose held runs all wait included, and
+prints how many runs the pool's runners hold, working and in a wait, all from one snapshot;
+`--json` carries the counts, waiting runs and held runs as `status`. Against a Cloud release
+that does not report pool status, it shows the pool alone, and against one that does not
+report held runs, it omits them. `--pool-id` and `--member` cannot be combined, and a service actor must name one
 of them, since it has no personal pool.
 
 A join key lets hosts become runners in a pool without an activation each. Any number of
@@ -2721,6 +2723,18 @@ useful runner serve
 useful runner status
 ```
 
+`runner status` prints the live runner's state, one field per line. Its `assignments:` line
+gives the total and the count of each nonzero state, `preparing`, `accepted`, `running`,
+`waiting`, `finishing` and `reporting`, a run the runner last reported waiting counted
+`waiting` and not `running`; a line follows for each run the runner holds that has not ended,
+with its run ID and whether it is working or waiting, the working ones first:
+
+```text
+assignments:    2 total (preparing: 1, waiting: 1)
+run:            run_01k0z6r1w8f4jy2m7q9v3x5abp · working
+run:            run_01k0z6r1w8f4jy2m7q9v3x5abq · waiting
+```
+
 A start that finds no enrolled state and is given neither a join key nor `--personal` or
 `--pool-id` exits 1 saying the host is not enrolled and naming `useful runner enroll --activation-file <PATH>` and
 `useful runner serve --join-key-file <PATH>` as the ways to enroll it; it contacts no Cloud
@@ -2938,10 +2952,12 @@ grace or revoke it immediately if compromise is suspected. Never print an activa
 artifact or runner state while transferring or verifying it.
 
 Runner Serve installs the agent logins members have authorized for the runner when it
-starts, every five minutes while it holds no assignment, and for each assignment it admits
+starts, every five minutes while no run it holds is working, and for each assignment it admits
 before offering it any, so an assignment admitted after a reconnect gets the new generation
-and one admitted after a revocation gets nothing of it, while an assignment already running
-keeps what it was offered. It removes a login once Cloud no longer authorizes it, a Codex
+and one admitted after a revocation gets nothing of it. A run it holds is working unless it is
+waiting: a run that is working keeps what it was offered, and one that waited through a
+reconnect or a revocation continues on the logins the runner holds then. It removes a login
+once Cloud no longer authorizes it, a Codex
 login with the runner's whole Codex home. It keeps the logins in its own
 `.runner-agent-login/` directory beside `runnerStatePath`, never in the service's `~/.codex`
 or Claude Code configuration, and offers them to each assignment as `CODEX_HOME` and
@@ -2955,9 +2971,9 @@ installed for it, and steps run on the service's login. Where neither the servic
 runner has a login, the variable is simply unset and the step starts. Runner Serve also checks a login with its
 provider by running that coding agent's own program once with the login, outside any run,
 with a fixed prompt that asks for a one-word answer: a login it installs when it starts or
-while it holds no assignment, and every `ready` login when you ask it to set up now. A check
-spends one model turn of the login owner's account at the provider, starts only while the
-runner holds no assignment, and is never made for an assignment's own setup. `useful runner
+on that five-minute schedule, and every `ready` login when you ask it to set up now. A check
+spends one model turn of the login owner's account at the provider, starts only while no run
+the runner holds is working, and is never made for an assignment's own setup. `useful runner
 status` shows each provider's readiness once it has set up, and you can ask the live runner
 to set up now:
 
@@ -2996,7 +3012,8 @@ Serve found no supported `claude` or `codex` on its `PATH` when it started), `st
 `timed_out` (no answer within 60 seconds) or `harness_error`. It exits 1 when a provider
 authorized for the runner is not `ready`, but not for one in `foreign_login`, whose steps run
 on the service's own login, or its login was refused at its last use, and 4 when
-Runner Serve is not reachable or holds an assignment (`runner_busy`); a check with no answer
+Runner Serve is not reachable or did not finish the setup because a run it holds is working
+(`runner_busy`); a check with no answer
 does not change the exit status. A Runner Serve process started from an older `useful` refuses
 the request; restart it on this release.
 

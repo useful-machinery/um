@@ -17,12 +17,17 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunnerActivity {
+    /// Assigned while the runner holds any run.
     #[serde(rename = "state")]
     pub state: State,
+    /// The number of runs the runner holds.
     #[serde(rename = "currentAssignmentCount")]
     pub current_assignment_count: i32,
     #[serde(rename = "currentAssignment", skip_serializing_if = "Option::is_none")]
     pub current_assignment: Option<Box<models::RunnerCurrentAssignment>>,
+    /// Every run the runner holds, the working ones first and then by assignment time. Absent from a Cloud that does not report it.
+    #[serde(rename = "assignments", skip_serializing_if = "Option::is_none")]
+    pub assignments: Option<Vec<models::RunnerHeldAssignment>>,
 }
 
 impl RunnerActivity {
@@ -31,9 +36,11 @@ impl RunnerActivity {
             state,
             current_assignment_count,
             current_assignment: None,
+            assignments: None,
         }
     }
 }
+/// Assigned while the runner holds any run.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum State {
     #[serde(rename = "idle")]

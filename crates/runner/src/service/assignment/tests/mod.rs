@@ -15,8 +15,13 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 
 use super::*;
+use crate::control_protocol::{HeldRun, HeldRunState};
 use crate::credential::test_credential;
-use crate::service::assignment::test_support::{active_step_count, align_fixture_capacity};
+use crate::service::assignment::test_support::{
+    active_step_count, align_fixture_capacity, held_assignment, hold_assignment,
+    install_running_renewal_fixture, install_running_renewal_fixture_beside, observation_retained,
+    reporting_assignment, take_held_assignment,
+};
 use crate::service::config::{AssignmentConfig, Config, RepositoryUrlPolicy};
 use crate::service::lease_clock::{
     ControlledLeaseClock, LeaseTimerRelease, controlled_lease_clock,
@@ -870,7 +875,7 @@ async fn prepare_current(manager: &mut AssignmentManager, offered: &AssignmentOf
     begin_preparation(manager, offered).await;
     with_watchdog(wait_for_manager_state(manager, |manager| {
         manager.drain_events();
-        !matches!(manager.slot, Some(LocalSlot::Preparing(_)))
+        !matches!(held_assignment(manager), Some(HeldAssignment::Preparing(_)))
     }))
     .await
     .expect("source materialization did not complete");
@@ -900,7 +905,7 @@ async fn offer_then_prepare(manager: &mut AssignmentManager, offered: &Assignmen
 async fn settle_cleanup(manager: &mut AssignmentManager) {
     with_watchdog(wait_for_manager_state(manager, |manager| {
         manager.drain_events();
-        !matches!(manager.slot, Some(LocalSlot::Releasing(_)))
+        !matches!(held_assignment(manager), Some(HeldAssignment::Releasing(_)))
     }))
     .await
     .expect("assignment cleanup did not complete");
@@ -909,7 +914,7 @@ async fn settle_cleanup(manager: &mut AssignmentManager) {
 async fn wait_for_execution_finalization(manager: &mut AssignmentManager) {
     with_watchdog(wait_for_manager_state(manager, |manager| {
         manager.drain_events();
-        !matches!(manager.slot, Some(LocalSlot::Running(_)))
+        !matches!(held_assignment(manager), Some(HeldAssignment::Running(_)))
     }))
     .await
     .expect("execution workspace disposition did not complete");
@@ -1018,7 +1023,7 @@ async fn assert_offer_declined(
             if *decline == expected
     ));
     settle_cleanup(manager).await;
-    assert!(manager.slot.is_none());
+    assert!(held_assignment(manager).is_none());
 }
 
 async fn assert_preparation_declined(
@@ -1045,7 +1050,7 @@ async fn assert_unmodified_preparation_declined(
             if *decline == expected
     )));
     settle_cleanup(manager).await;
-    assert!(manager.slot.is_none());
+    assert!(held_assignment(manager).is_none());
 }
 
 fn manager_fixture(workflow: &str) -> (tempfile::TempDir, AssignmentManager) {
@@ -1431,8 +1436,8 @@ fn enqueue_finished(manager: &AssignmentManager, identity: &AssignmentIdentity) 
 }
 
 fn enqueue_completion(manager: &AssignmentManager, final_delivery_deadline: LeaseInstant) -> u64 {
-    let identity = match &manager.slot {
-        Some(LocalSlot::Running(running)) => running.identity.clone(),
+    let identity = match held_assignment(manager) {
+        Some(HeldAssignment::Running(running)) => running.identity.clone(),
         _ => panic!("fixture assignment must be running"),
     };
     let final_observation_id = enqueue_finished(manager, &identity);
@@ -1479,16 +1484,16 @@ async fn cancellable_running_fixture() -> (
     let offered = offer("bg");
     offer_then_prepare(&mut manager, &offered).await;
     let _job = execution_job(&mut manager, &offered);
-    let cancellation = match &manager.slot {
-        Some(LocalSlot::Running(running)) => running.cancellation.clone(),
+    let cancellation = match held_assignment(&manager) {
+        Some(HeldAssignment::Running(running)) => running.cancellation.clone(),
         _ => panic!("assignment must be running"),
     };
     (temporary, manager, offered, cancellation)
 }
 
 fn request_next_renewal(manager: &mut AssignmentManager, offered: &AssignmentOffer) {
-    let causal_lease = match &manager.slot {
-        Some(LocalSlot::Running(running)) => running.causal_lease.clone(),
+    let causal_lease = match held_assignment(manager) {
+        Some(HeldAssignment::Running(running)) => running.causal_lease.clone(),
         _ => panic!("assignment must remain running"),
     };
     causal_lease
@@ -1530,8 +1535,8 @@ async fn controlled_running_fixture() -> (
     manager.lease_clock = lease_clock;
     let offered = offer("bg");
     offer_then_prepare(&mut manager, &offered).await;
-    let workspace = match &manager.slot {
-        Some(LocalSlot::Accepted(accepted)) => accepted.root.workspace.path(),
+    let workspace = match held_assignment(&manager) {
+        Some(HeldAssignment::Accepted(accepted)) => accepted.root.workspace.path(),
         _ => panic!("fixture assignment must be accepted"),
     };
     fs::write(
@@ -1610,7 +1615,7 @@ async fn assert_workflow_environment_unsupported(manager: &mut AssignmentManager
         }) if **decline == AssignmentDecline::RunnerUnable(RunnerUnableReason::WorkflowEnvironmentUnsupported)
     ));
     settle_cleanup(manager).await;
-    assert!(manager.slot.is_none());
+    assert!(held_assignment(manager).is_none());
 }
 
 async fn execute_to_terminal(
@@ -2364,19 +2369,22 @@ async fn prepared_event_after_absolute_deadline_cannot_retain_acceptance() {
     prepare_current(&mut manager, &offered).await;
     let acceptance = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
     manager.acknowledge_observation(acceptance);
-    let accepted = match manager.slot.take() {
-        Some(LocalSlot::Accepted(accepted)) => *accepted,
+    let accepted = match take_held_assignment(&mut manager) {
+        Some(HeldAssignment::Accepted(accepted)) => *accepted,
         _ => panic!("fixture assignment must be accepted"),
     };
-    manager.slot = Some(LocalSlot::Preparing(Box::new(PreparingAssignment {
-        offer: offered.clone(),
-        cancellation: CaptureCancellation::default(),
-        root_preparation: None,
-        root: None,
-        prepare_effect_id: Some("eff_01k0z6r1w8f4jy2m7q9v3x5acz".to_owned()),
-        preparation_event: None,
-        run_event: RunEvent::default(),
-    })));
+    hold_assignment(
+        &mut manager,
+        HeldAssignment::Preparing(Box::new(PreparingAssignment {
+            offer: offered.clone(),
+            cancellation: CaptureCancellation::default(),
+            root_preparation: None,
+            root: None,
+            prepare_effect_id: Some("eff_01k0z6r1w8f4jy2m7q9v3x5acz".to_owned()),
+            preparation_event: None,
+            run_event: RunEvent::default(),
+        })),
+    );
     manager
         .event_sender
         .send(ManagerEvent::Prepared {
@@ -2392,9 +2400,12 @@ async fn prepared_event_after_absolute_deadline_cannot_retain_acceptance() {
         entry.observation,
         AssignmentObservation::Decision(AssignmentDecision::Accepted { .. })
     )));
-    assert!(matches!(manager.slot, Some(LocalSlot::Releasing(_))));
+    assert!(matches!(
+        held_assignment(&manager),
+        Some(HeldAssignment::Releasing(_))
+    ));
     settle_cleanup(&mut manager).await;
-    assert!(manager.slot.is_none());
+    assert!(held_assignment(&manager).is_none());
 }
 
 #[tokio::test]
@@ -2551,8 +2562,8 @@ async fn command_failure_retains_git_dirty_untracked_ignored_and_build_bytes() {
     let (_temporary, mut manager) = manager_fixture(workflow);
     let offered = offer("bg");
     offer_then_prepare(&mut manager, &offered).await;
-    let (workspace, private) = match &manager.slot {
-        Some(LocalSlot::Accepted(accepted)) => (
+    let (workspace, private) = match held_assignment(&manager) {
+        Some(HeldAssignment::Accepted(accepted)) => (
             accepted.root.workspace.path(),
             accepted.root.private.path().to_owned(),
         ),
@@ -2602,8 +2613,8 @@ async fn staged_carrier_delivery_reads_while_the_workspace_remains_available() {
     let (_temporary, mut manager) = manager_fixture(workflow);
     let offered = offer("bg");
     offer_then_prepare(&mut manager, &offered).await;
-    let (workspace, private, helper) = match &manager.slot {
-        Some(LocalSlot::Accepted(accepted)) => {
+    let (workspace, private, helper) = match held_assignment(&manager) {
+        Some(HeldAssignment::Accepted(accepted)) => {
             let private = accepted.root.private.path().to_owned();
             (
                 accepted.root.workspace.path(),
@@ -2645,8 +2656,8 @@ async fn credential_teardown_failure_after_prepared_delivery_retains_and_admits_
     let (_temporary, mut manager) = manager_fixture(workflow);
     let offered = offer("bg");
     offer_then_prepare(&mut manager, &offered).await;
-    let workspace = match &manager.slot {
-        Some(LocalSlot::Accepted(accepted)) => accepted.root.workspace.path(),
+    let workspace = match held_assignment(&manager) {
+        Some(HeldAssignment::Accepted(accepted)) => accepted.root.workspace.path(),
         _ => panic!("fixture assignment must be accepted"),
     };
     let job = execution_job(&mut manager, &offered);
@@ -2685,8 +2696,8 @@ async fn credential_teardown_failure_after_prepared_delivery_retains_and_admits_
     let successor = offer("bh");
     manager.handle_offer(successor.clone()).unwrap();
     wait_for_offer_preparation(&mut manager).await;
-    let successor_workspace = match &manager.slot {
-        Some(LocalSlot::Preparing(preparing)) => preparing
+    let successor_workspace = match held_assignment(&manager) {
+        Some(HeldAssignment::Preparing(preparing)) => preparing
             .root
             .as_ref()
             .expect("successor root")
@@ -2761,7 +2772,10 @@ async fn release_during_root_preparation_retains_the_late_root() {
         .expect("assignment root preparation did not start");
     release_current(&mut manager, &offered, "stale_or_invalid_acceptance");
 
-    assert!(matches!(manager.slot, Some(LocalSlot::Preparing(_))));
+    assert!(matches!(
+        held_assignment(&manager),
+        Some(HeldAssignment::Preparing(_))
+    ));
     assert!(!has_offer_preparation(&mut manager));
 
     release_root_preparation
@@ -2769,13 +2783,13 @@ async fn release_during_root_preparation_retains_the_late_root() {
         .expect("release assignment root preparation");
     with_watchdog(wait_for_manager_state(&mut manager, |manager| {
         manager.drain_events();
-        matches!(manager.slot, Some(LocalSlot::Releasing(_)))
+        matches!(held_assignment(manager), Some(HeldAssignment::Releasing(_)))
     }))
     .await
     .expect("late assignment root did not reach cleanup");
     settle_cleanup(&mut manager).await;
 
-    assert!(manager.slot.is_none());
+    assert!(held_assignment(&manager).is_none());
     assert!(root_path.join("workspace").exists());
     assert!(!has_offer_preparation(&mut manager));
 }
@@ -2796,19 +2810,28 @@ async fn release_fences_source_preparation_and_exact_replay_cannot_reissue() {
     source.assert_not_started();
     begin_preparation(&mut manager, &offered).await;
     source.wait_until_started();
-    assert!(matches!(manager.slot, Some(LocalSlot::Preparing(_))));
+    assert!(matches!(
+        held_assignment(&manager),
+        Some(HeldAssignment::Preparing(_))
+    ));
     release_current(&mut manager, &offered, "offer_expired");
-    assert!(matches!(manager.slot, Some(LocalSlot::Preparing(_))));
+    assert!(matches!(
+        held_assignment(&manager),
+        Some(HeldAssignment::Preparing(_))
+    ));
     source.wait_until_stopped();
     with_watchdog(wait_for_manager_state(&mut manager, |manager| {
         manager.drain_events();
-        !matches!(manager.slot, Some(LocalSlot::Preparing(_)))
+        !matches!(held_assignment(manager), Some(HeldAssignment::Preparing(_)))
     }))
     .await
     .expect("cancelled source preparation did not reach cleanup");
-    assert!(matches!(manager.slot, Some(LocalSlot::Releasing(_))));
+    assert!(matches!(
+        held_assignment(&manager),
+        Some(HeldAssignment::Releasing(_))
+    ));
     settle_cleanup(&mut manager).await;
-    assert!(manager.slot.is_none());
+    assert!(held_assignment(&manager).is_none());
 
     manager.handle_offer(offered).unwrap();
     assert_eq!(source.calls(), 1);
@@ -2840,7 +2863,7 @@ async fn preparation_deadline_fences_blocked_source_materialization() {
     source.wait_until_stopped();
     with_watchdog(wait_for_manager_state(&mut manager, |manager| {
         manager.drain_events();
-        !matches!(manager.slot, Some(LocalSlot::Preparing(_)))
+        !matches!(held_assignment(manager), Some(HeldAssignment::Preparing(_)))
     }))
     .await
     .expect("expired source preparation did not reach cleanup");
@@ -2854,7 +2877,7 @@ async fn preparation_deadline_fences_blocked_source_materialization() {
             ))
     );
     settle_cleanup(&mut manager).await;
-    assert!(manager.slot.is_none());
+    assert!(held_assignment(&manager).is_none());
 }
 
 // REQ-DIAG-25
@@ -3176,8 +3199,8 @@ async fn root_cleanup_failure_suppresses_pre_execution_cancellation_evidence() {
     .await
     .expect("assignment root cleanup failure was not observed");
 
-    assert!(manager.slot.is_none());
-    assert!(manager.reporting.is_none());
+    assert!(held_assignment(&manager).is_none());
+    assert!(reporting_assignment(&manager).is_none());
     assert!(cancellation_applications(&mut manager).is_empty());
     assert_no_terminal_observation(&mut manager);
     let retained = manager
@@ -3262,15 +3285,18 @@ async fn cancellation_before_continuation_ready_releases_the_claim_without_an_ac
     assert!(claim_path.exists());
 
     let cancellation = CaptureCancellation::default();
-    manager.slot = Some(LocalSlot::Preparing(Box::new(PreparingAssignment {
-        offer: offered.clone(),
-        cancellation: cancellation.clone(),
-        root_preparation: None,
-        root: None, // The preparation worker owns the claimed root until it reports.
-        prepare_effect_id: Some(prepare.effect_id.clone()),
-        preparation_event: None,
-        run_event: RunEvent::default(),
-    })));
+    hold_assignment(
+        &mut manager,
+        HeldAssignment::Preparing(Box::new(PreparingAssignment {
+            offer: offered.clone(),
+            cancellation: cancellation.clone(),
+            root_preparation: None,
+            root: None, // The preparation worker owns the claimed root until it reports.
+            prepare_effect_id: Some(prepare.effect_id.clone()),
+            preparation_event: None,
+            run_event: RunEvent::default(),
+        })),
+    );
     let id = manager
         .outbox
         .enqueue(AssignmentObservation::ContinuationReady {
@@ -3319,7 +3345,7 @@ async fn cancellation_before_continuation_ready_releases_the_claim_without_an_ac
     with_watchdog(worker).await.unwrap().unwrap();
     with_watchdog(wait_for_manager_state(&mut manager, |manager| {
         manager.drain_events();
-        manager.slot.is_none()
+        held_assignment(manager).is_none()
     }))
     .await
     .unwrap();
@@ -3348,21 +3374,21 @@ async fn cancellation_before_start_waits_for_preparation_containment_and_replays
         .expect("release assignment root preparation");
     let contained = with_watchdog(wait_for_manager_state(&mut manager, |manager| {
         manager.drain_events();
-        manager.slot.is_none() && manager.reporting.is_some()
+        held_assignment(manager).is_none() && reporting_assignment(manager).is_some()
     }))
     .await;
     if let Err(expired) = contained {
-        let slot = match &manager.slot {
-            Some(LocalSlot::Preparing(_)) => "preparing",
-            Some(LocalSlot::Accepted(_)) => "accepted",
-            Some(LocalSlot::Running(_)) => "running",
-            Some(LocalSlot::Finishing(_)) => "finishing",
-            Some(LocalSlot::Releasing(_)) => "releasing",
+        let slot = match held_assignment(&manager) {
+            Some(HeldAssignment::Preparing(_)) => "preparing",
+            Some(HeldAssignment::Accepted(_)) => "accepted",
+            Some(HeldAssignment::Running(_)) => "running",
+            Some(HeldAssignment::Finishing(_)) => "finishing",
+            Some(HeldAssignment::Releasing(_)) => "releasing",
             None => "idle",
         };
         panic!(
             "cancelled preparation did not prove containment: slot={slot}, reporting={}, cleanup_failed={}, cancellations={:?}: {expired}",
-            manager.reporting.is_some(),
+            reporting_assignment(&manager).is_some(),
             manager.cleanup_failed,
             manager.cancellations
         );
@@ -3394,7 +3420,7 @@ async fn cancellation_before_start_waits_for_preparation_containment_and_replays
 
     manager.handle_offer(offered.clone()).unwrap();
     assert!(manager.handle_start(start_for(&offered)).unwrap().is_none());
-    assert!(manager.slot.is_none());
+    assert!(held_assignment(&manager).is_none());
 }
 
 #[tokio::test]
@@ -3409,8 +3435,8 @@ async fn running_cancellation_is_sticky_and_exactly_fenced() {
     let graceful = cancel_for(&offered, CancellationMode::Graceful, "bm");
     manager.handle_cancel(graceful.clone()).unwrap();
     assert!(matches!(
-        &manager.slot,
-        Some(LocalSlot::Running(running))
+        held_assignment(&manager),
+        Some(HeldAssignment::Running(running))
             if running.cancellation.cancellation_reason()
                 == Some(CancellationReason::UserRequest)
     ));
@@ -3730,7 +3756,7 @@ async fn blocked_checkout_fixture(
 async fn wait_until_not_preparing(manager: &mut AssignmentManager) {
     with_watchdog(wait_for_manager_state(manager, |manager| {
         manager.drain_events();
-        !matches!(manager.slot, Some(LocalSlot::Preparing(_)))
+        !matches!(held_assignment(manager), Some(HeldAssignment::Preparing(_)))
     }))
     .await
     .expect("blocked source preparation did not finish");
@@ -3820,7 +3846,7 @@ async fn shutdown_ends_a_run_it_gives_up_before_execution() {
         .await
         .expect("assignment root preparation did not start");
     manager.begin_shutdown().unwrap();
-    assert!(manager.slot.is_none());
+    assert!(held_assignment(&manager).is_none());
     let runs = captured_events(&capture, "runner.run");
     assert_eq!(runs.len(), 1);
     assert_eq!(runs[0]["um.run.result"], "aborted");
@@ -3836,7 +3862,10 @@ async fn shutdown_ends_a_run_it_gives_up_before_execution() {
     let (recorder, capture) = crate::telemetry::test_recorder("rbt_fixture");
     manager.recorder = Some(recorder);
     offer_then_prepare(&mut manager, &offered).await;
-    assert!(matches!(manager.slot, Some(LocalSlot::Accepted(_))));
+    assert!(matches!(
+        held_assignment(&manager),
+        Some(HeldAssignment::Accepted(_))
+    ));
     manager.outbox.maximum_encoded_bytes = 0;
     assert_eq!(
         manager.begin_shutdown(),
@@ -3883,7 +3912,7 @@ async fn failed_execution_activation_is_classified_without_error_text() {
     let workflow =
         "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
     let (_temporary, mut manager, _offered, job, capture) = run_event_fixture(workflow).await;
-    if let Some(LocalSlot::Running(running)) = &manager.slot {
+    if let Some(HeldAssignment::Running(running)) = held_assignment(&manager) {
         running.workflow_git.as_ref().unwrap().disable();
     }
     job.spawn();
@@ -4056,8 +4085,8 @@ async fn a_completed_run_writes_one_step_execution_per_executed_node() {
 #[tokio::test]
 async fn cancellation_during_result_delivery_reports_execution_terminal() {
     let (_temporary, mut manager, offered, cancellation) = cancellable_running_fixture().await;
-    let engine_terminal = match &manager.slot {
-        Some(LocalSlot::Running(running)) => Arc::clone(&running.engine_terminal),
+    let engine_terminal = match held_assignment(&manager) {
+        Some(HeldAssignment::Running(running)) => Arc::clone(&running.engine_terminal),
         _ => panic!("assignment must be running"),
     };
     engine_terminal.store(true, Ordering::Release);
@@ -4242,7 +4271,7 @@ async fn failed_containment_suppresses_cancellation_completion_and_slot_reuse() 
             manager.drain_events();
             let pending = manager.pending_observations(&BTreeSet::new(), 100);
             fail_pending_artifact_registrations(&mut manager, &pending);
-            if manager.cleanup_failed && manager.slot.is_none() {
+            if manager.cleanup_failed && held_assignment(&manager).is_none() {
                 return;
             }
             notified.await;
@@ -4250,11 +4279,11 @@ async fn failed_containment_suppresses_cancellation_completion_and_slot_reuse() 
     })
     .await
     .expect("failed containment did not fence assignment admission");
-    assert!(manager.reporting.is_none());
+    assert!(reporting_assignment(&manager).is_none());
     assert_no_terminal_observation(&mut manager);
 
     assert_offer_rejected_without_cleanup(&mut manager, offer("bh"), environment_unavailable());
-    assert!(manager.slot.is_none());
+    assert!(held_assignment(&manager).is_none());
 }
 
 #[tokio::test]
@@ -4264,18 +4293,22 @@ async fn stale_completion_events_preserve_an_accepted_successor() {
         let (_temporary, mut manager) = manager_fixture(workflow);
         let predecessor = offer("bg");
         offer_then_prepare(&mut manager, &predecessor).await;
-        let accepted = match manager.slot.take().unwrap() {
-            LocalSlot::Accepted(accepted) => accepted,
+        let accepted = match take_held_assignment(&mut manager).unwrap() {
+            HeldAssignment::Accepted(accepted) => accepted,
             _ => panic!("predecessor must be accepted"),
         };
         let identity = accepted.identity;
         let final_observation_id = enqueue_finished(&manager, &identity);
-        manager.slot = Some(LocalSlot::Finishing(Box::new(FinishingAssignment {
-            identity: identity.clone(),
-            final_observation_id,
-            root: Some(accepted.root),
-            workspace_disposition: WorkspaceDisposition::Remove,
-        })));
+        hold_assignment(
+            &mut manager,
+            HeldAssignment::Finishing(Box::new(FinishingAssignment {
+                identity: identity.clone(),
+                final_observation_id,
+                root: Some(accepted.root),
+                workspace_disposition: WorkspaceDisposition::Remove,
+                reported_wait: false,
+            })),
+        );
         manager.acknowledge_observation(final_observation_id);
         settle_cleanup(&mut manager).await;
         let successor = offer("bh");
@@ -4301,8 +4334,10 @@ async fn stale_completion_events_preserve_an_accepted_successor() {
         };
         manager.event_sender.send(event).unwrap();
         manager.pending_observations(&BTreeSet::new(), 100);
-        assert!(matches!(&manager.slot, Some(LocalSlot::Accepted(accepted))
-                if accepted.identity.assignment_id == successor.assignment_id));
+        assert!(
+            matches!(held_assignment(&manager), Some(HeldAssignment::Accepted(accepted))
+                if accepted.identity.assignment_id == successor.assignment_id)
+        );
     }
 }
 
@@ -4314,19 +4349,23 @@ async fn cleanup_exhaustion_preserves_the_preselected_terminal_report() {
     offer_then_prepare(&mut manager, &predecessor).await;
     let acceptance = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
     manager.acknowledge_observation(acceptance);
-    let accepted = match manager.slot.take() {
-        Some(LocalSlot::Accepted(accepted)) => accepted,
+    let accepted = match take_held_assignment(&mut manager) {
+        Some(HeldAssignment::Accepted(accepted)) => accepted,
         _ => panic!("predecessor must be accepted"),
     };
     let identity = accepted.identity.clone();
     let root_path = accepted.root.execution.parent().unwrap().to_owned();
     let final_observation_id = enqueue_finished(&manager, &identity);
-    manager.slot = Some(LocalSlot::Finishing(Box::new(FinishingAssignment {
-        identity: identity.clone(),
-        final_observation_id,
-        root: Some(accepted.root),
-        workspace_disposition: WorkspaceDisposition::Remove,
-    })));
+    hold_assignment(
+        &mut manager,
+        HeldAssignment::Finishing(Box::new(FinishingAssignment {
+            identity: identity.clone(),
+            final_observation_id,
+            root: Some(accepted.root),
+            workspace_disposition: WorkspaceDisposition::Remove,
+            reported_wait: false,
+        })),
+    );
     manager
         .event_sender
         .send(ManagerEvent::FinalGraceElapsed {
@@ -4361,6 +4400,112 @@ async fn cleanup_exhaustion_preserves_the_preselected_terminal_report() {
             ..
         }) if assignment_id == &successor.assignment_id
     )));
+}
+
+// REQ-RUNNERENROLL-71: a failed cleanup fences the boot, which interrupts every other run it
+// holds as a graceful stop does and exits only once none is held.
+#[tokio::test]
+async fn cleanup_failure_interrupts_the_other_held_runs_before_the_exit() {
+    let (_temporary, mut manager, _remover, mut requests) = gated_cleanup_manager([false; 6]);
+    let quarantined = offer("bg");
+    offer_then_prepare(&mut manager, &quarantined).await;
+    let acceptance = manager.pending_observations(&BTreeSet::new(), 1)[0].id;
+    manager.acknowledge_observation(acceptance);
+    let accepted = match take_held_assignment(&mut manager) {
+        Some(HeldAssignment::Accepted(accepted)) => accepted,
+        _ => panic!("the quarantined assignment must be accepted"),
+    };
+    let running = offer("bh");
+    let _running_fixture = install_running_renewal_fixture(&mut manager, running.clone());
+    let identity = accepted.identity.clone();
+    let final_observation_id = enqueue_finished(&manager, &identity);
+    hold_assignment(
+        &mut manager,
+        HeldAssignment::Finishing(Box::new(FinishingAssignment {
+            identity: identity.clone(),
+            final_observation_id,
+            root: Some(accepted.root),
+            workspace_disposition: WorkspaceDisposition::Remove,
+            reported_wait: false,
+        })),
+    );
+    manager
+        .event_sender
+        .send(ManagerEvent::FinalGraceElapsed {
+            assignment_id: identity.assignment_id.clone(),
+            final_observation_id,
+            continue_reporting: true,
+        })
+        .unwrap();
+    manager.pending_observations(&BTreeSet::new(), 10);
+    release_all_cleanup_retries(&mut manager, &mut requests).await;
+    with_watchdog(wait_for_manager_state(&mut manager, |manager| {
+        manager.drain_events();
+        !manager.held.contains_key(&identity.assignment_id)
+    }))
+    .await
+    .expect("the quarantined cleanup did not finish");
+    assert!(manager.cleanup_failed);
+
+    let Some(HeldAssignment::Running(held)) = manager.held.get(&running.assignment_id) else {
+        panic!("the other run must still be held");
+    };
+    assert_eq!(
+        held.cancellation.cancellation_reason(),
+        Some(CancellationReason::RunnerShutdown)
+    );
+    assert_eq!(
+        *held.infrastructure_interruption.borrow(),
+        Some(InfrastructureInterruption::RunnerShutdown)
+    );
+    let refused = offer("bj");
+    manager.handle_offer(refused.clone()).unwrap();
+    let pending = manager.pending_observations(&BTreeSet::new(), 100);
+    assert!(pending.iter().any(|entry| matches!(
+        &entry.observation,
+        AssignmentObservation::Decision(AssignmentDecision::Rejected {
+            assignment_id,
+            decline: AssignmentDecline::RunnerUnable(
+                RunnerUnableReason::ExecutionEnvironmentUnavailable
+            ),
+            ..
+        }) if assignment_id == &refused.assignment_id
+    )));
+    for entry in &pending {
+        manager.mark_observation_encoded(entry.id);
+    }
+    assert!(!manager.cleanup_failure_ready_to_exit());
+
+    // The interrupted run settles: its terminal report is queued and acknowledged.
+    let running_identity = AssignmentIdentity::from_offer(&running);
+    let report = enqueue_finished(&manager, &running_identity);
+    let deadline = manager
+        .lease_clock
+        .now()
+        .unwrap()
+        .checked_add(Duration::from_secs(5))
+        .unwrap();
+    manager
+        .event_sender
+        .send(ManagerEvent::Finished {
+            assignment_id: running.assignment_id.clone(),
+            final_observation_id: Some(report),
+            final_delivery_deadline: Some(deadline),
+            lease_clock_failed: false,
+            fenced: false,
+            retained_root: None,
+            quiescence: ProcessQuiescence::Proven,
+            quiescence_failure: None,
+            workspace_disposition: WorkspaceDisposition::Remove,
+        })
+        .unwrap();
+    manager.pending_observations(&BTreeSet::new(), 100);
+    assert!(manager.held.contains_key(&running.assignment_id));
+    manager.mark_observation_encoded(report);
+    assert!(!manager.cleanup_failure_ready_to_exit());
+    manager.acknowledge_observation(report);
+    assert!(manager.held.is_empty());
+    assert!(manager.cleanup_failure_ready_to_exit());
 }
 
 #[tokio::test]
@@ -4436,8 +4581,8 @@ steps:
 
     offer_then_prepare(&mut manager, &offered).await;
 
-    let execution = match &manager.slot {
-        Some(LocalSlot::Accepted(accepted)) => engine_admission(accepted).execution(),
+    let execution = match held_assignment(&manager) {
+        Some(HeldAssignment::Accepted(accepted)) => engine_admission(accepted).execution(),
         _ => panic!("assignment should be accepted"),
     };
     assert!(execution.root().join(".git").is_dir());
@@ -4517,8 +4662,8 @@ steps:
 
     offer_then_prepare(&mut manager, &offered).await;
 
-    let execution = match &manager.slot {
-        Some(LocalSlot::Accepted(accepted)) => engine_admission(accepted).execution(),
+    let execution = match held_assignment(&manager) {
+        Some(HeldAssignment::Accepted(accepted)) => engine_admission(accepted).execution(),
         _ => panic!("assignment should be accepted"),
     };
     for name in GRANT_TOKEN_NAMES {
@@ -4545,7 +4690,7 @@ async fn release_retires_an_unsent_acceptance_observation() {
         .unwrap();
     settle_cleanup(&mut manager).await;
 
-    assert!(manager.slot.is_none());
+    assert!(held_assignment(&manager).is_none());
     assert_only_workspace_retention(&mut manager);
 }
 
@@ -4558,7 +4703,10 @@ async fn accepted_phase_shutdown_omits_non_authoritative_finalization() {
 
     manager.begin_shutdown().unwrap();
 
-    assert!(matches!(manager.slot, Some(LocalSlot::Finishing(_))));
+    assert!(matches!(
+        held_assignment(&manager),
+        Some(HeldAssignment::Finishing(_))
+    ));
     let pending = manager.pending_observations(&BTreeSet::new(), 10);
     assert_eq!(
         pending.len(),
@@ -4585,18 +4733,22 @@ async fn shutdown_starts_finishing_cleanup_before_the_five_second_reserve() {
     let (_temporary, mut manager) = manager_fixture(workflow);
     let offered = offer("bg");
     offer_then_prepare(&mut manager, &offered).await;
-    let accepted = match manager.slot.take() {
-        Some(LocalSlot::Accepted(accepted)) => accepted,
+    let accepted = match take_held_assignment(&mut manager) {
+        Some(HeldAssignment::Accepted(accepted)) => accepted,
         _ => panic!("assignment should be accepted"),
     };
     let root_path = accepted.root.execution.parent().unwrap().to_owned();
     let final_observation_id = enqueue_finished(&manager, &accepted.identity);
-    manager.slot = Some(LocalSlot::Finishing(Box::new(FinishingAssignment {
-        identity: accepted.identity,
-        final_observation_id,
-        root: Some(accepted.root),
-        workspace_disposition: WorkspaceDisposition::Remove,
-    })));
+    hold_assignment(
+        &mut manager,
+        HeldAssignment::Finishing(Box::new(FinishingAssignment {
+            identity: accepted.identity,
+            final_observation_id,
+            root: Some(accepted.root),
+            workspace_disposition: WorkspaceDisposition::Remove,
+            reported_wait: false,
+        })),
+    );
     let (lease_clock, _control, mut waits) = controlled_lease_clock();
     manager.lease_clock = lease_clock;
 
@@ -4648,13 +4800,13 @@ async fn shutdown_requests_runner_cancellation_for_running_work() {
     manager.begin_shutdown().unwrap();
 
     assert!(matches!(
-        &manager.slot,
-        Some(LocalSlot::Running(running))
+        held_assignment(&manager),
+        Some(HeldAssignment::Running(running))
             if running.cancellation.cancellation_reason()
                 == Some(CancellationReason::RunnerShutdown)
     ));
-    let (authority_active, authority) = match &manager.slot {
-        Some(LocalSlot::Running(running)) => {
+    let (authority_active, authority) = match held_assignment(&manager) {
+        Some(HeldAssignment::Running(running)) => {
             let authority = running.workflow_git.clone().unwrap();
             (authority.is_active(), authority)
         }
@@ -4713,8 +4865,8 @@ async fn start_execution_waiting_for_authority(
         .handle_start(start_for(offered))
         .unwrap()
         .expect("valid start dispatches execution");
-    let workflow_git = match &manager.slot {
-        Some(LocalSlot::Running(running)) => running.workflow_git.clone().unwrap(),
+    let workflow_git = match held_assignment(manager) {
+        Some(HeldAssignment::Running(running)) => running.workflow_git.clone().unwrap(),
         _ => panic!("assignment must be waiting to run"),
     };
     job.spawn();
@@ -4781,8 +4933,8 @@ async fn delayed_start_authority_gates_first_workflow_git_fetch() {
         Err(AssignmentManagerFailure::ConflictingOffer)
     );
     assert!(matches!(
-        &manager.slot,
-        Some(LocalSlot::Running(running)) if !*running.start_authority.borrow()
+        held_assignment(&manager),
+        Some(HeldAssignment::Running(running)) if !*running.start_authority.borrow()
     ));
 
     let authorization = start_authorization_for(&offered);
@@ -4843,19 +4995,22 @@ async fn cancellation_during_start_authorization_reports_pre_execution_stop() {
     manager.handle_cancel(cancel.clone()).unwrap();
     assert!(cancellation_applications(&mut manager).is_empty());
     assert_no_terminal_observation(&mut manager);
-    assert!(matches!(manager.slot, Some(LocalSlot::Running(_))));
+    assert!(matches!(
+        held_assignment(&manager),
+        Some(HeldAssignment::Running(_))
+    ));
 
     manager
         .handle_start_authorized(start_authorization_for(&offered))
         .unwrap();
     assert!(matches!(
-        &manager.slot,
-        Some(LocalSlot::Running(running)) if !*running.start_authority.borrow()
+        held_assignment(&manager),
+        Some(HeldAssignment::Running(running)) if !*running.start_authority.borrow()
     ));
 
     with_watchdog(wait_for_manager_state(&mut manager, |manager| {
         manager.drain_events();
-        manager.slot.is_none() && manager.reporting.is_some()
+        held_assignment(manager).is_none() && reporting_assignment(manager).is_some()
     }))
     .await
     .expect("pre-execution cancellation did not finish containment");
@@ -5060,8 +5215,8 @@ async fn maximum_grace_renewal_delivery_boundary_is_fail_closed() {
         .await
         .expect("supervisor did not replace the obsolete cancellation timer");
     assert!(matches!(
-        &manager.slot,
-        Some(LocalSlot::Running(running))
+        held_assignment(&manager),
+        Some(HeldAssignment::Running(running))
             if running.current_grant.sequence == 2
                 && running.cancellation.cancellation_reason().is_none()
     ));
@@ -5099,8 +5254,8 @@ async fn maximum_grace_renewal_delivery_boundary_is_fail_closed() {
     assert_eq!(late.request_age_ms, Some(30_000));
     assert_eq!(late.cancellation_headroom_ms, Some(0));
     assert!(matches!(
-        &boundary_manager.slot,
-        Some(LocalSlot::Running(running))
+        held_assignment(&boundary_manager),
+        Some(HeldAssignment::Running(running))
             if running.current_grant.sequence == 1
                 && running.cancellation.cancellation_reason()
                     == Some(CancellationReason::ExecutionLeaseExpired)
@@ -5134,7 +5289,7 @@ async fn slow_renewal_is_applied_before_cancellation_and_reports_real_headroom()
             .checked_duration_since(manager.lease_clock.now().unwrap())
             .unwrap(),
     );
-    let Some(LocalSlot::Running(running)) = &manager.slot else {
+    let Some(HeldAssignment::Running(running)) = held_assignment(&manager) else {
         panic!("expected running assignment")
     };
     running
@@ -5166,6 +5321,256 @@ async fn slow_renewal_is_applied_before_cancellation_and_reports_real_headroom()
     assert_eq!(event["um.lease.disposition"], "applied");
     assert_eq!(event["um.lease.cancellation_headroom_ms"], 10_000);
     assert_eq!(event["um.lease.request_age_ms"], 20_000);
+}
+
+// INV-RUNNER-40
+#[tokio::test]
+async fn each_held_assignment_is_renewed_cancelled_released_and_finished_by_its_own_id() {
+    fn renewal(offered: &AssignmentOffer, suffix: &str) -> AssignmentRenewal {
+        AssignmentRenewal {
+            effect_id: format!("eff_01k0z6r1w8f4jy2m7q9v3x5a{suffix}"),
+            ..renewal_for(offered)
+        }
+    }
+    let first = offer("ra");
+    let second = offer("rb");
+
+    // A cancellation and an end reach only their own assignment.
+    let (_temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
+    let first_timing = install_running_renewal_fixture(&mut manager, first.clone());
+    let second_timing =
+        install_running_renewal_fixture_beside(&mut manager, second.clone(), &first_timing);
+    assert_eq!(
+        manager
+            .handle_renewal(renewal(&second, "rc"))
+            .unwrap()
+            .disposition,
+        RenewalDisposition::Applied
+    );
+    manager
+        .handle_cancel(cancel_for(&second, CancellationMode::Graceful, "rd"))
+        .unwrap();
+    assert!(second_timing.cancellation_started());
+    assert!(!first_timing.cancellation_started());
+    manager
+        .event_sender
+        .send(ManagerEvent::Finished {
+            assignment_id: second.assignment_id.clone(),
+            final_observation_id: None,
+            final_delivery_deadline: None,
+            lease_clock_failed: false,
+            fenced: false,
+            retained_root: None,
+            quiescence: ProcessQuiescence::Proven,
+            quiescence_failure: None,
+            workspace_disposition: WorkspaceDisposition::Remove,
+        })
+        .unwrap();
+    assert_eq!(
+        manager
+            .handle_renewal(renewal(&first, "re"))
+            .unwrap()
+            .disposition,
+        RenewalDisposition::Applied
+    );
+    assert_eq!(first_timing.authority_sequence(), 2);
+    assert!(!first_timing.cancellation_started());
+    // The ended assignment no longer renews.
+    assert_eq!(
+        manager
+            .handle_renewal(AssignmentRenewal {
+                lease: ExecutionLeaseGrant { sequence: 3 },
+                ..renewal(&second, "ri")
+            })
+            .unwrap()
+            .disposition,
+        RenewalDisposition::NotRunning
+    );
+
+    // A release that revokes one assignment's lease leaves the other's.
+    let (_temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
+    let first_timing = install_running_renewal_fixture(&mut manager, first.clone());
+    let second_timing =
+        install_running_renewal_fixture_beside(&mut manager, second.clone(), &first_timing);
+    manager
+        .handle_release(release_for(&first, "rf", "execution_lease_expired"))
+        .unwrap();
+    assert!(first_timing.cancellation_started());
+    assert_eq!(
+        manager
+            .handle_renewal(renewal(&first, "rg"))
+            .unwrap()
+            .disposition,
+        RenewalDisposition::CancellationStarted
+    );
+    assert_eq!(
+        manager
+            .handle_renewal(renewal(&second, "rh"))
+            .unwrap()
+            .disposition,
+        RenewalDisposition::Applied
+    );
+    assert_eq!(second_timing.authority_sequence(), 2);
+    assert!(!second_timing.cancellation_started());
+}
+
+// INV-RUNNER-40: an ended assignment that reported a wait may have been settled by Cloud
+// only after it offered a successor, so the successor's offer leaves its unacknowledged
+// terminal report queued, whether it is still finishing or only reporting, and the
+// successor is prepared beside it.
+#[tokio::test]
+async fn successor_keeps_the_terminal_report_of_an_assignment_that_waited() {
+    for still_finishing in [true, false] {
+        let (_temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
+        let predecessor = offer("bg");
+        let identity = AssignmentIdentity::from_offer(&predecessor);
+        let final_observation_id = enqueue_finished(&manager, &identity);
+        manager.mark_observation_encoded(final_observation_id);
+        hold_assignment(
+            &mut manager,
+            HeldAssignment::Finishing(Box::new(FinishingAssignment {
+                identity: identity.clone(),
+                final_observation_id,
+                root: None,
+                workspace_disposition: WorkspaceDisposition::Remove,
+                reported_wait: true,
+            })),
+        );
+        if !still_finishing {
+            manager
+                .event_sender
+                .send(ManagerEvent::FinalGraceElapsed {
+                    assignment_id: identity.assignment_id.clone(),
+                    final_observation_id,
+                    continue_reporting: true,
+                })
+                .unwrap();
+            manager.drain_events();
+            assert_eq!(reporting_assignment(&manager), Some(&identity));
+        }
+
+        let successor = offer("bh");
+        manager.handle_offer(successor.clone()).unwrap();
+        wait_for_offer_preparation(&mut manager).await;
+
+        assert!(observation_retained(&manager, final_observation_id));
+        assert!(manager.fenced_final_graces.is_empty());
+        assert!(matches!(
+            manager.held.get(&successor.assignment_id),
+            Some(HeldAssignment::Preparing(_))
+        ));
+        if still_finishing {
+            assert!(matches!(
+                manager.held.get(&identity.assignment_id),
+                Some(HeldAssignment::Finishing(_))
+            ));
+        } else {
+            assert_eq!(reporting_assignment(&manager), Some(&identity));
+        }
+    }
+}
+
+// REQ-RUNNERENROLL-132: with `MAXIMUM_HELD_ASSIGNMENTS` waiting assignments held, one more
+// offer is declined `capacity_unavailable`, and each held assignment still renews.
+#[tokio::test]
+async fn an_offer_past_the_held_assignment_bound_is_declined_and_each_held_one_renews() {
+    const ALPHABET: &[u8] = b"0123456789abcdefghjkmnpqrstvwxyz";
+    let suffix = |index: usize| {
+        format!(
+            "{}{}",
+            char::from(ALPHABET[index / ALPHABET.len()]),
+            char::from(ALPHABET[index % ALPHABET.len()])
+        )
+    };
+    let (_temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
+    let held: Vec<_> = (0..MAXIMUM_HELD_ASSIGNMENTS)
+        .map(|index| offer(&suffix(index)))
+        .collect();
+    let first_timing = install_running_renewal_fixture(&mut manager, held[0].clone());
+    for offered in &held[1..] {
+        install_running_renewal_fixture_beside(&mut manager, offered.clone(), &first_timing);
+    }
+    for offered in &held {
+        let activity = RunActivity::new();
+        activity.reported(true);
+        manager
+            .running_mut(&offered.assignment_id)
+            .expect("installed assignment runs")
+            .activity = Some(activity);
+    }
+
+    let past = offer(&suffix(MAXIMUM_HELD_ASSIGNMENTS));
+    manager.handle_offer(past.clone()).unwrap();
+    assert!(
+        manager
+            .pending_observations(&BTreeSet::new(), MAXIMUM_SERVICE_OBSERVATIONS)
+            .iter()
+            .any(|pending| matches!(
+                &pending.observation,
+                AssignmentObservation::Decision(AssignmentDecision::Rejected {
+                    assignment_id,
+                    decline: AssignmentDecline::CapacityUnavailable,
+                    ..
+                }) if assignment_id == &past.assignment_id
+            ))
+    );
+    assert!(!manager.held.contains_key(&past.assignment_id));
+
+    for (index, offered) in held.iter().enumerate() {
+        let renewal = AssignmentRenewal {
+            effect_id: format!("eff_01k0z6r1w8f4jy2m7q9v3x6r{}", suffix(index)),
+            ..renewal_for(offered)
+        };
+        assert_eq!(
+            manager.handle_renewal(renewal).unwrap().disposition,
+            RenewalDisposition::Applied,
+            "{}",
+            offered.assignment_id
+        );
+    }
+}
+
+// REQ-RUNNERENROLL-80: a held run whose loop last reported a wait is counted `waiting`
+// beside an assignment being prepared, and the status lists both, the working one first.
+#[tokio::test]
+async fn status_counts_a_waiting_run_beside_a_preparing_one_and_lists_both() {
+    let (_temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
+    let waiting = offer("bj");
+    install_running_renewal_fixture(&mut manager, waiting.clone());
+    let activity = RunActivity::new();
+    activity.reported(true);
+    manager
+        .running_mut(&waiting.assignment_id)
+        .expect("installed assignment runs")
+        .activity = Some(activity);
+    let preparing = offer("bk");
+    manager.handle_offer(preparing.clone()).unwrap();
+    assert!(manager.preparing(&preparing.assignment_id).is_some());
+
+    let (counts, held_runs) = manager.status_assignments();
+
+    assert_eq!(
+        counts,
+        AssignmentCounts {
+            preparing: 1,
+            waiting: 1,
+            ..AssignmentCounts::default()
+        }
+    );
+    assert_eq!(counts.total(), Some(2));
+    assert_eq!(
+        held_runs,
+        [
+            HeldRun {
+                run_id: preparing.run_id.clone(),
+                state: HeldRunState::Working,
+            },
+            HeldRun {
+                run_id: waiting.run_id.clone(),
+                state: HeldRunState::Waiting,
+            },
+        ]
+    );
 }
 
 // INV-LIFECYCLE-5
@@ -5367,7 +5772,7 @@ async fn delayed_replayed_and_conflicting_grants() {
 
     let (_temporary, mut unsolicited) = manager_fixture(workflow);
     unsolicited.handle_renewal(renewal_for(&offered)).unwrap();
-    assert!(unsolicited.slot.is_none());
+    assert!(held_assignment(&unsolicited).is_none());
 }
 
 #[tokio::test]
@@ -5469,7 +5874,10 @@ async fn lease_authority_arithmetic_failure_grants_no_execution() {
         manager.handle_start(start_for(&offered)),
         Err(AssignmentManagerFailure::LeaseClock)
     ));
-    assert!(matches!(manager.slot, Some(LocalSlot::Accepted(_))));
+    assert!(matches!(
+        held_assignment(&manager),
+        Some(HeldAssignment::Accepted(_))
+    ));
 }
 
 #[tokio::test]
@@ -5517,8 +5925,8 @@ async fn accepted_runner_assignment_enables_stopped_spawn_registration() {
     let offered = offer("bg");
     offer_then_prepare(&mut manager, &offered).await;
     assert!(matches!(
-        &manager.slot,
-        Some(LocalSlot::Accepted(accepted))
+        held_assignment(&manager),
+        Some(HeldAssignment::Accepted(accepted))
             if accepted.process_guards.registry(accepted.guard_processes).is_durable()
     ));
 }
@@ -5537,9 +5945,11 @@ async fn ordinary_admission_prepares_recovery_journal_without_a_start_gate() {
         .unwrap();
     let offered = offer("bg");
     offer_then_prepare(&mut manager, &offered).await;
-    assert!(matches!(&manager.slot, Some(LocalSlot::Accepted(accepted))
+    assert!(
+        matches!(held_assignment(&manager), Some(HeldAssignment::Accepted(accepted))
         if accepted.process_guards.recovery_journal()
-            && accepted.identity.assignment_id == offered.assignment_id));
+            && accepted.identity.assignment_id == offered.assignment_id)
+    );
 }
 
 #[tokio::test]
@@ -5572,7 +5982,7 @@ async fn lease_terminal_delivery_uses_the_welcomed_budget_without_reporting() {
             tokio::pin!(notified);
             notified.as_mut().enable();
             manager.pending_observations(&BTreeSet::new(), 100);
-            if manager.slot.is_none() {
+            if held_assignment(&manager).is_none() {
                 break;
             }
             notified.await;
@@ -5580,7 +5990,7 @@ async fn lease_terminal_delivery_uses_the_welcomed_budget_without_reporting() {
     })
     .await
     .expect("terminal delivery budget did not fence replay");
-    assert!(manager.reporting.is_none());
+    assert!(reporting_assignment(&manager).is_none());
     assert_eq!(manager.pending_observations(&BTreeSet::new(), 100), vec![]);
 }
 
@@ -5609,7 +6019,7 @@ async fn zero_terminal_delivery_budget_fences_the_report_at_selection() {
         pending.iter().all(|entry| entry.id != final_observation_id),
         "an exclusive zero delivery budget must not leave the terminal report replayable"
     );
-    assert!(manager.slot.is_none());
+    assert!(held_assignment(&manager).is_none());
 }
 
 #[tokio::test]
@@ -5691,7 +6101,7 @@ async fn completion_without_a_terminal_report_fences_assignment_writes() {
         .unwrap();
 
     assert_eq!(manager.pending_observations(&BTreeSet::new(), 100), vec![]);
-    assert!(manager.slot.is_none());
+    assert!(held_assignment(&manager).is_none());
 }
 
 // INV-LIFECYCLE-5
@@ -5710,8 +6120,8 @@ async fn expiry_release_revokes_running_authority_immediately() {
 
     assert!(job.authority_updates.borrow().revoked);
     assert!(matches!(
-        &manager.slot,
-        Some(LocalSlot::Running(running))
+        held_assignment(&manager),
+        Some(HeldAssignment::Running(running))
             if running.cancellation.cancellation_reason()
                 == Some(CancellationReason::ExecutionLeaseExpired)
     ));
@@ -5750,7 +6160,7 @@ async fn delayed_execution_job_does_not_start_at_cancellation_boundary() {
                 .all(|entry| !matches!(entry.observation, AssignmentObservation::Execution { .. })),
             "a delayed execution job must not publish assignment observations"
         );
-        manager.slot.is_none()
+        held_assignment(manager).is_none()
     }))
     .await
     .expect("delayed execution job did not relinquish its assignment");
@@ -5829,7 +6239,7 @@ async fn lease_loss_quiescence_attempts_artifact_delivery_before_terminal_report
                 break report;
             }
             assert!(
-                manager.slot.is_some(),
+                held_assignment(&manager).is_some(),
                 "orderly lease-loss quiescence dropped the terminal artifact delivery"
             );
             notified.await;
@@ -5883,8 +6293,8 @@ async fn renewal_at_cancellation_boundary_cannot_restore_authority() {
     assert_eq!(late.disposition, RenewalDisposition::CancellationStarted);
     assert_eq!(late.cancellation_headroom_ms, Some(-2000));
 
-    let running = match &manager.slot {
-        Some(LocalSlot::Running(running)) => running,
+    let running = match held_assignment(&manager) {
+        Some(HeldAssignment::Running(running)) => running,
         _ => panic!("fixture assignment must remain represented while fencing"),
     };
     assert_eq!(
@@ -6148,8 +6558,8 @@ async fn quiescence_failure_waits_for_terminal_ack_or_delivery_deadline() {
         manager.acknowledge_observation(acceptance);
         let job = execution_job(&mut manager, &offered);
         drop(job);
-        let identity = match &manager.slot {
-            Some(LocalSlot::Running(running)) => running.identity.clone(),
+        let identity = match held_assignment(&manager) {
+            Some(HeldAssignment::Running(running)) => running.identity.clone(),
             _ => panic!("fixture assignment must be running"),
         };
         let id = enqueue_finished(&manager, &identity);
@@ -6731,12 +7141,16 @@ async fn successor_fences_leave_room_for_more_than_256_completed_assignments() {
     let final_observation_id = enqueue_finished(&manager, &predecessor);
     manager.mark_observation_encoded(final_observation_id);
     manager.finish_transport();
-    manager.slot = Some(LocalSlot::Finishing(Box::new(FinishingAssignment {
-        identity: predecessor,
-        final_observation_id,
-        root: None,
-        workspace_disposition: WorkspaceDisposition::Remove,
-    })));
+    hold_assignment(
+        &mut manager,
+        HeldAssignment::Finishing(Box::new(FinishingAssignment {
+            identity: predecessor,
+            final_observation_id,
+            root: None,
+            workspace_disposition: WorkspaceDisposition::Remove,
+            reported_wait: false,
+        })),
+    );
 
     let successor = offer("80");
     assert_eq!(manager.handle_offer(successor), Ok(()));
@@ -6763,11 +7177,14 @@ async fn deferred_offer_outbox_exhaustion_is_reported_in_both_cleanup_outcomes()
         let (_temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
         let predecessor = offer("bg");
         let successor = offer("bh");
-        manager.slot = Some(LocalSlot::Releasing(ReleasingAssignment {
-            assignment_id: predecessor.assignment_id.clone(),
-            after: ReleaseAfter::Idle,
-            retention_report: None,
-        }));
+        hold_assignment(
+            &mut manager,
+            HeldAssignment::Releasing(Box::new(ReleasingAssignment {
+                assignment_id: predecessor.assignment_id.clone(),
+                after: ReleaseAfter::Idle,
+                retention_report: None,
+            })),
+        );
         manager.deferred_successor = Some(successor);
         // Both replay paths must enqueue a rejection even during shutdown.
         manager.shutting_down = true;
@@ -6802,11 +7219,14 @@ async fn conflicting_deferred_successor_is_reported_after_cleanup() {
             rejected(&conflict, AssignmentDecline::CapacityUnavailable),
         )
         .unwrap();
-    manager.slot = Some(LocalSlot::Releasing(ReleasingAssignment {
-        assignment_id: predecessor.assignment_id.clone(),
-        after: ReleaseAfter::Idle,
-        retention_report: None,
-    }));
+    hold_assignment(
+        &mut manager,
+        HeldAssignment::Releasing(Box::new(ReleasingAssignment {
+            assignment_id: predecessor.assignment_id.clone(),
+            after: ReleaseAfter::Idle,
+            retention_report: None,
+        })),
+    );
     manager.deferred_successor = Some(successor);
     manager
         .event_sender
@@ -6828,8 +7248,8 @@ async fn final_grace_acknowledgement_and_successor_fence_cleanup_state() {
     let (_temporary, mut manager) = manager_fixture(workflow);
     let predecessor = offer("bg");
     offer_then_prepare(&mut manager, &predecessor).await;
-    let identity = match manager.slot.take().unwrap() {
-        LocalSlot::Accepted(accepted) => accepted.identity.clone(),
+    let identity = match take_held_assignment(&mut manager).unwrap() {
+        HeldAssignment::Accepted(accepted) => accepted.identity.clone(),
         _ => panic!("offer must be accepted"),
     };
     let send_grace = |manager: &AssignmentManager, final_observation_id| {
@@ -6843,27 +7263,35 @@ async fn final_grace_acknowledgement_and_successor_fence_cleanup_state() {
             .unwrap();
     };
     let final_observation_id = enqueue_finished(&manager, &identity);
-    manager.slot = Some(LocalSlot::Finishing(Box::new(FinishingAssignment {
-        identity: identity.clone(),
-        final_observation_id,
-        root: None,
-        workspace_disposition: WorkspaceDisposition::Remove,
-    })));
+    hold_assignment(
+        &mut manager,
+        HeldAssignment::Finishing(Box::new(FinishingAssignment {
+            identity: identity.clone(),
+            final_observation_id,
+            root: None,
+            workspace_disposition: WorkspaceDisposition::Remove,
+            reported_wait: false,
+        })),
+    );
     send_grace(&manager, final_observation_id);
     manager.pending_observations(&BTreeSet::new(), 100);
-    assert!(manager.slot.is_none());
-    assert_eq!(manager.reporting, Some(identity.clone()));
+    assert!(held_assignment(&manager).is_none());
+    assert_eq!(reporting_assignment(&manager), Some(&identity));
     manager.acknowledge_observation(final_observation_id);
-    assert!(manager.reporting.is_none());
+    assert!(reporting_assignment(&manager).is_none());
 
     let final_observation_id = enqueue_finished(&manager, &identity);
     manager.mark_observation_encoded(final_observation_id);
-    manager.slot = Some(LocalSlot::Finishing(Box::new(FinishingAssignment {
-        identity: identity.clone(),
-        final_observation_id,
-        root: None,
-        workspace_disposition: WorkspaceDisposition::Remove,
-    })));
+    hold_assignment(
+        &mut manager,
+        HeldAssignment::Finishing(Box::new(FinishingAssignment {
+            identity: identity.clone(),
+            final_observation_id,
+            root: None,
+            workspace_disposition: WorkspaceDisposition::Remove,
+            reported_wait: false,
+        })),
+    );
     let successor = offer("bh");
     manager.handle_offer(successor.clone()).unwrap();
     assert!(manager.fenced_final_graces.contains(&FencedFinalGrace {
@@ -6874,9 +7302,9 @@ async fn final_grace_acknowledgement_and_successor_fence_cleanup_state() {
     send_grace(&manager, final_observation_id);
     manager.pending_observations(&BTreeSet::new(), 100);
     assert!(manager.fenced_final_graces.is_empty());
-    assert!(manager.reporting.is_none());
+    assert!(reporting_assignment(&manager).is_none());
     assert!(
-        matches!(&manager.slot, Some(LocalSlot::Preparing(preparing))
+        matches!(held_assignment(&manager), Some(HeldAssignment::Preparing(preparing))
             if preparing.offer.assignment_id == successor.assignment_id)
     );
     assert_eq!(manager.outbox.lock().entries.len(), 2);

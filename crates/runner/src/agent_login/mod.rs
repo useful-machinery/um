@@ -5,8 +5,9 @@
 //! them up for that admission (REQ-GRANT-49), noting how the provider
 //! answered each use of what it offered (REQ-GRANT-52), and checking a
 //! login it holds with its provider (REQ-GRANT-90). Each admission also
-//! asks Cloud for the grant tokens of its own assignment and keeps them
-//! until the assignment ends (REQ-GRANT-86). Where each provider's
+//! asks Cloud for the grant tokens of its own assignment and keeps them, in
+//! a directory of that assignment's own, until the assignment ends
+//! (REQ-GRANT-86, INV-RUNNER-28). Where each provider's
 //! credential comes from, the host or a grant, is settled by one rule,
 //! `credential_source`, which the readiness document, the offer and what
 //! the runner reports all take (REQ-GRANT-92, INV-RUNNER-31).
@@ -316,6 +317,63 @@ pub(crate) struct Offer {
     /// built from (REQ-INTEGRATION-12, INV-RUNNER-31); none where Cloud did
     /// not answer the list.
     pub(crate) token_services: Vec<cloud::ReportedTokenService>,
+    /// What each command a tree run of the admission starts is offered,
+    /// built when it starts (REQ-GRANT-49): from the same process
+    /// environment and directory as `environment`, with the grant token
+    /// variables `environment` added.
+    pub(crate) commands: CommandEnvironment,
+}
+
+/// What each `useful` command of a tree run is offered, built when the
+/// command starts (REQ-GRANT-49): the process environment, with each agent
+/// login the runner keeps in `directory` then added as `with_agent_logins`
+/// adds it, and with the grant token variables of the assignment's admission
+/// as that admission offered them (`grant_token::offer`). A token variable
+/// keeps the admission's value while the file its file variable names is
+/// kept current (REQ-GRANT-87), so a build reads no grant token file and no
+/// readiness document; only the agent logins are looked at again. The
+/// admission's own environment, its credential sources and its observer
+/// stay as the admission settled them (INV-RUNNER-31).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommandEnvironment {
+    process: EnvironmentSnapshot,
+    directory: Option<LoginDirectory>,
+    /// Each grant token variable the admission's offer added, with its value.
+    grant_tokens: Vec<(OsString, OsString)>,
+}
+
+impl CommandEnvironment {
+    /// What a runner that keeps no agent login offers: the process
+    /// environment, unchanged.
+    pub(crate) fn process(process: EnvironmentSnapshot) -> Self {
+        Self {
+            process,
+            directory: None,
+            grant_tokens: Vec::new(),
+        }
+    }
+
+    /// The environment a command starting now is given. It reads the agent
+    /// login files the runner keeps, small private files, so it runs on a
+    /// blocking worker.
+    pub(crate) fn build(&self) -> EnvironmentSnapshot {
+        let service = ServiceEnvironment::of(&self.process);
+        let logins = self
+            .directory
+            .as_ref()
+            .map(|directory| agent_logins(&service, directory))
+            .unwrap_or_default();
+        let mut variables = self.process.variables().clone();
+        variables.extend(logins.into_iter().map(|login| login.added));
+        // The admission added a token only under names its environment did
+        // not carry, so none of them replaces a value here either.
+        for (name, value) in &self.grant_tokens {
+            variables
+                .entry(name.clone())
+                .or_insert_with(|| value.clone());
+        }
+        EnvironmentSnapshot::new(variables)
+    }
 }
 
 /// A login the runner added to an admission's environment, as the
@@ -342,6 +400,11 @@ pub(crate) fn offer(process: &EnvironmentSnapshot, directory: Option<&LoginDirec
         offered,
         sources: sources(&service, directory, None),
         token_services: Vec::new(),
+        commands: CommandEnvironment {
+            process: process.clone(),
+            directory: directory.cloned(),
+            grant_tokens: Vec::new(),
+        },
     }
 }
 
@@ -352,17 +415,33 @@ pub(crate) fn offer(process: &EnvironmentSnapshot, directory: Option<&LoginDirec
 /// listed for the assignment included (REQ-INTEGRATION-12). The admission
 /// holds no token of a provider the host provides, whose names stay as the
 /// process environment has them, and nothing is withheld. No
-/// `OfferedLogin` records a grant token, whose uses are not noted.
+/// `OfferedLogin` records a grant token, whose uses are not noted. Its
+/// `commands` keep the token variables it added, as values, so the
+/// environment the admission reports its sources from and the one its tree
+/// run's first command is given come from this one call (INV-RUNNER-31).
 pub(crate) fn offer_with_grant_tokens(
     process: &EnvironmentSnapshot,
     directory: Option<&LoginDirectory>,
     grant_tokens: Option<&grant_token::AssignmentGrantTokens>,
 ) -> Offer {
     let offered = offer(process, directory);
+    let environment = grant_token::offer(&offered.environment, grant_tokens);
+    // `grant_token::offer` only adds names, and only ones its input did not
+    // carry.
+    let added = environment
+        .variables()
+        .iter()
+        .filter(|(name, _)| offered.environment.variable(name).is_none())
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
     Offer {
-        environment: grant_token::offer(&offered.environment, grant_tokens),
+        environment,
         sources: sources(&ServiceEnvironment::of(process), directory, grant_tokens),
         token_services: grant_token::token_service_sources(&offered.environment, grant_tokens),
+        commands: CommandEnvironment {
+            grant_tokens: added,
+            ..offered.commands
+        },
         ..offered
     }
 }
@@ -388,57 +467,69 @@ fn with_agent_logins(
     let Some(directory) = directory else {
         return (process.clone(), Vec::new());
     };
+    let logins = agent_logins(service, directory);
     let document = recorded_readiness(directory);
-    let recorded = |provider| {
-        document
-            .as_ref()
-            .and_then(|document| document.login(provider))
-    };
-    let mut added = Vec::new();
-    let mut offered = Vec::new();
-    for provider in AgentLoginProvider::INSTALLABLE {
-        let (variable, login) = match provider {
-            AgentLoginProvider::Codex => (
-                CODEX_LOGIN_VARIABLE,
-                codex::offered_home(service, directory),
-            ),
-            AgentLoginProvider::ClaudeCode => (
-                CLAUDE_CODE_LOGIN_VARIABLE,
-                claude_code::offered_token(service, directory),
-            ),
-            AgentLoginProvider::Github
-            | AgentLoginProvider::Gitlab
-            | AgentLoginProvider::Linear => {
-                continue;
-            }
-        };
-        let Some(login) = login else {
-            continue;
-        };
-        added.push(login);
-        offered.extend(
-            recorded(provider)
-                .and_then(readiness::LoginReadiness::installation)
-                .map(|installation| OfferedLogin {
-                    variable,
-                    provider,
-                    agent_login_id: installation.agent_login_id.clone(),
-                    generation: installation.generation,
-                }),
-        );
-    }
-    let environment = if added.is_empty() {
+    let offered = logins
+        .iter()
+        .filter_map(|login| {
+            let installation = document
+                .as_ref()
+                .and_then(|document| document.login(login.provider))
+                .and_then(readiness::LoginReadiness::installation)?;
+            Some(OfferedLogin {
+                variable: login.variable,
+                provider: login.provider,
+                agent_login_id: installation.agent_login_id.clone(),
+                generation: installation.generation,
+            })
+        })
+        .collect();
+    let environment = if logins.is_empty() {
         process.clone()
     } else {
-        EnvironmentSnapshot::new(
-            process
-                .variables()
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .chain(added),
-        )
+        let mut variables = process.variables().clone();
+        variables.extend(logins.into_iter().map(|login| login.added));
+        EnvironmentSnapshot::new(variables)
     };
     (environment, offered)
+}
+
+/// An agent login the runner keeps that an environment is offered.
+struct AddedLogin {
+    provider: AgentLoginProvider,
+    /// The variable its coding agent reads.
+    variable: &'static str,
+    /// That variable with the login.
+    added: (OsString, OsString),
+}
+
+/// Each agent login the runner keeps in `directory` that the environment of
+/// the service `service` describes is offered, where the service has no
+/// login of that agent's own (REQ-GRANT-51), in `INSTALLABLE`'s order.
+fn agent_logins(service: &ServiceEnvironment, directory: &LoginDirectory) -> Vec<AddedLogin> {
+    AgentLoginProvider::INSTALLABLE
+        .into_iter()
+        .filter_map(|provider| {
+            let (variable, added) = match provider {
+                AgentLoginProvider::Codex => (
+                    CODEX_LOGIN_VARIABLE,
+                    codex::offered_home(service, directory)?,
+                ),
+                AgentLoginProvider::ClaudeCode => (
+                    CLAUDE_CODE_LOGIN_VARIABLE,
+                    claude_code::offered_token(service, directory)?,
+                ),
+                AgentLoginProvider::Github
+                | AgentLoginProvider::Gitlab
+                | AgentLoginProvider::Linear => return None,
+            };
+            Some(AddedLogin {
+                provider,
+                variable,
+                added,
+            })
+        })
+        .collect()
 }
 
 /// Each provider's source, in `AgentLoginProvider::ALL`'s order, leaving out

@@ -1842,9 +1842,9 @@ async fn a_codex_home_removal_that_fails_is_finished_by_the_next_pass() {
 async fn an_admissions_pass_installs_and_ends_without_consulting_the_assignment_gate() {
     let fixture = Fixture::new(fake_codex_authorized(1));
     fixture.pass().await;
-    // The assignment being admitted holds the slot, so the periodic gate
-    // refuses; the admission's own pass installs generation 2, and ends it
-    // when its closing answer has revoked the login.
+    // The assignment being admitted is held and works, so the periodic gate
+    // refuses; with no other run held, the admission's own pass installs
+    // generation 2, and ends it when its closing answer has revoked the login.
     fixture.gate.idle_calls.store(0, Ordering::SeqCst);
     fixture
         .cloud

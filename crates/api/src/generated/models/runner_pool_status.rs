@@ -25,6 +25,8 @@ pub struct RunnerPoolStatus {
     pub queued_runs: i32,
     #[serde(rename = "runners")]
     pub runners: Box<models::RunnerPoolRunnerCounts>,
+    #[serde(rename = "heldRuns", skip_serializing_if = "Option::is_none")]
+    pub held_runs: Option<Box<models::RunnerPoolHeldRuns>>,
 }
 
 impl RunnerPoolStatus {
@@ -38,6 +40,7 @@ impl RunnerPoolStatus {
             runner_pool_id,
             queued_runs,
             runners: Box::new(runners),
+            held_runs: None,
         }
     }
 }

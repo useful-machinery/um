@@ -184,6 +184,10 @@ impl ShowCommand {
                 busy: status.runners.busy,
                 idle: status.runners.idle,
                 offline: status.runners.offline,
+                held_runs: status
+                    .held_runs
+                    .as_ref()
+                    .map(|held| (held.working, held.waiting)),
             });
             (pool, status)
         });

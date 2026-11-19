@@ -1,11 +1,14 @@
 //! The runner's own agent-login directory, `.runner-agent-login/` in the
 //! directory of `runnerStatePath`, mode `0700` (REQ-GRANT-36): the
 //! runner's Codex home `codex/`, the Claude Code token `claude-code.token`,
-//! and the grant tokens of the assignment the runner holds, `github.token`,
-//! `gitlab.token` and `linear.token`, and, for any other provider Cloud
-//! lists, `grant-tokens/<provider id>.token` (REQ-GRANT-86). Nothing but the
-//! runner writes there, so whatever is at one of its locations is the
-//! runner's to replace or remove.
+//! and, in `assignments/<assignment id>/`, mode `0700`, the grant tokens of
+//! each assignment the runner holds, `github.token`, `gitlab.token` and
+//! `linear.token`, and, for any other provider Cloud lists,
+//! `grant-tokens/<provider id>.token` (REQ-GRANT-86). An earlier release kept
+//! the grant tokens of its one assignment at those names in the directory
+//! itself, where they are only ever removed. Nothing but the runner writes
+//! there, so whatever is at one of its locations is the runner's to replace
+//! or remove.
 
 use std::fs::{self, DirBuilder, Permissions};
 use std::io;
@@ -27,6 +30,8 @@ const CLAUDE_CODE_TOKEN: &str = "claude-code.token";
 const GITHUB_TOKEN: &str = "github.token";
 const GITLAB_TOKEN: &str = "gitlab.token";
 const LINEAR_TOKEN: &str = "linear.token";
+/// The directory of the directories of each assignment's grant tokens.
+const ASSIGNMENTS: &str = "assignments";
 /// The prefixes of the temporary files each grant token file is written
 /// through, in the order of `github`, `gitlab` and `linear`.
 pub(crate) const GRANT_TOKEN_TEMPORARY_PREFIXES: [&str; 3] = [
@@ -34,14 +39,14 @@ pub(crate) const GRANT_TOKEN_TEMPORARY_PREFIXES: [&str; 3] = [
     ".useful-gitlab.token.tmp",
     ".useful-linear.token.tmp",
 ];
-/// The directory of the grant tokens of the providers other than the
-/// runner's three.
+/// The directory, in an assignment's, of the grant tokens of the providers
+/// other than the runner's three.
 const GRANT_TOKENS: &str = "grant-tokens";
 /// The prefix of the temporary files each token file in `grant-tokens` is
 /// written through. A write adds the process ID and a sequence to it, so one
 /// prefix serves every provider, and no provider id, which starts with a
 /// letter, can be mistaken for one.
-const CONFIGURED_GRANT_TOKEN_TEMPORARY_PREFIX: &str = ".useful-grant-token.tmp";
+pub(crate) const CONFIGURED_GRANT_TOKEN_TEMPORARY_PREFIX: &str = ".useful-grant-token.tmp";
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 
 /// Where the runner whose protected state is at a given path keeps the
@@ -70,11 +75,27 @@ impl LoginDirectory {
         self.0.join(CLAUDE_CODE_TOKEN)
     }
 
+    /// The directory of the directories of each assignment's grant tokens
+    /// (INV-RUNNER-28).
+    pub(crate) fn assignments(&self) -> PathBuf {
+        self.0.join(ASSIGNMENTS)
+    }
+
+    /// The directory of the grant tokens of the assignment `assignment_id`
+    /// (REQ-GRANT-86); `None` for anything but an assignment ID, which is a
+    /// file name as it stands and is never joined otherwise.
+    pub(crate) fn assignment(&self, assignment_id: &str) -> Option<PathBuf> {
+        useful_runner_protocol::valid_assignment_id(assignment_id)
+            .then(|| self.assignments().join(assignment_id))
+    }
+
     /// The file the runner keeps an OAuth provider's grant token in for the
-    /// assignment it holds (REQ-GRANT-86), and the prefix of the temporary
-    /// files it is written through; `None` for an installable provider.
+    /// assignment `assignment_id` (REQ-GRANT-86), and the prefix of the
+    /// temporary files it is written through; `None` for an installable
+    /// provider, and for anything but an assignment ID.
     pub(crate) fn grant_token(
         &self,
+        assignment_id: &str,
         provider: AgentLoginProvider,
     ) -> Option<(PathBuf, &'static str)> {
         let [github, gitlab, linear] = GRANT_TOKEN_TEMPORARY_PREFIXES;
@@ -84,26 +105,39 @@ impl LoginDirectory {
             AgentLoginProvider::Linear => (LINEAR_TOKEN, linear),
             AgentLoginProvider::Codex | AgentLoginProvider::ClaudeCode => return None,
         };
-        Some((self.0.join(name), temporary_prefix))
+        Some((self.assignment(assignment_id)?.join(name), temporary_prefix))
     }
 
-    /// The directory, inside this one, of the grant tokens of the providers
-    /// other than the runner's three: removed whole while no assignment's
-    /// tokens are in it (INV-RUNNER-28).
-    pub(crate) fn grant_tokens(&self) -> PathBuf {
-        self.0.join(GRANT_TOKENS)
+    /// The directory, in the assignment `assignment_id`'s, of the grant
+    /// tokens of the providers other than the runner's three; `None` for
+    /// anything but an assignment ID.
+    pub(crate) fn configured_grant_tokens(&self, assignment_id: &str) -> Option<PathBuf> {
+        Some(self.assignment(assignment_id)?.join(GRANT_TOKENS))
     }
 
     /// The file the runner keeps the grant token of the provider Cloud lists
-    /// as `provider_id`, other than its three, in for the assignment it holds
-    /// (REQ-GRANT-86), and the prefix of the temporary files it is written
-    /// through. A provider id starts with a letter and holds only lowercase
-    /// letters, digits, `.` and `-`, so it is a file name as it stands.
-    pub(crate) fn configured_grant_token(&self, provider_id: &str) -> (PathBuf, &'static str) {
-        (
-            self.grant_tokens().join(format!("{provider_id}.token")),
+    /// as `provider_id`, other than its three, in for the assignment
+    /// `assignment_id` (REQ-GRANT-86), and the prefix of the temporary files
+    /// it is written through; `None` for anything but an assignment ID. A
+    /// provider id starts with a letter and holds only lowercase letters,
+    /// digits, `.` and `-`, so it is a file name as it stands.
+    pub(crate) fn configured_grant_token(
+        &self,
+        assignment_id: &str,
+        provider_id: &str,
+    ) -> Option<(PathBuf, &'static str)> {
+        Some((
+            self.configured_grant_tokens(assignment_id)?
+                .join(format!("{provider_id}.token")),
             CONFIGURED_GRANT_TOKEN_TEMPORARY_PREFIX,
-        )
+        ))
+    }
+
+    /// Where an earlier release kept the grant tokens of the one assignment
+    /// it held: its three files and `grant-tokens`, in this directory. They
+    /// are never written again, only removed (INV-RUNNER-28).
+    pub(crate) fn earlier_grant_tokens(&self) -> [PathBuf; 4] {
+        [GITHUB_TOKEN, GITLAB_TOKEN, LINEAR_TOKEN, GRANT_TOKENS].map(|name| self.0.join(name))
     }
 
     /// Whether `path` names something inside the directory: below it, by

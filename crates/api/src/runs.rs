@@ -34,6 +34,8 @@ const MAX_PAGE_ITEMS: usize = 100;
 pub type Run = models::Run;
 pub type RunList = models::RunList;
 pub type RunObservation = models::RunObservation;
+/// Whether another run its runner holds is working or waiting (REQ-RUN-120).
+pub type RunHeldRunState = models::run_held_run::State;
 pub type RunLinearLifecycle = models::RunLinearLifecycle;
 pub type RunLinearLifecycleUpdate = models::RunLinearLifecycleUpdate;
 pub(crate) type RunLinearLifecycleUpdateList = models::RunLinearLifecycleUpdateList;

@@ -51,8 +51,8 @@ impl AssignmentManager {
             runner_id: config.credential().runner_id().to_owned(),
             run_events: BTreeMap::new(),
             lease_policy: None,
-            slot: None,
-            reporting: None,
+            held: BTreeMap::new(),
+            reporting: BTreeMap::new(),
             decisions: VecDeque::new(),
             cancellations: VecDeque::new(),
             releases: VecDeque::new(),
@@ -129,7 +129,10 @@ impl AssignmentManager {
         if self.cancellation_uses_effect_id(&offer.effect_id) {
             return Err(AssignmentManagerFailure::ConflictingOffer);
         }
-        if let Some(LocalSlot::Preparing(preparing)) = &self.slot {
+        for held in self.held.values() {
+            let HeldAssignment::Preparing(preparing) = held else {
+                continue;
+            };
             if preparing.offer.assignment_id == offer.assignment_id {
                 return if same_assignment(&preparing.offer, &offer) {
                     Ok(())
@@ -185,7 +188,7 @@ impl AssignmentManager {
             let response = rejected(&offer, environment_unavailable());
             return self.retain_decision(offer, response);
         }
-        if matches!(self.slot, Some(LocalSlot::Releasing(_))) {
+        if self.releasing_any() {
             if self.deferred_successor.is_none() {
                 self.deferred_successor = Some(offer);
                 return Ok(());
@@ -194,32 +197,45 @@ impl AssignmentManager {
             let response = rejected(&offer, AssignmentDecline::CapacityUnavailable);
             return self.retain_decision(offer, response);
         }
-        if matches!(
-            &self.slot,
-            Some(LocalSlot::Finishing(finishing))
-                if finishing.identity.assignment_id != offer.assignment_id
-        ) {
-            let Some(LocalSlot::Finishing(finishing)) = self.slot.take() else {
-                return Err(AssignmentManagerFailure::ConflictingOffer);
+        // The offer proves Cloud has settled an ended assignment only when that assignment
+        // never reported a wait; one that did reports on beside the successor
+        // (INV-RUNNER-40).
+        let fenced: Vec<String> = self
+            .held
+            .values()
+            .filter(|held| {
+                matches!(held, HeldAssignment::Finishing(finishing) if !finishing.reported_wait)
+                    && held.assignment_id() != offer.assignment_id
+            })
+            .map(|held| held.assignment_id().to_owned())
+            .collect();
+        let mut releasing_fenced = false;
+        for assignment_id in fenced {
+            let Some(finishing) = self.take_held(&assignment_id, HeldAssignment::finishing) else {
+                continue;
             };
-            self.retire_assignment_observations(&finishing.identity.assignment_id);
+            self.retire_assignment_observations(&assignment_id);
             if let Some(root) = finishing.root {
-                self.deferred_successor = Some(offer);
+                releasing_fenced = true;
                 self.begin_assignment_finalization(
-                    finishing.identity.assignment_id,
+                    assignment_id,
                     root,
                     ProcessQuiescence::Proven,
                     finishing.workspace_disposition,
                     ReleaseAfter::Idle,
                 );
-                return Ok(());
+                continue;
             }
             // The root is already released. Admission may proceed, but the old
             // grace event must not restore reporting after successor fencing.
             self.fenced_final_graces.insert(FencedFinalGrace {
-                assignment_id: finishing.identity.assignment_id,
+                assignment_id,
                 final_observation_id: finishing.final_observation_id,
             });
+        }
+        if releasing_fenced {
+            self.deferred_successor = Some(offer);
+            return Ok(());
         }
 
         if self.shutting_down {
@@ -230,7 +246,11 @@ impl AssignmentManager {
 
         self.apply_successor_fences(&offer.assignment_id);
         self.make_decision_room()?;
-        if self.slot.is_some() {
+        // The runner takes an offer only while every assignment it holds waits, and holds
+        // at most `MAXIMUM_HELD_ASSIGNMENTS` (INV-RUNNER-40).
+        if self.held.values().any(HeldAssignment::is_working)
+            || self.held.len() >= MAXIMUM_HELD_ASSIGNMENTS
+        {
             let response = rejected(&offer, AssignmentDecline::CapacityUnavailable);
             return self.retain_decision(offer, response);
         }
@@ -250,9 +270,10 @@ impl AssignmentManager {
                 &self.runner_id,
             );
         }
+        let assignment_id = offer.assignment_id.clone();
         self.run_events
             .insert(offer.assignment_id.clone(), run_event.clone());
-        self.slot = Some(LocalSlot::Preparing(Box::new(PreparingAssignment {
+        self.hold(HeldAssignment::Preparing(Box::new(PreparingAssignment {
             offer,
             cancellation: CaptureCancellation::default(),
             root_preparation: Some(Arc::clone(&root_preparation)),
@@ -265,7 +286,7 @@ impl AssignmentManager {
             .begin_workspace_preparation(root_offer, root_preparation)
             .is_err()
         {
-            let Some(LocalSlot::Preparing(preparing)) = self.slot.take() else {
+            let Some(preparing) = self.take_held(&assignment_id, HeldAssignment::preparing) else {
                 return Err(AssignmentManagerFailure::DecisionCapacity);
             };
             let offer = preparing.offer;
@@ -285,20 +306,29 @@ impl AssignmentManager {
         if self.cancellation_uses_effect_id(&prepare.effect_id) {
             return Err(AssignmentManagerFailure::ConflictingOffer);
         }
-        let Some(LocalSlot::Preparing(mut preparing)) = self.slot.take() else {
-            return Ok(());
+        let Some(mut preparing) = self.take_held(&prepare.assignment_id, HeldAssignment::preparing)
+        else {
+            // A prepare of an assignment not in preparation conflicts with one that is.
+            return if self
+                .held
+                .values()
+                .any(|held| matches!(held, HeldAssignment::Preparing(_)))
+            {
+                Err(AssignmentManagerFailure::ConflictingOffer)
+            } else {
+                Ok(())
+            };
         };
-        if prepare.assignment_id != preparing.offer.assignment_id
-            || prepare.run_id != preparing.offer.run_id
+        if prepare.run_id != preparing.offer.run_id
             || prepare.attempt_id != preparing.offer.attempt_id
             || prepare.execution_spec_id != preparing.offer.execution_spec.execution_spec_id
         {
-            self.slot = Some(LocalSlot::Preparing(preparing));
+            self.hold(HeldAssignment::Preparing(preparing));
             return Err(AssignmentManagerFailure::ConflictingOffer);
         }
         if let Some(effect_id) = &preparing.prepare_effect_id {
             let replay = effect_id == &prepare.effect_id;
-            self.slot = Some(LocalSlot::Preparing(preparing));
+            self.hold(HeldAssignment::Preparing(preparing));
             return if replay {
                 Ok(())
             } else {
@@ -306,7 +336,7 @@ impl AssignmentManager {
             };
         }
         let Some(root) = preparing.root.take() else {
-            self.slot = Some(LocalSlot::Preparing(preparing));
+            self.hold(HeldAssignment::Preparing(preparing));
             return Err(AssignmentManagerFailure::ConflictingOffer);
         };
         let offer = preparing.offer.clone();
@@ -366,7 +396,7 @@ impl AssignmentManager {
         // Checkout begins once Cloud can see its progress.
         preparing.run_event.enter(RunPhase::Checkout);
         preparing.prepare_effect_id = Some(prepare.effect_id.clone());
-        self.slot = Some(LocalSlot::Preparing(preparing));
+        self.hold(HeldAssignment::Preparing(preparing));
         self.begin_source_admission(offer, root, prepare.effect_id, deadline)
     }
 
@@ -386,8 +416,12 @@ impl AssignmentManager {
             })
     }
 
-    pub(super) fn finish_preparation_event(&mut self, outcome: TelemetryOutcome) {
-        if let Some(LocalSlot::Preparing(preparing)) = &mut self.slot
+    pub(super) fn finish_preparation_event(
+        &mut self,
+        assignment_id: &str,
+        outcome: TelemetryOutcome,
+    ) {
+        if let Some(preparing) = self.preparing_mut(assignment_id)
             && let Some(event) = preparing.preparation_event.take()
         {
             event.finish(outcome);
@@ -401,11 +435,10 @@ impl AssignmentManager {
         prepare_effect_id: String,
         decline: AssignmentDecline,
     ) -> Result<(), AssignmentManagerFailure> {
-        self.finish_preparation_event(TelemetryOutcome::Failure);
-        let run_event = match &self.slot {
-            Some(LocalSlot::Preparing(preparing)) => preparing.run_event.clone(),
-            _ => RunEvent::default(),
-        };
+        self.finish_preparation_event(&offer.assignment_id, TelemetryOutcome::Failure);
+        let run_event = self
+            .preparing(&offer.assignment_id)
+            .map_or_else(RunEvent::default, |preparing| preparing.run_event.clone());
         run_event.leave(PhaseEnd::Failed);
         self.reject_offered_run(&offer.assignment_id, &run_event, &decline);
         let response = AssignmentDecision::Rejected {
@@ -421,6 +454,25 @@ impl AssignmentManager {
             ReleaseAfter::Idle,
         );
         Ok(())
+    }
+
+    /// The other tree runs the manager holds, as the agent-login pass of the admission of
+    /// `assignment_id` reads them without the manager's lock (REQ-GRANT-49, INV-RUNNER-15):
+    /// the activity of each `Running` tree run but that assignment. The offer rule took the
+    /// offer only while each held assignment waited, and none is taken while this one is
+    /// prepared, so the set only shrinks; an ended assignment that only reports or releases
+    /// holds no process and is not in it.
+    fn runs_beside(&self, assignment_id: &str) -> HeldRuns {
+        HeldRuns::Waiting(
+            self.held
+                .iter()
+                .filter(|(id, _)| id.as_str() != assignment_id)
+                .filter_map(|(_, held)| match held {
+                    HeldAssignment::Running(running) => running.activity.clone(),
+                    _ => None,
+                })
+                .collect(),
+        )
     }
 
     pub(super) fn begin_source_admission(
@@ -445,13 +497,14 @@ impl AssignmentManager {
         let environment = self.environment.clone();
         let input_broker = self.input_broker.clone();
         let tree_run = self.tree_run.clone();
-        let mut runtime = self.admission_runtime();
+        let mut runtime = self.admission_runtime(&offer.assignment_id);
         let agent_login_directory = self.agent_login_directory.clone();
         let agent_login_setup = self.agent_login_setup.clone();
+        let runs_beside = self.runs_beside(&offer.assignment_id);
         let grant_token_refresh = self.grant_token_refresh.clone();
         let sender = self.event_sender.clone();
         let wake = self.outbox.clone();
-        if let Some(LocalSlot::Preparing(preparing)) = &mut self.slot {
+        if let Some(preparing) = self.preparing_mut(&offer.assignment_id) {
             preparing.cancellation = cancellation;
         }
         tokio::task::spawn_blocking(move || {
@@ -476,10 +529,14 @@ impl AssignmentManager {
             // The admission sets agent logins up for itself first, a
             // continuation's included, so it is offered a replaced generation
             // and nothing of a revoked login; nothing has been offered yet,
-            // and nothing is installed or removed once it has
-            // (REQ-GRANT-49, INV-RUNNER-15). Then it asks Cloud for its
-            // assignment's grant tokens, now that Cloud counts the assignment
-            // as preparing, as for its source credential, and keeps them
+            // and nothing is installed or removed once it has. Beside other
+            // runs it asks Cloud only while each waits, and installs or
+            // removes only while none also has a command in flight, holding
+            // their activities and never the manager's lock; otherwise it is
+            // offered what is on disk (REQ-GRANT-49, INV-RUNNER-15). Then it
+            // asks Cloud for its assignment's grant tokens, whatever the
+            // gate answered, now that Cloud counts the assignment as
+            // preparing, as for its source credential, and keeps them
             // until the assignment ends (REQ-GRANT-86, INV-RUNNER-28),
             // keeping each file current while it runs (REQ-GRANT-89).
             // Whatever the setup meets, a panic included, the admission goes
@@ -487,7 +544,11 @@ impl AssignmentManager {
             if let Some(setup) = &agent_login_setup {
                 runtime.grant_tokens =
                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        setup.set_up(&worker_offer.run_id, &worker_offer.assignment_id)
+                        setup.set_up(
+                            &runs_beside,
+                            &worker_offer.run_id,
+                            &worker_offer.assignment_id,
+                        )
                     }))
                     .ok()
                     .flatten()
@@ -498,10 +559,11 @@ impl AssignmentManager {
                         Arc::new(tokens)
                     });
             }
-            // The steps, a tree run's `useful` commands included, draw from the
-            // process environment with the agent logins the runner keeps now,
-            // looked at for this admission (REQ-GRANT-37, REQ-GRANT-44),
-            // where the service has none of its own; where the runner keeps
+            // The steps draw from the process environment with the agent
+            // logins the runner keeps now, looked at for this admission
+            // (REQ-GRANT-37, REQ-GRANT-44), and a tree run's `useful` commands
+            // with those it keeps as each starts (REQ-GRANT-49), where the
+            // service has none of its own; where the runner keeps
             // none either, nothing is added or withheld (REQ-GRANT-51,
             // INV-RUNNER-17). The admission's grant tokens and their files
             // are offered too; it holds none of a provider whose names the
@@ -528,6 +590,10 @@ impl AssignmentManager {
                 }));
             }
             runtime.environment = offered.environment;
+            // Each command of a tree run builds its own environment from the same process
+            // environment and directory when it starts, keeping the token variables this
+            // offer added (REQ-GRANT-49, REQ-GRANT-87).
+            runtime.command_environment = offered.commands;
             // How the provider answers each agent step given a login the
             // runner added is noted for the next pass, never for a variable
             // the service carried (REQ-GRANT-52).
@@ -844,10 +910,12 @@ impl AssignmentManager {
                     || decision.renewals.contains_key(&cancel.effect_id)
                     || decision.rejected_renewals.contains_key(&cancel.effect_id)
             })
-            || matches!(&self.slot,
-                Some(LocalSlot::Preparing(preparing))
+            || self.held.values().any(|held| {
+                matches!(held,
+                HeldAssignment::Preparing(preparing)
                     if preparing.offer.effect_id == cancel.effect_id
                         || preparing.prepare_effect_id.as_ref() == Some(&cancel.effect_id))
+            })
             || self
                 .deferred_successor
                 .as_ref()
@@ -862,9 +930,7 @@ impl AssignmentManager {
         }) {
             return Err(AssignmentManagerFailure::ConflictingOffer);
         }
-        if let Some(LocalSlot::Preparing(preparing)) = &self.slot
-            && preparing.offer.assignment_id == cancel.assignment_id
-        {
+        if let Some(preparing) = self.preparing(&cancel.assignment_id) {
             if preparing.offer.run_id != cancel.run_id
                 || preparing.offer.attempt_id != cancel.attempt_id
             {
@@ -876,8 +942,9 @@ impl AssignmentManager {
                 effective_mode,
                 cancellation_disposition(cancel.mode, effective_mode, false),
             );
+            let assignment_id = cancel.assignment_id.clone();
             self.retain_cancellation(cancel, Some(application), false)?;
-            let Some(LocalSlot::Preparing(preparing)) = &mut self.slot else {
+            let Some(preparing) = self.preparing_mut(&assignment_id) else {
                 return Err(AssignmentManagerFailure::ConflictingOffer);
             };
             preparing.cancellation.cancel();
@@ -885,11 +952,12 @@ impl AssignmentManager {
                 event.finish(TelemetryOutcome::Cancelled);
             }
             if preparing.root.is_some() && preparing.prepare_effect_id.is_none() {
-                let Some(LocalSlot::Preparing(mut preparing)) = self.slot.take() else {
+                let Some(mut preparing) = self.take_held(&assignment_id, HeldAssignment::preparing)
+                else {
                     return Err(AssignmentManagerFailure::ConflictingOffer);
                 };
                 let Some(root) = preparing.root.take() else {
-                    self.slot = Some(LocalSlot::Preparing(preparing));
+                    self.hold(HeldAssignment::Preparing(preparing));
                     return Err(AssignmentManagerFailure::ConflictingOffer);
                 };
                 let identity = AssignmentIdentity::from_offer(&preparing.offer);
@@ -909,8 +977,7 @@ impl AssignmentManager {
             &cancel.run_id,
             &cancel.attempt_id,
         )?;
-        if let Some(LocalSlot::Releasing(releasing)) = &self.slot
-            && releasing.assignment_id == cancel.assignment_id
+        if let Some(HeldAssignment::Releasing(releasing)) = self.held.get(&cancel.assignment_id)
             && let ReleaseAfter::PreExecutionCancellation(identity) = &releasing.after
             && (identity.run_id != cancel.run_id || identity.attempt_id != cancel.attempt_id)
         {
@@ -922,24 +989,19 @@ impl AssignmentManager {
                 AssignmentDecision::Accepted { .. }
             )
         });
-        let exact_slot = match &self.slot {
-            Some(LocalSlot::Accepted(accepted)) => {
-                accepted.identity.assignment_id == cancel.assignment_id
+        let held = match self.held.get(&cancel.assignment_id) {
+            Some(
+                HeldAssignment::Accepted(_)
+                | HeldAssignment::Running(_)
+                | HeldAssignment::Finishing(_),
+            ) => true,
+            Some(HeldAssignment::Releasing(releasing)) => {
+                accepted_target
+                    || matches!(&releasing.after, ReleaseAfter::PreExecutionCancellation(_))
             }
-            Some(LocalSlot::Running(running)) => {
-                running.identity.assignment_id == cancel.assignment_id
-            }
-            Some(LocalSlot::Finishing(finishing)) => {
-                finishing.identity.assignment_id == cancel.assignment_id
-            }
-            Some(LocalSlot::Releasing(releasing)) => {
-                releasing.assignment_id == cancel.assignment_id
-                    && (accepted_target
-                        || matches!(&releasing.after, ReleaseAfter::PreExecutionCancellation(_)))
-            }
-            Some(LocalSlot::Preparing(_)) | None => false,
+            Some(HeldAssignment::Preparing(_)) | None => false,
         };
-        if !exact_slot {
+        if !held {
             if accepted_target {
                 let effective_mode = self.effective_cancellation_mode(&cancel);
                 let application = cancellation_application(
@@ -959,8 +1021,8 @@ impl AssignmentManager {
         let superseded =
             cancel.mode == CancellationMode::Graceful && effective_mode == CancellationMode::Force;
         self.make_cancellation_room()?;
-        match self.slot.take() {
-            Some(LocalSlot::Accepted(accepted)) => {
+        match self.held.remove(&cancel.assignment_id) {
+            Some(HeldAssignment::Accepted(accepted)) => {
                 let identity = accepted.identity.clone();
                 let application = cancellation_application(
                     &cancel,
@@ -976,7 +1038,7 @@ impl AssignmentManager {
                     ReleaseAfter::PreExecutionCancellation(Box::new(identity)),
                 );
             }
-            Some(LocalSlot::Running(running)) => {
+            Some(HeldAssignment::Running(running)) => {
                 let awaiting_start_authority = !*running.start_authority.borrow();
                 let disposition = if superseded {
                     CancellationApplicationDisposition::Superseded
@@ -1012,22 +1074,22 @@ impl AssignmentManager {
                 let ready =
                     running.engine_terminal.load(Ordering::Acquire) || !awaiting_start_authority;
                 let index = self.retain_cancellation(cancel, Some(application), ready)?;
-                self.slot = Some(LocalSlot::Running(running));
+                self.hold(HeldAssignment::Running(running));
                 if self.cancellations[index].ready {
                     self.emit_cancellation_application(index)?;
                 }
             }
-            Some(LocalSlot::Finishing(finishing)) => {
+            Some(HeldAssignment::Finishing(finishing)) => {
                 let application = cancellation_application(
                     &cancel,
                     effective_mode,
                     cancellation_disposition(cancel.mode, effective_mode, true),
                 );
                 let index = self.retain_cancellation(cancel, Some(application), true)?;
-                self.slot = Some(LocalSlot::Finishing(finishing));
+                self.hold(HeldAssignment::Finishing(finishing));
                 self.emit_cancellation_application(index)?;
             }
-            Some(LocalSlot::Releasing(releasing)) => {
+            Some(HeldAssignment::Releasing(releasing)) => {
                 let pre_execution =
                     matches!(&releasing.after, ReleaseAfter::PreExecutionCancellation(_));
                 let application = cancellation_application(
@@ -1036,13 +1098,15 @@ impl AssignmentManager {
                     cancellation_disposition(cancel.mode, effective_mode, !pre_execution),
                 );
                 let index = self.retain_cancellation(cancel, Some(application), !pre_execution)?;
-                self.slot = Some(LocalSlot::Releasing(releasing));
+                self.hold(HeldAssignment::Releasing(releasing));
                 if self.cancellations[index].ready {
                     self.emit_cancellation_application(index)?;
                 }
             }
-            slot => {
-                self.slot = slot;
+            held => {
+                if let Some(held) = held {
+                    self.hold(held);
+                }
                 self.retain_cancellation(cancel, None, true)?;
             }
         }
@@ -1168,8 +1232,8 @@ struct TreeAdmission<'a> {
     tree_run: &'a TreeRunDependencies,
     broker: Arc<dyn SourceCredentialBroker>,
     input_broker: Option<&'a dyn RunInputBroker>,
-    /// The service environment the checkout uses; the tree's `useful` commands run with
-    /// `runtime.environment`, which carries the agent logins offered to the assignment.
+    /// The service environment the checkout uses; each of the tree's `useful` commands runs
+    /// with the environment `runtime.command_environment` builds when it starts.
     environment: &'a EnvironmentSnapshot,
     offer: &'a AssignmentOffer,
     tree: &'a useful_runner_protocol::WorkflowTreeV1RunnerProjection,
@@ -1226,7 +1290,7 @@ impl TreeAdmission<'_> {
                 tree: self.tree,
                 private: &root.private,
                 workspace: &workspace,
-                environment: &self.runtime.environment,
+                environment: &self.runtime.command_environment,
                 deadline: self.deadline,
                 cancellation: self.cancellation,
                 sleeper: Arc::clone(&self.sleeper),
@@ -1352,7 +1416,7 @@ impl TreeAdmission<'_> {
                 assignment_id: &offer.assignment_id,
                 home: &super::super::tree_run::tree_home(creator),
                 private: &root.private,
-                environment: &self.runtime.environment,
+                environment: &self.runtime.command_environment,
                 execution_spec: &offer.execution_spec,
                 sleeper: Arc::clone(&self.sleeper),
                 steps: &continuation.reexecuted_steps,

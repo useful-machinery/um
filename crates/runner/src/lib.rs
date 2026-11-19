@@ -25,8 +25,8 @@ use std::fmt;
 pub use control_client::{RequestFailure, request};
 pub use control_protocol::{
     AgentLoginProvider, AgentLoginReadiness, AgentLoginState, AgentLoginUse, AssignmentCounts,
-    ConnectionFailure, ConnectionState, ControlError, CredentialSource, Operation, ProcessState,
-    ProtocolFailure, ProviderReadiness, Response, StatusSnapshot,
+    ConnectionFailure, ConnectionState, ControlError, CredentialSource, HeldRun, HeldRunState,
+    Operation, ProcessState, ProtocolFailure, ProviderReadiness, Response, StatusSnapshot,
 };
 pub use doctor::{
     CheckDescriptor, CheckResult, CredentialKind, CredentialOrigin, CredentialRequirement,

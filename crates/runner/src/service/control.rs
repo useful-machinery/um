@@ -22,7 +22,7 @@ use crate::agent_login::cloud::CredentialSourcesRequest;
 use crate::agent_login::grant_token::AssignmentGrantTokens;
 use crate::agent_login::readiness::ReadinessDocument;
 use crate::agent_login::setup::{
-    AgentLoginSetup, SYNC_BOUND, SetupAnswer, SetupCaller, SetupOutcome,
+    AgentLoginSetup, AssignmentGate, SYNC_BOUND, SetupAnswer, SetupCaller, SetupOutcome,
 };
 use crate::control_protocol::{
     AgentLoginReadiness, ConnectionFailure, ConnectionState, ControlError, Operation, ProcessState,
@@ -76,11 +76,13 @@ pub(super) struct ControlContext {
 }
 
 /// Runs one agent-login setup for `caller` and publishes the readiness it
-/// recorded in the live status, also when an assignment interrupted it
+/// recorded in the live status, also when a held run's work interrupted it
 /// after it had recorded an install or removal: answers that readiness with
-/// each login whose check gave no answer, `runner_busy` while the runner
-/// holds an assignment, and `state_update_failed` when the readiness could
-/// not be recorded. The live status carries no check's answer.
+/// each login whose check gave no answer, `runner_busy` when a run the
+/// runner holds is working, or has a command in flight where the setup had
+/// a login to install or remove (REQ-GRANT-40), and `state_update_failed`
+/// when the readiness could not be recorded. The live status carries no
+/// check's answer.
 pub(super) async fn set_up_agent_logins(
     setup: &Arc<AgentLoginSetup>,
     status: &LiveStatus,
@@ -138,22 +140,26 @@ impl AdmissionAgentLogins {
         }
     }
 
-    /// Makes the admission's pass, when the readiness names a login, then
-    /// asks Cloud for the grant tokens of the assignment `assignment_id` of
-    /// the run `run_id` and this boot (REQ-GRANT-86), and publishes what
+    /// Makes the admission's pass, when the readiness names a login, under
+    /// `beside`, the gate over the other runs the runner held when the
+    /// preparation began (INV-RUNNER-15), then asks Cloud for the grant
+    /// tokens of the assignment `assignment_id` of the run `run_id` and this
+    /// boot (REQ-GRANT-86), whatever the gate answers, and publishes what
     /// each recorded. It
     /// blocks, on the admission's preparation task, for the bounded requests
-    /// of each; what it fails at is the setup's own record and never the
-    /// admission's. It answers what the admission holds of its assignment's
-    /// grant tokens, which removes their files when it is dropped; `None`
-    /// when the setup is gone.
+    /// of each; what it fails at or the gate stops is the setup's own record
+    /// and never the admission's. It answers what the admission holds of its
+    /// assignment's grant tokens, which removes their files when it is
+    /// dropped; `None` when the setup is gone.
     pub(super) fn set_up(
         &self,
+        beside: &dyn AssignmentGate,
         run_id: &str,
         assignment_id: &str,
     ) -> Option<AssignmentGrantTokens> {
         let setup = self.setup.upgrade()?;
-        let admitted = setup.set_up_admission(self.status.boot_id(), run_id, assignment_id);
+        let admitted =
+            setup.set_up_admission_beside(beside, self.status.boot_id(), run_id, assignment_id);
         if let Some(outcome) = admitted.agent_logins {
             let _ = publish(outcome, &self.status);
         }
@@ -318,9 +324,12 @@ impl LiveStatus {
         state.last_connection_failure = failure;
     }
 
+    /// The live status, beside the assignment counts and held runs the manager answered
+    /// in one read (REQ-RUNNERENROLL-42).
     fn snapshot(
         &self,
         assignment_counts: crate::control_protocol::AssignmentCounts,
+        held_runs: Vec<crate::control_protocol::HeldRun>,
     ) -> StatusSnapshot {
         let state = self.lock();
         let uptime_milliseconds =
@@ -336,6 +345,7 @@ impl LiveStatus {
             assignment_counts,
             last_connection_failure: state.last_connection_failure,
             agent_logins: state.agent_logins.clone(),
+            held_runs,
         }
     }
 
@@ -576,11 +586,11 @@ async fn handle_connection(mut stream: UnixStream, context: ControlContext) {
             let snapshot = control_timeout(
                 timeouts.snapshot,
                 tokio::task::spawn_blocking(move || {
-                    let counts = assignments
+                    let (counts, held_runs) = assignments
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .status_counts();
-                    status.snapshot(counts)
+                        .status_assignments();
+                    status.snapshot(counts, held_runs)
                 }),
             )
             .await;
@@ -840,7 +850,7 @@ mod tests {
 
     // REQ-GRANT-41, REQ-RUNNERENROLL-82
     #[tokio::test]
-    async fn sync_while_an_assignment_is_held_answers_runner_busy_without_asking() {
+    async fn sync_while_a_held_run_is_working_answers_runner_busy_without_asking() {
         let root = tempfile::tempdir().unwrap();
         let cloud = FakeAgentLoginCloud::new(fake_codex_authorized(1));
         let context = context(Some(agent_login_setup(
@@ -865,7 +875,7 @@ mod tests {
 
     // REQ-GRANT-41, REQ-RUNNERENROLL-42
     #[tokio::test]
-    async fn a_sync_an_assignment_interrupts_answers_runner_busy_and_status_shows_what_it_recorded()
+    async fn a_sync_a_working_run_interrupts_answers_runner_busy_and_status_shows_what_it_recorded()
     {
         let root = tempfile::tempdir().unwrap();
         let authorized = |provider| ProviderLogin {
@@ -878,8 +888,8 @@ mod tests {
         };
         let cloud =
             FakeAgentLoginCloud::new(Ok(AgentLoginProvider::INSTALLABLE.map(authorized).to_vec()));
-        // The pass finds the runner idle, asks for the Codex login and
-        // installs it; an assignment starts before it asks for the next.
+        // The pass finds no held run working, asks for the Codex login and
+        // installs it; a run is working before it asks for the next.
         let gate = Arc::new(CountedGate::idle());
         gate.idle_calls
             .store(3, std::sync::atomic::Ordering::SeqCst);
@@ -931,6 +941,7 @@ mod tests {
         let admission = AdmissionAgentLogins::new(&setup, Arc::clone(&context.status));
         let tokens = tokio::task::spawn_blocking(move || {
             admission.set_up(
+                &super::super::tree_run::HeldRuns::Nothing,
                 "run_01k0z6r1w8f4jy2m7q9v3x5abc",
                 "asn_01k0z6r1w8f4jy2m7q9v3x5abc",
             )
@@ -1042,7 +1053,7 @@ mod tests {
         );
         status.backing_off(ConnectionFailure::CloudUnavailable);
         status.connecting();
-        let snapshot = status.snapshot(AssignmentCounts::default());
+        let snapshot = status.snapshot(AssignmentCounts::default(), Vec::new());
         assert_eq!(snapshot.connection_state, ConnectionState::Connecting);
         assert_eq!(
             snapshot.last_connection_failure,

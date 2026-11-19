@@ -1,29 +1,34 @@
-//! The grant tokens of the assignment the serving runner holds
+//! The grant tokens of each assignment the serving runner holds
 //! (REQ-GRANT-86): at each admission the runner asks Cloud for the
 //! assignment's providers and, at the same time, its token services
 //! (REQ-INTEGRATION-12), then for the token of the run's grant of each
 //! provider listed, and of each token service, that the host does not provide
 //! (REQ-GRANT-87), keeps each token it is issued in a private file of its own
-//! in its agent-login directory, records the outcome of each of GitHub,
-//! GitLab.com and Linear for the run in the readiness document
-//! (REQ-GRANT-88), and writes a `runner.grant_token` record for each changed
-//! state and each failure (REQ-TELEMETRY-46). A token file is only ever the
-//! token of the assignment the runner holds (INV-RUNNER-28): the admission
-//! removes every token file before it uses any answer, an idle setup removes
-//! what an interrupted runner left, and the hold an admission returns removes
-//! them when the assignment ends. The admission offers each token it holds,
-//! and its file, to the steps of its workflow that pass their names or, for
-//! the runner's own three, declare the provider (REQ-WFEXEC-78): the runner's
-//! own names for its three, and the names of a listed provider's entry once
-//! it has checked them (REQ-GRANT-87, INV-RUNNER-32). While the assignment
-//! runs, a task the hold owns keeps each file current (REQ-GRANT-89): it asks
-//! again when the wait Cloud named has passed and replaces the file in one
-//! step, retries a request Cloud did not answer, removes the file at a
-//! refusal or once the held token has expired, and stops when the hold is
-//! dropped. Dropping the hold then marks the entries ended, unless a later
-//! admission has recorded its own since (INV-RUNNER-30).
+//! in the assignment's own directory of its agent-login directory, records
+//! the outcome of each of GitHub, GitLab.com and Linear for the run in the
+//! readiness document (REQ-GRANT-88), and writes a `runner.grant_token`
+//! record for each changed state and each failure (REQ-TELEMETRY-46). A
+//! token file is only ever the token of the assignment whose directory holds
+//! it (INV-RUNNER-28): every setup, an admission's included, removes what no
+//! assignment the runner holds owns, an admission clears its own
+//! assignment's directory before it uses any answer, and the hold an
+//! admission returns removes that directory when the assignment ends. The
+//! admission offers each token it holds, and its file, to the steps of its
+//! workflow that pass their names or, for the runner's own three, declare
+//! the provider (REQ-WFEXEC-78): the runner's own names for its three, and
+//! the names of a listed provider's entry once it has checked them
+//! (REQ-GRANT-87, INV-RUNNER-32). While the assignment runs, a task the hold
+//! owns keeps each file current (REQ-GRANT-89): it asks again when the wait
+//! Cloud named has passed and replaces the file in one step, retries a
+//! request Cloud did not answer, removes the file at a refusal or once the
+//! held token has expired, and stops when the hold is dropped. Dropping the
+//! hold then marks the entries ended, unless a later admission has recorded
+//! its own since (INV-RUNNER-30); a refresh records an entry only while its
+//! admission is the last that recorded them.
 
+use std::collections::BTreeSet;
 use std::ffi::{OsStr, OsString};
+use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
@@ -119,7 +124,8 @@ enum Stage {
     Issue,
     /// Keeping it in its file.
     Write,
-    /// Removing the provider's file.
+    /// Removing the provider's file, or what was at its assignment's
+    /// directory.
     Remove,
 }
 
@@ -212,34 +218,16 @@ fn usable_names(variable: &str, file_variable: &str, earlier: &[&str]) -> bool {
         })
 }
 
-/// The token files `TokenFiles::remove_all` could not remove.
-struct RemovalFailures {
-    /// Each of the runner's three whose file stayed.
-    runner: Vec<(AgentLoginProvider, io::Error)>,
-    /// The failure to remove `grant-tokens`, the directory of every other
-    /// provider's file.
-    configured: Option<io::Error>,
-}
-
-impl RemovalFailures {
-    /// The failure to remove the file of one of the runner's three.
-    fn of(&self, provider: AgentLoginProvider) -> Option<Failure> {
-        self.runner
-            .iter()
-            .find(|(failed, _)| *failed == provider)
-            .map(|(_, error)| Failure::io(Stage::Remove, error))
-    }
-}
-
-/// The runner's grant token files and the assignment whose tokens they
-/// hold. Every write and removal of a token file is made under its lock, so
-/// the end of one assignment never removes the files of the next.
+/// The runner's grant token files and the assignments it holds, whose
+/// directories hold them. Every write and removal of a token file is made
+/// under its lock, so the end of one assignment never removes the files of
+/// another (INV-RUNNER-28).
 pub(crate) struct TokenFiles {
     directory: LoginDirectory,
     recorder: Arc<Recorder>,
-    /// The assignment the files were written for, while they may hold its
-    /// tokens.
-    holder: Mutex<Option<String>>,
+    /// Each assignment the runner holds, from its admission's registration,
+    /// made before it asks Cloud, to its hold's end.
+    held: Mutex<BTreeSet<String>>,
 }
 
 impl TokenFiles {
@@ -247,26 +235,28 @@ impl TokenFiles {
         Self {
             directory,
             recorder,
-            holder: Mutex::new(None),
+            held: Mutex::new(BTreeSet::new()),
         }
     }
 
-    fn holder(&self) -> std::sync::MutexGuard<'_, Option<String>> {
-        self.holder.lock().unwrap_or_else(PoisonError::into_inner)
+    fn held(&self) -> std::sync::MutexGuard<'_, BTreeSet<String>> {
+        self.held.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Whether the files are still those of `assignment_id`.
-    fn held_for(&self, assignment_id: &str) -> bool {
-        self.holder().as_deref() == Some(assignment_id)
+    /// Whether the runner holds `assignment_id`.
+    fn holds(&self, assignment_id: &str) -> bool {
+        self.held().contains(assignment_id)
     }
 
-    /// Removes the token file of one of the runner's three, and anything
-    /// else at its location.
-    fn remove(&self, provider: AgentLoginProvider) -> io::Result<()> {
-        let Some((path, _)) = self.directory.grant_token(provider) else {
-            return Ok(());
-        };
-        self.remove_at(&path)
+    /// Whether the runner holds any assignment: while it does, no setup
+    /// marks an entry ended (INV-RUNNER-30).
+    pub(crate) fn holds_any(&self) -> bool {
+        !self.held().is_empty()
+    }
+
+    /// The ID of each assignment the runner holds.
+    pub(crate) fn held_assignments(&self) -> Vec<String> {
+        self.held().iter().cloned().collect()
     }
 
     /// Removes whatever is at `path` in the runner's directory. A directory
@@ -279,53 +269,87 @@ impl TokenFiles {
         }
     }
 
-    /// Removes every token file: those of the runner's three, then
-    /// `grant-tokens` whole, with any temporary file a write left in it.
-    fn remove_all(&self) -> RemovalFailures {
-        RemovalFailures {
-            runner: brokered_providers()
-                .filter_map(|provider| self.remove(provider).err().map(|error| (provider, error)))
-                .collect(),
-            configured: self.remove_at(&self.directory.grant_tokens()).err(),
-        }
-    }
-
-    /// Removes every token file an earlier assignment or an interrupted
-    /// runner left, for a setup while the runner holds no assignment; each
-    /// file of the runner's three it cannot remove is recorded with its
-    /// provider, and `grant-tokens`, which no provider is known for, with
-    /// none.
-    pub(crate) fn remove_leftovers(&self) {
-        let mut holder = self.holder();
-        let failures = self.remove_all();
-        for (provider, error) in &failures.runner {
-            self.record_removal_failure(Some(provider.as_str()), None, error);
-        }
-        if let Some(error) = &failures.configured {
-            self.record_removal_failure(None, None, error);
-        }
-        *holder = None;
-    }
-
-    /// Removes the token files of `held`, each a provider as its record
-    /// names it with the file kept for `assignment_id`, one by one, when
-    /// they are still its own; each file it cannot remove is recorded. The
-    /// emptied `grant-tokens` is left for the next setup to remove.
-    fn release(&self, assignment_id: &str, held: &[(String, PathBuf)]) {
-        let mut holder = self.holder();
-        if holder.as_deref() != Some(assignment_id) {
-            return;
-        }
-        for (provider, file) in held {
-            if let Err(error) = self.remove_at(file) {
-                self.record_removal_failure(Some(provider), Some(assignment_id), &error);
+    /// Removes what no assignment in `held` owns: the token files and
+    /// `grant-tokens` an earlier release kept at fixed names, and every
+    /// entry of `assignments`, whatever it is, whose name is not a held
+    /// assignment's, or `assignments` itself when it is not a real
+    /// directory. Each it cannot remove is recorded with no provider.
+    fn remove_unowned(&self, held: &BTreeSet<String>) {
+        for path in self.directory.earlier_grant_tokens() {
+            if let Err(error) = self.remove_at(&path) {
+                self.record_removal_failure(None, None, &error);
             }
         }
-        *holder = None;
+        let assignments = self.directory.assignments();
+        if !directory::real_directory(&assignments) {
+            if let Err(error) = self.remove_at(&assignments) {
+                self.record_removal_failure(None, None, &error);
+            }
+            return;
+        }
+        let entries = match fs::read_dir(&assignments) {
+            Ok(entries) => entries,
+            Err(error) => {
+                self.record_removal_failure(None, None, &error);
+                return;
+            }
+        };
+        for entry in entries {
+            let removed = entry.and_then(|entry| {
+                let owned = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| held.contains(name));
+                if owned {
+                    Ok(())
+                } else {
+                    self.remove_at(&entry.path())
+                }
+            });
+            if let Err(error) = removed {
+                self.record_removal_failure(None, None, &error);
+            }
+        }
     }
 
-    /// Records a token file that could not be removed, with the provider
-    /// as its record names it when one is known.
+    /// Removes what no assignment the runner holds owns, at a setup
+    /// (INV-RUNNER-28); nothing of a held assignment is touched.
+    pub(crate) fn remove_leftovers(&self) {
+        let held = self.held();
+        self.remove_unowned(&held);
+    }
+
+    /// Registers the assignment `assignment_id` an admission is admitting,
+    /// removes what no held assignment owns and clears whatever is at the
+    /// assignment's own directory; answers the failure to clear it.
+    fn admit(&self, assignment_id: &str) -> Option<Failure> {
+        let mut held = self.held();
+        held.insert(assignment_id.to_owned());
+        self.remove_unowned(&held);
+        // Anything but an assignment ID has no directory, and each write
+        // for it fails.
+        let own = self.directory.assignment(assignment_id)?;
+        self.remove_at(&own)
+            .err()
+            .map(|error| Failure::io(Stage::Remove, &error))
+    }
+
+    /// Removes the directory of the assignment `assignment_id`, with every
+    /// token file in it, and no longer counts it held; a directory it cannot
+    /// remove is recorded with the assignment and no provider, and is
+    /// removed by the next setup.
+    fn release(&self, assignment_id: &str) {
+        let mut held = self.held();
+        if let Some(own) = self.directory.assignment(assignment_id)
+            && let Err(error) = self.remove_at(&own)
+        {
+            self.record_removal_failure(None, Some(assignment_id), &error);
+        }
+        held.remove(assignment_id);
+    }
+
+    /// Records a token file or directory that could not be removed, with
+    /// the provider as its record names it when one is known.
     fn record_removal_failure(
         &self,
         provider: Option<&str>,
@@ -362,12 +386,14 @@ struct HeldToken {
     refresh_after: Duration,
 }
 
-/// What an admission holds of its assignment's grant tokens, which the slot
-/// carries until the assignment ends, whether or not it kept a token:
-/// dropping it stops its refresh task, then removes the token files it
-/// holds and marks the entries its admission recorded ended
-/// (INV-RUNNER-30), on a blocking thread when there is a runtime to run one
-/// on.
+/// What an admission holds of its assignment's grant tokens, which the manager
+/// holds with the assignment until it ends, whether or not it kept a token. It is
+/// made before the admission registers the assignment in `TokenFiles`, so
+/// whatever ends the admission ends the registration with it: dropping it
+/// stops its refresh task, then removes the assignment's directory, with
+/// every token file in it, no longer counts the assignment held and marks
+/// the entries its admission recorded ended (INV-RUNNER-28, INV-RUNNER-30),
+/// on a blocking thread when there is a runtime to run one on.
 pub(crate) struct AssignmentGrantTokens {
     files: Arc<TokenFiles>,
     /// The setup each refresh is made and recorded through, and the end
@@ -725,20 +751,10 @@ impl Drop for AssignmentGrantTokens {
         let setup = Weak::clone(&self.setup);
         let publish = self.publish.take();
         let assignment_id = std::mem::take(&mut self.assignment_id);
-        let held: Vec<(String, PathBuf)> = self
-            .held
-            .iter()
-            .map(|held| {
-                (
-                    record_name(&held.offering.provider).to_owned(),
-                    held.file.clone(),
-                )
-            })
-            .collect();
         // The files are released first, so a refresh still waiting for the
         // pass lock writes nothing after the end is marked.
         let release = move || {
-            files.release(&assignment_id, &held);
+            files.release(&assignment_id);
             let ended = setup
                 .upgrade()
                 .and_then(|setup| setup.mark_grants_ended(&assignment_id));
@@ -970,7 +986,9 @@ struct Settled {
 }
 
 impl Asking<'_> {
-    /// Once every token file is gone, asks Cloud once for the assignment's
+    /// Registers the assignment as held, with the hold it answers, removes
+    /// what no held assignment owns and clears the assignment's own
+    /// directory (INV-RUNNER-28); then asks Cloud once for the assignment's
     /// providers (REQ-GRANT-97) and, at the same time, once for its token
     /// services (REQ-INTEGRATION-12), then for the token of the grant of
     /// each provider the first list names, and of each token service the
@@ -988,7 +1006,10 @@ impl Asking<'_> {
     /// (REQ-GRANT-88). A listed provider other than the three is asked for
     /// only when the names its entry gives may carry its token
     /// (`usable_names`, INV-RUNNER-32), and an entry whose names may not is
-    /// recorded as a failure of stage `list` (REQ-TELEMETRY-46). Keeps each
+    /// recorded as a failure of stage `list` (REQ-TELEMETRY-46). A failure to
+    /// clear its own directory asks for no token and leaves each provider it
+    /// would have asked for `install_failed` with stage `remove`; a leftover
+    /// it cannot remove is recorded and withholds nothing. Keeps each
     /// issued token in its file; records the entry of each of the three in
     /// `document`, as `previous` recorded it before, a provider the host
     /// provides as `not_delivered` for the run, each with its source as
@@ -1005,11 +1026,20 @@ impl Asking<'_> {
         document: &mut ReadinessDocument,
     ) -> AssignmentGrantTokens {
         let recorded = |provider| previous.and_then(|document| document.grant(provider));
-        let removal = {
-            let mut holder = self.files.holder();
-            *holder = None;
-            self.files.remove_all()
+        // The hold is made before the assignment is registered, so whatever
+        // stops the admission, a panic included, releases it.
+        let mut tokens = AssignmentGrantTokens {
+            files: Arc::clone(self.files),
+            setup,
+            boot_id: self.boot_id.to_owned(),
+            run_id: self.run_id.to_owned(),
+            assignment_id: self.assignment_id.to_owned(),
+            held: Vec::new(),
+            services: Vec::new(),
+            refresh: None,
+            publish: None,
         };
+        let uncleared = self.files.admit(self.assignment_id);
         let (providers, services) = self.lists();
         // The names of each configured entry so far, used or not, of the
         // OAuth list and then of the token-service list.
@@ -1031,45 +1061,47 @@ impl Asking<'_> {
         let asked: Vec<GrantProvider> = brokered_providers()
             .filter(|&provider| {
                 !service.provides(provider)
-                    && removal.of(provider).is_none()
                     && listed.as_ref().is_ok_and(|listed| listed.names(provider))
             })
             .filter_map(|provider| GrantProvider::try_from(provider).ok())
             .chain(configured.iter().copied().filter_map(|entry| match entry {
-                Configured::Checked(offering)
-                    if !offering.provided_by(service) && removal.configured.is_none() =>
-                {
+                Configured::Checked(offering) if !offering.provided_by(service) => {
                     Some(offering.provider.clone())
                 }
                 Configured::Checked(_) | Configured::Refused(_) => None,
             }))
+            .filter(|_| uncleared.is_none())
             .collect();
         let answers = self.ask(&asked);
-        let answer = |offering: &Offering| match answers
-            .iter()
-            .find(|(asked, _)| **asked == offering.provider)
-        {
-            Some((_, answer)) => self.settle(offering, answer),
-            None => self.unavailable(&offering.provider, Stage::Issue, CloudFailure::Transport),
+        // What its directory held could not be cleared: each provider it
+        // would have asked for fails to be kept.
+        let answer = |offering: &Offering| match (
+            uncleared,
+            answers
+                .iter()
+                .find(|(asked, _)| **asked == offering.provider),
+        ) {
+            (Some(failure), _) => self.failed_write(&offering.provider, failure),
+            (None, Some((_, answer))) => self.settle(offering, answer),
+            (None, None) => {
+                self.unavailable(&offering.provider, Stage::Issue, CloudFailure::Transport)
+            }
         };
         let mut settled: Vec<Settled> = Vec::new();
         {
-            let mut holder = self.files.holder();
+            let _held = self.files.held();
             for offering in brokered_providers().filter_map(Offering::runner) {
                 let provider = &offering.provider;
                 let outcome = match provider.agent_login_provider() {
-                    Some(own) => match removal.of(own) {
-                        Some(failure) => self.failed_write(provider, failure),
-                        None if service.provides(own) => {
-                            self.settled(provider, AgentLoginState::NotDelivered)
+                    Some(own) if service.provides(own) => {
+                        self.settled(provider, AgentLoginState::NotDelivered)
+                    }
+                    Some(own) => match &listed {
+                        Err(failure) => self.unavailable(provider, Stage::List, *failure),
+                        Ok(listed) if !listed.names(own) => {
+                            self.settled(provider, AgentLoginState::NotAuthorized)
                         }
-                        None => match &listed {
-                            Err(failure) => self.unavailable(provider, Stage::List, *failure),
-                            Ok(listed) if !listed.names(own) => {
-                                self.settled(provider, AgentLoginState::NotAuthorized)
-                            }
-                            Ok(_) => answer(&offering),
-                        },
+                        Ok(_) => answer(&offering),
                     },
                     None => continue,
                 };
@@ -1087,33 +1119,16 @@ impl Asking<'_> {
                     // The host provides it, so it is `not_delivered`, which
                     // it already counts as: nothing is recorded.
                     Configured::Checked(offering) if offering.provided_by(service) => continue,
-                    Configured::Checked(offering) => match &removal.configured {
-                        Some(error) => {
-                            self.failed_write(&offering.provider, Failure::io(Stage::Remove, error))
-                        }
-                        None => answer(offering),
-                    },
+                    Configured::Checked(offering) => answer(offering),
                 };
                 settled.push(outcome);
             }
-            if settled.iter().any(|outcome| outcome.kept.is_some()) {
-                *holder = Some(self.assignment_id.to_owned());
-            }
         }
-        let tokens = AssignmentGrantTokens {
-            files: Arc::clone(self.files),
-            setup,
-            boot_id: self.boot_id.to_owned(),
-            run_id: self.run_id.to_owned(),
-            assignment_id: self.assignment_id.to_owned(),
-            held: settled
-                .iter_mut()
-                .filter_map(|outcome| outcome.kept.take())
-                .collect(),
-            services: checked_services,
-            refresh: None,
-            publish: None,
-        };
+        tokens.held = settled
+            .iter_mut()
+            .filter_map(|outcome| outcome.kept.take())
+            .collect();
+        tokens.services = checked_services;
         for outcome in &settled {
             match outcome.provider.agent_login_provider() {
                 Some(provider) => {
@@ -1150,22 +1165,24 @@ impl Asking<'_> {
     /// its state, grant or generation changed; any other provider has no
     /// entry, so its refresh changes no document. Answers what the task does
     /// next, the state, grant and generation now recorded for it to carry
-    /// on, and whether it changed `document`. It asks nothing, and changes
-    /// nothing, once the files are no longer the assignment's.
+    /// on, and whether it changed `document`. `entries` is `None` while the
+    /// entries are another admission's (INV-RUNNER-30): the refresh then
+    /// compares against what the task carries, as any other provider's does,
+    /// and records no entry. It asks nothing, and changes nothing, once the
+    /// runner no longer holds the assignment.
     pub(crate) fn refresh(
         &self,
         step: &RefreshStep,
-        previous: Option<&ReadinessDocument>,
-        document: &mut ReadinessDocument,
+        entries: Option<(Option<&ReadinessDocument>, &mut ReadinessDocument)>,
     ) -> (Next, Recorded, bool) {
         let offering = &step.offering;
         let provider = &offering.provider;
-        if !self.files.held_for(self.assignment_id) {
+        if !self.files.holds(self.assignment_id) {
             return (Next::End, step.recorded.clone(), false);
         }
         let answer = self.grant_token(provider);
-        let holder = self.files.holder();
-        if holder.as_deref() != Some(self.assignment_id) {
+        let held = self.files.held();
+        if !held.contains(self.assignment_id) {
             return (Next::End, step.recorded.clone(), false);
         }
         let (outcome, next) = match &answer {
@@ -1212,16 +1229,23 @@ impl Asking<'_> {
                 (outcome, Next::End)
             }
         };
-        drop(holder);
-        let entry = provider
-            .agent_login_provider()
-            .map(|own| (own, previous.and_then(|document| document.grant(own))));
-        let recorded =
-            entry.map_or_else(|| step.recorded.clone(), |(_, grant)| Recorded::of(grant));
+        drop(held);
+        let entry = match (provider.agent_login_provider(), entries) {
+            (Some(own), Some((previous, document))) => Some((
+                own,
+                previous.and_then(|document| document.grant(own)),
+                document,
+            )),
+            (Some(_) | None, _) => None,
+        };
+        let recorded = entry.as_ref().map_or_else(
+            || step.recorded.clone(),
+            |(_, grant, _)| Recorded::of(*grant),
+        );
         self.record(Phase::Refresh, &recorded, &outcome);
         let now = Recorded::outcome(&outcome);
         let changed = match entry {
-            Some((own, grant)) if now != recorded => {
+            Some((own, grant, document)) if now != recorded => {
                 // The source is the one the admission settled for the run
                 // (INV-RUNNER-31): a refresh changes the file, never the
                 // offer.
@@ -1425,21 +1449,17 @@ impl Asking<'_> {
         }
     }
 
-    /// Keeps `issued` in the provider's file, mode `0600`, in one step: the
-    /// runner's own file for its three, and a file of its own in
-    /// `grant-tokens` for any other provider.
+    /// Keeps `issued` in the provider's file in the assignment's directory,
+    /// mode `0600`, in one step: the runner's own file for its three, and a
+    /// file of its own in `grant-tokens` for any other provider. Each
+    /// directory on the way, the agent-login directory, `assignments`, the
+    /// assignment's and its `grant-tokens`, is made a private one first.
     fn keep(&self, offering: &Offering, issued: &IssuedToken) -> Settled {
         let provider = &offering.provider;
         let directory = &self.files.directory;
-        let (file, directories) = match provider.agent_login_provider() {
-            Some(own) => (
-                directory.grant_token(own),
-                vec![directory.path().to_owned()],
-            ),
-            None => (
-                Some(directory.configured_grant_token(provider.cloud_id())),
-                vec![directory.path().to_owned(), directory.grant_tokens()],
-            ),
+        let file = match provider.agent_login_provider() {
+            Some(own) => directory.grant_token(self.assignment_id, own),
+            None => directory.configured_grant_token(self.assignment_id, provider.cloud_id()),
         };
         let Some((path, temporary_prefix)) = file else {
             return self.failed_write(
@@ -1450,9 +1470,15 @@ impl Asking<'_> {
                 },
             );
         };
+        let mut directories: Vec<&Path> = path
+            .ancestors()
+            .skip(1)
+            .take_while(|ancestor| ancestor.starts_with(directory.path()))
+            .collect();
+        directories.reverse();
         let written = directories
-            .iter()
-            .try_for_each(|directory| directory::ensure_private_directory(directory))
+            .into_iter()
+            .try_for_each(directory::ensure_private_directory)
             .and_then(|()| {
                 directory::write_file(&path, issued.access_token.as_bytes(), temporary_prefix)
             });
@@ -1472,8 +1498,8 @@ impl Asking<'_> {
         }
     }
 
-    /// A provider whose token the runner could not keep, or whose earlier
-    /// file it could not remove.
+    /// A provider whose token the runner could not keep, or for which what
+    /// was at its assignment's directory could not be removed.
     fn failed_write(&self, provider: &GrantProvider, failure: Failure) -> Settled {
         Settled {
             failure: Some(failure),

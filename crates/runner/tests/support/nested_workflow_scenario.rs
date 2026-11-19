@@ -157,8 +157,8 @@ pub(crate) async fn run_nested_workflow_delivery_failure_scenario(
         "nested workflow assignment cleanup failed"
     );
     ensure!(
-        manager.slot.is_none(),
-        "nested workflow slot remained occupied"
+        held_assignment(&manager).is_none(),
+        "nested workflow assignment remained held"
     );
     ensure!(
         assignment_path.exists(),
@@ -361,7 +361,7 @@ pub(crate) async fn run_nested_workflow_delivery_failure_scenario(
     manager.acknowledge_observation(ready.id);
     wait_for_manager_state(&mut manager, |manager| {
         manager.drain_events();
-        !matches!(manager.slot, Some(LocalSlot::Preparing(_)))
+        !matches!(held_assignment(manager), Some(HeldAssignment::Preparing(_)))
     })
     .await;
     let pending = manager.pending_observations(&BTreeSet::new(), 100);
@@ -376,7 +376,7 @@ pub(crate) async fn run_nested_workflow_delivery_failure_scenario(
     manager.acknowledge_observation(rejection.id);
     wait_for_manager_state(&mut manager, |manager| {
         manager.drain_events();
-        manager.slot.is_none()
+        held_assignment(manager).is_none()
     })
     .await;
     fs::remove_file(&unsupported)?;
@@ -410,7 +410,7 @@ pub(crate) async fn run_nested_workflow_delivery_failure_scenario(
     );
     run_git(&retained_workspace, &["fetch", "origin"])?;
     ensure!(
-        matches!(&manager.slot, Some(LocalSlot::Accepted(accepted))
+        matches!(held_assignment(&manager), Some(HeldAssignment::Accepted(accepted))
         if accepted.root.execution == assignment_path.join("workspace")),
         "successor did not adopt the exact retained workspace"
     );
@@ -418,8 +418,8 @@ pub(crate) async fn run_nested_workflow_delivery_failure_scenario(
     let next_pending = wait_for_carrier_registration(&mut manager).await?;
     ensure!(
         matches!(
-            &manager.slot,
-            Some(LocalSlot::Running(_)) | Some(LocalSlot::Finishing(_))
+            held_assignment(&manager),
+            Some(HeldAssignment::Running(_)) | Some(HeldAssignment::Finishing(_))
         ),
         "replacement did not execute after admission"
     );
@@ -623,7 +623,7 @@ pub(crate) async fn run_nested_workflow_delivery_failure_scenario(
         .map_err(|error| anyhow!("prepare stale-boot continuation: {error:?}"))?;
     wait_for_manager_state(&mut next_boot, |manager| {
         manager.drain_events();
-        !matches!(manager.slot, Some(LocalSlot::Preparing(_)))
+        !matches!(held_assignment(manager), Some(HeldAssignment::Preparing(_)))
     })
     .await;
     let observations = next_boot.pending_observations(&BTreeSet::new(), 100);
@@ -910,12 +910,12 @@ async fn prepare_current(
     }
     wait_for_manager_state(manager, |manager| {
         manager.drain_events();
-        !matches!(manager.slot, Some(LocalSlot::Preparing(_)))
+        !matches!(held_assignment(manager), Some(HeldAssignment::Preparing(_)))
     })
     .await;
     let pending = manager.pending_observations(&BTreeSet::new(), 10);
     ensure!(
-        matches!(manager.slot, Some(LocalSlot::Accepted(_))),
+        matches!(held_assignment(manager), Some(HeldAssignment::Accepted(_))),
         "nested workflow assignment preparation was not accepted: {pending:#?}"
     );
     for id in pending.into_iter().filter_map(|pending| {
@@ -1124,7 +1124,7 @@ async fn wait_for_terminal(
 async fn acknowledge_terminal_and_settle(manager: &mut AssignmentManager) -> anyhow::Result<()> {
     wait_for_manager_state(manager, |manager| {
         manager.drain_events();
-        !matches!(manager.slot, Some(LocalSlot::Running(_)))
+        !matches!(held_assignment(manager), Some(HeldAssignment::Running(_)))
     })
     .await;
     let terminal_id = manager
@@ -1136,7 +1136,7 @@ async fn acknowledge_terminal_and_settle(manager: &mut AssignmentManager) -> any
     manager.acknowledge_observation(terminal_id);
     wait_for_manager_state(manager, |manager| {
         manager.drain_events();
-        !matches!(manager.slot, Some(LocalSlot::Releasing(_)))
+        !matches!(held_assignment(manager), Some(HeldAssignment::Releasing(_)))
     })
     .await;
     Ok(())

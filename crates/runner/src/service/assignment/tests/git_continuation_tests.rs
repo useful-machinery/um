@@ -16,8 +16,8 @@ async fn exercise_retained_cloud_git_continuation(v3: bool) {
     let successor = continuation_successor(&manager, &initial, &workspace);
     manager.handle_offer(successor.clone()).unwrap();
     prepare_retained_continuation(&mut manager, &successor).await;
-    let accepted = match &manager.slot {
-        Some(LocalSlot::Accepted(accepted)) => accepted,
+    let accepted = match held_assignment(&manager) {
+        Some(HeldAssignment::Accepted(accepted)) => accepted,
         _ => panic!(
             "retained Git workflow was not admitted: {:?}",
             manager
@@ -67,8 +67,8 @@ async fn execution_lost_before_the_engine_starts_ends_the_execution_phase_failed
     let successor = continuation_successor(&manager, &initial, &workspace);
     manager.handle_offer(successor.clone()).unwrap();
     prepare_retained_continuation(&mut manager, &successor).await;
-    let private = match &manager.slot {
-        Some(LocalSlot::Accepted(accepted)) => accepted.root.private.path().to_path_buf(),
+    let private = match held_assignment(&manager) {
+        Some(HeldAssignment::Accepted(accepted)) => accepted.root.private.path().to_path_buf(),
         _ => panic!("retained Git workflow was not admitted"),
     };
     let job = start_continuation(&mut manager, &successor);
@@ -169,8 +169,8 @@ exports:
     }
     manager.handle_offer(initial.clone()).unwrap();
     prepare_current(&mut manager, &initial).await;
-    let workspace = match &manager.slot {
-        Some(LocalSlot::Accepted(accepted)) => accepted.root.execution.clone(),
+    let workspace = match held_assignment(&manager) {
+        Some(HeldAssignment::Accepted(accepted)) => accepted.root.execution.clone(),
         _ => panic!(
             "initial Git workflow was not admitted: {:?}",
             manager.pending_observations(&BTreeSet::new(), 100)
@@ -266,8 +266,8 @@ pub(super) async fn prepare_retained_continuation(
     with_watchdog(wait_for_manager_state(manager, |manager| {
         manager.drain_events();
         !matches!(
-            manager.slot,
-            Some(LocalSlot::Preparing(_) | LocalSlot::Releasing(_))
+            held_assignment(manager),
+            Some(HeldAssignment::Preparing(_) | HeldAssignment::Releasing(_))
         )
     }))
     .await

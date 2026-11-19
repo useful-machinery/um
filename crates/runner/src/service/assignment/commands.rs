@@ -210,23 +210,12 @@ impl AssignmentManager {
         if self.cancellations.len() < MAXIMUM_RETAINED_DECISIONS {
             return Ok(());
         }
-        let active_assignment_id = match &self.slot {
-            Some(LocalSlot::Preparing(preparing)) => Some(preparing.offer.assignment_id.as_str()),
-            Some(LocalSlot::Accepted(accepted)) => Some(accepted.identity.assignment_id.as_str()),
-            Some(LocalSlot::Running(running)) => Some(running.identity.assignment_id.as_str()),
-            Some(LocalSlot::Finishing(finishing)) => {
-                Some(finishing.identity.assignment_id.as_str())
-            }
-            Some(LocalSlot::Releasing(releasing)) => Some(releasing.assignment_id.as_str()),
-            None => self
-                .reporting
-                .as_ref()
-                .map(|identity| identity.assignment_id.as_str()),
-        };
+        // Never the entry of an assignment the runner holds or that still reports.
         let Some(index) = self.cancellations.iter().position(|retained| {
             retained.observation_id.is_none()
                 && retained.ready
-                && active_assignment_id != Some(retained.command.assignment_id.as_str())
+                && !self.held.contains_key(&retained.command.assignment_id)
+                && !self.reporting.contains_key(&retained.command.assignment_id)
         }) else {
             return Err(AssignmentManagerFailure::DecisionCapacity);
         };
@@ -305,17 +294,10 @@ impl AssignmentManager {
         }
         self.decisions[index].start = Some(start.clone());
 
-        let Some(slot) = self.slot.take() else {
+        let Some(mut accepted) = self.take_held(&start.assignment_id, HeldAssignment::accepted)
+        else {
             return Ok(None);
         };
-        let LocalSlot::Accepted(mut accepted) = slot else {
-            self.slot = Some(slot);
-            return Ok(None);
-        };
-        if accepted.identity.assignment_id != start.assignment_id {
-            self.slot = Some(LocalSlot::Accepted(accepted));
-            return Ok(None);
-        }
         let Some(causal_lease) = self.decisions[index].causal_lease.clone() else {
             let identity = accepted.identity.clone();
             let root = accepted.root;
@@ -333,7 +315,7 @@ impl AssignmentManager {
                     return Ok(None);
                 }
                 Err(GrantValidationFailure::Arithmetic(_)) => {
-                    self.slot = Some(LocalSlot::Accepted(accepted));
+                    self.hold(HeldAssignment::Accepted(accepted));
                     self.lease_clock_failed = true;
                     return Err(AssignmentManagerFailure::LeaseClock);
                 }
@@ -341,7 +323,7 @@ impl AssignmentManager {
         let now = match self.lease_clock.now() {
             Ok(now) => now,
             Err(_) => {
-                self.slot = Some(LocalSlot::Accepted(accepted));
+                self.hold(HeldAssignment::Accepted(accepted));
                 self.lease_clock_failed = true;
                 return Err(AssignmentManagerFailure::LeaseClock);
             }
@@ -355,7 +337,7 @@ impl AssignmentManager {
                 return Ok(None);
             }
             Err(_) => {
-                self.slot = Some(LocalSlot::Accepted(accepted));
+                self.hold(HeldAssignment::Accepted(accepted));
                 self.lease_clock_failed = true;
                 return Err(AssignmentManagerFailure::LeaseClock);
             }
@@ -374,7 +356,7 @@ impl AssignmentManager {
             .entry(accepted.assignment_id().to_owned())
             .or_default()
             .clone();
-        self.slot = Some(LocalSlot::Running(Box::new(RunningAssignment {
+        self.hold(HeldAssignment::Running(Box::new(RunningAssignment {
             identity: accepted.identity.clone(),
             cancellation,
             cancellation_grace,
@@ -387,9 +369,13 @@ impl AssignmentManager {
             engine_terminal: Arc::clone(&engine_terminal),
             workspace_release: None,
             run_event: run_event.clone(),
-            // The slot, not the execution, holds the assignment's grant
+            // The held assignment, not the execution, holds its grant
             // tokens until the assignment ends.
             _grant_tokens: accepted.grant_tokens.take(),
+            activity: match &accepted.execution {
+                AcceptedExecution::Tree(tree) => Some(Arc::clone(tree.activity())),
+                AcceptedExecution::Engine(_) => None,
+            },
         })));
         Ok(Some(ExecutionJob::new(
             *accepted,
@@ -474,8 +460,7 @@ impl AssignmentManager {
             return Err(AssignmentManagerFailure::ConflictingOffer);
         }
         self.decisions[index].start_authorization = Some(authorization.clone());
-        if let Some(LocalSlot::Running(running)) = &self.slot
-            && running.identity.assignment_id == authorization.assignment_id
+        if let Some(running) = self.running(&authorization.assignment_id)
             && running.identity.run_id == authorization.run_id
             && running.identity.attempt_id == authorization.attempt_id
             && !self.has_pending_pre_execution_cancellation(&authorization.assignment_id)
@@ -544,29 +529,25 @@ impl AssignmentManager {
         {
             return Err(AssignmentManagerFailure::ConflictingOffer);
         }
-        let running_matches = matches!(
-            &self.slot,
-            Some(LocalSlot::Running(running))
-                if running.identity.assignment_id == renewal.assignment_id
-        );
-        if !running_matches {
+        if self.running(&renewal.assignment_id).is_none() {
             // A later causal request must not change this grant's replay disposition.
             self.decisions[index]
                 .rejected_renewals
                 .insert(renewal.effect_id.clone(), renewal);
             return Ok(RenewalDecision::untimed(RenewalDisposition::NotRunning));
         }
-        let Some(LocalSlot::Running(running)) = &self.slot else {
+        let assignment_id = renewal.assignment_id.as_str();
+        let Some(running) = self.running(assignment_id) else {
             return Ok(RenewalDecision::untimed(RenewalDisposition::NotRunning));
         };
         let now = match self.lease_clock.now() {
             Ok(now) => now,
-            Err(error) => return Err(self.fail_lease_clock(error)),
+            Err(error) => return Err(self.fail_lease_clock(assignment_id, error)),
         };
         let authority = running.authority_updates.borrow().clone();
         let cancellation_order = match now.checked_cmp(authority.cancellation_start) {
             Ok(ordering) => ordering,
-            Err(error) => return Err(self.fail_lease_clock(error)),
+            Err(error) => return Err(self.fail_lease_clock(assignment_id, error)),
         };
         // These local monotonic durations diagnose queueing and deadline pressure;
         // unavailable telemetry must not alter the authority decision.
@@ -596,7 +577,7 @@ impl AssignmentManager {
         let cancellation_started =
             authority.revoked || cancellation_order != std::cmp::Ordering::Less;
         if cancellation_started {
-            let Some(LocalSlot::Running(running)) = &mut self.slot else {
+            let Some(running) = self.running_mut(assignment_id) else {
                 return Ok(timed(RenewalDisposition::NotRunning));
             };
             revoke_authority(running);
@@ -630,7 +611,7 @@ impl AssignmentManager {
                 return Ok(timed(RenewalDisposition::MissingBasis));
             }
             Err(GrantValidationFailure::Arithmetic(error)) => {
-                return Err(self.fail_lease_clock(error));
+                return Err(self.fail_lease_clock(assignment_id, error));
             }
         };
         match next_authority.local_expiry.checked_cmp(current_expiry) {
@@ -638,10 +619,10 @@ impl AssignmentManager {
             Ok(std::cmp::Ordering::Less | std::cmp::Ordering::Equal) => {
                 return Err(AssignmentManagerFailure::ConflictingOffer);
             }
-            Err(error) => return Err(self.fail_lease_clock(error)),
+            Err(error) => return Err(self.fail_lease_clock(assignment_id, error)),
         }
 
-        let Some(LocalSlot::Running(running)) = &mut self.slot else {
+        let Some(running) = self.running_mut(assignment_id) else {
             return Ok(timed(RenewalDisposition::NotRunning));
         };
         running.current_grant = renewal.lease.clone();
@@ -679,41 +660,24 @@ impl AssignmentManager {
         if retained_conflict {
             return Err(AssignmentManagerFailure::ConflictingOffer);
         }
-        let slot_conflict = match &self.slot {
-            Some(LocalSlot::Preparing(preparing))
-                if preparing.offer.assignment_id == release.assignment_id =>
-            {
-                preparing.offer.run_id != release.run_id
-                    || preparing.offer.attempt_id != release.attempt_id
+        let held_identity = match self.held.get(&release.assignment_id) {
+            Some(HeldAssignment::Preparing(preparing)) => {
+                Some((&preparing.offer.run_id, &preparing.offer.attempt_id))
             }
-            Some(LocalSlot::Accepted(accepted))
-                if accepted.identity.assignment_id == release.assignment_id =>
-            {
-                accepted.identity.run_id != release.run_id
-                    || accepted.identity.attempt_id != release.attempt_id
+            Some(HeldAssignment::Accepted(accepted)) => {
+                Some((&accepted.identity.run_id, &accepted.identity.attempt_id))
             }
-            Some(LocalSlot::Running(running))
-                if running.identity.assignment_id == release.assignment_id =>
-            {
-                running.identity.run_id != release.run_id
-                    || running.identity.attempt_id != release.attempt_id
+            Some(HeldAssignment::Running(running)) => {
+                Some((&running.identity.run_id, &running.identity.attempt_id))
             }
-            Some(LocalSlot::Finishing(finishing))
-                if finishing.identity.assignment_id == release.assignment_id =>
-            {
-                finishing.identity.run_id != release.run_id
-                    || finishing.identity.attempt_id != release.attempt_id
+            Some(HeldAssignment::Finishing(finishing)) => {
+                Some((&finishing.identity.run_id, &finishing.identity.attempt_id))
             }
-            Some(
-                LocalSlot::Preparing(_)
-                | LocalSlot::Accepted(_)
-                | LocalSlot::Running(_)
-                | LocalSlot::Finishing(_)
-                | LocalSlot::Releasing(_),
-            )
-            | None => false,
+            Some(HeldAssignment::Releasing(_)) | None => None,
         };
-        if slot_conflict {
+        if held_identity.is_some_and(|(run_id, attempt_id)| {
+            run_id != &release.run_id || attempt_id != &release.attempt_id
+        }) {
             return Err(AssignmentManagerFailure::ConflictingOffer);
         }
         self.retain_release(release.clone());
@@ -721,13 +685,12 @@ impl AssignmentManager {
         let run_id = release.run_id.as_str();
         let attempt_id = release.attempt_id.as_str();
         let reason = release.reason.as_str();
-        if let Some(LocalSlot::Preparing(preparing)) = &self.slot
-            && preparing.offer.assignment_id == assignment_id
-        {
+        if let Some(preparing) = self.preparing(assignment_id) {
             if preparing.offer.run_id != run_id || preparing.offer.attempt_id != attempt_id {
                 return Err(AssignmentManagerFailure::ConflictingOffer);
             }
-            let Some(LocalSlot::Preparing(mut preparing)) = self.slot.take() else {
+            let Some(mut preparing) = self.take_held(assignment_id, HeldAssignment::preparing)
+            else {
                 return Err(AssignmentManagerFailure::ConflictingOffer);
             };
             preparing.cancellation.cancel();
@@ -749,18 +712,11 @@ impl AssignmentManager {
                     ReleaseAfter::Idle,
                 );
             } else {
-                self.slot = Some(LocalSlot::Preparing(preparing));
+                self.hold(HeldAssignment::Preparing(preparing));
             }
             return Ok(());
         }
-        if matches!(
-            &self.slot,
-            Some(LocalSlot::Accepted(accepted))
-                if accepted.identity.assignment_id == assignment_id
-        ) {
-            let Some(LocalSlot::Accepted(accepted)) = self.slot.take() else {
-                return Err(AssignmentManagerFailure::ConflictingOffer);
-            };
+        if let Some(accepted) = self.take_held(assignment_id, HeldAssignment::accepted) {
             self.retire_assignment_observations(assignment_id);
             self.begin_assignment_cleanup(
                 assignment_id.to_owned(),
@@ -770,14 +726,10 @@ impl AssignmentManager {
             );
             return Ok(());
         }
-        match &mut self.slot {
-            Some(LocalSlot::Running(running))
-                if running.identity.assignment_id == assignment_id
-                    && reason == "execution_lease_expired" =>
-            {
-                revoke_authority(running);
-            }
-            _ => {}
+        if reason == "execution_lease_expired"
+            && let Some(running) = self.running_mut(assignment_id)
+        {
+            revoke_authority(running);
         }
         Ok(())
     }
@@ -883,14 +835,18 @@ impl AssignmentManager {
             if self.lease_clock_failure_report == Some(id) {
                 self.lease_clock_failure_report = None;
             }
-            if matches!(
-                &self.slot,
-                Some(LocalSlot::Finishing(finishing)) if finishing.final_observation_id == id
-            ) {
-                let Some(LocalSlot::Finishing(finishing)) = self.slot.take() else {
+            let finished = self.held.values().find_map(|held| match held {
+                HeldAssignment::Finishing(finishing) if finishing.final_observation_id == id => {
+                    Some(finishing.identity.assignment_id.clone())
+                }
+                _ => None,
+            });
+            if let Some(assignment_id) = finished {
+                let Some(finishing) = self.take_held(&assignment_id, HeldAssignment::finishing)
+                else {
                     return;
                 };
-                self.reporting = None;
+                self.reporting.remove(&assignment_id);
                 if let Some(root) = finishing.root {
                     self.begin_assignment_finalization(
                         finishing.identity.assignment_id,
@@ -900,12 +856,8 @@ impl AssignmentManager {
                         ReleaseAfter::Idle,
                     );
                 }
-            } else if self
-                .reporting
-                .as_ref()
-                .is_some_and(|reporting| reporting.assignment_id == observation.assignment_id())
-            {
-                self.reporting = None;
+            } else {
+                self.reporting.remove(observation.assignment_id());
             }
         }
         self.outbox.wake();
@@ -970,6 +922,32 @@ impl AssignmentManager {
 
     pub(in crate::service) fn begin_shutdown(&mut self) -> Result<(), AssignmentManagerFailure> {
         self.drain_events();
+        self.interrupt_held()
+    }
+
+    /// Once a failed cleanup has fenced the boot, interrupts every assignment it still holds
+    /// as a graceful stop does, once, so the exit the fence leads to waits for them
+    /// (REQ-RUNNERENROLL-71). One that only releases its root holds no process.
+    pub(super) fn interrupt_held_after_cleanup_failure(&mut self) {
+        if !self.cleanup_failed
+            || self.shutting_down
+            || self.lease_clock_failed
+            || self
+                .held
+                .values()
+                .all(|held| matches!(held, HeldAssignment::Releasing(_)))
+        {
+            return;
+        }
+        // Any other failure gave up an assignment whose report could not be queued, its run
+        // recorded `aborted`; the others are interrupted all the same.
+        if self.interrupt_held() == Err(AssignmentManagerFailure::LeaseClock) {
+            self.lease_clock_failed = true;
+        }
+    }
+
+    /// Applies the runner's shutdown to every held assignment.
+    fn interrupt_held(&mut self) -> Result<(), AssignmentManagerFailure> {
         let cleanup_deadline = match self.shutdown_cleanup_deadline {
             Some(deadline) => deadline,
             None => self
@@ -980,12 +958,32 @@ impl AssignmentManager {
         };
         self.shutdown_cleanup_deadline = Some(cleanup_deadline);
         self.shutting_down = true;
-        let Some(slot) = self.slot.take() else {
-            self.outbox.wake();
+        let mut failure = None;
+        let held: Vec<String> = self.held.keys().cloned().collect();
+        for assignment_id in held {
+            if let Err(error) = self.shut_down_held(&assignment_id, cleanup_deadline) {
+                failure.get_or_insert(error);
+            }
+        }
+        if let Some(failure) = failure {
+            return Err(failure);
+        }
+        self.outbox.wake();
+        Ok(())
+    }
+
+    /// Applies the runner's shutdown to the assignment held under `assignment_id`, as its
+    /// state calls for.
+    fn shut_down_held(
+        &mut self,
+        assignment_id: &str,
+        cleanup_deadline: LeaseInstant,
+    ) -> Result<(), AssignmentManagerFailure> {
+        let Some(held) = self.held.remove(assignment_id) else {
             return Ok(());
         };
-        match slot {
-            LocalSlot::Preparing(preparing) => {
+        match held {
+            HeldAssignment::Preparing(preparing) => {
                 preparing.cancellation.cancel();
                 let detached_root_preparation = preparing.root.is_none()
                     && preparing.prepare_effect_id.is_none()
@@ -1001,15 +999,15 @@ impl AssignmentManager {
                         "aborted",
                     );
                 } else {
-                    self.slot = Some(LocalSlot::Preparing(preparing));
+                    self.hold(HeldAssignment::Preparing(preparing));
                 }
             }
-            LocalSlot::Accepted(accepted) => {
+            HeldAssignment::Accepted(accepted) => {
                 let identity = accepted.identity.clone();
                 let root = accepted.root;
                 self.finish_before_execution(identity, root, "graceful_shutdown")?;
             }
-            LocalSlot::Running(running) => {
+            HeldAssignment::Running(running) => {
                 running
                     .infrastructure_interruption
                     .send_replace(Some(InfrastructureInterruption::RunnerShutdown));
@@ -1019,9 +1017,9 @@ impl AssignmentManager {
                 running
                     .cancellation
                     .request_cancellation(CancellationReason::RunnerShutdown);
-                self.slot = Some(LocalSlot::Running(running));
+                self.hold(HeldAssignment::Running(running));
             }
-            LocalSlot::Finishing(finishing) => {
+            HeldAssignment::Finishing(finishing) => {
                 self.start_final_grace(
                     finishing.identity.assignment_id.clone(),
                     finishing.final_observation_id,
@@ -1029,13 +1027,12 @@ impl AssignmentManager {
                     false,
                 )
                 .map_err(|_| AssignmentManagerFailure::LeaseClock)?;
-                self.slot = Some(LocalSlot::Finishing(finishing));
+                self.hold(HeldAssignment::Finishing(finishing));
             }
-            LocalSlot::Releasing(releasing) => {
-                self.slot = Some(LocalSlot::Releasing(releasing));
+            HeldAssignment::Releasing(releasing) => {
+                self.hold(HeldAssignment::Releasing(releasing));
             }
         }
-        self.outbox.wake();
         Ok(())
     }
 }

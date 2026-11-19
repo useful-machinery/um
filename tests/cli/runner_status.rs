@@ -596,6 +596,41 @@ fn run_status_with_response(response: &'static [u8]) -> Output {
     output
 }
 
+// REQ-RUNNERENROLL-42, REQ-RUNNERENROLL-80: the assignment line gives the total and each
+// nonzero count, a waiting run's among them, and one line follows for each held run.
+#[test]
+fn runner_status_counts_waiting_runs_and_lists_each_held_run() {
+    let output = run_status_with_response(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/runner-control/v1/valid/status-held-runs-response.json"
+    )));
+
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let lines = stdout.lines().collect::<Vec<_>>();
+    let assignments = lines
+        .iter()
+        .position(|line| line.starts_with("assignments:"))
+        .unwrap_or_else(|| panic!("{stdout}"));
+    let line = lines[assignments];
+    for part in ["2 total", "preparing: 1", "waiting: 1"] {
+        assert!(line.contains(part), "{stdout}");
+    }
+    assert!(!line.contains("running"), "{stdout}");
+    for (offset, (run_id, state)) in [
+        ("run_01k0z6r1w8f4jy2m7q9v3x5abp", "working"),
+        ("run_01k0z6r1w8f4jy2m7q9v3x5abq", "waiting"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let held = lines[assignments + 1 + offset];
+        assert!(held.contains(run_id) && held.contains(state), "{stdout}");
+    }
+    assert_eq!(lines.len(), assignments + 3, "{stdout}");
+    assert!(output.stderr.is_empty());
+}
+
 // REQ-RUNNERENROLL-42, REQ-GRANT-88
 #[test]
 fn runner_status_prints_each_provider_readiness_once_the_runner_has_set_up() {

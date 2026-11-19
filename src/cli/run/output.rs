@@ -5,7 +5,7 @@ use serde::Serialize;
 use serde_json::Value;
 use useful_api::{
     ProjectReadinessBlocker, Publication, PublicationState, Run, RunArtifactDelivery,
-    RunCancellationReceipt, RunObservation, RunPublicationHandoffState,
+    RunCancellationReceipt, RunHeldRunState, RunObservation, RunPublicationHandoffState,
 };
 use useful_execution::visible_text;
 
@@ -585,6 +585,30 @@ pub(crate) fn write_waiting(out: &mut impl Write, observation: &RunObservation) 
         Some(since) => writeln!(out, "waiting: {reason} since {}", visible_text(since)),
         None => writeln!(out, "waiting: {reason}"),
     }
+}
+
+/// The other runs the run's runner holds, in Cloud's order, each with whether it is working
+/// or waiting (REQ-RUN-120); nothing when the runner holds no other run or Cloud does not say.
+pub(crate) fn write_held_with(
+    out: &mut impl Write,
+    observation: &RunObservation,
+) -> io::Result<()> {
+    let Some(held) = observation
+        .held_with
+        .as_deref()
+        .filter(|held| !held.is_empty())
+    else {
+        return Ok(());
+    };
+    writeln!(out, "runner also holds:")?;
+    for run in held {
+        let state = match run.state {
+            RunHeldRunState::Working => "working",
+            RunHeldRunState::Waiting => "waiting",
+        };
+        writeln!(out, "  {}: {state}", visible_text(&run.run_id))?;
+    }
+    Ok(())
 }
 
 /// The block saying why Cloud rejected a run, nothing when it did not: its reason, under it

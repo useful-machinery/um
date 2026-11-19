@@ -145,7 +145,10 @@ exports:
     );
     let offered = decoded_source_display_offer();
     offer_then_prepare(&mut manager, &offered).await;
-    assert!(matches!(manager.slot, Some(LocalSlot::Accepted(_))));
+    assert!(matches!(
+        held_assignment(&manager),
+        Some(HeldAssignment::Accepted(_))
+    ));
     spawn_execution(&mut manager, &offered);
 
     let artifact_set_id = "ats_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned();

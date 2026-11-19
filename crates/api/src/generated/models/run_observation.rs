@@ -37,7 +37,7 @@ pub struct RunObservation {
         skip_serializing_if = "Option::is_none"
     )]
     pub placement_reason: Option<Option<PlacementReason>>,
-    /// What a queued run waits for, read at request time. Null when a runner that fits the run is connected and free, and when the run is not queued; absent from a Cloud that does not report it.
+    /// What a queued run waits for, read at request time. Null when a runner that fits the run is connected and working on no run, and when the run is not queued; absent from a Cloud that does not report it.
     #[serde(
         rename = "waiting",
         default,
@@ -45,6 +45,9 @@ pub struct RunObservation {
         skip_serializing_if = "Option::is_none"
     )]
     pub waiting: Option<Option<Box<models::RunWaiting>>>,
+    /// The other runs the run's runner holds, the working ones first. Omitted when the run has no assignment or its runner holds no other run.
+    #[serde(rename = "heldWith", skip_serializing_if = "Option::is_none")]
+    pub held_with: Option<Vec<models::RunHeldRun>>,
 }
 
 impl RunObservation {
@@ -64,6 +67,7 @@ impl RunObservation {
             last_decline: last_decline.map(Box::new),
             placement_reason: None,
             waiting: None,
+            held_with: None,
         }
     }
 }

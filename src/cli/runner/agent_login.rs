@@ -174,7 +174,7 @@ fn control_failure(error: ControlError) -> CommandFailure {
     match error {
         ControlError::RunnerBusy => CommandFailure::with_exit_code(
             anyhow!(
-                "Runner Serve holds an assignment and did not finish agent-login setup (runner_busy); retry when it is idle"
+                "Runner Serve did not finish agent-login setup because a run it holds is working (runner_busy); retry once every run it holds is waiting or has ended"
             ),
             ExitCode::Unavailable,
         ),

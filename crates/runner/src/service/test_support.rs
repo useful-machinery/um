@@ -1452,8 +1452,9 @@ impl AgentLoginCloud for FakeAgentLoginCloud {
     }
 }
 
-/// An assignment gate that is idle for a number of calls and busy after
-/// them, as when an assignment starts while a pass runs.
+/// An assignment gate that lets setup act for a number of calls, at either
+/// level, and refuses after them, as when a held run starts working while a
+/// pass runs.
 pub(crate) struct CountedGate {
     pub(crate) idle_calls: AtomicUsize,
 }
@@ -1474,14 +1475,24 @@ impl CountedGate {
     }
 }
 
-impl AssignmentGate for CountedGate {
-    fn while_idle(&self, change: &mut dyn FnMut()) -> bool {
-        let idle = self
-            .idle_calls
+impl CountedGate {
+    /// Counts one call, answering whether it is one of the idle ones.
+    fn count_call(&self) -> bool {
+        self.idle_calls
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
                 left.checked_sub(1)
             })
-            .is_ok();
+            .is_ok()
+    }
+}
+
+impl AssignmentGate for CountedGate {
+    fn none_working(&self) -> bool {
+        self.count_call()
+    }
+
+    fn while_still(&self, change: &mut dyn FnMut()) -> bool {
+        let idle = self.count_call();
         if idle {
             change();
         }
@@ -1642,5 +1653,812 @@ mod tests {
             Duration::from_secs(3)
         );
         assert_eq!(sleeper.utc_now() - utc_origin, time::Duration::seconds(3));
+    }
+}
+
+/// The tree-run fixture the tree-run job's tests and the connection's share: a manager whose
+/// offers run a published tree with an injected `useful` against a fake capability server.
+pub(in crate::service) mod tree_fixture {
+    use std::fs;
+    use std::io::{BufRead as _, BufReader, Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    use ring::digest::{SHA256, digest};
+    use serde_json::{Value, json};
+    use tokio_tungstenite::tungstenite::Message;
+    use url::Url;
+    use useful_execution::EnvironmentSnapshot;
+    use useful_runner_protocol::{
+        CloudFrame, WorkflowTreeFileV1RunnerProjection, decode_cloud_frame,
+    };
+
+    use super::{
+        CountedGate, FakeAgentLoginCloud, FakeGrantToken, fake_agent_login_setup_serving,
+        run_fixture_git,
+    };
+    use crate::agent_login::cloud::{GrantTokenFailure, GrantTokenRefusal};
+    use crate::agent_login::directory::LoginDirectory;
+    use crate::agent_login::setup::AgentLoginSetup;
+    use crate::control_protocol::AgentLoginProvider;
+    use crate::credential::test_credential;
+    use crate::service::assignment::test_support::{keep_agent_logins_in, tree_run_manager};
+    use crate::service::assignment::{AssignmentManager, AssignmentOffer};
+    use crate::service::config::{AssignmentConfig, Config, RepositoryUrlPolicy};
+    use crate::service::control::{AdmissionAgentLogins, LiveStatus};
+    use crate::service::source::SourceCredentialBroker;
+    use crate::service::tree_run::{HttpTreeBroker, TreeRunDependencies};
+
+    /// The digest the fixture's offer names for its tree.
+    pub(in crate::service) const TREE_DIGEST: &str =
+        "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945";
+
+    /// The injected `useful`: answers `definition publish --json` with revision 1 of
+    /// `$TREE_TEST_DIGEST`, making its revision directory as the local publish does, or, while
+    /// `$TREE_TEST_PUBLISH_REPORT` is set, prints its value and exits 1 as a refused publish
+    /// does, after writing `publish.args` either way; records
+    /// each command line under `$TREE_TEST_LOG`, and for `run create` copies the revision's
+    /// `resolution.json` there when one exists, copies the directory `$TREE_TEST_MIRROR`, when
+    /// set, as the run's `mirror/`, and leaves a `run.json` reading `$TREE_TEST_STATE` and
+    /// `$TREE_TEST_OUTCOME`, answering with `$TREE_TEST_RESULT` as the document's `result`, the
+    /// engine's `{"outcome":"succeeded"}` when it is unset: for state `waiting`
+    /// beside a `wait.json` of kind `$TREE_TEST_WAIT_KIND` whose rule names
+    /// `$TREE_TEST_WAIT_SOURCE`, its `step` and the record's `position` the JSON
+    /// `$TREE_TEST_POSITION` (`["merge"]` when unset), its `then` `$TREE_TEST_THEN` (`merge`
+    /// when unset) and its `payload` the JSON `$TREE_TEST_WAIT_PAYLOAD` (`{}` when unset), the
+    /// record first reading `running` at that position while
+    /// `$TREE_TEST_LOG/running` exists, and for state `cancellable` a running record until `run
+    /// cancel` ends it `canceled`; for state `refused` it makes no run and answers with the
+    /// runtime's rejection whose diagnostic code is `$TREE_TEST_REFUSAL`, by default
+    /// `required_tool_unavailable`, that of a root whose `requires.tools` names a missing tool.
+    /// Each `run resume` appends its command line to
+    /// `resume.args`, leaves its environment in `resume.env` and answers with the next word of
+    /// `$TREE_TEST_RESUMES`, or with the word in `$TREE_TEST_LOG/answer` while that file
+    /// exists: `held` (the default) reports the wait unchanged, `gated` waits until
+    /// `$TREE_TEST_LOG/gate` no longer exists and then answers with the word in
+    /// `$TREE_TEST_LOG/answer` when that file exists, reporting the wait unchanged while it
+    /// still reads `gated` or is absent, `unavailable`
+    /// refuses with `wait_condition_unavailable`, `refuse` refuses with
+    /// `continuation_nodes_unsatisfied`, `stall` starts nothing and prints nothing until `run
+    /// cancel` runs, and `continue` starts the record's next attempt at
+    /// that position, then lands the run once `$TREE_TEST_LOG/proceed` exists, its result
+    /// `{"outcome":"succeeded"}`. `run cancel` ends a waiting
+    /// record `canceled`. A stage `$TREE_TEST_LOG/stages/<name>/` is copied into the run
+    /// directory: `create` before the first record is written, `exited` after `create` writes
+    /// an `exited` record, `resume<n>` by the n-th `resume` (after `continue` writes attempt 2)
+    /// and `landed` before the run lands.
+    /// `run event` copies its event and claim files to the log and answers by
+    /// `$TREE_TEST_EVENT`: `cancel` applies `cancel`, ending the run `canceled`, after copying
+    /// the stage `event` into the run directory, and signalling
+    /// a `cancellable` process as the live run's cancellation does, `withdraw` applies
+    /// `withdraw` with the JSON `$TREE_TEST_ACTION_OUTCOME` as its `actionOutcome`, leaving the
+    /// record as it is, `not_later`
+    /// refuses `event_not_later` before any read, and `owned` refuses `issue_in_owned_state`
+    /// after one. `run stop` and `run lift` record their command lines; `run answer`, `approve`
+    /// and `hand-back` append theirs to `control.args` and answer `recorded`, or, with
+    /// `$TREE_TEST_CONTROL` `refuse`, refuse `question_unknown`, with `hang` hang until killed,
+    /// with `silent` exit 0 printing nothing, which the runner reads as no document, and with
+    /// `record_hang` (`approve` and `hand-back`) record their control for the run's
+    /// wait under `controls/` and then hang until killed; `run retry` appends its command
+    /// line there too and then answers as `resume`. `event`, `stop`, `lift`, `answer`,
+    /// `approve`, `hand-back`, `retry` and `resume` (but not a retry's) each append their name
+    /// to `$TREE_TEST_LOG/order`. `run event` with `$TREE_TEST_EVENT` `hang` starts a `sleep`
+    /// beside it in its process group, writes the sleep's pid to `$TREE_TEST_LOG/hang.pid` and
+    /// waits for it. While `$TREE_TEST_LOG/noise` exists every command first writes that many
+    /// bytes to stderr. While `$TREE_TEST_LOG/unlaunchable` exists `run create` removes the
+    /// injected `useful` itself, so no later command can be launched. While the directory
+    /// `$TREE_TEST_LOG/git-home` exists `run create` first names its execution root in `git-root`
+    /// and writes that root's local `credential.*` configuration to `create.git-config` and, run
+    /// there with that directory as `HOME`, the answer of `git credential fill` for the root's
+    /// `origin` to `create.credential` and its exit status to `create.credential.status`; and
+    /// `run resume`, while `git-root` names a root, does the same to `resume.git-config`,
+    /// `resume.credential` and `resume.credential.status` before it answers.
+    /// `run withdraw` appends its command line to `withdraw.args` and its name to `order`, leaves
+    /// its environment in `withdraw.env` and answers with the next word of
+    /// `$TREE_TEST_WITHDRAWS`: `withdrawn` (the default) ends a waiting record `withdrawn`, as
+    /// the runtime does, with the outcome write `withdrawn_write` under the run's `mirror/`, and
+    /// answers `withdrawn`; `recorded` answers `recorded` and creates
+    /// `$TREE_TEST_LOG/withdraw.recorded`, which a `cancellable` process honors by ending its run
+    /// `withdrawn` the same way; `refuse` refuses `mirror_credentials_unavailable`;
+    /// `withdrawn_hang` ends a waiting record as `withdrawn` does and then hangs until killed,
+    /// printing nothing; and `hang` hangs until killed, leaving the record as it is.
+    /// While the directory `$TREE_TEST_LOG/runs` exists, each run keeps all of the above in a log
+    /// of its own instead, `runs/<assignment>` under it, named by the assignment directory its
+    /// `USEFUL_HOME` lies under (`per_run_log`), so the runs of one manager count, gate and answer
+    /// apart.
+    const USEFUL_FIXTURE: &str = r#"#!/bin/sh
+log="$TREE_TEST_LOG"
+if [ -d "$log/runs" ]; then
+  log="$log/runs/$(basename "$(dirname "$(dirname "$USEFUL_HOME")")")"
+  mkdir -p "$log"
+fi
+position='["merge"]'
+[ -z "$TREE_TEST_POSITION" ] || position="$TREE_TEST_POSITION"
+wait_payload='{}'
+[ -z "$TREE_TEST_WAIT_PAYLOAD" ] || wait_payload="$TREE_TEST_WAIT_PAYLOAD"
+if [ -f "$log/noise" ]; then head -c "$(cat "$log/noise")" /dev/zero >&2; fi
+stage() {
+  if [ -d "$log/stages/$1" ]; then cp -R "$log/stages/$1/." "$run/"; fi
+}
+observe_git() {
+  git -C "$1" config --local --get-regexp '^credential\.' > "$log/$2.git-config"
+  printf 'url=%s\n\n' "$(git -C "$1" remote get-url origin)" |
+    HOME="$log/git-home" GIT_TERMINAL_PROMPT=0 git -C "$1" credential fill > "$log/$2.credential" 2> /dev/null
+  echo "$?" > "$log/$2.credential.status"
+}
+recorded() {
+  printf '{"schemaVersion":1,"command":"useful workflow run %s","outcome":"recorded","exitStatus":0,"runDirectory":"%s","run":"run_01k0z6r1w8f4jy2m7q9v3x5loc","control":{"ordinal":1,"event":"control.%s","path":"controls/0001-%s.json","wait":null},"wait":null}\n' "$1" "$2" "$1" "$1"
+}
+withdrawn() {
+  rm -f "$1/wait.json"
+  mkdir -p "$1/mirror"
+  printf '{"schemaVersion":1,"hook":"outcome","at":"2026-07-23T00:00:05Z","issue":"AUTO-143","action":{"kind":"state","state":"Todo","binding":"todoState"},"outcome":"written"}\n' > "$1/mirror/0001-outcome.json"
+  # Replaced whole, as the runtime writes it.
+  printf '{"state":"exited","outcome":"withdrawn","attempts":1,"position":[]}\n' > "$1/run.json.next"
+  mv "$1/run.json.next" "$1/run.json"
+}
+retrying=
+if [ "$1 $2 $3" = "workflow run retry" ]; then
+  printf '%s\n' "$*" >> "$log/control.args"
+  echo retry >> "$log/order"
+  retrying=1
+  set -- workflow run resume "$4" --json
+fi
+case "$1 $2 $3" in
+"workflow definition publish")
+  printf '%s\n' "$@" > "$log/publish.args"
+  if [ "${TREE_TEST_PUBLISH_REPORT+set}" ]; then
+    printf '%s' "$TREE_TEST_PUBLISH_REPORT"
+    exit 1
+  fi
+  env > "$log/publish.env"
+  if test -x "$4/bin/check.sh"; then echo executable; else echo plain; fi > "$log/check.mode"
+  if test -x "$4/workflow.yaml"; then echo executable; else echo plain; fi > "$log/workflow.mode"
+  cp "$6" "$log/bindings.json"
+  mkdir -p -m 700 "$USEFUL_HOME/workflows/def_01k0z6r1w8f4jy2m7q9v3x5loc/revisions/1"
+  printf '{"definition":{"id":"def_01k0z6r1w8f4jy2m7q9v3x5loc"},"revision":{"n":1,"tree":"%s"}}\n' "$TREE_TEST_DIGEST"
+  ;;
+"workflow run create")
+  printf '%s\n' "$@" > "$log/create.args"
+  env > "$log/create.env"
+  if [ -e "$log/unlaunchable" ]; then rm -f "$0"; fi
+  if [ -d "$log/git-home" ]; then
+    printf '%s' "$6" > "$log/git-root"
+    observe_git "$6" create
+  fi
+  if [ "$TREE_TEST_STATE" = refused ]; then
+    printf '{"schemaVersion":1,"command":"useful workflow run create","outcome":"rejected","exitStatus":1,"phase":"admission","workflow":{"path":"workflow.yaml"},"diagnostics":[{"code":"%s","message":"Install the tool the root workflow'"'"'s `requires.tools` names, or put it on the launching `PATH`.","location":{"kind":"required_tool","tool":"useful-test-no-such-tool"}}]}\n' "${TREE_TEST_REFUSAL:-required_tool_unavailable}"
+    exit 1
+  fi
+  resolution="$USEFUL_HOME/workflows/def_01k0z6r1w8f4jy2m7q9v3x5loc/revisions/1/resolution.json"
+  if test -e "$resolution"; then cp "$resolution" "$log/resolution.json"; fi
+  run="$USEFUL_HOME/workflows/def_01k0z6r1w8f4jy2m7q9v3x5loc/runs/run_01k0z6r1w8f4jy2m7q9v3x5loc"
+  mkdir -p "$run"
+  if test -n "$TREE_TEST_MIRROR"; then cp -R "$TREE_TEST_MIRROR" "$run/mirror"; fi
+  stage create
+  case "$TREE_TEST_STATE" in
+  cancellable)
+    printf '{"state":"running","outcome":null,"attempts":1,"position":["build"]}\n' > "$run/run.json"
+    n=0
+    while [ ! -e "$log/cancelled" ] && [ ! -e "$log/withdraw.recorded" ] && [ "$n" -lt 400 ]; do sleep 0.05; n=$((n + 1)); done
+    if [ -e "$log/withdraw.recorded" ]; then
+      withdrawn "$run"
+    else
+      printf '{"state":"exited","outcome":"canceled","attempts":1,"position":[]}\n' > "$run/run.json"
+    fi
+    ;;
+  waiting)
+    if [ -e "$log/running" ]; then
+      printf '{"state":"running","outcome":null,"attempts":1,"position":%s}\n' "$position" > "$run/run.json"
+      n=0
+      while [ -e "$log/running" ] && [ "$n" -lt 400 ]; do sleep 0.05; n=$((n + 1)); done
+    fi
+    printf '{"kind":"%s","since":"2026-07-23T00:00:05Z","step":%s,"then":"%s","rule":{"source":"%s","event":"pull_request.merged"},"payload":%s}\n' "$TREE_TEST_WAIT_KIND" "$position" "${TREE_TEST_THEN:-merge}" "$TREE_TEST_WAIT_SOURCE" "$wait_payload" > "$run/wait.json"
+    printf '{"state":"waiting","outcome":null,"attempts":1,"position":%s}\n' "$position" > "$run/run.json"
+    ;;
+  exited)
+    printf '{"state":"exited","outcome":%s,"attempts":1,"position":[]}\n' "$TREE_TEST_OUTCOME" > "$run/run.json"
+    stage exited
+    ;;
+  *)
+    printf '{"state":"%s","outcome":%s,"attempts":1,"position":["build"]}\n' "$TREE_TEST_STATE" "$TREE_TEST_OUTCOME" > "$run/run.json"
+    ;;
+  esac
+  result="$TREE_TEST_RESULT"
+  [ -n "$result" ] || result='{"outcome":"succeeded"}'
+  printf '{"runDirectory":"%s","result":%s}\n' "$run" "$result"
+  ;;
+"workflow run event")
+  run="$4"
+  printf '%s\n' "$@" >> "$log/event.args"
+  echo event >> "$log/order"
+  cp "$6" "$log/event.json"
+  cp "$8" "$log/claim.json"
+  case "$TREE_TEST_EVENT" in
+  cancel)
+    : > "$log/cancelled"
+    rm -f "$4/wait.json"
+    stage event
+    printf '{"state":"exited","outcome":"canceled","attempts":1,"position":[]}\n' > "$4/run.json"
+    printf '{"schemaVersion":1,"command":"useful workflow run event","outcome":"applied","exitStatus":0,"runDirectory":"%s","run":"run_01k0z6r1w8f4jy2m7q9v3x5loc","trigger":"departed","action":"cancel","actionOutcome":"canceled","control":{"ordinal":1,"event":"cancel","path":"controls/0001-cancel.json","wait":null},"observation":{"team":"team_8c1b","state":"state_canceled","updatedAt":"2026-07-23T00:00:07.512Z"}}\n' "$4"
+    ;;
+  withdraw)
+    printf '{"schemaVersion":1,"command":"useful workflow run event","outcome":"applied","exitStatus":0,"runDirectory":"%s","run":"run_01k0z6r1w8f4jy2m7q9v3x5loc","trigger":"departed","action":"withdraw","actionOutcome":%s,"control":{"ordinal":1,"event":"withdraw","path":"controls/0001-withdraw.json","wait":null},"observation":{"team":"team_8c1b","state":"state_canceled","updatedAt":"2026-07-23T00:00:07.512Z"}}\n' "$4" "$TREE_TEST_ACTION_OUTCOME"
+    ;;
+  hang)
+    sleep 60 &
+    printf '%s\n' "$!" > "$log/hang.pid"
+    wait
+    ;;
+  owned)
+    printf '{"schemaVersion":1,"command":"useful workflow run event","outcome":"refused","exitStatus":1,"runDirectory":"%s","diagnostics":[{"code":"issue_in_owned_state","message":"owned"}],"observation":{"team":"team_8c1b","state":"state_build","updatedAt":null}}\n' "$4"
+    exit 1
+    ;;
+  *)
+    printf '{"schemaVersion":1,"command":"useful workflow run event","outcome":"refused","exitStatus":1,"runDirectory":"%s","diagnostics":[{"code":"event_not_later","message":"not later"}],"observation":null}\n' "$4"
+    exit 1
+    ;;
+  esac
+  ;;
+"workflow run stop")
+  printf '%s\n' "$@" > "$log/stop.args"
+  echo stop >> "$log/order"
+  recorded stop "$4"
+  ;;
+"workflow run lift")
+  printf '%s\n' "$@" > "$log/lift.args"
+  echo lift >> "$log/order"
+  recorded lift "$4"
+  ;;
+"workflow run answer"|"workflow run approve"|"workflow run hand-back")
+  printf '%s\n' "$*" >> "$log/control.args"
+  echo "$3" >> "$log/order"
+  if [ "$TREE_TEST_CONTROL" = refuse ]; then
+    printf '{"schemaVersion":1,"command":"useful workflow run %s","outcome":"refused","exitStatus":1,"runDirectory":"%s","diagnostics":[{"code":"question_unknown","message":"unknown"}]}\n' "$3" "$4"
+    exit 1
+  fi
+  if [ "$TREE_TEST_CONTROL" = silent ]; then
+    exit 0
+  fi
+  if [ "$TREE_TEST_CONTROL" = record_hang ]; then
+    name=$(printf '%s' "$3" | tr - _)
+    mkdir -p "$4/controls"
+    printf '{"source":"um","event":"control.%s","run":"run_01k0z6r1w8f4jy2m7q9v3x5abp","by":"cloud","at":"2026-07-23T00:00:06Z","wait":"%s@2026-07-23T00:00:05Z"}\n' "$name" "$TREE_TEST_WAIT_KIND" > "$4/controls/0001-$name.json"
+  fi
+  case "$TREE_TEST_CONTROL" in
+  hang|record_hang) sleep 60 & wait ;;
+  esac
+  recorded "$3" "$4"
+  ;;
+"workflow run resume")
+  run="$4"
+  [ -n "$retrying" ] || echo resume >> "$log/order"
+  printf '%s\n' "$run" >> "$log/resume.log"
+  printf '%s\n' "$*" >> "$log/resume.args"
+  env > "$log/resume.env"
+  if [ -f "$log/git-root" ]; then observe_git "$(cat "$log/git-root")" resume; fi
+  n=$(wc -l < "$log/resume.log" | tr -d ' ')
+  answer=$(printf '%s\n' $TREE_TEST_RESUMES | sed -n "${n}p")
+  if [ -f "$log/answer" ]; then answer=$(cat "$log/answer"); fi
+  if [ "$answer" = gated ]; then
+    i=0
+    while [ -e "$log/gate" ] && [ "$i" -lt 400 ]; do sleep 0.05; i=$((i + 1)); done
+    if [ -f "$log/answer" ]; then answer=$(cat "$log/answer"); fi
+  fi
+  case "$answer" in
+  continue)
+    rm -f "$run/wait.json"
+    next=$(($(sed -n 's/.*"attempts":\([0-9]*\).*/\1/p' "$run/run.json") + 1))
+    printf '{"state":"running","outcome":null,"attempts":%s,"position":%s}\n' "$next" "$position" > "$run/run.json"
+    stage "resume$n"
+    i=0
+    while [ ! -e "$log/proceed" ] && [ "$i" -lt 400 ]; do sleep 0.05; i=$((i + 1)); done
+    stage landed
+    printf '{"state":"exited","outcome":"landed","attempts":%s,"position":[]}\n' "$next" > "$run/run.json"
+    printf '{"outcome":"succeeded","runDirectory":"%s","result":{"outcome":"succeeded"}}\n' "$run"
+    ;;
+  refuse)
+    printf '{"schemaVersion":1,"outcome":"rejected","exitStatus":1,"phase":"continuation","runDirectory":"%s","diagnostics":[{"code":"continuation_nodes_unsatisfied","message":"refused"}]}\n' "$run"
+    exit 1
+    ;;
+  unavailable)
+    stage "resume$n"
+    printf '{"schemaVersion":1,"outcome":"rejected","exitStatus":1,"phase":"continuation","runDirectory":"%s","attemptNumber":1,"diagnostics":[{"code":"wait_condition_unavailable","message":"unavailable"}]}\n' "$run"
+    exit 1
+    ;;
+  stall)
+    i=0
+    while [ ! -e "$log/cancelled" ] && [ "$i" -lt 400 ]; do sleep 0.05; i=$((i + 1)); done
+    exit 1
+    ;;
+  *)
+    stage "resume$n"
+    printf '{"schemaVersion":1,"outcome":"waiting","exitStatus":0,"runDirectory":"%s","attemptNumber":1}\n' "$run"
+    ;;
+  esac
+  ;;
+"workflow run withdraw")
+  printf '%s\n' "$*" >> "$log/withdraw.args"
+  echo withdraw >> "$log/order"
+  env > "$log/withdraw.env"
+  n=$(wc -l < "$log/withdraw.args" | tr -d ' ')
+  answer=$(printf '%s\n' $TREE_TEST_WITHDRAWS | sed -n "${n}p")
+  case "$answer" in
+  recorded)
+    : > "$log/withdraw.recorded"
+    printf '{"schemaVersion":1,"command":"useful workflow run withdraw","outcome":"recorded","exitStatus":0,"runDirectory":"%s","run":"run_01k0z6r1w8f4jy2m7q9v3x5loc"}\n' "$4"
+    ;;
+  refuse)
+    printf '{"schemaVersion":1,"command":"useful workflow run withdraw","outcome":"refused","exitStatus":1,"runDirectory":"%s","diagnostics":[{"code":"mirror_credentials_unavailable","message":"unavailable"}]}\n' "$4"
+    exit 1
+    ;;
+  hang) sleep 60 & wait ;;
+  *)
+    if grep -q '"state":"waiting"' "$4/run.json"; then withdrawn "$4"; fi
+    if [ "$answer" = withdrawn_hang ]; then sleep 60 & wait; fi
+    printf '{"schemaVersion":1,"command":"useful workflow run withdraw","outcome":"withdrawn","exitStatus":0,"runDirectory":"%s","run":"run_01k0z6r1w8f4jy2m7q9v3x5loc"}\n' "$4"
+    ;;
+  esac
+  ;;
+"workflow run cancel")
+  printf '%s\n' "$@" > "$log/cancel.args"
+  : > "$log/cancelled"
+  if grep -q '"state":"waiting"' "$4/run.json"; then
+    rm -f "$4/wait.json"
+    # Replaced whole, as the runtime writes it, so a `cancel` killed midway leaves it readable.
+    printf '{"state":"exited","outcome":"canceled","attempts":1,"position":[]}\n' > "$4/run.json.next"
+    mv "$4/run.json.next" "$4/run.json"
+  fi
+  ;;
+esac
+"#;
+
+    /// A file of a published tree.
+    pub(in crate::service) struct TreeFile {
+        pub(in crate::service) path: &'static str,
+        pub(in crate::service) bytes: &'static [u8],
+        pub(in crate::service) executable: bool,
+    }
+
+    /// A dataflow tree: its root's steps `build` and `review` are `cmd` steps, so the runtime
+    /// holds before none of them.
+    pub(in crate::service) const TREE_FILES: &[TreeFile] = &[
+    TreeFile {
+        path: "workflow.yaml",
+        bytes: b"schemaVersion: 1\nname: build\nsteps:\n  build:\n    kind: cmd\n    command:\n      argv: [/bin/sh, -c, 'exit 0']\n  review:\n    kind: cmd\n    dependsOn: [build]\n    command:\n      argv: [/bin/sh, -c, 'exit 0']\n",
+        executable: false,
+    },
+    TreeFile {
+        path: "bin/check.sh",
+        bytes: b"#!/bin/sh\nexit 0\n",
+        executable: true,
+    },
+];
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        digest(&SHA256, bytes)
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    /// A Gateway stand-in serving the tree capability route and the signed file URLs of
+    /// `tree`.
+    fn capability_server(tree: &'static [TreeFile]) -> (Url, Arc<Mutex<Vec<Value>>>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        std::thread::spawn(move || {
+            for connection in listener.incoming() {
+                let Ok(mut connection) = connection else {
+                    return;
+                };
+                let mut reader = BufReader::new(connection.try_clone().unwrap());
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                let mut length = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    if header == "\r\n" {
+                        break;
+                    }
+                    if let Some(value) = header.to_ascii_lowercase().strip_prefix("content-length:")
+                    {
+                        length = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; length];
+                reader.read_exact(&mut body).unwrap();
+                let target = request_line
+                    .split(' ')
+                    .nth(1)
+                    .unwrap_or_default()
+                    .to_owned();
+                let (content_type, answer) = if let Some(path) = target.strip_prefix("/files/") {
+                    let file = tree.iter().find(|file| file.path == path).unwrap();
+                    ("application/octet-stream", file.bytes.to_vec())
+                } else {
+                    let request: Value = serde_json::from_slice(&body).unwrap();
+                    let files = request["files"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|path| {
+                            let file = tree
+                                .iter()
+                                .find(|file| file.path == path.as_str().unwrap())
+                                .unwrap();
+                            json!({
+                                "path": file.path,
+                                "sha256": sha256_hex(file.bytes),
+                                "size": file.bytes.len(),
+                                "executable": file.executable,
+                                "url": format!("http://{address}/files/{}", file.path),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let answer = json!({
+                        "schemaVersion": 1,
+                        "digest": request["digest"],
+                        "capabilityExpiresAt": "2099-01-01T00:00:00Z",
+                        "files": files,
+                    });
+                    recorded.lock().unwrap().push(request);
+                    ("application/json", serde_json::to_vec(&answer).unwrap())
+                };
+                write!(
+                connection,
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                answer.len()
+            )
+            .unwrap();
+                connection.write_all(&answer).unwrap();
+            }
+        });
+        (
+            Url::parse(&format!("ws://{address}/v1/runner/connect")).unwrap(),
+            requests,
+        )
+    }
+
+    const TREE_OFFER: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer-workflow-tree.json"
+    ));
+
+    /// The protocol fixture's offer of a published tree.
+    pub(in crate::service) fn tree_offer() -> CloudFrame {
+        decode_cloud_frame(TREE_OFFER).unwrap()
+    }
+
+    /// The protocol fixture's offer of a published tree, as Cloud sends `offer`: its IDs, its
+    /// commits and its tree's digest, path, stop and files set in the frame.
+    pub(in crate::service) fn offer_frame(offer: &AssignmentOffer) -> Message {
+        let mut frame: Value = serde_json::from_slice(TREE_OFFER).unwrap();
+        let payload = &mut frame["payload"];
+        payload["effectId"] = json!(offer.effect_id);
+        payload["assignmentId"] = json!(offer.assignment_id);
+        payload["runId"] = json!(offer.run_id);
+        payload["projectId"] = json!(offer.project_id);
+        payload["attemptId"] = json!(offer.attempt_id);
+        payload["attemptNumber"] = json!(offer.attempt_number);
+        let spec = &offer.execution_spec;
+        let wire = &mut payload["executionSpec"];
+        wire["workflowDefinitionSource"]["commitOid"] =
+            json!(spec.workflow_definition_source.commit_oid);
+        wire["primaryWorkspaceSource"]["commitOid"] =
+            json!(spec.primary_workspace_source.commit_oid);
+        let tree = spec.workflow_tree.as_ref().unwrap();
+        let wire = &mut wire["workflowTree"];
+        wire["digest"] = json!(tree.digest);
+        wire["workflowPath"] = json!(tree.workflow_path);
+        wire["stopBefore"] = json!(tree.stop_before);
+        wire["files"] = tree
+            .files
+            .iter()
+            .map(|file| {
+                json!({
+                    "path": file.path,
+                    "sha256": file.sha256,
+                    "size": file.size,
+                    "executable": file.executable,
+                })
+            })
+            .collect();
+        Message::Text(frame.to_string().into())
+    }
+
+    /// The built `useful` beside the test binary, which serves the workflow-Git helper's
+    /// internal mode the test binary does not; the checks build it before the tests.
+    pub(in crate::service) fn built_useful() -> PathBuf {
+        std::env::current_exe()
+            .unwrap()
+            .parent()
+            .and_then(Path::parent)
+            .unwrap()
+            .join(format!("useful{}", std::env::consts::EXE_SUFFIX))
+    }
+
+    /// Writes the injected `useful` to `directory`.
+    pub(in crate::service) fn injected_useful(directory: &Path) -> PathBuf {
+        let useful = directory.join("useful");
+        fs::write(&useful, USEFUL_FIXTURE).unwrap();
+        fs::set_permissions(&useful, fs::Permissions::from_mode(0o755)).unwrap();
+        useful
+    }
+
+    /// An offered tree's files and the `useful` that publishes and runs it, written or found
+    /// for the fixture's temporary directory: by default the injected script.
+    pub(in crate::service) struct OfferedTree {
+        pub(in crate::service) files: &'static [TreeFile],
+        pub(in crate::service) useful: fn(&Path) -> PathBuf,
+    }
+
+    impl From<&'static [TreeFile]> for OfferedTree {
+        fn from(files: &'static [TreeFile]) -> Self {
+            Self {
+                files,
+                useful: injected_useful,
+            }
+        }
+    }
+
+    /// A manager whose next offer, `offer`, is a tree run, beside what it runs on: the
+    /// temporary directory, the repository, the injected `useful`'s log and the capability
+    /// requests the fake Gateway answered.
+    pub(in crate::service) struct Fixture {
+        pub(in crate::service) _temporary: tempfile::TempDir,
+        /// The repository every workspace checkout clones.
+        pub(in crate::service) source: PathBuf,
+        pub(in crate::service) manager: AssignmentManager,
+        pub(in crate::service) offer: AssignmentOffer,
+        pub(in crate::service) log: PathBuf,
+        pub(in crate::service) capability_requests: Arc<Mutex<Vec<Value>>>,
+    }
+
+    /// A manager whose next offer is a tree run of `tree`'s files, each workspace checked out
+    /// through the broker `source_broker` makes for the fixture repository, `tree`'s `useful`,
+    /// by default the injected one, reporting `published_digest` and leaving a record in
+    /// `state` with `outcome`, `variables` added to the daemon's environment, its telemetry
+    /// recorded to `recorder` and its tree-run dependencies those `tune` makes of the
+    /// fixture's.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "each fixture variant names the parameters it varies through its wrapper"
+    )]
+    pub(in crate::service) fn fixture_sourced(
+        published_digest: &str,
+        state: &str,
+        outcome: &str,
+        variables: &[(&str, &str)],
+        recorder: Option<Arc<crate::telemetry::Recorder>>,
+        tune: impl FnOnce(TreeRunDependencies) -> TreeRunDependencies,
+        source_broker: impl FnOnce(&Path) -> Arc<dyn SourceCredentialBroker>,
+        tree: impl Into<OfferedTree>,
+    ) -> Fixture {
+        let OfferedTree { files, useful } = tree.into();
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("source");
+        let work = temporary.path().join("work");
+        let log = temporary.path().join("log");
+        for directory in [&source, &work, &log] {
+            fs::create_dir(directory).unwrap();
+        }
+        fs::set_permissions(&work, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::write(source.join("README"), "workspace\n").unwrap();
+        run_fixture_git(&source, &["init", "--quiet", "--object-format=sha1"]);
+        run_fixture_git(&source, &["config", "user.name", "Tree Fixture"]);
+        run_fixture_git(
+            &source,
+            &["config", "user.email", "fixture@usefulmachinery.invalid"],
+        );
+        run_fixture_git(&source, &["add", "."]);
+        run_fixture_git(&source, &["commit", "--quiet", "-m", "fixture"]);
+        let commit = run_fixture_git(&source, &["rev-parse", "HEAD"]);
+        let useful = useful(temporary.path());
+
+        let (endpoint, capability_requests) = capability_server(files);
+        let config = Config::new(
+            "wss://gateway.example.test/v1/runner/connect",
+            test_credential(),
+            false,
+            AssignmentConfig::new(&work).unwrap(),
+            RepositoryUrlPolicy::with_file_repositories(true),
+        )
+        .unwrap();
+        let broker = HttpTreeBroker::new(
+            &endpoint,
+            &test_credential(),
+            "rbt_01k0z6r1w8f4jy2m7q9v3x5abe",
+        )
+        .unwrap();
+        let environment = EnvironmentSnapshot::new(
+            [
+                ("PATH", std::env::var_os("PATH").unwrap_or_default()),
+                ("TREE_TEST_LOG", log.clone().into_os_string()),
+                ("TREE_TEST_DIGEST", published_digest.into()),
+                ("TREE_TEST_STATE", state.into()),
+                ("TREE_TEST_OUTCOME", outcome.into()),
+                ("GITHUB_TOKEN", "daemon-github-token".into()),
+            ]
+            .into_iter()
+            .chain(
+                variables
+                    .iter()
+                    .map(|(name, value)| (*name, std::ffi::OsString::from(value))),
+            ),
+        );
+        let manager = tree_run_manager(
+            &config,
+            source_broker(&source),
+            tune(
+                TreeRunDependencies::new(Some(Arc::new(broker)))
+                    .with_executable(useful)
+                    .with_helper_executable(built_useful()),
+            ),
+            environment,
+            recorder,
+        );
+
+        let CloudFrame::AssignmentOffer {
+            effect_id,
+            assignment_id,
+            run_id,
+            project_id,
+            attempt_id,
+            attempt_number,
+            execution_spec,
+            ..
+        } = tree_offer()
+        else {
+            panic!("expected an assignment offer");
+        };
+        let mut execution_spec = *execution_spec;
+        execution_spec
+            .workflow_definition_source
+            .commit_oid
+            .clone_from(&commit);
+        execution_spec.primary_workspace_source.commit_oid = commit;
+        let tree = execution_spec.workflow_tree.as_mut().unwrap();
+        tree.digest = TREE_DIGEST.to_owned();
+        tree.workflow_path = "workflow.yaml".to_owned();
+        tree.stop_before = Some("review".to_owned());
+        tree.files = files
+            .iter()
+            .map(|file| WorkflowTreeFileV1RunnerProjection {
+                path: file.path.to_owned(),
+                sha256: sha256_hex(file.bytes),
+                size: file.bytes.len() as u64,
+                executable: file.executable,
+            })
+            .collect();
+        Fixture {
+            _temporary: temporary,
+            source,
+            manager,
+            offer: AssignmentOffer {
+                effect_id,
+                assignment_id,
+                run_id,
+                project_id,
+                attempt_id,
+                attempt_number,
+                execution_spec,
+                continuation: None,
+            },
+            log,
+            capability_requests,
+        }
+    }
+
+    /// What `issue_github_token` set up: the state directory, the setup and the telemetry
+    /// capture, which the caller keeps, the assignment's GitHub token file and the Cloud that
+    /// issued it.
+    pub(in crate::service) struct IssuedGithubToken {
+        state: tempfile::TempDir,
+        _setup: Arc<AgentLoginSetup>,
+        _capture: crate::telemetry::TestCapture,
+        pub(in crate::service) file: PathBuf,
+        pub(in crate::service) cloud: Arc<FakeAgentLoginCloud>,
+    }
+
+    impl IssuedGithubToken {
+        /// The GitHub token file of the assignment `assignment_id`, under its own directory.
+        pub(in crate::service) fn file_for(&self, assignment_id: &str) -> PathBuf {
+            login_directory(self.state.path())
+                .grant_token(assignment_id, AgentLoginProvider::Github)
+                .unwrap()
+                .0
+        }
+    }
+
+    /// The agent-login directory of the runner whose state lies in `state`.
+    fn login_directory(state: &Path) -> LoginDirectory {
+        LoginDirectory::beside(&state.join("runner-state.json"))
+    }
+
+    /// Has the fixture's manager, whose service carries `service`, set agent logins up for its
+    /// admissions over a Cloud that issues the assignment a GitHub token of generation 3 and
+    /// refuses a GitLab one.
+    pub(in crate::service) fn issue_github_token(
+        fixture: &mut Fixture,
+        service: &[(&str, &str)],
+    ) -> IssuedGithubToken {
+        let state = tempfile::tempdir().unwrap();
+        let home = state.path().join("service-home");
+        fs::create_dir(&home).unwrap();
+        let directory = login_directory(state.path());
+        let (file, _) = directory
+            .grant_token(&fixture.offer.assignment_id, AgentLoginProvider::Github)
+            .unwrap();
+        keep_agent_logins_in(&mut fixture.manager, directory);
+        let cloud = FakeAgentLoginCloud::new(Ok(Vec::new()));
+        cloud.answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(3));
+        cloud.answer_grant_token(
+            AgentLoginProvider::Gitlab,
+            FakeGrantToken::Fail(GrantTokenFailure::Refused(
+                GrantTokenRefusal::ReconnectRequired,
+            )),
+        );
+        let (recorder, capture) = crate::telemetry::test_recorder("rbt_01k0z6r1w8f4jy2m7q9v3x5abe");
+        let setup = Arc::new(AgentLoginSetup::new(
+            fake_agent_login_setup_serving(
+                Arc::clone(&cloud),
+                &home,
+                service,
+                state.path(),
+                recorder,
+            ),
+            Arc::new(CountedGate::idle()),
+            || time::OffsetDateTime::from_unix_timestamp(1_794_450_000).unwrap(),
+        ));
+        let status = Arc::new(LiveStatus::new(
+            "rbt_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),
+            "rrc_01k0z6r1w8f4jy2m7q9v3x5abe".to_owned(),
+            None,
+        ));
+        fixture
+            .manager
+            .set_up_agent_logins_with(AdmissionAgentLogins::new(&setup, status));
+        IssuedGithubToken {
+            state,
+            _setup: setup,
+            _capture: capture,
+            file,
+            cloud,
+        }
+    }
+
+    /// `id`, an ID of the fixture's offer, marked as another run's by `mark`, a digit other
+    /// than 5.
+    pub(in crate::service) fn other_id(id: &str, mark: char) -> String {
+        let marked = id.replacen("v3x5", &format!("v3x{mark}"), 1);
+        assert_ne!(marked, id, "{id} carries no mark");
+        marked
+    }
+
+    /// A second offer of `offer`'s tree on the same manager, another run under effect,
+    /// assignment, run and attempt IDs of its own, marked by `mark`.
+    pub(in crate::service) fn other_offer(offer: &AssignmentOffer, mark: char) -> AssignmentOffer {
+        AssignmentOffer {
+            effect_id: other_id(&offer.effect_id, mark),
+            assignment_id: other_id(&offer.assignment_id, mark),
+            run_id: other_id(&offer.run_id, mark),
+            attempt_id: other_id(&offer.attempt_id, mark),
+            ..offer.clone()
+        }
+    }
+
+    /// Has the injected `useful` keep each run's log apart and returns the one for `offer`'s
+    /// run, created, which its gates, answers and counters read in place of the fixture's log.
+    pub(in crate::service) fn per_run_log(fixture: &Fixture, offer: &AssignmentOffer) -> PathBuf {
+        let log = fixture.log.join("runs").join(&offer.assignment_id);
+        fs::create_dir_all(&log).unwrap();
+        log
     }
 }

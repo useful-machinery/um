@@ -79,8 +79,8 @@ pub(super) fn write_pool_create(
     )
 }
 
-/// A pool's waiting runs and runner counts as `useful runner pool show` reports them
-/// (REQ-RUNNERPOOL-89). useful-api does not name its pool-status model, so the JSON
+/// A pool's waiting runs, runner counts and held runs as `useful runner pool show` reports
+/// them (REQ-RUNNERPOOL-89). useful-api does not name its pool-status model, so the JSON
 /// document borrows it generically and the report takes its counts.
 pub(super) struct PoolStatus<'a, S> {
     pub(super) document: &'a S,
@@ -89,6 +89,9 @@ pub(super) struct PoolStatus<'a, S> {
     pub(super) busy: i32,
     pub(super) idle: i32,
     pub(super) offline: i32,
+    /// The runs the pool's runners hold as (working, waiting), absent from a Cloud that does
+    /// not report them.
+    pub(super) held_runs: Option<(i32, i32)>,
 }
 
 // Only `show` reads a pool's status; creating and renaming a pool report its identity alone.
@@ -167,6 +170,12 @@ fn write_pool<S: Serialize>(
                         "  Runners:      {} online · {} busy · {} idle · {} offline",
                         status.online, status.busy, status.idle, status.offline
                     )?;
+                    if let Some((working, waiting)) = status.held_runs {
+                        writeln!(
+                            stdout,
+                            "  Held runs:    {working} working · {waiting} in a wait"
+                        )?;
+                    }
                 }
                 writeln!(stdout, "  Deployment:   {deployment}")?;
             }
@@ -260,8 +269,14 @@ fn write_runner_list_human_to(
             enum_text(&runner.connectivity.state)?,
             enum_text(&runner.activity.state)?,
         )?;
-        if let Some(assignment) = &runner.activity.current_assignment {
-            write_assignment_to(output, assignment, "    ")?;
+        match &runner.activity.assignments {
+            Some(held) => write_held_assignments_to(output, held, "    ")?,
+            // A Cloud that does not report every held run names the current one alone.
+            None => {
+                if let Some(assignment) = &runner.activity.current_assignment {
+                    write_assignment_to(output, assignment, "    ")?;
+                }
+            }
         }
     }
     if !page.items.is_empty() {
@@ -421,15 +436,28 @@ fn write_runner_human_to(
         "    State:      {}",
         enum_text(&runner.activity.state)?
     )?;
-    writeln!(
-        output,
-        "    Assignments: {} current",
-        runner.activity.current_assignment_count
-    )?;
-    if let Some(assignment) = &runner.activity.current_assignment {
-        write_assignment_to(output, assignment, "    ")?;
-    } else {
-        writeln!(output, "    Current assignment: none")?;
+    match &runner.activity.assignments {
+        Some(held) => {
+            writeln!(
+                output,
+                "    Runs held:  {}",
+                runner.activity.current_assignment_count
+            )?;
+            write_held_assignments_to(output, held, "    ")?;
+        }
+        // A Cloud that does not report every held run gives the count and current run alone.
+        None => {
+            writeln!(
+                output,
+                "    Assignments: {} current",
+                runner.activity.current_assignment_count
+            )?;
+            if let Some(assignment) = &runner.activity.current_assignment {
+                write_assignment_to(output, assignment, "    ")?;
+            } else {
+                writeln!(output, "    Current assignment: none")?;
+            }
+        }
     }
     writeln!(output, "\n  Advertised metadata (informational)")?;
     if let Some(metadata) = &runner.advertised_metadata {
@@ -447,12 +475,51 @@ fn write_assignment_to(
     assignment: &useful_api::RunnerCurrentAssignment,
     indent: &str,
 ) -> anyhow::Result<()> {
-    writeln!(output, "{indent}Run:         {}", assignment.run_id)?;
-    if let Some(name) = &assignment.run_display_name {
+    write_assigned_run_to(
+        output,
+        indent,
+        &assignment.run_id,
+        assignment.run_display_name.as_deref(),
+        &assignment.project_id,
+        &assignment.assigned_at,
+    )
+}
+
+/// Every run a registration holds, in the Cloud's order, each with whether it is working or
+/// waiting (REQ-RUNNERPOOL-50).
+fn write_held_assignments_to(
+    output: &mut impl Write,
+    held: &[useful_api::RunnerHeldAssignment],
+    indent: &str,
+) -> anyhow::Result<()> {
+    for run in held {
+        write_assigned_run_to(
+            output,
+            indent,
+            &run.run_id,
+            run.run_display_name.as_deref(),
+            &run.project_id,
+            &run.assigned_at,
+        )?;
+        writeln!(output, "{indent}Run state:   {}", enum_text(&run.state)?)?;
+    }
+    Ok(())
+}
+
+fn write_assigned_run_to(
+    output: &mut impl Write,
+    indent: &str,
+    run_id: &str,
+    run_display_name: Option<&str>,
+    project_id: &str,
+    assigned_at: &str,
+) -> anyhow::Result<()> {
+    writeln!(output, "{indent}Run:         {run_id}")?;
+    if let Some(name) = run_display_name {
         writeln!(output, "{indent}Run name:    {name}")?;
     }
-    writeln!(output, "{indent}Project:     {}", assignment.project_id)?;
-    writeln!(output, "{indent}Assigned at: {}", assignment.assigned_at)?;
+    writeln!(output, "{indent}Project:     {project_id}")?;
+    writeln!(output, "{indent}Assigned at: {assigned_at}")?;
     Ok(())
 }
 

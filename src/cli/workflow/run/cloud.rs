@@ -749,6 +749,7 @@ fn write_plain(
     cli::run::write_route(&mut out, typed)?;
     if let Some(observation) = typed.observation.as_deref() {
         cli::run::write_waiting(&mut out, observation)?;
+        cli::run::write_held_with(&mut out, observation)?;
     }
     let definition = &run["definition"];
     if definition.is_object() {

@@ -32,6 +32,7 @@ pub type RunnerPool = models::RunnerPool;
 pub type RunnerPoolList = models::RunnerPoolList;
 pub(crate) type RunnerPoolStatus = models::RunnerPoolStatus;
 pub type RunnerCurrentAssignment = models::RunnerCurrentAssignment;
+pub type RunnerHeldAssignment = models::RunnerHeldAssignment;
 pub type RunnerRegistration = models::RunnerRegistration;
 pub type RunnerRegistrationList = models::RunnerRegistrationList;
 pub type RunnerActivation = models::RunnerActivation;

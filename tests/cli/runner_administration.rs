@@ -2100,6 +2100,54 @@ fn pool_show_reads_the_pool_then_its_status_and_reports_its_load() {
 
 // REQ-RUNNERPOOL-89
 #[test]
+fn pool_show_prints_the_runs_its_runners_hold_after_the_runner_counts() {
+    let mut held_status = pool_status_body();
+    held_status["heldRuns"] = serde_json::json!({"working": 2, "waiting": 3});
+    for (status, json) in [
+        (held_status.clone(), false),
+        (held_status, true),
+        (pool_status_body(), false),
+    ] {
+        let (server, _directory, credential_path) = prepared_runner(vec![
+            json_http_response("200 OK", pool_list_body()),
+            json_http_response("200 OK", status.clone()),
+        ]);
+
+        let output = pool_show(&server, &credential_path, json);
+
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty());
+        if json {
+            let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(result["status"], status);
+        } else {
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let lines = stdout.lines().collect::<Vec<_>>();
+            let runners = lines
+                .iter()
+                .position(|line| line.trim_start().starts_with("Runners:"))
+                .unwrap_or_else(|| panic!("runner counts should be printed: {stdout}"));
+            let held = lines
+                .iter()
+                .position(|line| line.trim_start().starts_with("Held runs:"));
+            if status.get("heldRuns").is_none() {
+                assert_eq!(held, None, "a status without heldRuns: {stdout}");
+                assert_pool_then_status_requests(&server.finish());
+                continue;
+            }
+            let held = held.unwrap_or_else(|| panic!("held runs should be printed: {stdout}"));
+            assert!(runners < held, "{stdout}");
+            for count in ["2 working", "3 in a wait"] {
+                assert!(lines[held].contains(count), "{count}: {stdout}");
+            }
+            assert!(!lines[held].contains("Waiting runs"), "{stdout}");
+        }
+        assert_pool_then_status_requests(&server.finish());
+    }
+}
+
+// REQ-RUNNERPOOL-89
+#[test]
 fn pool_show_against_a_cloud_without_pool_status_prints_the_pool_alone() {
     for json in [false, true] {
         let (server, _directory, credential_path) = prepared_runner(vec![
@@ -2197,6 +2245,162 @@ fn runner_commands_report_reserved_run_and_idle_capacity() {
                     ] {
                         assert_eq!(text.contains(field), assigned, "{command} {field}: {text}");
                     }
+                }
+            }
+        }
+        assert_eq!(server.finish().len(), 4);
+    }
+}
+
+fn held_run(run: &str, assigned_at: &str, state: &str) -> serde_json::Value {
+    serde_json::json!({
+        "runId": run,
+        "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "assignedAt": assigned_at,
+        "state": state
+    })
+}
+
+// The text of each held run's block, from the line naming its run to the next held run's
+// line or the end of the run's lines, in the order the runs are printed.
+fn held_run_blocks(text: &str, runs: &[&str]) -> Vec<String> {
+    let lines = text.lines().collect::<Vec<_>>();
+    let starts = runs
+        .iter()
+        .map(|run| {
+            lines
+                .iter()
+                .position(|line| line.contains(run))
+                .unwrap_or_else(|| panic!("{run} should be printed: {text}"))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        starts.windows(2).all(|pair| pair[0] < pair[1]),
+        "held runs should print in order: {text}"
+    );
+    starts
+        .iter()
+        .enumerate()
+        .map(|(index, &start)| {
+            let end = starts.get(index + 1).copied().unwrap_or_else(|| {
+                lines[start..]
+                    .iter()
+                    .position(|line| line.trim().is_empty() || line.contains("Runner: "))
+                    .map_or(lines.len(), |offset| start + offset)
+            });
+            lines[start..end].join("\n")
+        })
+        .collect()
+}
+
+// REQ-RUNNERPOOL-50, REQ-RUNNERPOOL-51, REQ-RUNNERPOOL-52
+#[test]
+fn runner_commands_print_every_run_a_runner_holds_with_its_state() {
+    const WORKING: &str = "run_01k0z6r1w8f4jy2m7q9v3x5aaa";
+    const FIRST_WAITING: &str = "run_01k0z6r1w8f4jy2m7q9v3x5bbb";
+    const SECOND_WAITING: &str = "run_01k0z6r1w8f4jy2m7q9v3x5ccc";
+    let mut holding = registration_body();
+    let mut working = held_run(WORKING, "2026-08-09T12:05:00Z", "working");
+    working["runDisplayName"] = serde_json::json!("Production release");
+    holding["activity"] = serde_json::json!({
+        "state": "assigned",
+        "currentAssignmentCount": 3,
+        "currentAssignment": {
+            "runId": WORKING,
+            "runDisplayName": "Production release",
+            "projectId": "prj_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "assignedAt": "2026-08-09T12:05:00Z"
+        },
+        "assignments": [
+            working,
+            held_run(FIRST_WAITING, "2026-08-09T12:06:00Z", "waiting"),
+            held_run(SECOND_WAITING, "2026-08-09T12:07:00Z", "waiting"),
+        ]
+    });
+    let mut waiting = registration_body();
+    waiting["activity"] = serde_json::json!({
+        "state": "assigned",
+        "currentAssignmentCount": 2,
+        "assignments": [
+            held_run(FIRST_WAITING, "2026-08-09T12:06:00Z", "waiting"),
+            held_run(SECOND_WAITING, "2026-08-09T12:07:00Z", "waiting"),
+        ]
+    });
+
+    for (runner, held) in [
+        (
+            holding,
+            vec![
+                (WORKING, "working"),
+                (FIRST_WAITING, "waiting"),
+                (SECOND_WAITING, "waiting"),
+            ],
+        ),
+        (
+            waiting,
+            vec![(FIRST_WAITING, "waiting"), (SECOND_WAITING, "waiting")],
+        ),
+    ] {
+        let responses = vec![
+            json_http_response("200 OK", runner.clone()),
+            json_http_response("200 OK", runner.clone()),
+            json_http_response("200 OK", serde_json::json!({"items": [runner.clone()]})),
+            json_http_response("200 OK", serde_json::json!({"items": [runner.clone()]})),
+        ];
+        let (server, _directory, credential_path) = prepared_runner(responses);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let runs = held.iter().map(|(run, _)| *run).collect::<Vec<_>>();
+        for (command, arguments) in [("show", vec![RUNNER_ID]), ("list", vec![])] {
+            for json in [false, true] {
+                let mut args = vec!["runner", command, ORGANIZATION];
+                args.extend(arguments.iter().copied());
+                if json {
+                    args.push("--json");
+                }
+                args.push("--allow-insecure-http");
+                let output = run_with_env(&args, &environment);
+                assert!(output.status.success(), "{command}: {output:?}");
+                assert!(output.stderr.is_empty());
+                if json {
+                    let document: serde_json::Value =
+                        serde_json::from_slice(&output.stdout).unwrap();
+                    let activity = if command == "show" {
+                        &document["runner"]["activity"]
+                    } else {
+                        &document["items"][0]["activity"]
+                    };
+                    assert_eq!(activity, &runner["activity"], "{command}");
+                    continue;
+                }
+                let text = String::from_utf8(output.stdout).unwrap();
+                if command == "show" {
+                    let count = held.len().to_string();
+                    assert!(
+                        text.lines().any(|line| {
+                            line.to_ascii_lowercase().contains("held")
+                                && line.split_whitespace().any(|word| word == count)
+                        }),
+                        "show should print the number of runs held: {text}"
+                    );
+                } else {
+                    let runner_line = text
+                        .lines()
+                        .position(|line| line.contains(RUNNER_ID))
+                        .unwrap_or_else(|| panic!("runner line: {text}"));
+                    let first_run = text
+                        .lines()
+                        .position(|line| line.contains(runs[0]))
+                        .unwrap_or_else(|| panic!("held run: {text}"));
+                    assert!(runner_line < first_run, "{text}");
+                }
+                for (block, (run, state)) in held_run_blocks(&text, &runs).iter().zip(&held) {
+                    let other = if *state == "working" {
+                        "waiting"
+                    } else {
+                        "working"
+                    };
+                    assert!(block.contains(state), "{command} {run}: {block}");
+                    assert!(!block.contains(other), "{command} {run}: {block}");
                 }
             }
         }

@@ -5278,6 +5278,92 @@ fn run_show_reports_the_complete_projection_in_plain_and_json_modes() {
     }
 }
 
+const HELD_WORKING_RUN: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abd";
+const HELD_WAITING_RUN: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abe";
+
+/// A running run's observation whose runner also holds one working and one waiting run.
+fn observation_held_with_two_runs() -> serde_json::Value {
+    serde_json::json!({
+        "observedAt": "2026-08-03T12:00:00Z",
+        "placement": {"runnerId": "runner-b", "runnerName": "second",
+            "poolId": "pool-b", "poolName": "work"},
+        "assignment": {"id": "assignment-b", "state": "active", "runnerId": "runner-b",
+            "bootId": "boot-b", "presenceGeneration": 2, "leaseSequence": 9,
+            "leaseExpiresAt": "2026-08-03T13:00:00Z", "leaseValid": true,
+            "runnerConnected": true, "runnerLastSeenAt": "2026-08-03T12:00:00Z"},
+        "lastTransition": null,
+        "lastDecline": null,
+        "heldWith": [
+            {"runId": HELD_WORKING_RUN, "state": "working"},
+            {"runId": HELD_WAITING_RUN, "state": "waiting"}
+        ]
+    })
+}
+
+/// The plain report's list of the other runs the run's runner holds, in Cloud's order, or
+/// `None` when it printed none.
+fn reported_held_runs(text: &str) -> Option<Vec<&str>> {
+    let mut lines = text
+        .lines()
+        .skip_while(|line| *line != "runner also holds:");
+    lines.next()?;
+    Some(
+        lines
+            .take_while(|line| line.starts_with("  "))
+            .map(str::trim_start)
+            .collect(),
+    )
+}
+
+/// Asserts the plain report lists each run of `observation_held_with_two_runs` with its state.
+fn assert_reports_held_runs(text: &str) {
+    assert_eq!(
+        reported_held_runs(text),
+        Some(vec![
+            format!("{HELD_WORKING_RUN}: working").as_str(),
+            format!("{HELD_WAITING_RUN}: waiting").as_str(),
+        ]),
+        "{text}"
+    );
+}
+
+// REQ-RUN-120: `useful run show` lists the other runs the run's runner holds, each with
+// whether it is working or waiting, and carries `heldWith` under --json as received.
+#[test]
+fn run_show_lists_the_other_runs_its_runner_holds() {
+    for json in [false, true] {
+        let mut body = run_body();
+        body["observation"] = observation_held_with_two_runs();
+        let (server, _directory, credential_path) = prepared_run(vec![run_response(body.clone())]);
+        let environment = deployment_environment(&server.api_url, &credential_path);
+        let mut args = vec!["run", "show", ORGANIZATION, RUN_ID];
+        if json {
+            args.push("--json");
+        }
+        args.push("--allow-insecure-http");
+
+        let output = run_with_env(&args, &environment);
+
+        assert!(output.status.success(), "{output:?}");
+        if json {
+            let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                document["run"]["observation"]["heldWith"],
+                body["observation"]["heldWith"]
+            );
+        } else {
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert_reports_held_runs(&text);
+            let assignment = text.find("  assignment: assignment-b (active)").unwrap();
+            assert!(
+                assignment < text.find("runner also holds:").unwrap(),
+                "{text}"
+            );
+        }
+        server.finish();
+    }
+}
+
 const LIFECYCLE_TRIGGER_ID: &str = "trg_01k0z6r1w8f4jy2m7q9v3x5abc";
 const LIFECYCLE_CONNECTION_ID: &str = "lcn_01k0z6r1w8f4jy2m7q9v3x5abc";
 const LIFECYCLE_WORKSPACE_ID: &str = "a3b2c1d0-1111-4222-8333-944455556666";
@@ -7472,6 +7558,43 @@ mod workflow_run_cloud {
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         let text = String::from_utf8(output.stdout).unwrap();
         assert_eq!(reported(&text, "waiting"), Some("runners_asleep"), "{text}");
+    }
+
+    // REQ-RUN-120: Cloud show lists the other runs the run's runner holds, each with whether
+    // it is working or waiting, and its JSON document carries `heldWith` as received; a run
+    // whose observation has no `heldWith` lists none.
+    #[test]
+    fn cloud_show_lists_the_other_runs_its_runner_holds() {
+        let home = tempfile::tempdir().unwrap();
+        let mut held = run_body_with_state("running");
+        held["observation"] = observation_held_with_two_runs();
+        let (output, _) = cloud(
+            "show",
+            RUN_ID,
+            &["--json"],
+            vec![run_response(held.clone())],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_eq!(
+            document(&output)["run"]["observation"]["heldWith"],
+            held["observation"]["heldWith"]
+        );
+
+        let (output, _) = cloud("show", RUN_ID, &[], vec![run_response(held)], home.path());
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_reports_held_runs(&String::from_utf8(output.stdout).unwrap());
+
+        let (output, _) = cloud(
+            "show",
+            RUN_ID,
+            &[],
+            vec![run_response(queued_owned_run(offline_since_last_seen()))],
+            home.path(),
+        );
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(reported_held_runs(&text), None, "{text}");
     }
 
     // REQ-RUN-101: `useful run show` names the same owner, route and waiting reason.
