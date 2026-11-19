@@ -121,6 +121,7 @@ pub enum GetWorkflowDefinitionEvaluationError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum GetWorkflowDefinitionRevisionError {
+    Status400(models::Problem),
     Status401(models::Problem),
     Status403(models::Problem),
     Status404(models::Problem),
@@ -731,18 +732,21 @@ pub fn get_workflow_definition_evaluation(
     }
 }
 
+/// A binding of a kind outside the requested `vocabulary` is left out of `bindings` and `resolution`, and the rest of the revision is answered as it is.
 pub fn get_workflow_definition_revision(
     configuration: &configuration::Configuration,
     organization_ref: &str,
     project_id: &str,
     definition_id: &str,
     revision: i32,
+    vocabulary: Option<i32>,
 ) -> Result<models::WorkflowDefinitionRevision, Error<GetWorkflowDefinitionRevisionError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_organization_ref = organization_ref;
     let p_path_project_id = project_id;
     let p_path_definition_id = definition_id;
     let p_path_revision = revision;
+    let p_query_vocabulary = vocabulary;
 
     let uri_str = format!(
         "{}/v1/organizations/{organizationRef}/projects/{projectId}/workflow-definitions/{definitionId}/revisions/{revision}",
@@ -754,6 +758,9 @@ pub fn get_workflow_definition_revision(
     );
     let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
 
+    if let Some(ref param_value) = p_query_vocabulary {
+        req_builder = req_builder.query(&[("vocabulary", &param_value.to_string())]);
+    }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
     }
@@ -896,6 +903,7 @@ pub fn list_workflow_definition_evaluations(
     }
 }
 
+/// A binding of a kind outside the requested `vocabulary` is left out of a revision's `bindings` and `resolution`, and the rest of the revision is answered as it is. No revision is left out, so the cursor is independent of `vocabulary`.
 pub fn list_workflow_definition_revisions(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -903,6 +911,7 @@ pub fn list_workflow_definition_revisions(
     definition_id: &str,
     limit: Option<i32>,
     cursor: Option<&str>,
+    vocabulary: Option<i32>,
 ) -> Result<models::WorkflowDefinitionRevisionList, Error<ListWorkflowDefinitionRevisionsError>> {
     // add a prefix to parameters to efficiently prevent name collisions
     let p_path_organization_ref = organization_ref;
@@ -910,6 +919,7 @@ pub fn list_workflow_definition_revisions(
     let p_path_definition_id = definition_id;
     let p_query_limit = limit;
     let p_query_cursor = cursor;
+    let p_query_vocabulary = vocabulary;
 
     let uri_str = format!(
         "{}/v1/organizations/{organizationRef}/projects/{projectId}/workflow-definitions/{definitionId}/revisions",
@@ -925,6 +935,9 @@ pub fn list_workflow_definition_revisions(
     }
     if let Some(ref param_value) = p_query_cursor {
         req_builder = req_builder.query(&[("cursor", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_vocabulary {
+        req_builder = req_builder.query(&[("vocabulary", &param_value.to_string())]);
     }
     if let Some(ref user_agent) = configuration.user_agent {
         req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
@@ -1117,7 +1130,7 @@ pub fn publish_workflow_definition_revision(
     }
 }
 
-/// Owner only. The evaluation keeps its revision, trigger, event, connection, execution principal and `expiresAt`. Only a `failed` evaluation without a run and with a reason other than `event_invalid` is retried, while its definition is active with automatic starts, its connection (when it has one; a schedule evaluation has none) active and its principal an active member; otherwise 409 `evaluation-not-retryable`. While the project is archived a retry opens no cycle and is answered 409 `project-archived` with `reason` `project-archived`. An exact key replay returns the cycle it accepted while the evaluation is retained, even while the project is archived; another key starts a cycle only once that one fails. An evaluation of an event outside the requested `vocabulary` is answered 404, a key's replay included, as an evaluation that does not exist is.
+/// Owner only. The evaluation keeps its revision, trigger, event, connection, execution principal and `expiresAt`. Only a `failed` evaluation without a run and with a reason other than `event_invalid`, `export_unavailable` or `export_too_large` is retried, while its definition is active with automatic starts, its connection (when it has one; a schedule or `run.ended` evaluation has none) active and its principal an active member; otherwise 409 `evaluation-not-retryable`. While the project is archived a retry opens no cycle and is answered 409 `project-archived` with `reason` `project-archived`. An exact key replay returns the cycle it accepted while the evaluation is retained, even while the project is archived; another key starts a cycle only once that one fails. An evaluation of an event outside the requested `vocabulary` is answered 404, a key's replay included, as an evaluation that does not exist is.
 pub fn retry_workflow_definition_evaluation(
     configuration: &configuration::Configuration,
     organization_ref: &str,

@@ -243,6 +243,103 @@ pub struct TreeExit {
     pub mirror: Vec<Value>,
     /// Whether the runner requests release of the run's subject claim.
     pub claim_release: bool,
+    /// The root's text exports the finish lists, in order (REQ-RUNNERENROLL-130).
+    /// The encoder writes `exports` only when the list is not empty, so a finish
+    /// that lists none is the frame it was before the member existed
+    /// (REQ-COMPAT-18). The encoder does not truncate the list: a list longer
+    /// than [`MAXIMUM_TREE_EXPORTS`] fails `encode_runner_frame`.
+    pub exports: Vec<TreeExport>,
+}
+
+/// At most this many exports in one finish; mirrors the schema's `maxItems` on
+/// `exports` and `maximumItems` of `finished-exports-bounds.json`.
+pub const MAXIMUM_TREE_EXPORTS: usize = 64;
+/// At most this many bytes in one carried text; `maximumTextBytes` of
+/// `finished-exports-bounds.json`.
+pub const MAXIMUM_TREE_EXPORT_TEXT_BYTES: usize = 65_536;
+/// At most this many bytes of text in all the exports one finish carries;
+/// `maximumTotalTextBytes` of `finished-exports-bounds.json`. The encoder does
+/// not check it: the caller bounds what it carries.
+pub const MAXIMUM_TREE_EXPORTS_TEXT_BYTES: usize = 131_072;
+/// The largest `size` the frame admits, the schema's `maximum` on
+/// `FinishedExport.size`.
+const MAXIMUM_TREE_EXPORT_SIZE: u64 = 9_007_199_254_740_991;
+
+/// One text export a tree run's finish lists: its name, its size in bytes and,
+/// when the runner carries it, its text. Only [`TreeExport::with_text`] and
+/// [`TreeExport::by_size`] make one, so every export is within the frame's
+/// `FinishedExport` form, and a carried text gives the size.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TreeExport {
+    name: String,
+    size: u64,
+    text: Option<String>,
+}
+
+/// The part of a [`TreeExport`] the frame's item form refuses.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TreeExportError {
+    /// The name is not `^[a-z][A-Za-z0-9]*$` of at most 64 characters.
+    Name,
+    /// The size is over 9,007,199,254,740,991.
+    Size,
+    /// The text is over [`MAXIMUM_TREE_EXPORT_TEXT_BYTES`] bytes.
+    Text,
+}
+
+impl fmt::Display for TreeExportError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Name => "tree export name is outside the frame's form",
+            Self::Size => "tree export size is over the frame's maximum",
+            Self::Text => "tree export text is over the frame's maximum bytes",
+        })
+    }
+}
+
+impl std::error::Error for TreeExportError {}
+
+impl TreeExport {
+    /// An export that carries its text; its size is the text's bytes.
+    pub fn with_text(
+        name: impl Into<String>,
+        text: impl Into<String>,
+    ) -> Result<Self, TreeExportError> {
+        let text = text.into();
+        if text.len() > MAXIMUM_TREE_EXPORT_TEXT_BYTES {
+            return Err(TreeExportError::Text);
+        }
+        let size = u64::try_from(text.len()).map_err(|_| TreeExportError::Size)?;
+        Self::listed(name.into(), size, Some(text))
+    }
+
+    /// An export listed by its size alone, without its text.
+    pub fn by_size(name: impl Into<String>, size: u64) -> Result<Self, TreeExportError> {
+        Self::listed(name.into(), size, None)
+    }
+
+    fn listed(name: String, size: u64, text: Option<String>) -> Result<Self, TreeExportError> {
+        if name.parse::<generated::FinishedExportName>().is_err() {
+            return Err(TreeExportError::Name);
+        }
+        if size > MAXIMUM_TREE_EXPORT_SIZE {
+            return Err(TreeExportError::Size);
+        }
+        Ok(Self { name, size, text })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// The carried text, `None` for an export listed by size alone.
+    pub fn text(&self) -> Option<&str> {
+        self.text.as_deref()
+    }
 }
 
 /// One root progress report of a tree run: the internal engine attempt ordinal
@@ -1798,6 +1895,19 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
                 }
                 payload["mirror"] = Value::Array(exit.mirror.clone());
                 payload["claimRelease"] = json!(exit.claim_release);
+                if !exit.exports.is_empty() {
+                    payload["exports"] = exit
+                        .exports
+                        .iter()
+                        .map(|export| {
+                            let mut item = json!({"name": export.name, "size": export.size});
+                            if let Some(text) = &export.text {
+                                item["text"] = json!(text);
+                            }
+                            item
+                        })
+                        .collect();
+                }
             }
             runner_frame_value(
                 envelope,
@@ -3364,7 +3474,13 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
         ],
         "workspace_inventory" => &["discovery", "diagnostic"],
         "execution_transition" | "execution_interrupted" => &["diagnostic"],
-        "execution_finished" => &["diagnostic", "chosenOutcome", "mirror", "claimRelease"],
+        "execution_finished" => &[
+            "diagnostic",
+            "chosenOutcome",
+            "mirror",
+            "claimRelease",
+            "exports",
+        ],
         "tree_progress" => &["steps"],
         "assignment_offer" => &["continuation"],
         "workspace_retention_report" => &["settlementSnapshot"],
@@ -4188,6 +4304,7 @@ mod tests {
             chosen_outcome: None,
             mirror: Vec::new(),
             claim_release: false,
+            exports: Vec::new(),
         });
         let encoded = encode_runner_frame(&frame).unwrap();
         assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
@@ -4215,6 +4332,144 @@ mod tests {
         for field in ["chosenOutcome", "mirror", "claimRelease"] {
             assert!(payload.get(field).is_none(), "{field} on a non-tree finish");
         }
+    }
+
+    // REQ-RUNNERENROLL-130
+    #[test]
+    fn tree_finish_listing_exports_decodes_as_a_runner_frame() {
+        assert!(matches!(
+            decode_frame(include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/runner-protocol/v1/valid/execution-finished-exports.json"
+            ))),
+            Ok(ValidatedFrame::Runner)
+        ));
+    }
+
+    fn tree_finish_with_exports(exports: Vec<TreeExport>) -> RunnerFrame {
+        let mut frame = maximal_recovery_terminal_frame();
+        let RunnerFrame::ExecutionFinished {
+            outcome, tree_exit, ..
+        } = &mut frame
+        else {
+            panic!("expected terminal frame");
+        };
+        *outcome = json!({"outcome": "succeeded", "forceAbort": null});
+        *tree_exit = Some(TreeExit {
+            chosen_outcome: Some("broken".to_owned()),
+            mirror: Vec::new(),
+            claim_release: false,
+            exports,
+        });
+        frame
+    }
+
+    // REQ-RUNNERENROLL-130, REQ-COMPAT-18
+    #[test]
+    fn tree_finish_writes_its_exports_only_when_it_lists_one() {
+        let repair = "Repair the build.\nThe café step failed.";
+        let exports = vec![
+            TreeExport::with_text("repairRequest", repair).unwrap(),
+            TreeExport::by_size("buildLog", 70_000).unwrap(),
+            TreeExport::with_text("empty", "").unwrap(),
+        ];
+        let listing = encode_runner_frame(&tree_finish_with_exports(exports)).unwrap();
+        let mut listing: Value = serde_json::from_slice(&listing).unwrap();
+        assert_eq!(
+            listing["payload"]["exports"],
+            json!([
+                {"name": "repairRequest", "size": repair.len(), "text": repair},
+                {"name": "buildLog", "size": 70_000},
+                {"name": "empty", "size": 0, "text": ""},
+            ])
+        );
+
+        // Without an export the finish is the same frame with no `exports` key.
+        let unlisted = encode_runner_frame(&tree_finish_with_exports(Vec::new())).unwrap();
+        listing["payload"]
+            .as_object_mut()
+            .unwrap()
+            .remove("exports");
+        assert_eq!(unlisted, serde_json::to_vec(&listing).unwrap());
+        let unlisted: Value = serde_json::from_slice(&unlisted).unwrap();
+        assert!(unlisted["payload"].get("exports").is_none());
+        assert_eq!(unlisted["payload"]["chosenOutcome"], "broken");
+
+        let encoded = encode_runner_frame(&maximal_recovery_terminal_frame()).unwrap();
+        let untreed: Value = serde_json::from_slice(&encoded).unwrap();
+        assert!(untreed["payload"].get("exports").is_none());
+    }
+
+    // REQ-RUNNERENROLL-130
+    #[test]
+    fn tree_export_is_built_only_within_the_frame_item_form() {
+        let longest_name = format!("a{}", "B".repeat(63));
+        let longest_text = "x".repeat(MAXIMUM_TREE_EXPORT_TEXT_BYTES);
+        let admitted = TreeExport::with_text(longest_name.as_str(), longest_text.as_str()).unwrap();
+        assert_eq!(admitted.name(), longest_name);
+        assert_eq!(admitted.text(), Some(longest_text.as_str()));
+        assert_eq!(admitted.size(), 65_536);
+        assert_eq!(
+            TreeExport::by_size("buildLog", 9_007_199_254_740_991)
+                .unwrap()
+                .text(),
+            None
+        );
+
+        for name in ["", "Summary", "1summary", "repair-request", "café"] {
+            assert_eq!(
+                TreeExport::by_size(name, 1),
+                Err(TreeExportError::Name),
+                "{name:?}"
+            );
+        }
+        assert_eq!(
+            TreeExport::by_size(format!("{longest_name}c"), 1),
+            Err(TreeExportError::Name)
+        );
+        assert_eq!(
+            TreeExport::with_text("summary", format!("{longest_text}x")),
+            Err(TreeExportError::Text)
+        );
+        // 32,769 characters of two bytes each: within the schema's 65,536
+        // characters but over the 65,536 bytes a text may carry.
+        assert_eq!(
+            TreeExport::with_text("summary", "é".repeat(32_769)),
+            Err(TreeExportError::Text)
+        );
+        assert_eq!(
+            TreeExport::by_size("summary", 9_007_199_254_740_992),
+            Err(TreeExportError::Size)
+        );
+
+        let too_many = (0..=MAXIMUM_TREE_EXPORTS)
+            .map(|index| TreeExport::with_text(format!("e{index}"), "x").unwrap())
+            .collect();
+        assert!(matches!(
+            encode_runner_frame(&tree_finish_with_exports(too_many)),
+            Err(EncodeError::InvalidFrame(_))
+        ));
+        let most = (0..MAXIMUM_TREE_EXPORTS)
+            .map(|index| TreeExport::with_text(format!("e{index}"), "x").unwrap())
+            .collect();
+        assert!(encode_runner_frame(&tree_finish_with_exports(most)).is_ok());
+    }
+
+    // REQ-RUNNERENROLL-130
+    #[test]
+    fn tree_export_bounds_are_the_published_bounds() {
+        let fixture: Value = serde_json::from_slice(include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/finished-exports-bounds.json"
+        )))
+        .unwrap();
+        let bound = |field| usize::try_from(fixture[field].as_u64().unwrap()).unwrap();
+        assert_eq!(bound("maximumItems"), MAXIMUM_TREE_EXPORTS);
+        assert_eq!(bound("maximumTextBytes"), MAXIMUM_TREE_EXPORT_TEXT_BYTES);
+        assert_eq!(
+            bound("maximumTotalTextBytes"),
+            MAXIMUM_TREE_EXPORTS_TEXT_BYTES
+        );
     }
 
     fn valid_runner_fixture(name: &str) -> Value {

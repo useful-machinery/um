@@ -64,7 +64,7 @@ repository changes.
 | `finalizers` | no | Nodes considered after the ordinary phase. |
 | `exports` | no | Stable names selecting declared outputs. |
 | `outcomes`, `outcome` | no | Declared run outcome names and the `text` output that chooses one; declared together. |
-| `programs`, `exclude`, `requires`, `bindings`, `triggers`, `mirror` | no | Root only: program directories, digest excludes, required `tools` and declared `integrations`, typed bindings with optional text `default`, triggers on the event of a `$binding` or integration source (Linear issue or GitHub `push`), and a run's Linear writes. |
+| `programs`, `exclude`, `requires`, `bindings`, `triggers`, `mirror` | no | Root only: program directories, digest excludes, required `tools` and declared `integrations`, typed bindings (kinds include `definition`) with optional text `default`, triggers on a `$binding` or integration source's event (Linear issue, GitHub `push`) or a `$binding` definition's run outcome, and a run's Linear writes. |
 
 Identifiers use lower camel case, contain 1 through 64 ASCII letters or digits, and
 match `^[a-z][A-Za-z0-9]*$`. Ordinary step and finalizer IDs share a namespace. V1
@@ -335,14 +335,14 @@ That `$schema` belongs in the separate result-schema JSON file. Do not add a roo
 required nodes. A finalizer export also requires `succeeded` in that finalizer's trigger
 set.
 
-`outcomes` lists between 1 and 64 distinct names a run may end with. Each name
+`outcomes` lists 1 to 64 distinct names a run may end with. Each name
 matches `^[a-z][a-z0-9_]*$`, has at most 64 characters, and is not one of the engine
 outcomes `withdrawn`, `canceled`, or `superseded`. `outcome` names where the choice comes
 from: `from` is an `outputs.<step>.<output>` reference and `onFailure` is the name a
-failed run takes. Declare both keys or neither; `onFailure` must be one of `outcomes`, or
-validation fails with `invalid_outcome_declaration`. The source must be a declared `text`
-output of a required ordinary step without a `condition`, otherwise validation fails with
-`invalid_outcome_source`. Without the declaration a workflow has the implicit outcomes
+failed run takes. Declare both keys or neither; `onFailure` must be one of `outcomes`
+(else `invalid_outcome_declaration`). The source must be a declared `text`
+output of a required ordinary step without a `condition` (else
+`invalid_outcome_source`). Without the declaration a workflow has the implicit outcomes
 `succeeded` and `failed`.
 
 ```yaml
@@ -537,7 +537,7 @@ exports:
 <!-- workflow-reference-fixture:installed-workflow:end -->
 
 The `build -> summarize` edge is inferred from the output reference. Adding
-`dependsOn: [build]` to `summarize` would be valid but unnecessary because the data edge
+`dependsOn: [build]` to `summarize` would be valid but redundant: the data edge
 already requires `build` to succeed. `cleanup` is required by default and is considered
 after every ordinary outcome.
 

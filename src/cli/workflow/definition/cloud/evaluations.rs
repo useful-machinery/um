@@ -1,9 +1,9 @@
 //! `useful workflow definition cloud evaluation list` and `show` (REQ-CLOUDDEF-15): a Cloud
-//! definition's retained start evaluations (REQ-TRIGGER-132) in evaluation vocabulary 3
+//! definition's retained start evaluations (REQ-TRIGGER-132) in evaluation vocabulary 4
 //! (REQ-TRIGGER-166), listed with the exact `state` and `runId` filters and read one at a
-//! time, each with its stored reason, what its event names (a Linear issue, or a push's
-//! branch and commit) and, when it waited for its issue's blockers, that blocker wait
-//! (REQ-TRIGGER-181).
+//! time, each with its stored reason, what its event names (a Linear issue, a push's branch
+//! and commit, or an ended run with its attempt and outcome) and, when it waited for its
+//! issue's blockers, that blocker wait (REQ-TRIGGER-181).
 
 use std::io::{self, Write};
 
@@ -179,7 +179,7 @@ impl Show {
     }
 }
 
-/// One evaluation on a line in vocabulary 3: id, state with its reason, trigger, revision,
+/// One evaluation on a line in vocabulary 4: id, state with its reason, trigger, revision,
 /// event, run, the run blocking it and, when Cloud observed them, its project's readiness
 /// blockers and its blocker wait.
 fn summary(evaluation: &WorkflowDefinitionEvaluation) -> String {
@@ -271,11 +271,19 @@ fn write_evaluation(
 }
 
 /// What the evaluation's event names: a push's branch and commit as `<branch> <commit>`, a
-/// Linear event's issue identifier, `-` for a schedule's event.
+/// run's end as `<run id> attempt <n> <outcome>`, a Linear event's issue identifier, `-` for a
+/// schedule's event.
 fn event_subject(evaluation: &WorkflowDefinitionEvaluation) -> String {
     let event = serde_json::to_value(&evaluation.event).unwrap_or(Value::Null);
     if let (Some(branch), Some(commit)) = (event["branch"].as_str(), event["commit"].as_str()) {
         return format!("{} {}", display(branch), display(commit));
+    }
+    if let (Some(run), Some(attempt), Some(outcome)) = (
+        event["runId"].as_str(),
+        event["attempt"].as_i64(),
+        event["outcome"].as_str(),
+    ) {
+        return format!("{} attempt {attempt} {}", display(run), display(outcome));
     }
     or_dash(event["issue"]["identifier"].as_str())
 }

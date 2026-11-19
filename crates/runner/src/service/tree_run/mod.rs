@@ -7,7 +7,8 @@
 //! under the assignment's lease, resumes the run through its waits and attempts
 //! (`resume_loop`), reporting its root progress and the step states of the run and its
 //! child runs (`steps`, REQ-RUNNERENROLL-88), and reports the record's exit once
-//! (REQ-RUNNERENROLL-99). It applies each trigger delivery for the assignment with `useful
+//! (REQ-RUNNERENROLL-99), with the root's text exports its current attempt published
+//! (`exports`, REQ-RUNNERENROLL-131). It applies each trigger delivery for the assignment with `useful
 //! workflow run event`, those the offer carries before the run's first step
 //! (REQ-TRIGGER-136), and each authorized Cloud control with the `useful workflow run` control
 //! command it names (REQ-RUNNERENROLL-90). A continuation attempt adopts the run an earlier
@@ -39,6 +40,7 @@ use super::run_inputs::PreparationDeadline;
 
 mod command;
 mod download;
+mod exports;
 mod records;
 mod resume_loop;
 mod steps;

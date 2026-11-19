@@ -213,6 +213,7 @@ enum BusyBehaviorDto {
 enum StartRuleDto {
     Event(TriggerRuleDto),
     Schedule(ScheduleRuleDto),
+    Definition(DefinitionRuleDto),
 }
 
 #[derive(Deserialize)]
@@ -220,6 +221,21 @@ enum StartRuleDto {
 struct ScheduleRuleDto {
     schedule: String,
     timezone: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DefinitionRuleDto {
+    definition: String,
+    outcome: OutcomeNamesDto,
+}
+
+/// One outcome name, or a list of them.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OutcomeNamesDto {
+    One(String),
+    Many(Vec<String>),
 }
 
 #[derive(Deserialize)]
@@ -339,6 +355,13 @@ impl TriggerDto {
                     StartRuleDto::Schedule(rule) => StartRule::Schedule {
                         cron: rule.schedule,
                         timezone: rule.timezone,
+                    },
+                    StartRuleDto::Definition(rule) => StartRule::Definition {
+                        definition: rule.definition,
+                        outcomes: match rule.outcome {
+                            OutcomeNamesDto::One(name) => vec![name],
+                            OutcomeNamesDto::Many(names) => names,
+                        },
                     },
                 },
                 subject: start.subject,

@@ -29,6 +29,8 @@ pub enum WorkflowBindingKind {
     WorkflowBindingMember,
     #[serde(rename = "members")]
     WorkflowBindingMembers,
+    #[serde(rename = "definition")]
+    WorkflowBindingDefinition,
 }
 
 impl std::fmt::Display for WorkflowBindingKind {
@@ -40,6 +42,7 @@ impl std::fmt::Display for WorkflowBindingKind {
             Self::WorkflowBindingGitHubRepository => write!(f, "github.repository"),
             Self::WorkflowBindingMember => write!(f, "member"),
             Self::WorkflowBindingMembers => write!(f, "members"),
+            Self::WorkflowBindingDefinition => write!(f, "definition"),
         }
     }
 }

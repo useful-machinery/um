@@ -27,7 +27,7 @@
       "pattern": "^[a-z][A-Za-z0-9]*$"
     },
     "BindingKind": {
-      "enum": ["connection", "linear.team", "linear.state", "github.repository", "member", "members"]
+      "enum": ["connection", "linear.team", "linear.state", "github.repository", "member", "members", "definition"]
     },
     "BoundBinding": {
       "description": "A binding of the flat bindings block: its kind and the value bound for the environment.",

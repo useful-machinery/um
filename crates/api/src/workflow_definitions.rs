@@ -45,13 +45,18 @@ const PROBLEM_TYPE_PREFIX: &str = "https://api.usefulmachinery.com/problems/";
 const DEFINITION_ID_PREFIX: &str = "def_";
 const EVALUATION_ID_PREFIX: &str = "wev_";
 /// The evaluation vocabulary this release decodes (REQ-TRIGGER-166): its evaluation models
-/// hold the push event and, from 3, `issue.unblocked_in_state` beside the other Linear issue
-/// events and the schedule's due time. A request that named none would be answered in the
-/// vocabulary of releases before the parameter.
-const EVALUATION_VOCABULARY: &str = "3";
+/// hold the push event, from 3 `issue.unblocked_in_state` beside the other Linear issue events
+/// and the schedule's due time, and from 4 a run's end. A request that named none would be
+/// answered in the vocabulary of releases before the parameter.
+const EVALUATION_VOCABULARY: &str = "4";
 /// The evaluation representation whose members this release's generated model knows: 2
 /// adds `observations.project` and 3 `observations.blockerWait` (REQ-TRIGGER-165).
 const EVALUATION_REPRESENTATION: (&str, &str) = ("representation", "3");
+/// The binding vocabulary this release decodes (REQ-CLOUDDEF-8): its revision models hold the
+/// kinds `connection`, `linear.team`, `linear.state`, `github.repository`, `member` and
+/// `members` and the kind `definition`. A request that named none would be answered without a
+/// binding of a kind outside the first six.
+const BINDING_VOCABULARY: &str = "2";
 
 /// One file of a tree to upload: its tree-relative path, bytes and owner-execute bit.
 #[derive(Clone, Copy)]
@@ -518,7 +523,7 @@ impl<'a> WorkflowDefinitionApi<'a> {
     }
 
     /// One page of definition `id`'s revisions, newest first, with the next page's cursor
-    /// (REQ-CLOUDDEF-8).
+    /// (REQ-CLOUDDEF-8), asked for in `BINDING_VOCABULARY`.
     pub fn revisions(
         &self,
         organization: &str,
@@ -530,7 +535,8 @@ impl<'a> WorkflowDefinitionApi<'a> {
         let endpoint = self.definitions_endpoint(organization, project, &[id, "revisions"]);
         let stage = Stage::RevisionList;
         let list: models::WorkflowDefinitionRevisionList = receive(
-            self.page_request(&endpoint, limit, cursor),
+            self.page_request(&endpoint, limit, cursor)
+                .query(&[("vocabulary", BINDING_VOCABULARY)]),
             StatusCode::OK,
             None,
             stage,
@@ -541,7 +547,8 @@ impl<'a> WorkflowDefinitionApi<'a> {
         Ok((list.items, list.next_cursor))
     }
 
-    /// Revision `number` of definition `id` (REQ-CLOUDDEF-8).
+    /// Revision `number` of definition `id` (REQ-CLOUDDEF-8), asked for in
+    /// `BINDING_VOCABULARY`.
     pub fn revision(
         &self,
         organization: &str,
@@ -552,7 +559,8 @@ impl<'a> WorkflowDefinitionApi<'a> {
         let number_segment = number.to_string();
         let endpoint =
             self.definitions_endpoint(organization, project, &[id, "revisions", &number_segment]);
-        let request = super::generated_api_request(&self.configuration, Method::GET, &endpoint);
+        let request = super::generated_api_request(&self.configuration, Method::GET, &endpoint)
+            .query(&[("vocabulary", BINDING_VOCABULARY)]);
         let stage = Stage::RevisionRead;
         let revision: WorkflowDefinitionRevision = receive(request, StatusCode::OK, None, stage)?;
         validate_revision(&revision, id, Some(number), stage)?;

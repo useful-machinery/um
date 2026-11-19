@@ -115,13 +115,19 @@ fn write_human_valid(tree: &ValidatedTree) -> anyhow::Result<()> {
             &trigger.event,
             &trigger.schedule,
             &trigger.timezone,
+            &trigger.definition,
         ) {
-            (Some(source), Some(event), _, _) => {
+            (Some(source), Some(event), _, _, _) => {
                 format!("on {} {}", display(source), display(event))
             }
-            (_, _, Some(cron), Some(timezone)) => {
+            (_, _, Some(cron), Some(timezone), _) => {
                 format!("\"{}\" {}", display(cron), display(timezone))
             }
+            (_, _, _, _, Some(definition)) => format!(
+                "on {} outcome {}",
+                display(definition),
+                display_list(&trigger.outcomes)
+            ),
             _ => String::new(),
         };
         writeln!(
@@ -288,6 +294,8 @@ fn valid_report(tree: &ValidatedTree) -> JsonReport<'_> {
                         condition: trigger.condition.as_deref(),
                         schedule: trigger.schedule.as_deref(),
                         timezone: trigger.timezone.as_deref(),
+                        definition: trigger.definition.as_deref(),
+                        outcomes: &trigger.outcomes,
                         subject: trigger.subject.as_deref(),
                         inputs: &trigger.inputs,
                         stop_before: trigger.stop_before.as_ref(),
@@ -352,10 +360,10 @@ struct JsonDigest<'a> {
     value: &'a str,
 }
 
-/// A provider trigger's `source`, `event` and `where`, or a schedule's `schedule` and
-/// `timezone`, then a start trigger's `subject`, `inputs` (input name to the value as
-/// written), `stopBefore`, `owner` as `{from, only?, except?}` and `busyBehavior` as written,
-/// absent when undeclared.
+/// A provider trigger's `source`, `event` and `where`, a schedule's `schedule` and
+/// `timezone`, or a definition trigger's `definition` and `outcomes`, then a start trigger's
+/// `subject`, `inputs` (input name to the value as written), `stopBefore`, `owner` as
+/// `{from, only?, except?}` and `busyBehavior` as written, absent when undeclared.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct JsonTrigger<'a> {
@@ -370,6 +378,12 @@ struct JsonTrigger<'a> {
     schedule: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timezone: Option<&'a str>,
+    /// A definition trigger's binding reference as written (REQ-WFDEF-39).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    definition: Option<&'a str>,
+    /// A definition trigger's outcome names in the order written.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    outcomes: &'a [String],
     #[serde(skip_serializing_if = "Option::is_none")]
     subject: Option<&'a str>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]

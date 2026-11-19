@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// WorkflowDefinitionEvaluation : One accepted Linear delivery's, GitHub push's or schedule due time's evaluation of a start trigger, pinned at acceptance to the revision then current, the trigger and the execution principal.
+/// WorkflowDefinitionEvaluation : One accepted Linear delivery's, GitHub push's, schedule due time's or ended run's evaluation of a start trigger, pinned at acceptance to the revision then current, the trigger and the execution principal.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowDefinitionEvaluation {
     #[serde(rename = "id")]
@@ -27,7 +27,7 @@ pub struct WorkflowDefinitionEvaluation {
     pub revision: i32,
     #[serde(rename = "triggerName")]
     pub trigger_name: String,
-    /// The Linear connection the event arrived on, or for a push evaluation the GitHub installation binding the push arrived on; null for a schedule evaluation.
+    /// The Linear connection the event arrived on, or for a push evaluation the GitHub installation binding the push arrived on; null for a schedule evaluation and for a `run.ended` evaluation.
     #[serde(rename = "connectionId", deserialize_with = "Option::deserialize")]
     pub connection_id: Option<String>,
     #[serde(rename = "executionPrincipalId")]
@@ -69,7 +69,7 @@ pub struct WorkflowDefinitionEvaluation {
 }
 
 impl WorkflowDefinitionEvaluation {
-    /// One accepted Linear delivery's, GitHub push's or schedule due time's evaluation of a start trigger, pinned at acceptance to the revision then current, the trigger and the execution principal.
+    /// One accepted Linear delivery's, GitHub push's, schedule due time's or ended run's evaluation of a start trigger, pinned at acceptance to the revision then current, the trigger and the execution principal.
     pub fn new(
         id: String,
         definition_id: String,
@@ -130,6 +130,8 @@ pub enum EventName {
     Push,
     #[serde(rename = "issue.unblocked_in_state")]
     IssueUnblockedInState,
+    #[serde(rename = "run.ended")]
+    RunEnded,
 }
 
 impl Default for EventName {

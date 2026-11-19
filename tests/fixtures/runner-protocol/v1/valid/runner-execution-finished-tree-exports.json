@@ -1,0 +1,44 @@
+{
+  "bootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abe",
+  "direction": "runner_to_cloud",
+  "messageId": "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc",
+  "payload": {
+    "artifactDelivery": {
+      "code": "delivery_internal_failure",
+      "outcome": "failed",
+      "phase": "preparation"
+    },
+    "assignmentId": "asn_01k0z6r1w8f4jy2m7q9v3x5abn",
+    "attemptId": "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+    "chosenOutcome": "broken",
+    "claimRelease": false,
+    "exports": [
+      {
+        "name": "buildLog",
+        "size": 70000
+      },
+      {
+        "name": "empty",
+        "size": 0,
+        "text": ""
+      },
+      {
+        "name": "repairRequest",
+        "size": 48,
+        "text": "Repair the build.\nThe linker failed on café.o.\n"
+      }
+    ],
+    "finalExecutionEventSequence": 1,
+    "mirror": [],
+    "outcome": {
+      "forceAbort": null,
+      "outcome": "succeeded"
+    }
+  },
+  "payloadVersion": 1,
+  "protocolVersion": 1,
+  "runnerId": "rnr_01k0z6r1w8f4jy2m7q9v3x5abd",
+  "sentAt": "2026-07-23T00:00:00Z",
+  "sequence": 1,
+  "type": "execution_finished"
+}

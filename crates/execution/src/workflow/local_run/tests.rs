@@ -9435,3 +9435,25 @@ async fn cloud_checkpoint_accepts_carrier_free_git_and_rejects_unpublished_recor
         Err(LocalRunDirectoryError::StateInvalid)
     ));
 }
+
+// REQ-RUNNERENROLL-131: the bounded reader of a run directory's file returns a file of
+// exactly its bound and refuses one a byte larger from its size, with nothing read into the
+// answer.
+#[test]
+fn bounded_run_file_reader_returns_its_bound_and_refuses_a_byte_more() {
+    let temporary = tempfile::tempdir().unwrap();
+    let exports = temporary.path().join("attempts/000001/result/exports");
+    fs::create_dir_all(&exports).unwrap();
+    fs::write(exports.join("0001"), vec![b'a'; 16]).unwrap();
+    fs::write(exports.join("0002"), vec![b'a'; 17]).unwrap();
+
+    assert_eq!(
+        read_run_file_bounded(temporary.path(), "attempts/000001/result/exports/0001", 16),
+        Ok(vec![b'a'; 16])
+    );
+    assert!(matches!(
+        read_run_file_bounded(temporary.path(), "attempts/000001/result/exports/0002", 16),
+        Err(LocalRunDirectoryError::StateFile { operation: "validate", source, .. })
+            if matches!(*source, LocalRunDirectoryError::FileSizeInvalid)
+    ));
+}

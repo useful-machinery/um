@@ -15,7 +15,7 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-/// WorkflowDefinitionResolvedBinding : A binding's resolution. A Linear team or state adds its resolved id and display name; no credential is ever included.
+/// WorkflowDefinitionResolvedBinding : A binding's resolution. A Linear team or state adds its resolved id and display name, and a `definition` the bound definition's id and name; no credential is ever included.
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowDefinitionResolvedBinding {
     #[serde(rename = "kind")]
@@ -30,7 +30,7 @@ pub struct WorkflowDefinitionResolvedBinding {
 }
 
 impl WorkflowDefinitionResolvedBinding {
-    /// A binding's resolution. A Linear team or state adds its resolved id and display name; no credential is ever included.
+    /// A binding's resolution. A Linear team or state adds its resolved id and display name, and a `definition` the bound definition's id and name; no credential is ever included.
     pub fn new(
         kind: models::WorkflowBindingKind,
         value: Option<serde_json::Value>,

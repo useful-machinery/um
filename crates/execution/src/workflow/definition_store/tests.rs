@@ -51,6 +51,17 @@ steps:
     command:
       argv: ["true"]
 "#;
+const DEFINITION_ROOT: &str = r#"schemaVersion: 1
+name: repair
+bindings:
+  connection: {kind: connection}
+  verify: {kind: definition}
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["true"]
+"#;
 const ID_PATTERN: &str = "^def_[0-7][0-9a-hjkmnp-tv-z]{25}$";
 const DIGEST_PATTERN: &str = "^sha256:[0-9a-f]{64}$";
 
@@ -627,6 +638,150 @@ fn a_first_publish_with_a_required_binding_needs_a_file_and_a_root_without_one_d
     assert!(published.snapshot.bindings().is_empty());
     assert_eq!(home.snapshot_bytes(&published.record.id, 1), b"{}");
     assert_records_match_schemas(&home, &published.record.id, 1);
+}
+
+// REQ-WFDEF-40, REQ-WFDEF-3, REQ-WFDEF-20
+#[test]
+fn a_definition_binding_given_no_value_has_no_entry_and_a_given_one_is_recorded_as_written() {
+    let tree = Tree::with(DEFINITION_ROOT).validated();
+    let resolve = |value: Value| {
+        resolve_bindings(
+            &tree.bindings,
+            &tree.required_integrations,
+            Some(&bindings(value)),
+            None,
+        )
+    };
+
+    let home = Home::new();
+    let published = publish(
+        &home.home,
+        &tree,
+        PublishTarget::Resolve,
+        Some(&bindings(json!({"connection": "local"}))),
+        "tester",
+    )
+    .expect("a definition binding without a value should publish");
+    let snapshot = serde_json::from_slice::<Value>(&home.snapshot_bytes(&published.record.id, 1))
+        .expect("snapshot should be JSON");
+    assert_eq!(
+        snapshot,
+        json!({"connection": {"kind": "connection", "value": "local"}})
+    );
+    assert_records_match_schemas(&home, &published.record.id, 1);
+
+    // Recorded as written and resolved nowhere, a definition id or not.
+    for value in ["def_01hzy3v8k2m4n6p8q0r2s4t6v8", "the verify workflow"] {
+        let published = publish(
+            &home.home,
+            &tree,
+            PublishTarget::New,
+            Some(&bindings(json!({
+                "connection": "local",
+                "verify": {"kind": "definition", "value": value},
+            }))),
+            "tester",
+        )
+        .expect("a definition value should publish");
+        let snapshot =
+            serde_json::from_slice::<Value>(&home.snapshot_bytes(&published.record.id, 1))
+                .expect("snapshot should be JSON");
+        assert_eq!(
+            snapshot["verify"],
+            json!({"kind": "definition", "value": value})
+        );
+        assert_records_match_schemas(&home, &published.record.id, 1);
+    }
+
+    for value in [json!(""), json!(["def_01hzy3v8k2m4n6p8q0r2s4t6v8"])] {
+        let error = resolve(json!({"connection": "local", "verify": value}))
+            .expect_err("a definition value that is not a non-empty string should refuse");
+        assert_eq!(
+            (error.code(), error.key()),
+            ("binding_value_invalid", Some("verify"))
+        );
+    }
+
+    let error = resolve(json!({"verify": "def_01hzy3v8k2m4n6p8q0r2s4t6v8"}))
+        .expect_err("the connection omitted should still refuse");
+    assert_eq!(
+        (error.code(), error.key()),
+        ("binding_missing", Some("connection"))
+    );
+
+    let with_default = Tree::with(&DEFINITION_ROOT.replace(
+        "verify: {kind: definition}",
+        "verify: {kind: definition, default: def_01hzy3v8k2m4n6p8q0r2s4t6v8}",
+    ))
+    .validated();
+    let snapshot = resolve_bindings(
+        &with_default.bindings,
+        &with_default.required_integrations,
+        Some(&bindings(json!({"connection": "local"}))),
+        None,
+    )
+    .expect("a definition default should be recorded");
+    assert_eq!(
+        snapshot.bindings()["verify"],
+        BoundBinding {
+            kind: BindingKind::Definition,
+            value: BindingValue::Text("def_01hzy3v8k2m4n6p8q0r2s4t6v8".to_owned()),
+        }
+    );
+}
+
+// REQ-WFDEF-40, REQ-WFDEF-21
+#[test]
+fn a_definition_binding_needs_no_file_and_a_later_publish_carries_what_was_recorded() {
+    let home = Home::new();
+    let only_definition =
+        Tree::with(&DEFINITION_ROOT.replace("  connection: {kind: connection}\n", "")).validated();
+    let published = publish(
+        &home.home,
+        &only_definition,
+        PublishTarget::Resolve,
+        None,
+        "tester",
+    )
+    .expect("a root whose only required binding is a definition should publish without a file");
+    assert!(published.snapshot.bindings().is_empty());
+    assert_eq!(home.snapshot_bytes(&published.record.id, 1), b"{}");
+
+    let tree = Tree::with(DEFINITION_ROOT).validated();
+    let publish_new = |file: Value| {
+        publish(
+            &home.home,
+            &tree,
+            PublishTarget::New,
+            Some(&bindings(file)),
+            "tester",
+        )
+        .expect("first publish should succeed")
+    };
+    let publish_carried = |id: &str| {
+        publish(
+            &home.home,
+            &tree,
+            PublishTarget::To(id.to_owned()),
+            None,
+            "tester",
+        )
+        .expect("a carried publish should succeed")
+    };
+
+    let given =
+        publish_new(json!({"connection": "local", "verify": "def_01hzy3v8k2m4n6p8q0r2s4t6v8"}));
+    let carried = publish_carried(&given.record.id);
+    assert_eq!(carried.snapshot, given.snapshot);
+    assert_eq!(
+        carried.snapshot.bindings()["verify"].value.as_text(),
+        Some("def_01hzy3v8k2m4n6p8q0r2s4t6v8")
+    );
+
+    let absent = publish_new(json!({"connection": "local"}));
+    let carried = publish_carried(&absent.record.id);
+    assert_eq!(carried.snapshot, absent.snapshot);
+    assert!(!carried.snapshot.bindings().contains_key("verify"));
 }
 
 // REQ-WFDEF-21

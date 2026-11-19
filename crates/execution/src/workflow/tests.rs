@@ -807,6 +807,40 @@ fn root_requires_decodes_as_and_integrations_as_declared() {
     assert!(requires.integrations.is_empty());
 }
 
+// REQ-WFDEF-39, REQ-WFFORMAT-82
+#[test]
+fn a_definition_trigger_decodes_its_binding_and_outcomes_as_written() {
+    let workflow =
+        decode(&fs::read(fixture_root().join("valid/root-definition-trigger.yaml")).unwrap())
+            .unwrap();
+    let root = workflow.root.unwrap();
+    assert_eq!(
+        root.bindings["verify"],
+        Binding {
+            kind: BindingKind::Definition,
+            default: None,
+        }
+    );
+    let rule = |name: &str| match &root.triggers[name] {
+        Trigger::Start { on, .. } => on.clone(),
+        Trigger::Control { .. } => panic!("{name} is a start trigger"),
+    };
+    assert_eq!(
+        rule("repair"),
+        StartRule::Definition {
+            definition: "$verify".to_owned(),
+            outcomes: vec!["broken".to_owned()],
+        }
+    );
+    assert_eq!(
+        rule("repairAny"),
+        StartRule::Definition {
+            definition: "$verify".to_owned(),
+            outcomes: vec!["broken".to_owned(), "failed".to_owned()],
+        }
+    );
+}
+
 // REQ-WFDEF-34, REQ-WFFORMAT-82
 #[test]
 fn root_integration_bindings_decode_with_kinds_defaults_and_integration_references() {

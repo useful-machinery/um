@@ -24,7 +24,7 @@ use super::resolution::{
     ContentDigestAlgorithm, ResolutionFailure, ResolvedWorkflow, WorkflowContentDigest,
     resolve_workflow_file,
 };
-use super::schema_common::lowercase_hex;
+use super::schema_common::{is_identifier, lowercase_hex};
 use super::validated::{
     Scheduling, ValidatedEdgeTarget, ValidatedRecoveryHandler, ValidatedStep, ValidatedWorkflow,
     WorkflowValueType,
@@ -77,22 +77,28 @@ impl fmt::Debug for TreeFile {
 }
 
 /// A trigger as `useful workflow definition validate` reports it: a provider rule's source,
-/// event and `where`, or a schedule's timetable, and a start trigger's `subject`, `inputs`,
-/// `stopBefore`, `owner` and `busyBehavior`.
+/// event and `where`, a schedule's timetable or a definition rule's binding and outcomes, and
+/// a start trigger's `subject`, `inputs`, `stopBefore`, `owner` and `busyBehavior`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeTrigger {
     pub kind: TreeTriggerKind,
     /// As written: the binding reference, `$` and the binding key, or the integration's id;
-    /// none for a schedule.
+    /// none for a schedule or a definition rule.
     pub source: Option<String>,
-    /// None for a schedule.
+    /// None for a schedule or a definition rule.
     pub event: Option<String>,
-    /// A provider rule's `on.where` as written; none for a schedule or a rule without one.
+    /// A provider rule's `on.where` as written; none for a schedule, a definition rule or a
+    /// rule without one.
     pub condition: Option<String>,
     /// A schedule's cron expression.
     pub schedule: Option<String>,
     /// A schedule's time zone.
     pub timezone: Option<String>,
+    /// A definition rule's binding reference as written, `$` and the binding key; none for
+    /// every other trigger (REQ-WFDEF-39).
+    pub definition: Option<String>,
+    /// A definition rule's outcome names in the order written; empty for every other trigger.
+    pub outcomes: Vec<String>,
     /// A start trigger's `subject` as written.
     pub subject: Option<String>,
     /// A start trigger's `inputs`, input name to the value as written; empty for a control.
@@ -406,17 +412,17 @@ impl From<&Trigger> for TreeTrigger {
         let trigger = match on {
             StartRule::Event(rule) => Self::event(TreeTriggerKind::Start, rule),
             StartRule::Schedule { cron, timezone } => Self {
-                kind: TreeTriggerKind::Schedule,
-                source: None,
-                event: None,
-                condition: None,
                 schedule: Some(cron.clone()),
                 timezone: Some(timezone.clone()),
-                subject: None,
-                inputs: BTreeMap::new(),
-                stop_before: None,
-                owner: None,
-                busy_behavior: None,
+                ..Self::bare(TreeTriggerKind::Schedule)
+            },
+            StartRule::Definition {
+                definition,
+                outcomes,
+            } => Self {
+                definition: Some(definition.clone()),
+                outcomes: outcomes.clone(),
+                ..Self::bare(TreeTriggerKind::Start)
             },
         };
         Self {
@@ -433,12 +439,24 @@ impl From<&Trigger> for TreeTrigger {
 impl TreeTrigger {
     fn event(kind: TreeTriggerKind, rule: &TriggerRule) -> Self {
         Self {
-            kind,
             source: Some(rule.source.clone()),
             event: Some(rule.event.clone()),
             condition: rule.condition.clone(),
+            ..Self::bare(kind)
+        }
+    }
+
+    /// A trigger of `kind` with every other member none or empty.
+    fn bare(kind: TreeTriggerKind) -> Self {
+        Self {
+            kind,
+            source: None,
+            event: None,
+            condition: None,
             schedule: None,
             timezone: None,
+            definition: None,
+            outcomes: Vec::new(),
             subject: None,
             inputs: BTreeMap::new(),
             stop_before: None,
@@ -598,6 +616,16 @@ fn check_triggers(
                 on: StartRule::Schedule { .. },
                 ..
             } => {}
+            Trigger::Start {
+                on: StartRule::Definition { definition, .. },
+                ..
+            } => check_binding(
+                blocks,
+                definition.strip_prefix('$').unwrap_or(definition),
+                BindingKind::Definition,
+                TreeLocation::trigger(name).key("on.definition"),
+                diagnostics,
+            ),
             Trigger::Control { on, control } => {
                 let when = match control {
                     TriggerControlAction::Conditional { when, .. } => Some(when.as_str()),
@@ -656,15 +684,23 @@ fn check_triggers(
         if let Some(owner) = owner {
             check_owner(name, owner, blocks, diagnostics);
         }
-        if let StartRule::Schedule { cron, timezone } = on {
-            check_schedule(
+        let reads = match on {
+            StartRule::Event(_) => None,
+            StartRule::Schedule { .. } => Some(&SCHEDULE_READS),
+            StartRule::Definition { .. } => Some(&DEFINITION_READS),
+        };
+        if let Some(reads) = reads {
+            check_event_reads(
                 name,
+                reads,
                 subject.as_deref(),
                 inputs,
                 stop_before.as_ref(),
                 owner.as_ref(),
                 diagnostics,
             );
+        }
+        if let StartRule::Schedule { cron, timezone } = on {
             if !is_cron_shape(cron) {
                 diagnostics.push(TreeDiagnostic::new(
                     "schedule_timing_invalid",
@@ -827,34 +863,82 @@ fn check_owner(
     }
 }
 
-/// A schedule trigger reads no event (REQ-WFDEF-10, REQ-WFDEF-31): its subject and inputs
-/// are literals, its owner a `$binding` or absent, and it declares no `stopBefore`.
-fn check_schedule(
+/// What a start trigger on no provider event may read of the event that starts it, and the
+/// code that refuses anything else.
+struct EventReads {
+    code: &'static str,
+    /// Whether the event holds an `event.` value.
+    holds: fn(&str) -> bool,
+    /// Whether each `inputs` value at fault is reported with its input's name, rather than
+    /// the key once.
+    each_input: bool,
+}
+
+/// A schedule trigger reads no event (REQ-WFDEF-10, REQ-WFDEF-31).
+const SCHEDULE_READS: EventReads = EventReads {
+    code: "schedule_trigger_invalid",
+    holds: |_| false,
+    each_input: false,
+};
+
+/// A definition trigger reads the members of the run that ended and its exports by name
+/// (REQ-WFDEF-10, REQ-WFDEF-39). The check is of shape: whether the bound definition
+/// exports the name is known only when one of its runs ends. The event holds the attempt,
+/// but no trigger reads it.
+const DEFINITION_READS: EventReads = EventReads {
+    code: "definition_trigger_invalid",
+    holds: |value| {
+        matches!(
+            value,
+            "event.definitionId"
+                | "event.runId"
+                | "event.outcome"
+                | "event.subject"
+                | "event.commit"
+                | "event.at"
+        ) || value
+            .strip_prefix("event.exports.")
+            .is_some_and(is_identifier)
+    },
+    each_input: true,
+};
+
+/// A start trigger on a schedule or another definition's run (REQ-WFDEF-10): each `subject`
+/// or `inputs` value that begins `event.` is one its event holds, any other value being a
+/// literal, its owner is a `$binding` or absent, and it declares no `stopBefore`.
+fn check_event_reads(
     name: &str,
+    reads: &EventReads,
     subject: Option<&str>,
     inputs: &BTreeMap<String, String>,
     stop_before: Option<&StopBefore>,
     owner: Option<&OwnerDeclaration>,
     diagnostics: &mut Vec<TreeDiagnostic>,
 ) {
-    let reads_event = |value: &str| value.starts_with("event.");
-    let mut invalid = |key| {
-        diagnostics.push(TreeDiagnostic::new(
-            "schedule_trigger_invalid",
-            TreeLocation::trigger(name).key(key),
-        ));
+    let at_fault = |value: &str| value.starts_with("event.") && !(reads.holds)(value);
+    let mut invalid = |location: TreeLocation| {
+        diagnostics.push(TreeDiagnostic::new(reads.code, location));
     };
-    if subject.is_some_and(reads_event) {
-        invalid("subject");
+    let at = |key| TreeLocation::trigger(name).key(key);
+    if subject.is_some_and(at_fault) {
+        invalid(at("subject"));
     }
-    if inputs.values().any(|value| reads_event(value)) {
-        invalid("inputs");
+    let mut inputs_at_fault = inputs
+        .iter()
+        .filter(|(_, value)| at_fault(value))
+        .map(|(input, _)| input);
+    if reads.each_input {
+        for input in inputs_at_fault {
+            invalid(at("inputs").input(input));
+        }
+    } else if inputs_at_fault.next().is_some() {
+        invalid(at("inputs"));
     }
     if owner.is_some_and(|owner| !matches!(owner.from, OwnerSource::Binding(_))) {
-        invalid("owner");
+        invalid(at("owner"));
     }
     if stop_before.is_some() {
-        invalid("stopBefore");
+        invalid(at("stopBefore"));
     }
 }
 

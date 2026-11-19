@@ -836,6 +836,21 @@ fn trigger_rules_must_name_declared_bindings_of_the_right_kind() {
     assert_eq!(location["binding"], "nobody");
 }
 
+// REQ-WFDEF-10: a definition trigger's input reads only what a finished run's event holds,
+// and the event's attempt is not among it.
+#[test]
+fn a_definition_trigger_input_must_read_what_a_runs_event_holds() {
+    let from = "ticket: event.exports.repairRequest";
+    let root = definition_trigger_root("{definition: $verify, outcome: [broken, failed]}");
+    assert!(root.contains(from), "{from}");
+    let attempt = root.replacen(from, "ticket: event.attempt", 1);
+    let (code, location) = single_rejection(&attempt, DESIGN_WORKFLOW);
+    assert_eq!(code, "definition_trigger_invalid");
+    assert_eq!(location["trigger"], "repairMain");
+    assert_eq!(location["key"], "inputs");
+    assert_eq!(location["input"], "ticket");
+}
+
 // REQ-WFDEF-10: a trigger rule outside the grammar that evaluates it is refused, the start
 // `where` against Cloud's and the control `when` against the wait's.
 #[test]
@@ -1520,6 +1535,119 @@ fn start_policies_and_schedule_triggers_are_reported_and_start_nothing() {
 
     let home = Home::new();
     home.publish(&tree, &["--bindings", &tree.engineering_bindings()]);
+    home.assert_no_runs();
+}
+
+/// The engineering root with a `verify` definition binding and a `repairMain` start trigger
+/// on `on`, written as given.
+fn definition_trigger_root(on: &str) -> String {
+    let replacements = [
+        (
+            "  repository:      {kind: github.repository}\n".to_owned(),
+            "  repository:      {kind: github.repository}\n  verify:          {kind: definition}\n"
+                .to_owned(),
+        ),
+        (
+            "  release:".to_owned(),
+            format!(
+                "  repairMain:\n    on: {on}\n    subject: main\n    busyBehavior: skip\n    inputs:\n      ticket: event.exports.repairRequest\n      baseBranch: \"main\"\n  release:"
+            ),
+        ),
+    ];
+    replacements
+        .into_iter()
+        .fold(ROOT_WORKFLOW.to_owned(), |root, (from, to)| {
+            assert!(root.contains(&from), "{from}");
+            root.replacen(&from, &to, 1)
+        })
+}
+
+// REQ-WFDEF-1, REQ-WFDEF-14, REQ-WFDEF-39: a start trigger on another definition's run is
+// reported as a start trigger with its `definition` reference and `outcomes` as written, a
+// `definition` binding as any binding, and the other triggers gain no member; an engine
+// outcome or a `where` beside `definition` is structurally invalid.
+#[test]
+fn definition_triggers_and_bindings_are_reported_as_written() {
+    let unmodified = report(&validate(Tree::engineering().path(), true));
+    let tree = Tree::with(
+        &definition_trigger_root("{definition: $verify, outcome: [broken, failed]}"),
+        DESIGN_WORKFLOW,
+    );
+    let output = validate(tree.path(), true);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let report_value = report(&output);
+    let repair_main = |outcomes: Value| {
+        json!({
+            "kind": "start",
+            "definition": "$verify",
+            "outcomes": outcomes,
+            "subject": "main",
+            "inputs": {"ticket": "event.exports.repairRequest", "baseBranch": "main"},
+            "busyBehavior": "skip",
+        })
+    };
+    assert_eq!(
+        report_value["triggers"]["repairMain"],
+        repair_main(json!(["broken", "failed"]))
+    );
+    assert_eq!(
+        report_value["bindings"]["verify"],
+        json!({"kind": "definition", "required": true})
+    );
+    for name in ["start", "release"] {
+        assert_eq!(
+            report_value["triggers"][name], unmodified["triggers"][name],
+            "{name}"
+        );
+    }
+
+    let human = validate(tree.path(), false);
+    assert_eq!(human.status.code(), Some(0), "{human:?}");
+    assert_contains_all(
+        &String::from_utf8(human.stdout).expect("human output should be UTF-8"),
+        &["repairMain", "$verify", "broken", "failed"],
+    );
+
+    let tree = Tree::with(
+        &definition_trigger_root("{definition: $verify, outcome: broken}"),
+        DESIGN_WORKFLOW,
+    );
+    let output = validate(tree.path(), true);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        report(&output)["triggers"]["repairMain"],
+        repair_main(json!(["broken"]))
+    );
+
+    for root in [
+        definition_trigger_root("{definition: $verify, outcome: canceled}"),
+        definition_trigger_root(
+            "{definition: $verify, outcome: broken, where: \"event.outcome == broken\"}",
+        ),
+    ] {
+        let (code, _) = single_rejection(&root, DESIGN_WORKFLOW);
+        assert_eq!(code, "invalid_workflow_structure", "{root}");
+    }
+}
+
+// REQ-WFDEF-40, REQ-WFDEF-39: a tree with a definition trigger publishes locally with the
+// bindings a runner gives it, which omit the `definition` binding, and the snapshot has no
+// entry for it.
+#[test]
+fn a_definition_binding_given_no_value_publishes_locally_without_an_entry() {
+    let tree = Tree::with(
+        &definition_trigger_root("{definition: $verify, outcome: [broken, failed]}"),
+        DESIGN_WORKFLOW,
+    );
+    let home = Home::new();
+    let published = home.publish(&tree, &["--bindings", &tree.engineering_bindings()]);
+    let id = text(&published["definition"]["id"], "definition id").to_owned();
+    let shown = home.json(&["show", &id]);
+    let bindings = shown["bindings"]
+        .as_object()
+        .expect("show should report the bindings as an object");
+    assert!(bindings.contains_key("connection"), "{shown}");
+    assert!(!bindings.contains_key("verify"), "{shown}");
     home.assert_no_runs();
 }
 
@@ -2442,28 +2570,26 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
     {
         // As Cloud does (REQ-TRIGGER-166), an evaluation is listed and read only under a
         // vocabulary that holds its event: the push evaluation from 2, the
-        // `issue.unblocked_in_state` ones from 3; a request naming none is vocabulary 1.
-        let vocabulary = request
-            .path
-            .split_once('?')
-            .and_then(|(_, query)| {
-                query
-                    .split('&')
-                    .find_map(|pair| pair.strip_prefix("vocabulary="))
-            })
-            .map_or(1, |number| number.parse::<u32>().expect("a vocabulary"));
+        // `issue.unblocked_in_state` ones from 3 and the `run.ended` one from 4; a request
+        // naming none is vocabulary 1.
+        let vocabulary = evaluation_vocabulary(request);
         let answer = match evaluation.strip_prefix('/') {
             Some(CLOUD_PUSH_EVALUATION) if vocabulary < 2 => return gateway_not_found(),
             Some(CLOUD_WAITING_EVALUATION | CLOUD_UNBLOCKED_EVALUATION) if vocabulary < 3 => {
                 return gateway_not_found();
             }
+            Some(CLOUD_RUN_ENDED_EVALUATION) if vocabulary < 4 => return gateway_not_found(),
             Some(CLOUD_PUSH_EVALUATION) => gateway_push_evaluation(id),
             Some(CLOUD_WAITING_EVALUATION) => gateway_waiting_evaluation(id),
             Some(CLOUD_UNBLOCKED_EVALUATION) => gateway_unblocked_evaluation(id),
+            Some(CLOUD_RUN_ENDED_EVALUATION) => gateway_run_ended_evaluation(id),
             Some(CLOUD_NOT_READY_EVALUATION) => gateway_not_ready_evaluation(id),
             Some(evaluation) => gateway_evaluation(id, evaluation),
             None => {
                 let mut items = Vec::new();
+                if vocabulary >= 4 {
+                    items.push(gateway_run_ended_evaluation(id));
+                }
                 if vocabulary >= 3 {
                     items.extend([
                         gateway_unblocked_evaluation(id),
@@ -2641,6 +2767,34 @@ fn gateway_push_evaluation(id: &str) -> Value {
         "created": true,
         "forced": false,
         "projectBranch": true,
+        "at": CLOUD_TIME,
+    });
+    evaluation
+}
+
+const CLOUD_RUN_ENDED_EVALUATION: &str = "wev_01k0z6r1w8f4jy2m7q9v3x5abj";
+const CLOUD_ENDED_RUN: &str = "run_01k0z6r1w8f4jy2m7q9v3x5abe";
+
+/// The start evaluation of the end of a `verify` run of definition `id`, newer than the push
+/// evaluation, which Cloud shows only under evaluation vocabulary 4 and above.
+fn gateway_run_ended_evaluation(id: &str) -> Value {
+    let mut evaluation = gateway_evaluation(id, CLOUD_RUN_ENDED_EVALUATION);
+    evaluation["triggerName"] = json!("repairMain");
+    evaluation["connectionId"] = Value::Null;
+    evaluation["eventName"] = json!("run.ended");
+    evaluation["reason"] = json!("export_too_large");
+    evaluation["observations"] = json!({"observedAt": CLOUD_TIME, "input": "request"});
+    evaluation["event"] = json!({
+        "definitionId": CLOUD_BOUND_DEFINITION,
+        "runId": CLOUD_ENDED_RUN,
+        "attempt": 2,
+        "outcome": "broken",
+        "subject": "main",
+        "commit": "3b18e512dba79e4c8300dd08aeb37f8e728b8dad",
+        "exports": {
+            "request": {"state": "too_large", "size": 70000},
+            "notes": {"state": "available", "size": 12},
+        },
         "at": CLOUD_TIME,
     });
     evaluation
@@ -3824,6 +3978,115 @@ fn publish_cloud_refuses_an_ambiguous_reuse_and_leaves_the_record_unlinked() {
     assert_eq!(gateway_definitions(&gateway), held);
 }
 
+// REQ-CLOUDDEF-35, REQ-CLOUDDEF-7: each `binding-unresolved` refusal Cloud answers a
+// publication with names the binding, and one that would close a loop of definitions reports
+// the loop in start order; every refusal leaves the record unlinked and Cloud unchanged.
+#[test]
+fn publish_cloud_prints_the_loop_a_publication_would_close() {
+    let tree = Tree::engineering();
+    let bindings = tree.engineering_bindings();
+    let cloud_id = format!("{CLOUD_ID_STEM}c");
+    let second = format!("{CLOUD_ID_STEM}d");
+    let third = format!("{CLOUD_ID_STEM}e");
+    let (c, d, e) = (cloud_id.as_str(), second.as_str(), third.as_str());
+    let rows: [(&str, Option<Vec<&str>>); 4] = [
+        // A binding Cloud does not resolve, as a definition of another project is: no loop.
+        ("unresolved", None),
+        ("bound to itself", Some(vec![c, c])),
+        ("loop of two", Some(vec![c, d, c])),
+        ("loop of three", Some(vec![c, d, e, c])),
+    ];
+
+    for (row, loop_ids) in rows {
+        let gateway = FakeGateway::new();
+        gateway.define(&cloud_id, 2);
+        let workflow = match &loop_ids {
+            Some(ids) => json!({"bindingKey": "verify", "loop": ids}),
+            None => json!({"bindingKey": "verify"}),
+        };
+        let refuse_next = || {
+            gateway.refuse_next_keyed_with(
+                "422 Unprocessable Entity",
+                422,
+                "binding-unresolved",
+                workflow.clone(),
+            );
+        };
+
+        refuse_next();
+        let home = Home::new();
+        let (output, _) = gateway.run(
+            &home,
+            &cloud_publish_args(&tree, &bindings, &["--cloud-to", &cloud_id, "--json"]),
+        );
+        assert_eq!(output.status.code(), Some(1), "{row}: {output:?}");
+        let refused = report(&output);
+        assert_eq!(refused["outcome"], "cloud_failed", "{row}: {refused}");
+        assert_eq!(refused["cloud"]["failure"], "refused", "{row}");
+        assert_eq!(refused["cloud"]["status"], 422, "{row}");
+        assert_eq!(refused["cloud"]["problem"], "binding-unresolved", "{row}");
+        assert_eq!(
+            refused["cloud"]["workflow"]["bindingKey"], "verify",
+            "{row}"
+        );
+        match &loop_ids {
+            Some(ids) => assert_eq!(refused["cloud"]["workflow"]["loop"], json!(ids), "{row}"),
+            None => assert!(
+                refused["cloud"]["workflow"].get("loop").is_none(),
+                "{row}: {refused}"
+            ),
+        }
+        assert_eq!(
+            published_record(&home, &refused)["cloudId"],
+            Value::Null,
+            "{row}"
+        );
+        assert_eq!(
+            gateway_definitions(&gateway),
+            vec![(cloud_id.clone(), 2)],
+            "{row}"
+        );
+
+        refuse_next();
+        let (output, _) = gateway.run(
+            &Home::new(),
+            &cloud_publish_args(&tree, &bindings, &["--cloud-to", &cloud_id]),
+        );
+        assert_eq!(output.status.code(), Some(1), "{row}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let lines = stderr.lines().collect::<Vec<_>>();
+        let binding = lines
+            .iter()
+            .position(|line| line.starts_with("binding:") && line.contains("verify"))
+            .unwrap_or_else(|| panic!("{row}: no binding line: {stderr}"));
+        match &loop_ids {
+            Some(ids) => {
+                let named = lines
+                    .get(binding + 1)
+                    .and_then(|line| line.strip_prefix("loop:"))
+                    .unwrap_or_else(|| panic!("{row}: no loop line after the binding: {stderr}"));
+                // The line names the ids in start order.
+                let mut rest = named;
+                for id in ids {
+                    let at = rest
+                        .find(id)
+                        .unwrap_or_else(|| panic!("{row}: {id} not in order: {stderr}"));
+                    rest = &rest[at + id.len()..];
+                }
+            }
+            None => assert!(
+                !lines.iter().any(|line| line.starts_with("loop:")),
+                "{row}: {stderr}"
+            ),
+        }
+        assert_eq!(
+            gateway_definitions(&gateway),
+            vec![(cloud_id.clone(), 2)],
+            "{row}"
+        );
+    }
+}
+
 // REQ-CLOUDDEF-22, REQ-CLOUDDEF-14: a reuse whose reply is lost is sent once more under the
 // same key and reported as the reuse Cloud recorded.
 #[test]
@@ -3938,8 +4201,45 @@ fn gateway_integrations() -> (Value, Value) {
     )
 }
 
+/// Whether `request`'s query names vocabulary 2, as a revision read may (REQ-CLOUDDEF-8).
+fn asks_for_vocabulary_2(request: &GatewayRequest) -> bool {
+    request
+        .path
+        .split_once('?')
+        .is_some_and(|(_, query)| query.split('&').any(|pair| pair == "vocabulary=2"))
+}
+
+/// The evaluation vocabulary `request`'s query names, 1 when it names none (REQ-TRIGGER-166).
+fn evaluation_vocabulary(request: &GatewayRequest) -> u32 {
+    request
+        .path
+        .split_once('?')
+        .and_then(|(_, query)| {
+            query
+                .split('&')
+                .find_map(|pair| pair.strip_prefix("vocabulary="))
+        })
+        .map_or(1, |number| number.parse().expect("a vocabulary number"))
+}
+
+const CLOUD_BOUND_DEFINITION: &str = "def_01k0z6r1w8f4jy2m7q9v3x5abe";
+const CLOUD_BOUND_DEFINITION_NAME: &str = "verify-change";
+
+/// The `verify` binding of kind `definition` and its resolution, which Cloud shows only under
+/// binding vocabulary 2 (REQ-CLOUDDEF-8).
+fn gateway_definition_binding() -> (Value, Value) {
+    (
+        json!({"kind": "definition", "value": CLOUD_BOUND_DEFINITION}),
+        json!({
+            "kind": "definition", "value": CLOUD_BOUND_DEFINITION,
+            "id": CLOUD_BOUND_DEFINITION, "name": CLOUD_BOUND_DEFINITION_NAME,
+        }),
+    )
+}
+
 /// The definition list, the revision reads and the setting changes; an enable without an
-/// execution principal is refused 409 `definition-not-startable`.
+/// execution principal is refused 409 `definition-not-startable`. As Cloud does, a revision
+/// read or listing that asks for binding vocabulary 2 is answered with the `verify` binding.
 fn respond_settings(
     state: &mut GatewayState,
     request: &GatewayRequest,
@@ -3961,20 +4261,28 @@ fn respond_settings(
         .strip_prefix('/')?
         .split_once('/')?;
     let definition = state.definitions.get_mut(id)?;
+    let latest = asks_for_vocabulary_2(request);
+    let integrations = definition.integrations;
+    let revision = |number| {
+        let mut revision = gateway_revision(id, number, integrations);
+        if latest {
+            let (binding, resolved) = gateway_definition_binding();
+            revision["bindings"]["verify"] = binding;
+            revision["resolution"]["verify"] = resolved;
+        }
+        revision
+    };
     match (method, action) {
         ("GET", "revisions") => {
             let items = (1..=definition.current)
                 .rev()
-                .map(|number| gateway_revision(id, number, definition.integrations))
+                .map(revision)
                 .collect::<Vec<_>>();
             return Some(super::json_http_response("200 OK", json!({"items": items})));
         }
         ("GET", action) => {
             let number = action.strip_prefix("revisions/")?.parse().ok()?;
-            return Some(super::json_http_response(
-                "200 OK",
-                gateway_revision(id, number, definition.integrations),
-            ));
+            return Some(super::json_http_response("200 OK", revision(number)));
         }
         ("POST", "enable") if definition.principal.is_none() => {
             return Some(super::problem_http_response(
@@ -4455,7 +4763,7 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
             "representation=3",
             &format!("runId={run_id}"),
             "state=failed",
-            "vocabulary=3"
+            "vocabulary=4"
         ]
     );
     let listed = report(&output);
@@ -4489,7 +4797,7 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(
         requests[0].path,
-        format!("{evaluations}?representation=3&vocabulary=3")
+        format!("{evaluations}?representation=3&vocabulary=4")
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_contains_all(
@@ -4550,7 +4858,7 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
             .map(|request| &request.path)
             .collect::<Vec<_>>(),
         [&format!(
-            "{evaluations}/{CLOUD_EVALUATION}?representation=3&vocabulary=3"
+            "{evaluations}/{CLOUD_EVALUATION}?representation=3&vocabulary=4"
         )]
     );
     let shown = report(&output);
@@ -4636,7 +4944,7 @@ fn cloud_evaluations_list_and_show_a_push_with_its_branch_and_commit() {
     let (path, query) = requests[0].path.split_once('?').expect("a query");
     assert_eq!(path, evaluations);
     assert!(
-        query.split('&').any(|pair| pair == "vocabulary=3"),
+        query.split('&').any(|pair| pair == "vocabulary=4"),
         "{query}"
     );
     let listed = report(&output);
@@ -4649,7 +4957,7 @@ fn cloud_evaluations_list_and_show_a_push_with_its_branch_and_commit() {
     assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].path,
-        format!("{evaluations}/{CLOUD_PUSH_EVALUATION}?representation=3&vocabulary=3")
+        format!("{evaluations}/{CLOUD_PUSH_EVALUATION}?representation=3&vocabulary=4")
     );
     let shown = report(&output);
     assert_eq!(shown["outcome"], "shown", "{shown}");
@@ -4666,13 +4974,161 @@ fn cloud_evaluations_list_and_show_a_push_with_its_branch_and_commit() {
     assert!(home.workflow_entries().is_empty());
 }
 
-// REQ-CLOUDDEF-15, REQ-TRIGGER-165, REQ-TRIGGER-166, REQ-TRIGGER-181: `evaluation list` and
-// `evaluation show` ask for representation 3 and evaluation vocabulary 3, so an
-// `issue.unblocked_in_state` evaluation is listed and read, printed as Cloud sent it under
-// `--json` and in human output with its issue and its blocker wait: when the wait began and
-// the blockers still open, each by its identifier or else its Linear id.
+// REQ-CLOUDDEF-15, REQ-TRIGGER-166: `evaluation list` and `evaluation show` ask for evaluation
+// vocabulary 4, so a `run.ended` evaluation is listed and read, printed as Cloud sent it under
+// `--json` and with the ended run, its attempt and its outcome in human output.
 #[test]
-fn cloud_evaluations_ask_for_vocabulary_3_and_show_an_evaluation_with_its_blocker_wait() {
+fn cloud_evaluations_ask_for_vocabulary_4_and_show_a_run_end_with_its_run_attempt_and_outcome() {
+    let home = Home::new();
+    let gateway = FakeGateway::new();
+    let definition = format!("{CLOUD_ID_STEM}c");
+    gateway.define(&definition, 2);
+    let evaluations = format!(
+        "/api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions/{definition}/evaluations"
+    );
+    let ended = gateway_run_ended_evaluation(&definition);
+    let evaluation = |leaf: &str, extra: &[&str]| {
+        let mut all = vec![
+            "workflow",
+            "definition",
+            "cloud",
+            "evaluation",
+            leaf,
+            CLOUD_ORGANIZATION,
+            definition.as_str(),
+        ];
+        all.extend_from_slice(extra);
+        all.extend_from_slice(&["--project-id", CLOUD_PROJECT, "--allow-insecure-http"]);
+        let (output, requests) = gateway.run(&home, &all);
+        super::assert_no_secret_output(&output, &[CLOUD_TOKEN]);
+        (output, requests)
+    };
+
+    let (output, requests) = evaluation("list", &["--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(requests.len(), 1);
+    let (path, query) = requests[0].path.split_once('?').expect("a query");
+    assert_eq!(path, evaluations);
+    assert!(
+        query.split('&').any(|pair| pair == "vocabulary=4"),
+        "{query}"
+    );
+    let listed = report(&output);
+    assert_eq!(listed["outcome"], "listed", "{listed}");
+    let items = listed["evaluations"].as_array().expect("evaluations");
+    assert!(items.contains(&ended), "{listed}");
+
+    let (output, requests) = evaluation("show", &[CLOUD_RUN_ENDED_EVALUATION, "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0].path,
+        format!("{evaluations}/{CLOUD_RUN_ENDED_EVALUATION}?representation=3&vocabulary=4")
+    );
+    let shown = report(&output);
+    assert_eq!(shown["outcome"], "shown", "{shown}");
+    assert_eq!(shown["evaluation"], ended);
+
+    let subject = format!("run.ended {CLOUD_ENDED_RUN} attempt 2 broken");
+    for args in [vec!["list"], vec!["show", CLOUD_RUN_ENDED_EVALUATION]] {
+        let (output, _) = evaluation(args[0], &args[1..]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert_contains_all(
+            &String::from_utf8_lossy(&output.stdout),
+            &[CLOUD_RUN_ENDED_EVALUATION, &subject],
+        );
+    }
+    assert!(home.workflow_entries().is_empty());
+}
+
+// REQ-CLOUDDEF-15, REQ-CLOUDDEF-8: `show` asks for binding vocabulary 2 on the revision read and
+// the revision listing, so a `definition` binding is printed as Cloud sent it under `--json` and
+// with the bound definition's id and name in human output.
+#[test]
+fn cloud_show_asks_for_binding_vocabulary_2_and_prints_a_definition_binding() {
+    let home = Home::new();
+    let gateway = FakeGateway::new();
+    let definition = format!("{CLOUD_ID_STEM}c");
+    gateway.define(&definition, 2);
+    let revisions = format!(
+        "/api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions/{definition}/revisions"
+    );
+    let show = |json: bool| {
+        let mut all = vec![
+            "workflow",
+            "definition",
+            "cloud",
+            "show",
+            CLOUD_ORGANIZATION,
+            definition.as_str(),
+            "--project-id",
+            CLOUD_PROJECT,
+            "--allow-insecure-http",
+        ];
+        if json {
+            all.push("--json");
+        }
+        let (output, requests) = gateway.run(&home, &all);
+        super::assert_no_secret_output(&output, &[CLOUD_TOKEN]);
+        (output, requests)
+    };
+    let (binding, resolved) = gateway_definition_binding();
+
+    let (output, requests) = show(true);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let shown = report(&output);
+    assert_eq!(shown["outcome"], "shown", "{shown}");
+    assert_eq!(shown["revision"]["bindings"]["verify"], binding, "{shown}");
+    assert_eq!(
+        shown["revision"]["resolution"]["verify"], resolved,
+        "{shown}"
+    );
+    let items = shown["revisions"].as_array().expect("revisions");
+    assert_eq!(items.len(), 2, "{shown}");
+    for item in items {
+        assert_eq!(item["bindings"]["verify"], binding, "{item}");
+        assert_eq!(item["resolution"]["verify"], resolved, "{item}");
+    }
+    let revision_reads = requests
+        .iter()
+        .filter(|request| request.route().starts_with(&format!("GET {revisions}")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        revision_reads
+            .iter()
+            .map(|request| request.route())
+            .collect::<Vec<_>>(),
+        vec![format!("GET {revisions}/2"), format!("GET {revisions}")]
+    );
+    for request in revision_reads {
+        assert!(asks_for_vocabulary_2(request), "{}", request.path);
+    }
+
+    let (output, _) = show(false);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .find(|line| line.starts_with("verify"))
+        .unwrap_or_else(|| panic!("no verify line: {stdout}"));
+    assert_contains_all(
+        line,
+        &[
+            CLOUD_BOUND_DEFINITION,
+            "definition",
+            CLOUD_BOUND_DEFINITION_NAME,
+        ],
+    );
+    assert!(home.workflow_entries().is_empty());
+}
+
+// REQ-CLOUDDEF-15, REQ-TRIGGER-165, REQ-TRIGGER-166, REQ-TRIGGER-181: `evaluation list` and
+// `evaluation show` ask for representation 3 and an evaluation vocabulary that holds
+// `issue.unblocked_in_state`, so such an evaluation is listed and read, printed as Cloud sent
+// it under `--json` and in human output with its issue and its blocker wait: when the wait
+// began and the blockers still open, each by its identifier or else its Linear id.
+#[test]
+fn cloud_evaluations_ask_for_representation_3_and_show_an_evaluation_with_its_blocker_wait() {
     let home = Home::new();
     let gateway = FakeGateway::new();
     let definition = format!("{CLOUD_ID_STEM}c");
@@ -4706,7 +5162,7 @@ fn cloud_evaluations_ask_for_vocabulary_3_and_show_an_evaluation_with_its_blocke
     assert_eq!(path, evaluations);
     let mut pairs = query.split('&').collect::<Vec<_>>();
     pairs.sort_unstable();
-    assert_eq!(pairs, ["representation=3", "vocabulary=3"]);
+    assert_eq!(pairs, ["representation=3", "vocabulary=4"]);
     let listed = report(&output);
     assert_eq!(listed["outcome"], "listed", "{listed}");
     let items = listed["evaluations"].as_array().expect("evaluations");
@@ -4732,7 +5188,7 @@ fn cloud_evaluations_ask_for_vocabulary_3_and_show_an_evaluation_with_its_blocke
     assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].path,
-        format!("{evaluations}/{CLOUD_WAITING_EVALUATION}?representation=3&vocabulary=3")
+        format!("{evaluations}/{CLOUD_WAITING_EVALUATION}?representation=3&vocabulary=4")
     );
     let shown = report(&output);
     assert_eq!(shown["outcome"], "shown", "{shown}");

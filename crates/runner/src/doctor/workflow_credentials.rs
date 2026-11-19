@@ -834,8 +834,9 @@ impl Reading {
                     self.add_unknown(path, UnknownDeclaration::ConnectionBinding, None, Some(key));
                     continue;
                 }
-                // A member names an organization principal, not a provider credential.
-                BindingKind::Member | BindingKind::Members => continue,
+                // A member names an organization principal and a definition a workflow
+                // definition, neither a provider credential.
+                BindingKind::Member | BindingKind::Members | BindingKind::Definition => continue,
             };
             self.add_origin(kind, path, OriginDeclaration::Binding, None, Some(key));
         }

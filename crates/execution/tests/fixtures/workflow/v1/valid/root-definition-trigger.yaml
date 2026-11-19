@@ -1,0 +1,24 @@
+# A root whose triggers start on another definition's run ending with a named outcome,
+# one name or a list of them (REQ-WFDEF-39, REQ-WFFORMAT-82).
+schemaVersion: 1
+inputs:
+  ticket:
+    kind: text
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["true"]
+bindings:
+  verify: {kind: definition}
+triggers:
+  repair:
+    on: {definition: $verify, outcome: broken}
+    subject: main
+    inputs:
+      ticket: event.exports.repairRequest
+  repairAny:
+    on: {definition: $verify, outcome: [broken, failed]}
+    subject: main
+    inputs:
+      ticket: event.exports.repairRequest

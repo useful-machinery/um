@@ -41,11 +41,12 @@ use useful_execution::{
 };
 use useful_runner_protocol::{
     AssignmentDecline, CancellationMode, CloudFrame, ContinuationOffer, ExecutionSpecInvalidReason,
-    RunControlApplication, RunControlOutcome, RunControlSkip, RunnerEnvelope, RunnerFrame,
-    RunnerUnableReason, SourceDisplayRepositoryV1RunnerProjection, TreeExit, TriggerDelivery,
-    TriggerDeliveryAction, TriggerDeliveryApplication, TriggerDeliveryOutcome,
-    TriggerIssueObservation, ValidationFacts, WorkflowTreeFileV1RunnerProjection,
-    WorkflowTreeV1RunnerProjection, decode_cloud_frame, encode_runner_frame,
+    MAXIMUM_ORDINARY_FRAME_BYTES, RunControlApplication, RunControlOutcome, RunControlSkip,
+    RunnerEnvelope, RunnerFrame, RunnerUnableReason, SourceDisplayRepositoryV1RunnerProjection,
+    TreeExit, TreeExport, TriggerDelivery, TriggerDeliveryAction, TriggerDeliveryApplication,
+    TriggerDeliveryOutcome, TriggerIssueObservation, ValidationFacts,
+    WorkflowTreeFileV1RunnerProjection, WorkflowTreeV1RunnerProjection, decode_cloud_frame,
+    encode_runner_frame,
 };
 
 const TREE_DIGEST: &str = "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945";
@@ -372,6 +373,22 @@ const TREE_FILES: &[TreeFile] = &[
     TreeFile {
         path: "workflow.yaml",
         bytes: b"schemaVersion: 1\nname: build\nsteps:\n  build:\n    kind: cmd\n    command:\n      argv: [/bin/sh, -c, 'exit 0']\n  review:\n    kind: cmd\n    dependsOn: [build]\n    command:\n      argv: [/bin/sh, -c, 'exit 0']\n",
+        executable: false,
+    },
+    TreeFile {
+        path: "bin/check.sh",
+        bytes: b"#!/bin/sh\nexit 0\n",
+        executable: true,
+    },
+];
+
+/// `TREE_FILES` whose root binds `verify` to a workflow definition and starts on a run of that
+/// definition ending `broken`, binding its one optional input from the run's event. Its
+/// steps name their program `sh`, not a path, as the built `useful` requires.
+const DEFINITION_BOUND_TREE_FILES: &[TreeFile] = &[
+    TreeFile {
+        path: "workflow.yaml",
+        bytes: b"schemaVersion: 1\nname: build\ninputs:\n  note:\n    kind: text\n    optional: true\nsteps:\n  build:\n    kind: cmd\n    command:\n      argv: [sh, -c, 'exit 0']\n  review:\n    kind: cmd\n    dependsOn: [build]\n    command:\n      argv: [sh, -c, 'exit 0']\nbindings:\n  verify: {kind: definition}\ntriggers:\n  repair:\n    on: {definition: $verify, outcome: broken}\n    inputs:\n      note: event.runId\n",
         executable: false,
     },
     TreeFile {
@@ -856,6 +873,7 @@ async fn published_tree_runs_once_and_reports_the_chosen_outcome() {
             chosen_outcome: Some("planned".to_owned()),
             mirror: Vec::new(),
             claim_release: false,
+            exports: Vec::new(),
         }
     );
 }
@@ -1437,6 +1455,69 @@ async fn published_digest_other_than_the_spec_declines_the_assignment() {
     assert!(!fixture.log.join("create.args").exists());
 }
 
+/// The digest, `sha256:<hex>`, that `useful`'s `workflow definition validate` reports for
+/// `files`.
+fn validated_digest(useful: &Path, files: &[TreeFile]) -> String {
+    let tree = tempfile::tempdir().unwrap();
+    for file in files {
+        let path = tree.path().join(file.path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, file.bytes).unwrap();
+        if file.executable {
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let output = std::process::Command::new(useful)
+        .args(["workflow", "definition", "validate"])
+        .arg(tree.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    format!("sha256:{}", report["digest"]["value"].as_str().unwrap())
+}
+
+// REQ-CLOUDDEF-16, REQ-WFDEF-40: a run's offer carries no `definition` binding, and the
+// runner's own `useful` publishes a tree whose root declares one, required, without it.
+#[tokio::test]
+async fn a_tree_whose_definition_binding_the_offer_omits_is_published_by_the_built_useful() {
+    let digest = validated_digest(&built_useful(), DEFINITION_BOUND_TREE_FILES);
+    let mut fixture = fixture_sourced(
+        TREE_DIGEST,
+        "exited",
+        "\"planned\"",
+        &[],
+        None,
+        super::command::SHORT_COMMAND_BOUND,
+        fixture_source_broker,
+        OfferedTree {
+            files: DEFINITION_BOUND_TREE_FILES,
+            useful: |_| built_useful(),
+        },
+    );
+    let tree = fixture.offer.execution_spec.workflow_tree.as_mut().unwrap();
+    tree.digest = digest;
+    tree.bindings = json!({});
+    tree.resolution = json!({});
+
+    assert_eq!(
+        prepare_offered(&mut fixture.manager, &fixture.offer).await,
+        None
+    );
+
+    let (_, private) = accepted_roots(&fixture.manager);
+    let definition = super::command::only_entry(&private.join("home/workflows")).unwrap();
+    let revision = super::command::only_entry(&definition.join("revisions")).unwrap();
+    let bindings: Value =
+        serde_json::from_slice(&fs::read(revision.join("bindings.json")).unwrap()).unwrap();
+    assert!(bindings.get("verify").is_none(), "{bindings}");
+}
+
 /// The report a publish that refuses the tree prints, of `outcome` and `diagnostics`.
 fn publish_report(outcome: &str, diagnostics: Value) -> String {
     serde_json::to_string_pretty(&json!({
@@ -1725,6 +1806,7 @@ async fn resolution_is_written_before_create_and_the_finish_reports_the_mirror()
             chosen_outcome: Some("landed".to_owned()),
             mirror: writes.into_iter().map(mirror_result).collect(),
             claim_release: true,
+            exports: Vec::new(),
         }
     );
 }
@@ -2799,6 +2881,7 @@ async fn withdraw_control_on_a_waiting_run_ends_it_withdrawn_without_a_resume() 
             chosen_outcome: Some("withdrawn".to_owned()),
             mirror: vec![mirror_result(withdrawn_write())],
             claim_release: true,
+            exports: Vec::new(),
         }
     );
 }
@@ -3656,6 +3739,7 @@ fn exited(outcome: &str) -> super::records::TreeRecord {
         position: Vec::new(),
         mirror: Vec::new(),
         earlier_writes: 0,
+        exports: Vec::new(),
     }
 }
 
@@ -3848,6 +3932,7 @@ fn exited_records_conclude_from_the_engine_result_not_the_chosen_outcome() {
             position: vec![json!("merge")],
             mirror: Vec::new(),
             earlier_writes: 0,
+            exports: Vec::new(),
         };
         assert_eq!(
             conclude(Some(&record), None, Some(CancellationReason::UserRequest)),
@@ -4924,6 +5009,7 @@ async fn unreadable_mirror_reports_no_writes_and_is_recorded_on_the_run_event() 
                 chosen_outcome: Some("landed".to_owned()),
                 mirror: Vec::new(),
                 claim_release: false,
+                exports: Vec::new(),
             },
             "{name}"
         );
@@ -5423,6 +5509,7 @@ async fn adopted_exited_run_is_reported_as_it_reads_without_a_command() {
             chosen_outcome: Some("landed".to_owned()),
             mirror: Vec::new(),
             claim_release: false,
+            exports: Vec::new(),
         }
     );
     assert_eq!(files(&adopted.home), home);
@@ -5751,6 +5838,11 @@ fn finished_payload(reports: &[ExecutionReport], offer: &AssignmentOffer) -> Val
 /// The frame `report` encodes for `offer`, encoding validating it against the closed
 /// protocol schema.
 fn encoded_frame(report: &ExecutionReport, offer: &AssignmentOffer) -> Value {
+    serde_json::from_slice(&encoded_frame_bytes(report, offer)).unwrap()
+}
+
+/// The bytes of the frame `report` encodes for `offer`, as `encoded_frame` encodes it.
+fn encoded_frame_bytes(report: &ExecutionReport, offer: &AssignmentOffer) -> Vec<u8> {
     let frame = report.runner_frame(
         useful_runner_protocol::RunnerEnvelope {
             message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
@@ -5762,9 +5854,8 @@ fn encoded_frame(report: &ExecutionReport, offer: &AssignmentOffer) -> Value {
         offer.assignment_id.clone(),
         offer.attempt_id.clone(),
     );
-    let encoded = useful_runner_protocol::encode_runner_frame(&frame)
-        .unwrap_or_else(|error| panic!("{report:#?} does not encode: {error:?}"));
-    serde_json::from_slice(&encoded).unwrap()
+    useful_runner_protocol::encode_runner_frame(&frame)
+        .unwrap_or_else(|error| panic!("{report:#?} does not encode: {error:?}"))
 }
 
 // REQ-RUNNERENROLL-88: a state record that could not be read is skipped only until it can
@@ -5943,6 +6034,7 @@ fn unreported_exit() -> TreeExit {
         chosen_outcome: None,
         mirror: Vec::new(),
         claim_release: false,
+        exports: Vec::new(),
     }
 }
 
@@ -6181,6 +6273,7 @@ async fn adopted_exit_reports_the_run_mirror_and_releases_only_on_its_own_depart
             chosen_outcome: Some("failed".to_owned()),
             mirror: writes.iter().cloned().map(mirror_result).collect(),
             claim_release: false,
+            exports: Vec::new(),
         }
     );
 
@@ -6235,6 +6328,7 @@ async fn adopted_continuation_requests_release_only_on_its_own_outcome_write() {
                     .map(mirror_result)
                     .collect(),
                 claim_release: release,
+                exports: Vec::new(),
             },
             "{own:#?}"
         );
@@ -6271,6 +6365,7 @@ async fn adopted_run_whose_earlier_writes_cannot_be_counted_requests_no_release(
             chosen_outcome: Some("landed".to_owned()),
             mirror: vec![mirror_result(written.clone()), mirror_result(written)],
             claim_release: false,
+            exports: Vec::new(),
         }
     );
 }
@@ -6397,6 +6492,7 @@ async fn adopted_run_counts_its_earlier_writes_before_applying_its_offer_deliver
                     .map(mirror_result)
                     .collect(),
                 claim_release: release,
+                exports: Vec::new(),
             },
             "{own:#?}"
         );
@@ -7184,4 +7280,670 @@ async fn run_log_stops_growing_at_its_cap_with_one_truncation_line() {
     let cap = usize::try_from(super::command::MAXIMUM_LOG_BYTES).unwrap();
     assert_eq!(log.len(), cap + super::command::LOG_TRUNCATED.len());
     assert!(log.ends_with(super::command::LOG_TRUNCATED));
+}
+
+/// An export of a result `write_result` writes: its name, its entry in `result.json` and the
+/// bytes of the carrier its entry's `path` names under `exports/`, when one is written.
+struct StagedExport {
+    name: String,
+    entry: Value,
+    carrier: Option<Vec<u8>>,
+}
+
+/// The `result.json` entry of an available export of `kind` whose carrier is
+/// `exports/<ordinal>`, recorded of `size_bytes`.
+fn available_entry(kind: &str, ordinal: usize, size_bytes: Value) -> Value {
+    json!({
+        "state": "available",
+        "kind": kind,
+        "mediaType": if kind == "json" { "application/json" } else { "text/plain" },
+        "path": format!("exports/{ordinal:04}"),
+        "sizeBytes": size_bytes,
+        "digest": { "algorithm": "sha256", "value": "0".repeat(64) },
+    })
+}
+
+/// An available text export `name` at `exports/<ordinal>` whose carrier holds `bytes`, its
+/// recorded size theirs.
+fn text_export(name: &str, ordinal: usize, bytes: &[u8]) -> StagedExport {
+    StagedExport {
+        name: name.to_owned(),
+        entry: available_entry("text", ordinal, json!(bytes.len())),
+        carrier: Some(bytes.to_vec()),
+    }
+}
+
+/// An available text export `name` at `exports/<ordinal>` recorded of `size_bytes`, with
+/// no carrier written.
+fn unwritten_text_export(name: &str, ordinal: usize, size_bytes: u64) -> StagedExport {
+    StagedExport {
+        name: name.to_owned(),
+        entry: available_entry("text", ordinal, json!(size_bytes)),
+        carrier: None,
+    }
+}
+
+/// An export `name` the result lists unavailable for `reason`.
+fn unavailable_export(name: &str, reason: &str) -> StagedExport {
+    StagedExport {
+        name: name.to_owned(),
+        entry: json!({ "state": "unavailable", "reason": reason }),
+        carrier: None,
+    }
+}
+
+/// The text `repairRequest` carries in the exports of a `broken` run: two lines, one with a
+/// character outside ASCII.
+const REPAIR_REQUEST: &str = "Repair the build.\nThe linker failed on café.o.\n";
+
+/// The exports of the result a `broken` run publishes: `buildLog`, a text past the one-text
+/// bound with no carrier written, `empty`, a text of no bytes, `missing`, unavailable,
+/// `repairRequest`, a text of `REPAIR_REQUEST`, and `summary`, a JSON export.
+fn broken_run_exports() -> Vec<StagedExport> {
+    let summary = br#"{"failed":1}"#;
+    vec![
+        unwritten_text_export("buildLog", 1, 70_000),
+        text_export("empty", 2, b""),
+        unavailable_export("missing", "source_failed"),
+        text_export("repairRequest", 3, REPAIR_REQUEST.as_bytes()),
+        StagedExport {
+            name: "summary".to_owned(),
+            entry: available_entry("json", 4, json!(summary.len())),
+            carrier: Some(summary.to_vec()),
+        },
+    ]
+}
+
+/// Writes under `run` the `result.json` of the result at `relative`, `result` with `exports`
+/// as its `exports`, and each export's carrier.
+fn write_result(run: &Path, relative: &str, mut result: Value, exports: &[StagedExport]) {
+    let directory = run.join(relative);
+    fs::create_dir_all(directory.join("exports")).unwrap();
+    result["exports"] = Value::Object(
+        exports
+            .iter()
+            .map(|export| (export.name.clone(), export.entry.clone()))
+            .collect(),
+    );
+    fs::write(
+        directory.join("result.json"),
+        serde_json::to_vec(&result).unwrap(),
+    )
+    .unwrap();
+    for export in exports {
+        if let Some(carrier) = &export.carrier {
+            let path = export.entry["path"].as_str().unwrap();
+            fs::write(directory.join(path), carrier).unwrap();
+        }
+    }
+}
+
+/// The run directory as the fixture's stage `exited` leaves it.
+fn exited_stage(log: &Path) -> PathBuf {
+    let run = log.join("stages/exited");
+    fs::create_dir_all(&run).unwrap();
+    run
+}
+
+/// Stages, for the fixture's stage `exited`, the result the run's current attempt published:
+/// a `state.json` recording attempt 1 `state` with `published_result()`, and that result,
+/// `result` with `exports`, as `write_result` writes it.
+fn stage_result(log: &Path, state: &str, result: Value, exports: &[StagedExport]) {
+    let run = exited_stage(log);
+    fs::write(
+        run.join("state.json"),
+        attempt_state(state, published_result(), json!([])),
+    )
+    .unwrap();
+    write_result(&run, "attempts/000001/result", result, exports);
+}
+
+/// Executes a run that exits `outcome`, with `variables` added to the daemon's environment
+/// and `staging` given the fixture's log first, and returns its reports, its run event and
+/// its offer.
+async fn executed_recorded(
+    outcome: &str,
+    variables: &[(&str, &str)],
+    staging: impl FnOnce(&Path),
+) -> (
+    Vec<ExecutionReport>,
+    serde_json::Map<String, Value>,
+    AssignmentOffer,
+) {
+    let (recorder, capture) = crate::telemetry::test_recorder("rbt_fixture");
+    let mut fixture = fixture_recording(TREE_DIGEST, "exited", outcome, variables, Some(recorder));
+    staging(&fixture.log);
+    let reports = execute(&mut fixture).await;
+    (reports, capture.event("runner.run"), fixture.offer)
+}
+
+/// The exit of the tree finish that ends `reports`.
+fn finished_exit(reports: &[ExecutionReport]) -> &TreeExit {
+    let Some(ExecutionReport::TreeFinished { exit, .. }) = reports.last() else {
+        panic!("expected a tree finish: {reports:#?}");
+    };
+    exit
+}
+
+/// `payload` without its `exports`.
+fn without_exports(mut payload: Value) -> Value {
+    payload.as_object_mut().unwrap().remove("exports");
+    payload
+}
+
+fn carried(name: &str, text: &str) -> TreeExport {
+    TreeExport::with_text(name, text).unwrap()
+}
+
+fn sized(name: &str, size: u64) -> TreeExport {
+    TreeExport::by_size(name, size).unwrap()
+}
+
+// REQ-RUNNERENROLL-131: a run that exits with a workflow outcome reports the text exports its
+// current attempt's result lists available, in the result's order: one past the one-text
+// bound by its recorded size, unread, and the others with their text, an empty one included.
+// An unavailable export and one of another kind are not listed, and nothing else of the
+// finish changes.
+#[tokio::test]
+async fn exited_run_reports_the_available_text_exports_its_result_lists() {
+    let (unstaged, _, offer) = executed_recorded("\"broken\"", &[], |_| {}).await;
+    let (reports, run, _) = executed_recorded("\"broken\"", &[], |log| {
+        stage_result(
+            log,
+            "succeeded",
+            json!({ "outcome": "succeeded" }),
+            &broken_run_exports(),
+        );
+    })
+    .await;
+
+    let expected = vec![
+        sized("buildLog", 70_000),
+        carried("empty", ""),
+        carried("repairRequest", REPAIR_REQUEST),
+    ];
+    assert_eq!(finished_exit(&reports).exports, expected);
+    let payload = finished_payload(&reports, &offer);
+    assert_eq!(
+        payload["exports"],
+        json!([
+            { "name": "buildLog", "size": 70_000 },
+            { "name": "empty", "size": 0, "text": "" },
+            {
+                "name": "repairRequest",
+                "size": REPAIR_REQUEST.len(),
+                "text": REPAIR_REQUEST,
+            },
+        ])
+    );
+    assert_eq!(
+        without_exports(payload),
+        finished_payload(&unstaged, &offer)
+    );
+    assert_eq!(run.get("um.run.export_read_failure"), None);
+}
+
+// REQ-RUNNERENROLL-131, REQ-RUNNERENROLL-130: the finish a run that exits with text exports
+// encodes is the protocol fixture `runner-execution-finished-tree-exports.json`, which the
+// Gateway's suite decodes as a session does.
+#[tokio::test]
+async fn exited_run_with_text_exports_encodes_the_finish_the_gateway_admits() {
+    let (reports, _, offer) = executed_recorded("\"broken\"", &[], |log| {
+        stage_result(
+            log,
+            "succeeded",
+            json!({ "outcome": "succeeded" }),
+            &broken_run_exports(),
+        );
+    })
+    .await;
+
+    let Some(finished) = reports.last() else {
+        panic!("expected a terminal report");
+    };
+    let frame = encoded_frame(finished, &offer);
+    let fixture = fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/runner-protocol/v1/valid/runner-execution-finished-tree-exports.json"
+    ))
+    .unwrap();
+    assert_eq!(frame, serde_json::from_slice::<Value>(&fixture).unwrap());
+}
+
+// REQ-RUNNERENROLL-131: a result that lists no available text export carries no `exports`
+// member, and the finish is the one of the same run with nothing staged.
+#[tokio::test]
+async fn result_without_an_available_text_export_finishes_without_the_member() {
+    let (unstaged, _, offer) = executed_recorded("\"broken\"", &[], |_| {}).await;
+    let (reports, run, _) = executed_recorded("\"broken\"", &[], |log| {
+        let summary = br#"{"failed":1}"#;
+        stage_result(
+            log,
+            "succeeded",
+            json!({ "outcome": "succeeded" }),
+            &[
+                unavailable_export("missing", "source_failed"),
+                StagedExport {
+                    name: "summary".to_owned(),
+                    entry: available_entry("json", 1, json!(summary.len())),
+                    carrier: Some(summary.to_vec()),
+                },
+            ],
+        );
+    })
+    .await;
+
+    let payload = finished_payload(&reports, &offer);
+    assert_eq!(payload.get("exports"), None);
+    assert_eq!(payload, finished_payload(&unstaged, &offer));
+    assert_eq!(run.get("um.run.export_read_failure"), None);
+}
+
+// REQ-RUNNERENROLL-131: texts are carried while each is within the one-text bound and all
+// carried within the total; one past it is listed by size, a later one of no bytes still
+// carried; only the first 64 exports are listed, the 65th recorded `export_list_truncated`;
+// and a finish whose texts escape to more than an ordinary frame still encodes.
+#[tokio::test]
+async fn exports_past_a_bound_are_listed_by_size_or_not_at_all() {
+    let full = vec![b'a'; 65_536];
+    let (reports, run, _) = executed_recorded("\"broken\"", &[], |log| {
+        stage_result(
+            log,
+            "succeeded",
+            json!({ "outcome": "succeeded" }),
+            &[
+                text_export("a", 1, &full),
+                text_export("b", 2, &full),
+                text_export("c", 3, b"0123456789"),
+                text_export("d", 4, b""),
+            ],
+        );
+    })
+    .await;
+    let full = String::from_utf8(full).unwrap();
+    assert_eq!(
+        finished_exit(&reports).exports,
+        vec![
+            carried("a", &full),
+            carried("b", &full),
+            sized("c", 10),
+            carried("d", ""),
+        ]
+    );
+    assert_eq!(run.get("um.run.export_read_failure"), None);
+
+    let names = (0..70).map(|n| format!("e{n:02}")).collect::<Vec<_>>();
+    let (reports, run, _) = executed_recorded("\"broken\"", &[], |log| {
+        let exports = names
+            .iter()
+            .zip(1..)
+            .map(|(name, ordinal)| text_export(name, ordinal, b"x"))
+            .collect::<Vec<_>>();
+        stage_result(
+            log,
+            "succeeded",
+            json!({ "outcome": "succeeded" }),
+            &exports,
+        );
+    })
+    .await;
+    assert_eq!(
+        finished_exit(&reports).exports,
+        names[..64]
+            .iter()
+            .map(|name| carried(name, "x"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(run["um.run.export_read_failure"], "export_list_truncated");
+
+    let control = "\u{1}".repeat(65_536);
+    let (reports, _, offer) = executed_recorded("\"broken\"", &[], |log| {
+        stage_result(
+            log,
+            "succeeded",
+            json!({ "outcome": "succeeded" }),
+            &[
+                text_export("a", 1, control.as_bytes()),
+                text_export("b", 2, control.as_bytes()),
+            ],
+        );
+    })
+    .await;
+    assert_eq!(
+        finished_exit(&reports).exports,
+        vec![carried("a", &control), carried("b", &control)]
+    );
+    assert!(
+        encoded_frame_bytes(reports.last().unwrap(), &offer).len() > MAXIMUM_ORDINARY_FRAME_BYTES
+    );
+}
+
+// REQ-RUNNERENROLL-131: an export the runner cannot read is left out of a finish that is
+// otherwise the run's, never aborted, and the run event records the fault's class: beside a
+// readable `repairRequest`, a carrier that is absent or a symbolic link, one shorter than
+// its recorded size or not UTF-8, and an entry whose path or size is not the engine's; and,
+// with nothing listed, a result that cannot be found or read.
+#[tokio::test]
+async fn export_that_cannot_be_read_is_left_out_and_its_class_recorded() {
+    let (unstaged, _, offer) = executed_recorded("\"broken\"", &[], |_| {}).await;
+    let unstaged = finished_payload(&unstaged, &offer);
+    fn succeeded() -> Value {
+        json!({ "outcome": "succeeded" })
+    }
+    fn repair() -> StagedExport {
+        text_export("repairRequest", 2, REPAIR_REQUEST.as_bytes())
+    }
+    fn beside_repair(faulty: StagedExport) -> impl FnOnce(&Path) {
+        move |log: &Path| stage_result(log, "succeeded", succeeded(), &[faulty, repair()])
+    }
+    type Staging = Box<dyn FnOnce(&Path)>;
+    let rows: Vec<(&str, Staging, &str)> = vec![
+        (
+            "absent carrier",
+            Box::new(beside_repair(unwritten_text_export("faulty", 1, 5))),
+            "export_carrier_unavailable",
+        ),
+        (
+            "linked carrier",
+            Box::new(|log: &Path| {
+                stage_result(
+                    log,
+                    "succeeded",
+                    succeeded(),
+                    &[unwritten_text_export("faulty", 1, 5), repair()],
+                );
+                std::os::unix::fs::symlink(
+                    "0002",
+                    exited_stage(log).join("attempts/000001/result/exports/0001"),
+                )
+                .unwrap();
+            }),
+            "export_carrier_unavailable",
+        ),
+        (
+            "short carrier",
+            Box::new(beside_repair(StagedExport {
+                carrier: Some(b"short".to_vec()),
+                ..unwritten_text_export("faulty", 1, 10)
+            })),
+            "export_size_mismatch",
+        ),
+        (
+            "carrier not UTF-8",
+            Box::new(beside_repair(text_export("faulty", 1, &[0xff, 0xfe]))),
+            "export_not_utf8",
+        ),
+        (
+            "path out of the result",
+            Box::new(beside_repair(StagedExport {
+                entry: json!({
+                    "state": "available",
+                    "kind": "text",
+                    "mediaType": "text/plain",
+                    "path": "../../run.json",
+                    "sizeBytes": 5,
+                }),
+                ..unwritten_text_export("faulty", 1, 5)
+            })),
+            "export_entry_invalid",
+        ),
+        (
+            "size a string",
+            Box::new(beside_repair(StagedExport {
+                name: "faulty".to_owned(),
+                entry: available_entry("text", 1, json!("5")),
+                carrier: Some(b"12345".to_vec()),
+            })),
+            "export_entry_invalid",
+        ),
+        (
+            "state record absent",
+            Box::new(|log: &Path| {
+                write_result(
+                    &exited_stage(log),
+                    "attempts/000001/result",
+                    succeeded(),
+                    &[repair()],
+                );
+            }),
+            "export_result_unavailable",
+        ),
+        (
+            "result not published",
+            Box::new(|log: &Path| {
+                let run = exited_stage(log);
+                fs::write(
+                    run.join("state.json"),
+                    attempt_state(
+                        "succeeded",
+                        json!({ "status": "not_published", "reason": "publication_pending" }),
+                        json!([]),
+                    ),
+                )
+                .unwrap();
+                write_result(&run, "attempts/000001/result", succeeded(), &[repair()]);
+            }),
+            "export_result_unavailable",
+        ),
+        (
+            "result not JSON",
+            Box::new(|log: &Path| {
+                stage_result(log, "succeeded", succeeded(), &[repair()]);
+                fs::write(
+                    exited_stage(log).join("attempts/000001/result/result.json"),
+                    b"{\"exports\":",
+                )
+                .unwrap();
+            }),
+            "export_result_unavailable",
+        ),
+    ];
+    for (row, staging, class) in rows {
+        let (reports, run, _) = executed_recorded("\"broken\"", &[], staging).await;
+
+        let listed = if class == "export_result_unavailable" {
+            Vec::new()
+        } else {
+            vec![carried("repairRequest", REPAIR_REQUEST)]
+        };
+        assert_eq!(finished_exit(&reports).exports, listed, "{row}");
+        assert_eq!(
+            without_exports(finished_payload(&reports, &offer)),
+            unstaged,
+            "{row}"
+        );
+        assert_eq!(run["um.run.export_read_failure"], class, "{row}");
+    }
+}
+
+// REQ-RUNNERENROLL-131: a text that holds a NUL is carried as its file holds it.
+#[tokio::test]
+async fn text_holding_a_nul_is_carried_as_its_file_holds_it() {
+    let (reports, run, _) = executed_recorded("\"broken\"", &[], |log| {
+        stage_result(
+            log,
+            "succeeded",
+            json!({ "outcome": "succeeded" }),
+            &[text_export("note", 1, b"before\0after")],
+        );
+    })
+    .await;
+
+    assert_eq!(
+        finished_exit(&reports).exports,
+        vec![carried("note", "before\0after")]
+    );
+    assert_eq!(run.get("um.run.export_read_failure"), None);
+}
+
+// REQ-RUNNERENROLL-131: a run that failed and chose its `onFailure` outcome reports the text
+// export its result lists available and not the one its failed step could not produce.
+#[tokio::test]
+async fn failed_run_choosing_its_on_failure_outcome_reports_its_available_text_exports() {
+    let (reports, run, _) = executed_recorded(
+        "\"blocked\"",
+        &[("TREE_TEST_RESULT", BUILD_FAILED)],
+        |log| {
+            let (_, issue) = build_failure();
+            stage_result(
+                log,
+                "workflow_failed",
+                json!({ "outcome": "failed", "primaryIssue": issue }),
+                &[
+                    text_export("plan", 1, b"Split the build.\n"),
+                    unavailable_export("verdict", "source_failed"),
+                ],
+            );
+        },
+    )
+    .await;
+
+    let Some(ExecutionReport::TreeFinished { outcome, .. }) = reports.last() else {
+        panic!("expected a tree finish: {reports:#?}");
+    };
+    assert_eq!(outcome["outcome"], "failed");
+    assert_eq!(
+        finished_exit(&reports).exports,
+        vec![carried("plan", "Split the build.\n")]
+    );
+    assert_eq!(run.get("um.run.export_read_failure"), None);
+}
+
+// REQ-RUNNERENROLL-131: a continuation reports the exports of the attempt that exited the run,
+// the current attempt `state.json` names, not an earlier attempt's.
+#[tokio::test]
+async fn continuation_reports_the_exports_of_the_attempt_that_exited() {
+    let adopted = adopted(record("exited", Some("landed"), 2, json!([])), None);
+    let attempt = |number: u64, state: &str| {
+        json!({
+            "attemptNumber": number,
+            "state": state,
+            "result": {
+                "status": "published",
+                "relativeDirectory": format!("attempts/{number:06}/result"),
+            },
+            "progress": { "steps": [] },
+        })
+    };
+    fs::write(
+        adopted.run.join("state.json"),
+        serde_json::to_vec(&json!({
+            "schemaVersion": 1,
+            "currentAttemptNumber": 2,
+            "attempts": [attempt(1, "continued"), attempt(2, "succeeded")],
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    for (relative, text) in [
+        ("attempts/000001/result", "first attempt"),
+        ("attempts/000002/result", "second attempt"),
+    ] {
+        write_result(
+            &adopted.run,
+            relative,
+            json!({ "outcome": "succeeded" }),
+            &[text_export("note", 1, text.as_bytes())],
+        );
+    }
+    let (end, _) = drive_adopted(&adopted, &[], "").await;
+
+    let TreeConclusion::Terminal { exit, .. } = end.conclusion() else {
+        panic!("an exited record has a result: {end:#?}");
+    };
+    assert_eq!(exit.exports, vec![carried("note", "second attempt")]);
+    assert_eq!(end.export_failure, None);
+}
+
+// REQ-RUNNERENROLL-131: an exit that is not the run's own workflow outcome reports no export
+// and records no class: a run that ended `canceled`, and a cancellation that reached an
+// adopted run's first resume before any attempt started.
+#[tokio::test]
+async fn exit_that_is_not_a_workflow_outcome_reports_no_export() {
+    let (reports, run, _) = executed_recorded("\"canceled\"", &[], |log| {
+        stage_result(
+            log,
+            "succeeded",
+            json!({ "outcome": "succeeded" }),
+            &[text_export("note", 1, b"left")],
+        );
+    })
+    .await;
+    assert_eq!(finished_exit(&reports).exports, Vec::new());
+    assert_eq!(run.get("um.run.export_read_failure"), None);
+
+    let adopted = adopted(record("exited", Some("landed"), 1, json!([])), None);
+    write_attempt(&adopted.run, "succeeded", published_result(), json!([]));
+    write_result(
+        &adopted.run,
+        "attempts/000001/result",
+        json!({ "outcome": "succeeded" }),
+        &[text_export("note", 1, b"earlier")],
+    );
+    let end = cancel_unstarted_resume(&adopted, CancellationReason::UserRequest).await;
+    let TreeConclusion::Terminal { exit, .. } = end.conclusion() else {
+        panic!("a cancelled first resume has a result: {end:#?}");
+    };
+    assert_eq!(exit, unreported_exit());
+    assert_eq!(end.export_failure, None);
+}
+
+/// A tree whose root is one `cmd` step that writes a text and a JSON document and exports
+/// both. Its step names its program `sh`, not a path, as the built `useful` requires.
+const TEXT_EXPORT_TREE_FILES: &[TreeFile] = &[
+    TreeFile {
+        path: "workflow.yaml",
+        bytes: br#"schemaVersion: 1
+name: report
+steps:
+  write:
+    kind: cmd
+    command:
+      argv: [sh, -c, "printf 'Repair the build.\\nIt failed.\\n' > note.txt && printf '{\"failed\":1}' > summary.json"]
+    outputs:
+      note: {kind: text, from: path, path: note.txt}
+      summary: {kind: json, from: path, path: summary.json, schema: summary.schema.json}
+exports:
+  note: {ref: outputs.write.note}
+  summary: {ref: outputs.write.summary}
+"#,
+        executable: false,
+    },
+    TreeFile {
+        path: "summary.schema.json",
+        bytes: br#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+        executable: false,
+    },
+];
+
+// REQ-RUNNERENROLL-131: the result the built `useful` publishes for a root that exports a
+// text and a JSON document is reported with the text alone, its bytes as the step wrote
+// them.
+#[tokio::test]
+async fn result_the_built_useful_publishes_reports_its_text_export() {
+    let digest = validated_digest(&built_useful(), TEXT_EXPORT_TREE_FILES);
+    let mut fixture = fixture_sourced(
+        TREE_DIGEST,
+        "exited",
+        "null",
+        &[],
+        None,
+        super::command::SHORT_COMMAND_BOUND,
+        fixture_source_broker,
+        OfferedTree {
+            files: TEXT_EXPORT_TREE_FILES,
+            useful: |_| built_useful(),
+        },
+    );
+    let tree = fixture.offer.execution_spec.workflow_tree.as_mut().unwrap();
+    tree.digest = digest;
+    tree.bindings = json!({});
+    tree.resolution = json!({});
+    tree.stop_before = None;
+    let reports = execute(&mut fixture).await;
+
+    assert_eq!(
+        finished_exit(&reports).exports,
+        vec![carried("note", "Repair the build.\nIt failed.\n")]
+    );
 }

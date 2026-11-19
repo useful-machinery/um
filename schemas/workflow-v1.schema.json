@@ -976,7 +976,7 @@
       "description": "A reference to a declared binding, written `$` followed by the binding key, or `$<integration>.<name>` for a binding declared under an integration."
     },
     "BindingKind": {
-      "enum": ["connection", "linear.team", "linear.state", "github.repository", "member", "members"]
+      "enum": ["connection", "linear.team", "linear.state", "github.repository", "member", "members", "definition"]
     },
     "EventName": {
       "type": "string",
@@ -1142,6 +1142,21 @@
         "timezone": { "type": "string", "minLength": 1 }
       }
     },
+    "DefinitionRule": {
+      "type": "object",
+      "description": "A run of another definition of the same project that ended with a named outcome, in place of a provider event: a definition binding and one outcome name or a list of them. The binding it names and what the trigger reads are checked with the tree, not here.",
+      "additionalProperties": false,
+      "required": ["definition", "outcome"],
+      "properties": {
+        "definition": { "$ref": "#/$defs/BindingReference" },
+        "outcome": {
+          "oneOf": [
+            { "$ref": "#/$defs/OutcomeName" },
+            { "$ref": "#/$defs/Outcomes" }
+          ]
+        }
+      }
+    },
     "EventPath": {
       "type": "string",
       "pattern": "^event(\\.[A-Za-z0-9_]+)+$",
@@ -1188,14 +1203,15 @@
     },
     "StartTrigger": {
       "type": "object",
-      "description": "A trigger that starts a run of the workflow, on a provider event or a schedule.",
+      "description": "A trigger that starts a run of the workflow, on a provider event, a schedule or another definition's run.",
       "additionalProperties": false,
       "required": ["on", "inputs"],
       "properties": {
         "on": {
           "oneOf": [
             { "$ref": "#/$defs/TriggerRule" },
-            { "$ref": "#/$defs/ScheduleRule" }
+            { "$ref": "#/$defs/ScheduleRule" },
+            { "$ref": "#/$defs/DefinitionRule" }
           ]
         },
         "subject": { "type": "string", "minLength": 1 },

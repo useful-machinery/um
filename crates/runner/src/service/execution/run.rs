@@ -1010,6 +1010,14 @@ impl ExecutionJob {
                 failure,
             ));
         }
+        // An export the runner could not list is left out of the finish
+        // (REQ-RUNNERENROLL-131); the run event keeps the class of the first.
+        if let Some(failure) = end.export_failure {
+            self.run_event.set(KeyValue::new(
+                telemetry::attribute::EXPORT_READ_FAILURE,
+                failure,
+            ));
+        }
         let (transitions, result, tree_exit) = match end.conclusion() {
             TreeConclusion::Terminal {
                 transitions,

@@ -283,9 +283,9 @@ impl RevisionRecord {
 }
 
 /// A revision's `bindings.json` (REQ-WFDEF-3): every declared binding with its kind and value,
-/// the flat block's by key and each integration's under its id. Only an integration that
-/// declares bindings has a group, so the snapshot of a root that declares no integration
-/// binding is the flat block alone.
+/// the flat block's by key and each integration's under its id, but a `definition` binding
+/// given none (REQ-WFDEF-40). Only an integration that declares bindings has a group, so the
+/// snapshot of a root that declares no integration binding is the flat block alone.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct BindingsSnapshot {
     flat: BTreeMap<String, BoundBinding>,
@@ -606,6 +606,12 @@ impl<'a> Declared<'a> {
         }
     }
 
+    /// Whether the binding may have no value: a `definition` binding without one has no
+    /// entry in the snapshot (REQ-WFDEF-40).
+    fn may_be_unbound(self) -> bool {
+        matches!(self, Self::Flat(binding) if binding.kind == BindingKind::Definition)
+    }
+
     fn default(self) -> Option<BindingValue> {
         match self {
             Self::Flat(binding) => binding.default.clone(),
@@ -688,7 +694,8 @@ impl<'a> Declarations<'a> {
 /// The snapshot of the bindings the root declares, flat (`declared`) and under its
 /// `integrations` (REQ-WFDEF-20, REQ-WFDEF-21): from `file` when given, otherwise from the
 /// `carried` snapshot with bindings no longer declared dropped; a declared binding neither
-/// supplies takes its default.
+/// supplies takes its default, and a `definition` binding without one has no entry
+/// (REQ-WFDEF-40). A value is recorded as written and never resolved.
 pub(crate) fn resolve_bindings(
     declared: &BTreeMap<String, Binding>,
     integrations: &BTreeMap<IntegrationProvider, Integration>,
@@ -736,10 +743,12 @@ pub(crate) fn resolve_bindings(
     }
     let mut snapshot = BindingsSnapshot::default();
     for (at, declared) in declarations.all() {
-        let value = supplied
-            .remove(&at)
-            .or_else(|| declared.default())
-            .ok_or_else(|| at.missing())?;
+        let Some(value) = supplied.remove(&at).or_else(|| declared.default()) else {
+            if declared.may_be_unbound() {
+                continue;
+            }
+            return Err(at.missing());
+        };
         let value = declared.admit(at, None, Some(value))?;
         match (declared, at.integration, value) {
             (Declared::Flat(binding), _, value) => {
@@ -854,7 +863,7 @@ pub fn publish(
             if bindings.is_none()
                 && declarations
                     .all()
-                    .any(|(_, declared)| declared.default().is_none())
+                    .any(|(_, declared)| declared.default().is_none() && !declared.may_be_unbound())
             {
                 return Err(DefinitionError::BindingsRequired);
             }

@@ -22,8 +22,8 @@ use useful_execution::{
     read_durable_record, wait_failed_child, wait_identity, wait_questions,
 };
 use useful_runner_protocol::{
-    TreeExit, TreeProgressFailedChild, TreeProgressFailedChildRole, TreeProgressFailedChildState,
-    TreeProgressWaitQuestion, TreeProgressWaitQuestions,
+    TreeExit, TreeExport, TreeProgressFailedChild, TreeProgressFailedChildRole,
+    TreeProgressFailedChildState, TreeProgressWaitQuestion, TreeProgressWaitQuestions,
 };
 use useful_support::is_diagnostic_slug;
 
@@ -35,7 +35,7 @@ const MAXIMUM_MIRROR_RESULTS: usize = 1024;
 /// a regular file opened, as each directory on the way to it, without following a symbolic
 /// link and without waiting on a FIFO, of at most the engine's bound; `None` for a file
 /// that is absent, behind a link, of another kind, larger or not JSON.
-fn read_json(run_directory: &Path, name: &str) -> Option<Value> {
+pub(super) fn read_json(run_directory: &Path, name: &str) -> Option<Value> {
     let bytes = read_durable_record(run_directory, name).ok()?;
     serde_json::from_slice(&bytes).ok()
 }
@@ -55,6 +55,10 @@ pub(in crate::service) struct TreeRecord {
     /// `mirror/` held when the runner took the run, or all of them when that count could
     /// not be read (REQ-RUNNERENROLL-99). Zero while the loop observes the record.
     pub(in crate::service) earlier_writes: usize,
+    /// The root's text exports the exit lists (REQ-RUNNERENROLL-131), read only for the
+    /// record the loop ends on, when it exits with a workflow outcome the runner reports
+    /// from the record; empty while the loop observes the record.
+    pub(in crate::service) exports: Vec<TreeExport>,
 }
 
 impl TreeRecord {
@@ -96,6 +100,7 @@ pub(in crate::service) fn read_record(run_directory: &Path) -> Option<TreeRecord
         position: record["position"].as_array()?.clone(),
         mirror: Vec::new(),
         earlier_writes: 0,
+        exports: Vec::new(),
     })
 }
 
@@ -328,14 +333,7 @@ fn settled_outcome(result: &Value) -> Option<EngineOutcome> {
 /// recorded published, or a file `read_json` cannot read.
 pub(in crate::service) fn read_recorded_result(run_directory: &Path) -> Option<EngineResult> {
     let state = read_json(run_directory, "state.json")?;
-    let current = state["currentAttemptNumber"].as_u64()?;
-    let attempt = state["attempts"]
-        .as_array()?
-        .iter()
-        .find(|attempt| attempt["attemptNumber"].as_u64() == Some(current))?;
-    if attempt["result"]["status"] != "published" {
-        return None;
-    }
+    let attempt = published_attempt(&state)?;
     let outcome = match attempt["state"].as_str()? {
         "succeeded" => EngineOutcome::Succeeded,
         "workflow_failed" => EngineOutcome::Failed {
@@ -348,6 +346,17 @@ pub(in crate::service) fn read_recorded_result(run_directory: &Path) -> Option<E
         outcome,
         recorded: true,
     })
+}
+
+/// The run's current attempt as `state` records it, the attempt whose `attemptNumber` is
+/// `currentAttemptNumber`, once its result is recorded `published`; `None` otherwise.
+pub(super) fn published_attempt(state: &Value) -> Option<&Value> {
+    let current = state["currentAttemptNumber"].as_u64()?;
+    state["attempts"]
+        .as_array()?
+        .iter()
+        .find(|attempt| attempt["attemptNumber"].as_u64() == Some(current))
+        .filter(|attempt| attempt["result"]["status"] == "published")
 }
 
 /// The primary issue of the result an attempt recorded `published`: the `primaryIssue` of
@@ -453,18 +462,19 @@ fn cancelled_result(cancellation: Option<CancellationReason>) -> TransportResult
 }
 
 /// The exit of an attempt that changed nothing of its run: no chosen outcome, no mirror
-/// write and no release request.
+/// write, no release request and no export.
 fn unchanged_exit() -> TreeExit {
     TreeExit {
         chosen_outcome: None,
         mirror: Vec::new(),
         claim_release: false,
+        exports: Vec::new(),
     }
 }
 
 /// The exit `record` reports: its outcome as the chosen outcome, its run's mirror writes,
-/// every attempt's, and whether a write past the earlier attempts' confirms the runner's own
-/// departure.
+/// every attempt's, whether a write past the earlier attempts' confirms the runner's own
+/// departure, and the root's text exports read for it (REQ-RUNNERENROLL-131).
 fn recorded_exit(record: &TreeRecord) -> TreeExit {
     TreeExit {
         chosen_outcome: record.outcome.clone(),
@@ -474,6 +484,7 @@ fn recorded_exit(record: &TreeRecord) -> TreeExit {
             .iter()
             .skip(record.earlier_writes)
             .any(confirms_departure),
+        exports: record.exports.clone(),
     }
 }
 

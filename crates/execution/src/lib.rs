@@ -121,7 +121,7 @@ pub use workflow::local_run::{
     bind_cloud_continuation_context, child_run_directories, child_runs, inspect_wait, is_run_id,
     latest_attempt_failed, latest_child_run, list_runs, load_cloud_continuation_seed, locate_run,
     lock_holder, positioned_element, read_durable_record, read_local_run_status,
-    retain_cloud_continuation_evidence, wait_child,
+    read_run_file_bounded, retain_cloud_continuation_evidence, wait_child,
 };
 pub use workflow::login_check::{
     HarnessLoginCheck, HarnessLoginCheckCause, HarnessLoginCheckStage, check_claude_code_login,

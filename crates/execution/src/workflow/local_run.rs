@@ -7946,6 +7946,20 @@ pub fn read_durable_record(
     requested: &Path,
     name: &str,
 ) -> Result<Vec<u8>, LocalRunDirectoryError> {
+    read_run_file_bounded(requested, name, MAXIMUM_DURABLE_RECORD_BYTES)
+}
+
+/// Reads the bytes of the file `name` of the run at `requested` as `read_durable_record`
+/// reads a record, walking the same path beneath the run directory without following a
+/// link, but of at most `maximum_bytes`: a larger file is refused from its size before any
+/// of it is read. The runner reads an exported text's carrier, which a step can make as
+/// large as a set admits, through this reader with the bound the runner protocol puts on a
+/// carried text (REQ-RUNNERENROLL-131).
+pub fn read_run_file_bounded(
+    requested: &Path,
+    name: &str,
+    maximum_bytes: u64,
+) -> Result<Vec<u8>, LocalRunDirectoryError> {
     let (_, mut parent) = open_run_root(requested)?;
     let mut components = Path::new(name).components();
     let file = match components.next_back() {
@@ -7966,7 +7980,7 @@ pub fn read_durable_record(
     for directory in components {
         parent = open_directory_at(&parent, directory)?;
     }
-    read_regular_file(&parent, file)
+    read_regular_file_bounded(&parent, file, maximum_bytes)
 }
 
 pub(super) fn open_run_root(

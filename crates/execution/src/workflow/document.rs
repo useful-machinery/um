@@ -227,6 +227,10 @@ pub enum BindingKind {
     /// A list of organization members.
     #[serde(rename = "members")]
     Members,
+    /// One workflow definition of the same project, named by a definition trigger
+    /// (REQ-WFDEF-39).
+    #[serde(rename = "definition")]
+    Definition,
 }
 
 impl BindingKind {
@@ -238,6 +242,7 @@ impl BindingKind {
             Self::GithubRepository => "github.repository",
             Self::Member => "member",
             Self::Members => "members",
+            Self::Definition => "definition",
         }
     }
 }
@@ -274,7 +279,8 @@ impl BindingValue {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Trigger {
     /// Starts a run of the workflow. No local command acts on `stop_before`, `owner`,
-    /// `busy_behavior` or a schedule rule (REQ-WFDEF-30, REQ-WFDEF-31, REQ-WFDEF-33).
+    /// `busy_behavior`, a schedule rule or a definition rule (REQ-WFDEF-30, REQ-WFDEF-31,
+    /// REQ-WFDEF-33, REQ-WFDEF-39).
     Start {
         on: StartRule,
         subject: Option<String>,
@@ -300,7 +306,8 @@ pub struct TriggerRule {
     pub condition: Option<String>,
 }
 
-/// What a start trigger evaluates: a provider event or a timetable (REQ-WFDEF-31).
+/// What a start trigger evaluates: a provider event, a timetable (REQ-WFDEF-31) or the end
+/// of another definition's run (REQ-WFDEF-39).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum StartRule {
     Event(TriggerRule),
@@ -308,6 +315,13 @@ pub enum StartRule {
     Schedule {
         cron: String,
         timezone: String,
+    },
+    /// A run of the bound definition that ended with one of `outcomes`.
+    Definition {
+        /// A binding reference as written, `$` followed by the binding key.
+        definition: String,
+        /// The outcome names in the order written; one name written alone is a list of one.
+        outcomes: Vec<String>,
     },
 }
 

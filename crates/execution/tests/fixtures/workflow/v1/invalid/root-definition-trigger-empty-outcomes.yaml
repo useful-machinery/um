@@ -1,0 +1,17 @@
+# A definition rule's list of outcomes names at least one (REQ-WFDEF-39, REQ-WFFORMAT-82).
+schemaVersion: 1
+inputs:
+  ticket:
+    kind: text
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["true"]
+bindings:
+  verify: {kind: definition}
+triggers:
+  repair:
+    on: {definition: $verify, outcome: []}
+    inputs:
+      ticket: event.exports.repairRequest

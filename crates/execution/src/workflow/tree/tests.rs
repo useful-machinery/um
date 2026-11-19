@@ -403,10 +403,14 @@ type TriggerRejection = (
 );
 
 /// The diagnostics of the tree whose root is `root_workflow`, which must be invalid.
-fn trigger_rejections(root_workflow: &str) -> Vec<TriggerRejection> {
+fn tree_diagnostics(root_workflow: &str) -> Vec<TreeDiagnostic> {
     let tree = trigger_tree(root_workflow);
-    let diagnostics = validate_workflow_tree(tree.path()).expect_err("tree should be invalid");
-    diagnostics
+    validate_workflow_tree(tree.path()).expect_err("tree should be invalid")
+}
+
+/// Each diagnostic of the invalid tree whose root is `root_workflow`, as a `TriggerRejection`.
+fn trigger_rejections(root_workflow: &str) -> Vec<TriggerRejection> {
+    tree_diagnostics(root_workflow)
         .into_iter()
         .map(|diagnostic| {
             (
@@ -784,6 +788,205 @@ fn a_schedule_trigger_reads_no_event_and_has_a_timetable_of_the_right_shape() {
         validate_workflow_tree(tree.path())
             .unwrap_or_else(|diagnostics| panic!("{schedule} {timezone}: {diagnostics:?}"));
     }
+}
+
+/// `TRIGGER_ROOT` with the binding `verify: {kind: definition}` and, after its triggers, a
+/// trigger `repair` whose `on` is `on` and whose remaining lines are `rest`, as written.
+fn definition_trigger_root(on: &str, rest: &str) -> String {
+    let owner = "  nightlyOwner: {kind: member}\n";
+    assert!(TRIGGER_ROOT.contains(owner));
+    let root = TRIGGER_ROOT.replacen(
+        owner,
+        &format!("{owner}  verify: {{kind: definition}}\n"),
+        1,
+    );
+    format!("{root}  repair:\n    on: {on}\n{rest}")
+}
+
+/// `root`, a `TRIGGER_ROOT`, with an optional text input `note` beside `ticket`.
+fn with_optional_note(root: &str) -> String {
+    let ticket = "inputs:\n  ticket:\n    kind: text\n";
+    assert!(root.contains(ticket));
+    root.replacen(
+        ticket,
+        &format!("{ticket}  note:\n    kind: text\n    optional: true\n"),
+        1,
+    )
+}
+
+/// A diagnostic's code with the trigger, key, binding and input it names.
+fn located(
+    diagnostic: TreeDiagnostic,
+) -> (
+    &'static str,
+    Option<String>,
+    Option<&'static str>,
+    Option<String>,
+    Option<String>,
+) {
+    let location = diagnostic.location;
+    (
+        diagnostic.code,
+        location.trigger,
+        location.key,
+        location.binding,
+        location.input,
+    )
+}
+
+// REQ-WFDEF-10, REQ-WFDEF-39: a definition trigger names a declared `definition` binding,
+// and its subject, inputs and owner read only what a finished run's event holds: the run's
+// members and `event.exports.<name>`, an export name. It declares no `stopBefore`.
+#[test]
+fn a_definition_trigger_names_a_definition_binding_and_reads_only_a_runs_event() {
+    let on = "{definition: $verify, outcome: broken}";
+    let inputs = |ticket: &str| format!("    inputs:\n      ticket: {ticket}\n");
+    let repair = |code, key, binding: Option<&str>, input: Option<&str>| {
+        (
+            code,
+            Some("repair".to_owned()),
+            Some(key),
+            binding.map(str::to_owned),
+            input.map(str::to_owned),
+        )
+    };
+    let rejections = |root: &str| {
+        tree_diagnostics(root)
+            .into_iter()
+            .map(located)
+            .collect::<Vec<_>>()
+    };
+
+    for value in [
+        "event.definitionId",
+        "event.runId",
+        "event.outcome",
+        "event.subject",
+        "event.commit",
+        "event.at",
+        "event.exports.repairRequest",
+        "main",
+    ] {
+        for owner in ["", "    owner: $nightlyOwner\n"] {
+            let root = definition_trigger_root(
+                on,
+                &format!("    subject: {value}\n{owner}{}", inputs(value)),
+            );
+            let tree = trigger_tree(&root);
+            validate_workflow_tree(tree.path())
+                .unwrap_or_else(|diagnostics| panic!("{value} {owner}: {diagnostics:?}"));
+        }
+    }
+
+    let valid_inputs = inputs("event.runId");
+    for (reference, code, binding) in [
+        ("$nobody", "binding_undeclared", "nobody"),
+        ("$connection", "binding_kind_mismatch", "connection"),
+    ] {
+        assert_eq!(
+            rejections(&definition_trigger_root(
+                &format!("{{definition: {reference}, outcome: broken}}"),
+                &valid_inputs
+            )),
+            [repair(code, "on.definition", Some(binding), None)],
+            "{reference}"
+        );
+    }
+    assert_eq!(
+        rejections(&definition_trigger_root(
+            on,
+            &format!("    subject: event.issue.identifier\n{valid_inputs}")
+        )),
+        [repair("definition_trigger_invalid", "subject", None, None)]
+    );
+    for value in [
+        "event.attempt",
+        "event.exports",
+        "event.exports.",
+        "event.exports.a.b",
+        "event.exports.Bad",
+        "event.exports.with_underscore",
+        "event.issue.identifier",
+    ] {
+        assert_eq!(
+            rejections(&definition_trigger_root(on, &inputs(value))),
+            [repair(
+                "definition_trigger_invalid",
+                "inputs",
+                None,
+                Some("ticket")
+            )],
+            "{value}"
+        );
+    }
+    let two_inputs = with_optional_note(&definition_trigger_root(
+        on,
+        "    inputs:\n      ticket: event.attempt\n      note: event.issue.title\n",
+    ));
+    assert_eq!(
+        rejections(&two_inputs),
+        [
+            repair("definition_trigger_invalid", "inputs", None, Some("note")),
+            repair("definition_trigger_invalid", "inputs", None, Some("ticket")),
+        ]
+    );
+    assert_eq!(
+        rejections(&definition_trigger_root(
+            on,
+            &format!("    owner: event.issue.assignee\n{valid_inputs}")
+        )),
+        [repair("definition_trigger_invalid", "owner", None, None)]
+    );
+    assert_eq!(
+        rejections(&definition_trigger_root(
+            on,
+            &format!(
+                "    stopBefore: {{labels: event.issue.labels, prefix: \"hold:\"}}\n{valid_inputs}"
+            )
+        )),
+        [repair(
+            "definition_trigger_invalid",
+            "stopBefore",
+            None,
+            None
+        )]
+    );
+}
+
+// REQ-WFDEF-33, REQ-WFDEF-10: a definition trigger is a start trigger: `queueLatest` needs
+// the root's subject slot, and it binds every required root input.
+#[test]
+fn a_definition_trigger_queues_on_the_subject_slot_and_binds_required_inputs() {
+    let on = "{definition: $verify, outcome: [broken, failed]}";
+    assert_eq!(
+        trigger_rejections(&definition_trigger_root(
+            on,
+            "    busyBehavior: queueLatest\n    inputs:\n      ticket: event.runId\n"
+        )),
+        [(
+            "busy_behavior_subject_missing",
+            Some("repair".to_owned()),
+            Some("busyBehavior"),
+            None
+        )]
+    );
+    let missing = tree_diagnostics(&with_optional_note(&definition_trigger_root(
+        on,
+        "    inputs:\n      note: event.runId\n",
+    )))
+    .into_iter()
+    .map(located)
+    .collect::<Vec<_>>();
+    assert_eq!(
+        missing,
+        [(
+            "trigger_input_missing",
+            Some("repair".to_owned()),
+            None,
+            None,
+            Some("ticket".to_owned())
+        )]
+    );
 }
 
 // REQ-WFDEF-33: `queueLatest` needs the root's subject slot, on an event or a schedule

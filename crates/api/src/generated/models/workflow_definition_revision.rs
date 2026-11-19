@@ -26,7 +26,7 @@ pub struct WorkflowDefinitionRevision {
     /// The tree's files the revision runs executable, in bytewise order; absent when the revision keeps the bits its tree was sealed with.
     #[serde(rename = "executablePaths", skip_serializing_if = "Option::is_none")]
     pub executable_paths: Option<Vec<String>>,
-    /// The bindings snapshot as published, every key the root declares.
+    /// The bindings snapshot as published: every key the root declares whose kind is in the requested binding `vocabulary`.
     #[serde(rename = "bindings")]
     pub bindings: std::collections::HashMap<String, models::WorkflowDefinitionBinding>,
     #[serde(rename = "resolution")]

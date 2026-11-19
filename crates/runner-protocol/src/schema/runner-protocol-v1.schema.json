@@ -936,6 +936,17 @@
       },
       "required": ["kind", "binding"]
     },
+    "FinishedExport": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One text export of a tree run's root: its name, its size in bytes as the runner measured it and, when the runner carries it, its text.",
+      "properties": {
+        "name": {"type": "string", "maxLength": 64, "pattern": "^[a-z][A-Za-z0-9]*$"},
+        "size": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+        "text": {"type": "string", "maxLength": 65536}
+      },
+      "required": ["name", "size"]
+    },
     "WorkflowTreeOwner": {
       "type": "object",
       "additionalProperties": false,
@@ -5526,6 +5537,12 @@
                 "claimRelease": {
                   "type": "boolean",
                   "description": "For a run executing a published tree, whether the runner requests release of the run's subject claim: true exactly when its outcome hook confirmed the issue's departure."
+                },
+                "exports": {
+                  "type": "array",
+                  "maxItems": 64,
+                  "items": {"$ref": "#/$defs/FinishedExport"},
+                  "description": "For a run executing a published tree, the text exports of its root that the attempt's result reports available, in order."
                 }
               },
               "required": [

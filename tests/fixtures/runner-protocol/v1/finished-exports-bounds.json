@@ -1,0 +1,5 @@
+{
+  "maximumItems": 64,
+  "maximumTextBytes": 65536,
+  "maximumTotalTextBytes": 131072
+}

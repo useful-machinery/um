@@ -20,7 +20,10 @@
 //! writes as earlier attempts', which request no release (REQ-RUNNERENROLL-99): none for a
 //! created run, and for an adopted run the count read before its offer's deliveries are
 //! applied and before its first command. When the last document carries no settled engine
-//! result, it also reads the result the run's current attempt recorded in `state.json`.
+//! result, it also reads the result the run's current attempt recorded in `state.json`. For
+//! an exit with a workflow outcome that the runner reports from the record, it also reads the
+//! root's text exports from the result the current attempt published (`exports`,
+//! REQ-RUNNERENROLL-131), which `records::recorded_exit` carries with the record's outcome.
 //!
 //! A `create` the runtime refuses made no run: it ends the loop as a
 //! `ClassifiedEnd::Refused` naming the root workflow's first step, never as a missing
@@ -76,6 +79,7 @@ use useful_runner_protocol::{
 };
 
 use super::command::{self, CommandExit, UsefulCommand};
+use super::exports::{EXPORT_READER_LOST, read_exports};
 use super::records::{
     ClassifiedEnd, EngineResult, MIRROR_READER_LOST, RecordState, RefusedCommand, TreeConclusion,
     TreeRecord, TreeWait, conclude, conclude_classified, mirror_read_failure, read_record,
@@ -111,7 +115,8 @@ impl Default for ResumeIntervals {
 /// The record the loop ended on, the last command's document, the cancellation the
 /// runner applied, for a run whose end the runner classifies itself, how it ended, the
 /// engine's result the run directory recorded for an exited run whose document carries
-/// none, and the class of a failure to read the exited run's `mirror/`.
+/// none, the class of a failure to read the exited run's `mirror/`, and the class of the
+/// first of its text exports that could not be listed.
 #[derive(Debug)]
 pub(in crate::service) struct TreeEnd {
     pub(in crate::service) record: Option<TreeRecord>,
@@ -120,6 +125,7 @@ pub(in crate::service) struct TreeEnd {
     pub(in crate::service) classified: Option<ClassifiedEnd>,
     pub(in crate::service) recorded: Option<EngineResult>,
     pub(in crate::service) mirror_failure: Option<&'static str>,
+    pub(in crate::service) export_failure: Option<&'static str>,
 }
 
 impl TreeEnd {
@@ -142,6 +148,7 @@ impl TreeEnd {
             classified: None,
             recorded: None,
             mirror_failure: None,
+            export_failure: None,
         }
     }
 
@@ -169,14 +176,16 @@ impl TreeEnd {
 
     /// The end with what the run at `directory` recorded beside its exited record, read on
     /// one blocking worker: its mirror writes on the record, the first `earlier_writes` of
-    /// them marked an earlier attempt's, and, for an unclassified end whose outcome is not
-    /// the engine's cancellation and whose document carries no settled result, the engine's
-    /// result its current attempt recorded. Only a write past the earlier ones can request
-    /// release (REQ-RUNNERENROLL-99): when their count could not be read every write is
-    /// marked earlier, and a `mirror/` that cannot be read now reports no writes, so the
-    /// report requests no release on an outcome it cannot confirm as the attempt's own. The
-    /// end keeps the class of either failure for the run event, the later read's when both
-    /// failed.
+    /// them marked an earlier attempt's; for an unclassified end whose outcome is not the
+    /// engine's cancellation, the root's text exports on the record (REQ-RUNNERENROLL-131)
+    /// and the class of the first that could not be listed; and, for such an end whose
+    /// document carries no settled result, the engine's result its current attempt
+    /// recorded. Only a write past the earlier ones can request release
+    /// (REQ-RUNNERENROLL-99): when their count could not be read every write is marked
+    /// earlier, and a `mirror/` that cannot be read now reports no writes, so the report
+    /// requests no release on an outcome it cannot confirm as the attempt's own. The end
+    /// keeps the class of either mirror failure for the run event, the later read's when
+    /// both failed, and a worker that did not return loses both reads.
     async fn with_exit_records(
         mut self,
         directory: PathBuf,
@@ -194,17 +203,19 @@ impl TreeEnd {
             return self;
         };
         let wants_result = wants_result && !record.reads_cancellation();
+        let wants_exports = self.classified.is_none() && !record.reads_cancellation();
         match tokio::task::spawn_blocking(move || {
             (
                 useful_execution::read_mirror_writes(&directory),
                 wants_result
                     .then(|| read_recorded_result(&directory))
                     .flatten(),
+                wants_exports.then(|| read_exports(&directory)),
             )
         })
         .await
         {
-            Ok((writes, recorded)) => {
+            Ok((writes, recorded, exports)) => {
                 match writes {
                     Ok(writes) => {
                         record.earlier_writes = earlier_writes.unwrap_or(writes.len());
@@ -213,8 +224,17 @@ impl TreeEnd {
                     Err(error) => self.mirror_failure = Some(mirror_read_failure(&error)),
                 }
                 self.recorded = recorded;
+                if let Some(exports) = exports {
+                    record.exports = exports.exports;
+                    self.export_failure = exports.failure;
+                }
             }
-            Err(_) => self.mirror_failure = Some(MIRROR_READER_LOST),
+            Err(_) => {
+                self.mirror_failure = Some(MIRROR_READER_LOST);
+                if wants_exports {
+                    self.export_failure = Some(EXPORT_READER_LOST);
+                }
+            }
         }
         self
     }

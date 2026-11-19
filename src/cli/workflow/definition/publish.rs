@@ -544,6 +544,15 @@ fn write_cloud_published(
                     {
                         writeln!(stderr, "binding: {}", display(key))?;
                     }
+                    // The loop the publication would close, in start order (REQ-CLOUDDEF-35).
+                    if let Some(ids) = refusal
+                        .workflow
+                        .as_ref()
+                        .and_then(|detail| detail.r#loop.as_deref())
+                    {
+                        let ids = ids.iter().map(|id| display(id)).collect::<Vec<_>>();
+                        writeln!(stderr, "loop: {}", ids.join(" -> "))?;
+                    }
                     if let Some(ids) = refusal
                         .workflow
                         .as_ref()

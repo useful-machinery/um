@@ -41,6 +41,9 @@ pub struct WorkflowProblemDetail {
     /// The identical active definitions, in id order, for `definition-reuse-ambiguous`.
     #[serde(rename = "definitionIds", skip_serializing_if = "Option::is_none")]
     pub definition_ids: Option<Vec<String>>,
+    /// The definitions of the loop a publication would close, in the order each starts the next, beginning and ending with the definition published to, for `binding-unresolved`.
+    #[serde(rename = "loop", skip_serializing_if = "Option::is_none")]
+    pub r#loop: Option<Vec<String>>,
 }
 
 impl WorkflowProblemDetail {
@@ -57,6 +60,7 @@ impl WorkflowProblemDetail {
             validator_failure: None,
             missing_paths: None,
             definition_ids: None,
+            r#loop: None,
         }
     }
 }
