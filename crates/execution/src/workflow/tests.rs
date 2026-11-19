@@ -788,7 +788,8 @@ fn root_requires_decodes_as_and_integrations_as_declared() {
                     bindings: BTreeMap::from([(
                         "team".to_owned(),
                         IntegrationBinding {
-                            kind: "team".to_owned()
+                            kind: "team".to_owned(),
+                            default: None,
                         }
                     )]),
                 }
@@ -804,6 +805,50 @@ fn root_requires_decodes_as_and_integrations_as_declared() {
     assert_eq!(requires.tools, ["git", "gh", "python3"]);
     assert_eq!(requires.acting_as, None);
     assert!(requires.integrations.is_empty());
+}
+
+// REQ-WFDEF-34, REQ-WFFORMAT-82
+#[test]
+fn root_integration_bindings_decode_with_kinds_defaults_and_integration_references() {
+    let workflow =
+        decode(&fs::read(fixture_root().join("valid/root-integration-bindings.yaml")).unwrap())
+            .unwrap();
+    let root = workflow.root.unwrap();
+    let binding = |kind: &str, default: Option<&str>| IntegrationBinding {
+        kind: kind.to_owned(),
+        default: default.map(str::to_owned),
+    };
+    let integrations = &root.requires.as_ref().unwrap().integrations;
+    assert_eq!(
+        integrations[&IntegrationProvider::Linear].bindings,
+        BTreeMap::from([
+            ("team".to_owned(), binding("team", None)),
+            (
+                "ownedState".to_owned(),
+                binding("state", Some("Engineering"))
+            ),
+            ("backlog".to_owned(), binding("state", Some("Backlog"))),
+            ("canceled".to_owned(), binding("state", Some("Canceled"))),
+            ("done".to_owned(), binding("state", Some("Done"))),
+        ])
+    );
+    assert_eq!(
+        integrations[&IntegrationProvider::Github].bindings,
+        BTreeMap::from([("repository".to_owned(), binding("repository", None))])
+    );
+    assert!(root.bindings.is_empty());
+    let Trigger::Start {
+        on: StartRule::Event(on),
+        ..
+    } = &root.triggers["start"]
+    else {
+        panic!("start must be an event start trigger");
+    };
+    assert_eq!(on.source, "linear");
+    assert_eq!(
+        root.mirror.unwrap().on_outcome["landed"].state,
+        "linear.done"
+    );
 }
 
 // REQ-WFDEF-34
@@ -1186,6 +1231,26 @@ fn a_structural_failure_names_the_field_and_the_rule() {
             "requires.integrations.linear.scopes",
             "unknown_field",
             None,
+        ),
+        // An integration binding's kind is one its provider lists, a provider that lists
+        // none holds no bindings, and a default is text (REQ-WFDEF-34).
+        (
+            "root-integration-binding-unknown-kind.yaml",
+            "requires.integrations.linear.bindings.team.kind",
+            "enum",
+            Some(serde_json::json!(["team", "state"])),
+        ),
+        (
+            "root-integration-bindings-without-kinds.yaml",
+            "requires.integrations.claude_code.bindings",
+            "unknown_field",
+            None,
+        ),
+        (
+            "root-integration-binding-default-not-text.yaml",
+            "requires.integrations.linear.bindings.team.default",
+            "type",
+            Some(serde_json::json!(["string"])),
         ),
     ] {
         assert_eq!(

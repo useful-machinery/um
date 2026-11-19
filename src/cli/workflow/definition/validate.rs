@@ -9,8 +9,8 @@ use serde::Serialize;
 use super::report::{JsonTree, display, display_members, display_path, write_invalid, write_json};
 use crate::exit_code::ExitCode;
 use useful_execution::{
-    BindingValue, BusyBehavior, IntegrationAs, IntegrationProvider, OwnerDeclaration, OwnerSource,
-    StopBefore, ValidatedTree, validate_workflow_tree,
+    BindingValue, BusyBehavior, Integration, IntegrationAs, IntegrationProvider, OwnerDeclaration,
+    OwnerSource, StopBefore, ValidatedTree, validate_workflow_tree,
 };
 
 pub(super) const ABOUT: &str = "Validate a local workflow tree and print its digest";
@@ -160,10 +160,20 @@ fn write_human_valid(tree: &ValidatedTree) -> anyhow::Result<()> {
             writeln!(stdout, "    busy behavior: {}", busy_behavior.as_str())?;
         }
     }
+    let integration_bindings = tree
+        .required_integrations
+        .iter()
+        .flat_map(|(provider, integration)| {
+            integration
+                .bindings
+                .iter()
+                .map(move |(name, binding)| (provider, name, binding))
+        })
+        .collect::<Vec<_>>();
     writeln!(
         stdout,
         "bindings:{}",
-        if tree.bindings.is_empty() {
+        if tree.bindings.is_empty() && integration_bindings.is_empty() {
             " none"
         } else {
             ""
@@ -184,16 +194,27 @@ fn write_human_valid(tree: &ValidatedTree) -> anyhow::Result<()> {
             binding.kind.as_str()
         )?;
     }
+    for (provider, name, binding) in integration_bindings {
+        let value = match &binding.default {
+            None => "(required)".to_owned(),
+            Some(default) => format!("(default \"{}\")", display(default)),
+        };
+        writeln!(
+            stdout,
+            "  {}.{}: {} {value}",
+            display(provider.as_str()),
+            display(name),
+            display(&binding.kind)
+        )?;
+    }
     Ok(())
 }
 
 /// Each provider id with the `as` that applies to it: `github as member, linear as org`.
-fn display_integrations(
-    integrations: &BTreeMap<IntegrationProvider, Option<IntegrationAs>>,
-) -> String {
+fn display_integrations(integrations: &BTreeMap<IntegrationProvider, Integration>) -> String {
     integrations
         .iter()
-        .map(|(provider, acting_as)| match acting_as {
+        .map(|(provider, integration)| match integration.acting_as {
             Some(IntegrationAs::Member) => format!("{} as member", display(provider.as_str())),
             Some(IntegrationAs::Org) => format!("{} as org", display(provider.as_str())),
             None => display(provider.as_str()),
@@ -235,11 +256,21 @@ fn valid_report(tree: &ValidatedTree) -> JsonReport<'_> {
         requires_integrations: tree
             .required_integrations
             .iter()
-            .map(|(provider, acting_as)| {
+            .map(|(provider, integration)| {
                 (
                     provider.as_str(),
                     JsonIntegration {
-                        acting_as: *acting_as,
+                        acting_as: integration.acting_as,
+                        bindings: integration
+                            .bindings
+                            .iter()
+                            .map(|(name, binding)| {
+                                (
+                                    name.as_str(),
+                                    JsonBinding::new(&binding.kind, binding.default.as_deref()),
+                                )
+                            })
+                            .collect(),
                     },
                 )
             })
@@ -272,11 +303,7 @@ fn valid_report(tree: &ValidatedTree) -> JsonReport<'_> {
             .map(|(key, binding)| {
                 (
                     key.as_str(),
-                    JsonBinding {
-                        kind: binding.kind.as_str(),
-                        default: binding.default.as_ref(),
-                        required: binding.default.is_none(),
-                    },
+                    JsonBinding::new(binding.kind.as_str(), binding.default.as_ref()),
                 )
             })
             .collect(),
@@ -301,18 +328,22 @@ struct JsonReport<'a> {
     workflow_files: &'a [String],
     programs: &'a [String],
     requires_tools: &'a [String],
-    /// Provider id to `{as?}`, in bytewise order; absent when the root declares none.
+    /// Provider id to `{as?, bindings?}`, in bytewise order; absent when the root declares
+    /// none.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
-    requires_integrations: BTreeMap<&'a str, JsonIntegration>,
+    requires_integrations: BTreeMap<&'a str, JsonIntegration<'a>>,
     triggers: BTreeMap<&'a str, JsonTrigger<'a>>,
-    bindings: BTreeMap<&'a str, JsonBinding<'a>>,
+    bindings: BTreeMap<&'a str, JsonBinding<'a, BindingValue>>,
 }
 
-/// The `as` that applies to a declared integration, absent where none does.
+/// The `as` that applies to a declared integration, absent where none does, and its bindings
+/// by name, absent where it declares none.
 #[derive(Serialize)]
-struct JsonIntegration {
+struct JsonIntegration<'a> {
     #[serde(rename = "as", skip_serializing_if = "Option::is_none")]
     acting_as: Option<IntegrationAs>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    bindings: BTreeMap<&'a str, JsonBinding<'a, str>>,
 }
 
 #[derive(Serialize)]
@@ -351,11 +382,22 @@ struct JsonTrigger<'a> {
     busy_behavior: Option<&'static str>,
 }
 
+/// A flat or an integration binding, `required` exactly when it has no default.
 #[derive(Serialize)]
-struct JsonBinding<'a> {
-    kind: &'static str,
-    /// As declared: a string, or for `members` an array.
+struct JsonBinding<'a, DefaultValue: ?Sized> {
+    kind: &'a str,
+    /// As declared: a string, or for a flat `members` binding an array.
     #[serde(skip_serializing_if = "Option::is_none")]
-    default: Option<&'a BindingValue>,
+    default: Option<&'a DefaultValue>,
     required: bool,
+}
+
+impl<'a, DefaultValue: ?Sized> JsonBinding<'a, DefaultValue> {
+    fn new(kind: &'a str, default: Option<&'a DefaultValue>) -> Self {
+        Self {
+            kind,
+            default,
+            required: default.is_none(),
+        }
+    }
 }

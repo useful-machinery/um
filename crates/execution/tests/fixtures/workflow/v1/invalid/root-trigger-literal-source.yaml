@@ -8,6 +8,6 @@ bindings:
   connection: {kind: connection}
 triggers:
   start:
-    on: {source: linear, event: issue.state_entered}
+    on: {source: linear-main, event: issue.state_entered}
     inputs:
       ticket: event.issue.identifier

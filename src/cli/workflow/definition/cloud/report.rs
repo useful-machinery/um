@@ -141,14 +141,13 @@ pub(super) fn shown(scope: &Scope<'_>, shown: &Shown) -> anyhow::Result<()> {
             binding_value(resolved.value.as_ref()),
             wire(resolved.kind)
         )?;
-        if let Some(id) = &resolved.id {
-            write!(stdout, " · id {}", display(id))?;
-        }
-        if let Some(name) = &resolved.name {
-            write!(stdout, " · name {}", display(name))?;
-        }
-        writeln!(stdout)?;
+        end_resolved(
+            &mut stdout,
+            resolved.id.as_deref(),
+            resolved.name.as_deref(),
+        )?;
     }
+    write_integration_resolution(&mut stdout, current)?;
     writeln!(stdout, "── revisions ──")?;
     for revision in &shown.revisions {
         writeln!(
@@ -169,6 +168,48 @@ pub(super) fn shown(scope: &Scope<'_>, shown: &Shown) -> anyhow::Result<()> {
         writeln!(stdout, "older revisions: not shown")?;
     }
     Ok(())
+}
+
+/// Each integration's resolution in id order (REQ-CLOUDDEF-15): its account under its id, then
+/// each binding as `<id>.<name>` in the line form of a flat one; nothing for a revision that
+/// holds none.
+fn write_integration_resolution(
+    out: &mut impl Write,
+    revision: &WorkflowDefinitionRevision,
+) -> io::Result<()> {
+    let Some(integrations) = &revision.integration_resolution else {
+        return Ok(());
+    };
+    for (integration, resolution) in integrations.iter().collect::<BTreeMap<_, _>>() {
+        if let Some(account) = &resolution.account {
+            write!(out, "{}: account", display(integration))?;
+            end_resolved(out, Some(&account.id), account.name.as_deref())?;
+        }
+        let bindings = resolution.bindings.iter().flatten();
+        for (name, resolved) in bindings.collect::<BTreeMap<_, _>>() {
+            write!(
+                out,
+                "{}.{}: {} ({})",
+                display(integration),
+                display(name),
+                display(&resolved.value),
+                wire(resolved.kind)
+            )?;
+            end_resolved(out, resolved.id.as_deref(), resolved.name.as_deref())?;
+        }
+    }
+    Ok(())
+}
+
+/// Ends a resolution line with the resolved id and display name Cloud recorded, if any.
+fn end_resolved(out: &mut impl Write, id: Option<&str>, name: Option<&str>) -> io::Result<()> {
+    if let Some(id) = id {
+        write!(out, " · id {}", display(id))?;
+    }
+    if let Some(name) = name {
+        write!(out, " · name {}", display(name))?;
+    }
+    writeln!(out)
 }
 
 pub(super) fn changed(
@@ -263,6 +304,9 @@ fn failed(scope: &Scope<'_>, failure: &WorkflowDefinitionFailure) -> anyhow::Res
         }
         if let Some(trigger) = &detail.trigger_key {
             writeln!(stderr, "trigger: {}", display(trigger))?;
+        }
+        if let Some(integration) = &detail.integration {
+            writeln!(stderr, "integration: {}", display(integration))?;
         }
         if let Some(binding) = &detail.binding_key {
             writeln!(stderr, "binding: {}", display(binding))?;

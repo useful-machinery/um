@@ -606,7 +606,7 @@
     "WorkflowTreeExecution": {
       "type": "object",
       "additionalProperties": false,
-      "description": "The definition revision a definition-backed run executes: the sealed tree's files, the bindings snapshot and its resolution, and the start's owner, stop step and pending deliveries.",
+      "description": "The definition revision a definition-backed run executes: the sealed tree's files, the bindings snapshot and its resolution, and the start's owner, stop step and pending deliveries. Beside the flat bindings, an integration's bindings sit under the integration's id, and its resolution under the same id holds the integration's account and its bindings' resolved ids and names. The two objects hold at most 256 bindings in all, flat and integration together. Cloud sends an integration entry only to a runner that advertised `treeIntegrationBindings`.",
       "properties": {
         "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
         "definitionId": {"type": "string", "pattern": "^def_[0-7][0-9a-hjkmnp-tv-z]{25}$"},
@@ -619,12 +619,12 @@
         "bindings": {
           "type": "object", "maxProperties": 256,
           "propertyNames": {"$ref": "#/$defs/workflowBindingKey"},
-          "additionalProperties": {"$ref": "#/$defs/WorkflowTreeBinding"}
+          "additionalProperties": {"$ref": "#/$defs/WorkflowTreeBindingsEntry"}
         },
         "resolution": {
           "type": "object", "maxProperties": 256,
           "propertyNames": {"$ref": "#/$defs/workflowBindingKey"},
-          "additionalProperties": {"$ref": "#/$defs/WorkflowTreeResolvedBinding"}
+          "additionalProperties": {"$ref": "#/$defs/WorkflowTreeResolutionEntry"}
         },
         "owner": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/WorkflowTreeOwner"}]},
         "stopBefore": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/stepId"}]},
@@ -805,6 +805,86 @@
         "name": {"type": "string", "maxLength": 255}
       },
       "required": ["kind", "value"]
+    },
+    "WorkflowTreeBindingsEntry": {
+      "description": "A member of the block's bindings: a flat binding, or an integration's bindings under the integration's id.",
+      "oneOf": [
+        {"$ref": "#/$defs/WorkflowTreeBinding"},
+        {"$ref": "#/$defs/WorkflowTreeIntegrationBindings"}
+      ]
+    },
+    "WorkflowTreeResolutionEntry": {
+      "description": "A member of the block's resolution: a flat binding's resolution, or an integration's account and resolved bindings under the integration's id.",
+      "oneOf": [
+        {"$ref": "#/$defs/WorkflowTreeResolvedBinding"},
+        {"$ref": "#/$defs/WorkflowTreeIntegrationResolution"}
+      ]
+    },
+    "WorkflowIntegrationBindingKind": {
+      "enum": ["team", "state", "repository"]
+    },
+    "WorkflowTreeIntegrationBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"$ref": "#/$defs/WorkflowIntegrationBindingKind"},
+        "value": {"type": "string", "minLength": 1}
+      },
+      "required": ["kind", "value"]
+    },
+    "WorkflowTreeIntegrationBindings": {
+      "type": "object", "minProperties": 1, "maxProperties": 256,
+      "propertyNames": {"$ref": "#/$defs/workflowBindingKey"},
+      "additionalProperties": {"$ref": "#/$defs/WorkflowTreeIntegrationBinding"}
+    },
+    "WorkflowTreeResolvedIntegrationBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": {"$ref": "#/$defs/WorkflowIntegrationBindingKind"},
+        "value": {"type": "string", "minLength": 1},
+        "id": {"type": "string", "minLength": 1, "maxLength": 255},
+        "name": {"type": "string", "maxLength": 255}
+      },
+      "required": ["kind", "value"]
+    },
+    "WorkflowTreeIntegrationAccount": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "id": {"type": "string", "minLength": 1, "maxLength": 255},
+        "name": {"type": "string", "maxLength": 255}
+      },
+      "required": ["id"]
+    },
+    "WorkflowTreeIntegrationResolution": {
+      "description": "An integration's resolution: its account, its bindings' resolution, or both. The two alternatives are disjoint: the first holds `account`, the second does not.",
+      "oneOf": [
+        {"$ref": "#/$defs/WorkflowTreeIntegrationAccountResolution"},
+        {"$ref": "#/$defs/WorkflowTreeIntegrationBindingsResolution"}
+      ]
+    },
+    "WorkflowTreeIntegrationAccountResolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "account": {"$ref": "#/$defs/WorkflowTreeIntegrationAccount"},
+        "bindings": {"$ref": "#/$defs/WorkflowTreeResolvedIntegrationBindings"}
+      },
+      "required": ["account"]
+    },
+    "WorkflowTreeIntegrationBindingsResolution": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "bindings": {"$ref": "#/$defs/WorkflowTreeResolvedIntegrationBindings"}
+      },
+      "required": ["bindings"]
+    },
+    "WorkflowTreeResolvedIntegrationBindings": {
+      "type": "object", "minProperties": 1, "maxProperties": 256,
+      "propertyNames": {"$ref": "#/$defs/workflowBindingKey"},
+      "additionalProperties": {"$ref": "#/$defs/WorkflowTreeResolvedIntegrationBinding"}
     },
     "MirrorResult": {
       "type": "object",
@@ -1131,6 +1211,7 @@
                 "treeExecution": {"const": 1},
                 "treeContinuation": {"const": 1},
                 "treeWithdraw": {"const": 1},
+                "treeIntegrationBindings": {"const": 1},
                 "workspaceRecoveryRoot": {
                   "type": "object", "additionalProperties": false,
                   "properties": {

@@ -1167,14 +1167,19 @@ fn tree_code_message(code: &str) -> &'static str {
             "Move the root-only block into the tree's root workflow.yaml."
         }
         "integration_undeclared" => {
-            "Declare the integration under the root's `requires.integrations`, or remove it from the override."
+            "Declare the integration under the root's `requires.integrations`, or name only declared ones."
         }
         "program_directory_missing" => {
             "Create the directory the root's `programs` names, or remove the entry."
         }
-        "binding_undeclared" => "Declare the binding under the root's `bindings`.",
+        "binding_undeclared" => {
+            "Declare the binding under the root's `bindings` or `requires.integrations.<id>.bindings`."
+        }
         "binding_kind_mismatch" => {
-            "Name a `connection` binding as a trigger's source and a `linear.state` one in `mirror`."
+            "Name a `connection` binding as a trigger's source, and a `linear.state` one or a `state` one under `linear` in `mirror`."
+        }
+        "binding_declared_twice" => {
+            "Rename the flat binding so it names neither a binding under an integration nor an integration with bindings."
         }
         "literal_where_binding_expected" => {
             "Replace the quoted literal with a declared `$binding`."

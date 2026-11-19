@@ -73,14 +73,17 @@ impl fmt::Debug for WorkflowTreeFile<'_> {
     }
 }
 
-/// What a create or publish records: the sealed tree, `sha256:<hex>`, the bindings, and the
-/// tree's files the revision runs executable, in bytewise order; omitted bindings take the
-/// root's defaults on create and the current snapshot on publish, and omitted executable
-/// paths keep the bits the tree was sealed with.
+/// What a create or publish records: the sealed tree, `sha256:<hex>`, the bindings, the
+/// integration bindings (an integration's id to its binding names and their values), and the
+/// tree's files the revision runs executable, in bytewise order; omitted bindings or
+/// integration bindings take the root's defaults on create and the current revision's on
+/// publish (REQ-CLOUDDEF-33), and omitted executable paths keep the bits the tree was sealed
+/// with.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkflowPublication<'a> {
     pub tree_digest: &'a str,
     pub bindings: Option<&'a WorkflowBindingValues>,
+    pub integration_bindings: Option<&'a HashMap<String, HashMap<String, String>>>,
     pub executable_paths: Option<&'a [String]>,
 }
 
@@ -733,6 +736,7 @@ impl<'a> WorkflowDefinitionApi<'a> {
         let mut body =
             models::CreateWorkflowDefinitionRequest::new(publication.tree_digest.to_owned());
         body.bindings = publication.bindings.cloned();
+        body.integration_bindings = publication.integration_bindings.cloned();
         body.executable_paths = publication.executable_paths.map(<[String]>::to_vec);
         body.reuse_identical = reuse_identical.then_some(true);
         let endpoint = self.definitions_endpoint(organization, project, &[]);
@@ -779,6 +783,7 @@ impl<'a> WorkflowDefinitionApi<'a> {
             models::PublishWorkflowDefinitionRevisionRequest::new(expected_current_revision);
         body.tree_digest = Some(publication.tree_digest.to_owned());
         body.bindings = publication.bindings.cloned();
+        body.integration_bindings = publication.integration_bindings.cloned();
         body.executable_paths = publication.executable_paths.map(<[String]>::to_vec);
         let stage = Stage::RevisionPublish;
         let next = expected_current_revision
@@ -1362,6 +1367,40 @@ mod tests {
         );
     }
 
+    // REQ-CLOUDDEF-34, REQ-COMPAT-20: a refusal whose `workflow` facts carry a member this
+    // release does not know is still the refusal, with the binding it names and the
+    // integration it knows.
+    #[test]
+    fn a_refusal_naming_a_fact_this_release_does_not_know_keeps_the_binding() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type": "https://api.usefulmachinery.com/problems/binding-unresolved",
+            "title": "Binding unresolved",
+            "status": 422,
+            "workflow": {
+                "integration": "linear",
+                "bindingKey": "team",
+                "bindingScope": {"account": "lcn_01k0z6r1w8f4jy2m7q9v3x5abc"},
+            },
+        }))
+        .expect("problem body");
+        let failure = classify(
+            &raw(422, "application/problem+json", body),
+            Stage::DefinitionCreate,
+        );
+        let refusal = match failure {
+            WorkflowDefinitionFailure::Refused(refusal) => Some(refusal),
+            _ => None,
+        }
+        .expect("a refusal");
+        assert_eq!(
+            (refusal.status, refusal.problem.as_str()),
+            (422, "binding-unresolved")
+        );
+        let workflow = refusal.workflow.expect("the workflow facts");
+        assert_eq!(workflow.binding_key.as_deref(), Some("team"));
+        assert_eq!(workflow.integration.as_deref(), Some("linear"));
+    }
+
     // REQ-CLOUDDEF-22: a 200 answering a create is the project's identical definition, reused,
     // only when the create asked for reuse; to any other create it is an invalid response.
     #[test]
@@ -1392,6 +1431,7 @@ mod tests {
         let publication = WorkflowPublication {
             tree_digest: &digest,
             bindings: None,
+            integration_bindings: None,
             executable_paths: None,
         };
 
@@ -1665,6 +1705,7 @@ mod tests {
             let publication = WorkflowPublication {
                 tree_digest: &digest,
                 bindings: None,
+                integration_bindings: None,
                 executable_paths: None,
             };
             let read = match self {

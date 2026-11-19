@@ -22,6 +22,13 @@ pub struct CreateWorkflowDefinitionRequest {
     /// Values keyed by the binding keys the root workflow declares; an omitted key takes its default.
     #[serde(rename = "bindings", skip_serializing_if = "Option::is_none")]
     pub bindings: Option<std::collections::HashMap<String, serde_json::Value>>,
+    /// Values of the bindings the root declares under an integration: integration id to binding name to its value, a string. An omitted binding takes its default. The value has no minimum length here: an empty one is answered 422 `binding-unresolved`, as an empty value in `bindings` is.
+    #[serde(
+        rename = "integrationBindings",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub integration_bindings:
+        Option<std::collections::HashMap<String, std::collections::HashMap<String, String>>>,
     /// The tree's files the revision runs executable, in bytewise order, each a file of the tree; `[]` makes none executable. Omitted keeps the bits the tree was sealed with.
     #[serde(rename = "executablePaths", skip_serializing_if = "Option::is_none")]
     pub executable_paths: Option<Vec<String>>,
@@ -35,6 +42,7 @@ impl CreateWorkflowDefinitionRequest {
         CreateWorkflowDefinitionRequest {
             tree_digest,
             bindings: None,
+            integration_bindings: None,
             executable_paths: None,
             reuse_identical: None,
         }

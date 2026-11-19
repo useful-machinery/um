@@ -828,3 +828,270 @@ fn queue_latest_needs_a_root_subject_and_the_tree_keeps_the_busy_behavior() {
         assert_eq!(kept(&queued, other), None, "{other}");
     }
 }
+
+/// The engineering root with its bindings declared under the integrations they belong to.
+const NESTED_ROOT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/workflow/v1/valid/root-integration-bindings.yaml"
+));
+
+/// `TRIGGER_ROOT` half migrated: `linear` declares `team` beside the flat block, and the start
+/// trigger's `where` names it as `$linear.team` beside its flat `$connection` source.
+fn half_migrated_root() -> String {
+    let flat = "event.team == $linearTeam and event.issue.blocked == false";
+    assert!(TRIGGER_ROOT.contains(flat));
+    TRIGGER_ROOT
+        .replacen(
+            "bindings:\n",
+            "requires:\n  integrations:\n    linear:\n      bindings:\n        team: {kind: team}\nbindings:\n",
+            1,
+        )
+        .replacen(
+            flat,
+            "event.team == $linear.team and event.issue.blocked == false",
+            1,
+        )
+}
+
+/// The tree of `trigger_tree` with the policy file the nested root's `policy` input defaults to.
+fn reference_tree(root_workflow: &str) -> TempDir {
+    let tree = trigger_tree(root_workflow);
+    write(tree.path(), "policy/engineering.json", b"{}\n");
+    tree
+}
+
+/// `root` with `from` replaced by `to` once.
+fn replaced(root: &str, from: &str, to: &str) -> String {
+    assert!(root.contains(from), "{from:?}");
+    root.replacen(from, to, 1)
+}
+
+/// A diagnostic's code with its location's kind, trigger, key, integration and binding.
+type ReferenceRejection = (
+    &'static str,
+    &'static str,
+    Option<String>,
+    Option<&'static str>,
+    Option<String>,
+    Option<String>,
+);
+
+/// The diagnostics of the tree whose root is `root_workflow`, which must be invalid.
+fn reference_rejections(root_workflow: &str) -> Vec<ReferenceRejection> {
+    let tree = reference_tree(root_workflow);
+    let diagnostics = validate_workflow_tree(tree.path()).expect_err("tree should be invalid");
+    diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            let location = diagnostic.location;
+            (
+                diagnostic.code,
+                location.kind,
+                location.trigger,
+                location.key,
+                location.integration,
+                location.binding,
+            )
+        })
+        .collect()
+}
+
+/// The one diagnostic of a trigger reference: its code, trigger, key, integration and binding.
+fn trigger_reference(
+    code: &'static str,
+    trigger: &str,
+    key: Option<&'static str>,
+    integration: &str,
+    binding: &str,
+) -> Vec<ReferenceRejection> {
+    vec![(
+        code,
+        "trigger",
+        Some(trigger.to_owned()),
+        key,
+        Some(integration.to_owned()),
+        Some(binding.to_owned()),
+    )]
+}
+
+// REQ-WFDEF-37, REQ-WFDEF-38, REQ-WFDEF-10: a root whose bindings are declared under its
+// integrations validates with its triggers on `linear` itself, the source kept as written, and
+// a root that references one integration binding beside its flat block validates too.
+#[test]
+fn integration_bindings_and_an_integration_source_validate() {
+    let tree = reference_tree(NESTED_ROOT);
+    let validated = validate_workflow_tree(tree.path())
+        .unwrap_or_else(|diagnostics| panic!("tree should be valid: {diagnostics:?}"));
+    assert_eq!(
+        validated.triggers["start"].source.as_deref(),
+        Some("linear")
+    );
+    assert_eq!(
+        validated.triggers["release"].source.as_deref(),
+        Some("linear")
+    );
+    assert!(validated.bindings.is_empty());
+    // REQ-WFDEF-14: each integration keeps its bindings as declared for what reads the tree.
+    assert_eq!(
+        validated.required_integrations[&IntegrationProvider::Linear].bindings["ownedState"],
+        IntegrationBinding {
+            kind: "state".to_owned(),
+            default: Some("Engineering".to_owned()),
+        }
+    );
+
+    let half = half_migrated_root();
+    let tree = reference_tree(&half);
+    let validated = validate_workflow_tree(tree.path())
+        .unwrap_or_else(|diagnostics| panic!("tree should be valid: {diagnostics:?}"));
+    assert_eq!(
+        validated.triggers["start"].source.as_deref(),
+        Some("$connection")
+    );
+}
+
+// REQ-WFDEF-37, REQ-WFDEF-38, REQ-WFDEF-10: an integration reference that names no declared
+// binding, of a kind the place does not take, or a source naming an undeclared integration
+// is refused, located with the integration and the binding as written.
+#[test]
+fn integration_references_and_sources_are_checked() {
+    const START_WHERE: &str = "event.state == $linear.ownedState\"}";
+    const WHEN: &str = "when: \"event.to == $linear.canceled\"";
+    let rejections = |from: &str, to: &str| reference_rejections(&replaced(NESTED_ROOT, from, to));
+
+    assert_eq!(
+        rejections(START_WHERE, "event.state == $linear.nobody\"}"),
+        trigger_reference("binding_undeclared", "start", None, "linear", "nobody")
+    );
+    assert_eq!(
+        rejections(START_WHERE, "event.state == $github.team\"}"),
+        trigger_reference("binding_undeclared", "start", None, "github", "team")
+    );
+    // The integration is what precedes the reference's last `.`, so a provider id that
+    // holds a dot is named whole.
+    assert_eq!(
+        rejections(START_WHERE, "event.state == $gitlab.com.group\"}"),
+        trigger_reference("binding_undeclared", "start", None, "gitlab.com", "group")
+    );
+    assert_eq!(
+        rejections(WHEN, "when: \"event.to == $linear.nobody\""),
+        trigger_reference("binding_undeclared", "release", None, "linear", "nobody")
+    );
+    assert_eq!(
+        rejections(WHEN, "when: \"event.to == $linear.canceled-x\""),
+        [(
+            "trigger_rule_invalid",
+            "trigger",
+            Some("release".to_owned()),
+            Some("control.action.when"),
+            None,
+            None,
+        )]
+    );
+
+    const START_SOURCE: &str = "source: linear, event: issue.state_entered";
+    assert_eq!(
+        rejections(
+            START_SOURCE,
+            "source: gitlab.com, event: issue.state_entered"
+        ),
+        [(
+            "integration_undeclared",
+            "trigger",
+            Some("start".to_owned()),
+            Some("on.source"),
+            Some("gitlab.com".to_owned()),
+            None,
+        )]
+    );
+    assert_eq!(
+        rejections(
+            START_SOURCE,
+            "source: $linear.team, event: issue.state_entered"
+        ),
+        trigger_reference("binding_kind_mismatch", "start", None, "linear", "team")
+    );
+
+    let half = half_migrated_root();
+    const OWNER: &str = "owner: {from: [event.issue.assignee, event.issue.creator], only: $includedOwners, except: $excludedOwners}";
+    assert_eq!(
+        reference_rejections(&replaced(&half, OWNER, "owner: $linear.team")),
+        trigger_reference(
+            "binding_kind_mismatch",
+            "start",
+            Some("owner"),
+            "linear",
+            "team"
+        )
+    );
+    assert_eq!(
+        reference_rejections(&replaced(
+            &half,
+            "only: $includedOwners",
+            "only: $linear.team"
+        )),
+        trigger_reference(
+            "binding_kind_mismatch",
+            "start",
+            Some("owner.only"),
+            "linear",
+            "team"
+        )
+    );
+}
+
+// REQ-WFDEF-37: a flat key that is also a name an integration declares, or the id of an
+// integration that declares bindings, is declared twice; the id of one that declares none is
+// not.
+#[test]
+fn a_binding_declared_twice_is_refused() {
+    let flat = |block: &str| {
+        replaced(
+            NESTED_ROOT,
+            "\ntriggers:",
+            &format!("\nbindings:\n{block}\ntriggers:"),
+        )
+    };
+    let twice = |binding: &str| {
+        vec![(
+            "binding_declared_twice",
+            "binding",
+            None,
+            None,
+            Some("linear".to_owned()),
+            Some(binding.to_owned()),
+        )]
+    };
+    assert_eq!(
+        reference_rejections(&flat("  team: {kind: linear.team}")),
+        twice("team")
+    );
+    assert_eq!(
+        reference_rejections(&flat("  linear: {kind: connection}")),
+        twice("linear")
+    );
+
+    let github = "    github:\n      bindings:\n        repository: {kind: repository}\n";
+    let root = replaced(
+        &flat("  github: {kind: connection}"),
+        github,
+        "    github: {}\n",
+    );
+    let tree = reference_tree(&root);
+    validate_workflow_tree(tree.path())
+        .unwrap_or_else(|diagnostics| panic!("tree should be valid: {diagnostics:?}"));
+}
+
+// REQ-WFDEF-37: a control's `when` takes a `$<id>.<name>` operand, the integration before
+// the last `.`, and refuses one with no integration or no identifier after it.
+#[test]
+fn a_control_when_takes_an_integration_reference() {
+    use crate::workflow::wait::control_when_parses;
+
+    for key in ["$linear.canceled", "$gitlab.com.group"] {
+        assert!(control_when_parses(&format!("event.to == {key}")), "{key}");
+    }
+    for key in ["$linear.", "$.canceled", "$linear.Canceled"] {
+        assert!(!control_when_parses(&format!("event.to == {key}")), "{key}");
+    }
+}

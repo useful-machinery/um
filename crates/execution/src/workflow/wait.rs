@@ -25,7 +25,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::admission::{ResolvedInput, ResolvedInputs};
-use super::document::{Trigger, TriggerControlAction};
+use super::document::{BindingKey, Trigger, TriggerControlAction};
 pub use super::document::{WaitKind, WaitRule};
 use super::evidence::FailedChild;
 use super::local_run::{
@@ -901,8 +901,9 @@ impl<'a> ControlTrigger<'a> {
     /// The action the trigger takes: its named action, or its conditional action's `then`
     /// when `when` holds over `fields` and its `else` otherwise. `when` is read in the
     /// matcher's grammar, a conjunction of `lhs == rhs`, with `event.<path>` read from
-    /// `fields`, quoted literals and `true` and `false`, and a `$<key>` operand the text
-    /// `bound` answers for the binding key; a side that does not resolve never equals
+    /// `fields`, quoted literals and `true` and `false`, and a `$<key>` or `$<id>.<name>`
+    /// operand the text `bound` answers for the key as written (REQ-WFDEF-37); a side that
+    /// does not resolve never equals
     /// anything. A `when` outside that grammar, or naming `run.*`, `wait.*`, `inputs.*` or
     /// `outputs.*`, is `RuleError`.
     pub fn action(
@@ -943,7 +944,7 @@ fn control_when_holds(
         clause: clause.to_owned(),
     };
     let side = |text: &str| match text.strip_prefix('$') {
-        Some(key) if is_identifier(key) => Ok(bound(key).map(Value::String)),
+        Some(key) if BindingKey::parse(key).is_some() => Ok(bound(key).map(Value::String)),
         Some(_) => Err(invalid()),
         None => match parse_operand(text).ok_or_else(invalid)? {
             Operand::Event(path) => Ok(path

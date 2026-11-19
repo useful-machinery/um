@@ -108,6 +108,7 @@ struct IntegrationDto {
 #[serde(deny_unknown_fields)]
 struct IntegrationBindingDto {
     kind: String,
+    default: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -939,7 +940,13 @@ impl WorkflowDto {
                                     .bindings
                                     .into_iter()
                                     .map(|(name, binding)| {
-                                        (name, IntegrationBinding { kind: binding.kind })
+                                        (
+                                            name,
+                                            IntegrationBinding {
+                                                kind: binding.kind,
+                                                default: binding.default,
+                                            },
+                                        )
                                     })
                                     .collect(),
                             },

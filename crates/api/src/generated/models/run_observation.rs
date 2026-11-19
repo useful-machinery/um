@@ -29,7 +29,7 @@ pub struct RunObservation {
     /// Latest assignment decline only while queued; cleared by the next offer.
     #[serde(rename = "lastDecline", deserialize_with = "Option::deserialize")]
     pub last_decline: Option<Box<models::RunPlacementDecline>>,
-    /// Why a queued run cannot be offered to any runner of its pool, read at request time: tree_execution_unavailable while the run is definition-backed and no enabled, connected runner of the pool advertises tree execution. Null or absent when the run is not queued or some runner could take it.
+    /// Why a queued run cannot be offered to any runner of its pools, read at request time: tree_execution_unavailable while the run is definition-backed and no enabled, connected runner of its pools advertises what the run's tree needs, tree execution and, for a revision that holds integration bindings or an integration's account, `treeIntegrationBindings`. Null or absent when the run is not queued or some runner could take it.
     #[serde(
         rename = "placementReason",
         default,
@@ -67,7 +67,7 @@ impl RunObservation {
         }
     }
 }
-/// Why a queued run cannot be offered to any runner of its pool, read at request time: tree_execution_unavailable while the run is definition-backed and no enabled, connected runner of the pool advertises tree execution. Null or absent when the run is not queued or some runner could take it.
+/// Why a queued run cannot be offered to any runner of its pools, read at request time: tree_execution_unavailable while the run is definition-backed and no enabled, connected runner of its pools advertises what the run's tree needs, tree execution and, for a revision that holds integration bindings or an integration's account, `treeIntegrationBindings`. Null or absent when the run is not queued or some runner could take it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum PlacementReason {
     #[serde(rename = "tree_execution_unavailable")]

@@ -18,6 +18,10 @@ const ROOT_WORKFLOW: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/workflow/v1/valid/root-workflow.yaml"
 ));
+const NESTED_ROOT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/workflow/v1/valid/root-integration-bindings.yaml"
+));
 const DESIGN_WORKFLOW: &str = r#"schemaVersion: 1
 inputs:
   ticket:
@@ -200,6 +204,10 @@ fn assert_records_match_schemas(home: &Home, id: &str, n: u64) {
         .expect("snapshot should be JSON");
     assert!(
         schema_validator("workflow-definition-bindings-v1.schema.json").is_valid(&snapshot),
+        "{snapshot}"
+    );
+    assert!(
+        schema_validator("workflow-definition-bindings-v2.schema.json").is_valid(&snapshot),
         "{snapshot}"
     );
 }
@@ -432,8 +440,15 @@ fn bindings_file_fills_defaults_into_a_snapshot_of_every_declared_binding() {
 // REQ-WFDEF-20
 #[test]
 fn bindings_file_members_are_checked_against_the_declared_bindings() {
-    let declared = Tree::engineering().validated().bindings;
-    let resolve = |value: Value| resolve_bindings(&declared, Some(&bindings(value)), None);
+    let tree = Tree::engineering().validated();
+    let resolve = |value: Value| {
+        resolve_bindings(
+            &tree.bindings,
+            &tree.required_integrations,
+            Some(&bindings(value)),
+            None,
+        )
+    };
 
     let snapshot = resolve(json!({
         "connection": {"kind": "connection", "value": "local"},
@@ -474,18 +489,17 @@ fn bindings_file_members_are_checked_against_the_declared_bindings() {
             "binding_missing",
             "repository",
         ),
+        (
+            json!({"connection": {"value": "x", "other": 1}, "linearTeam": "AUTO", "repository": "r"}),
+            "bindings_file_invalid",
+            "connection",
+        ),
     ] {
         let error = resolve(value).expect_err("the file should refuse");
         assert_eq!((error.code(), error.key()), (code, Some(key)));
     }
 
-    for bytes in [
-        &b"[]"[..],
-        b"\"x\"",
-        b"{",
-        b"",
-        b"{\"connection\": {\"value\": \"x\", \"other\": 1}}",
-    ] {
+    for bytes in [&b"[]"[..], b"\"x\"", b"{", b""] {
         let error = BindingsFile::parse(bytes).expect_err("a non-object file should refuse");
         assert_eq!(error.code(), "bindings_file_invalid");
     }
@@ -559,8 +573,13 @@ fn member_and_members_bindings_publish_typed_values_kept_as_written() {
             "includedOwners",
         ),
     ] {
-        let error = resolve_bindings(&tree.bindings, Some(&bindings(value)), None)
-            .expect_err("a value that does not fit its kind should refuse");
+        let error = resolve_bindings(
+            &tree.bindings,
+            &tree.required_integrations,
+            Some(&bindings(value)),
+            None,
+        )
+        .expect_err("a value that does not fit its kind should refuse");
         assert_eq!(
             (error.code(), error.key()),
             ("binding_value_invalid", Some(key))
@@ -571,6 +590,7 @@ fn member_and_members_bindings_publish_typed_values_kept_as_written() {
         Tree::with(&MEMBER_ROOT.replace("default: []", "default: [\"\"]")).validated();
     let error = resolve_bindings(
         &empty_member_default.bindings,
+        &empty_member_default.required_integrations,
         Some(&bindings(json!({"nightlyOwner": "prn_x"}))),
         None,
     )
@@ -660,6 +680,275 @@ fn a_later_publish_carries_the_snapshot_forward_and_drops_undeclared_keys() {
     assert_eq!(
         (error.code(), error.key()),
         ("binding_missing", Some("reviewer"))
+    );
+}
+
+fn nested_bindings() -> BindingsFile {
+    bindings(json!({
+        "linear": {"team": "AUTO"},
+        "github": {"repository": {"kind": "repository", "value": "useful-machinery/platform"}},
+    }))
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    format!("sha256:{}", lowercase_hex(digest(&SHA256, bytes).as_ref()))
+}
+
+// REQ-WFDEF-3, REQ-WFDEF-20, REQ-WFDEF-22
+#[test]
+fn integration_bindings_publish_under_their_integration_in_a_canonical_snapshot() {
+    let home = Home::new();
+    let tree = Tree::with(NESTED_ROOT).validated();
+    let published = publish(
+        &home.home,
+        &tree,
+        PublishTarget::Resolve,
+        Some(&nested_bindings()),
+        "tester",
+    )
+    .expect("publish should succeed");
+    let id = published.record.id.clone();
+    let bytes = home.snapshot_bytes(&id, 1);
+    let snapshot = serde_json::from_slice::<Value>(&bytes).expect("snapshot should be JSON");
+    assert_eq!(
+        snapshot,
+        json!({
+            "github": {"repository": {"kind": "repository", "value": "useful-machinery/platform"}},
+            "linear": {
+                "backlog": {"kind": "state", "value": "Backlog"},
+                "canceled": {"kind": "state", "value": "Canceled"},
+                "done": {"kind": "state", "value": "Done"},
+                "ownedState": {"kind": "state", "value": "Engineering"},
+                "team": {"kind": "team", "value": "AUTO"},
+            },
+        })
+    );
+    let mut canonical = Vec::new();
+    canonical_json::to_writer(&mut canonical, &snapshot).expect("snapshot should re-encode");
+    assert_eq!(bytes, canonical);
+    assert_eq!(published.revision.bindings, sha256(&bytes));
+    assert!(schema_validator("workflow-definition-bindings-v2.schema.json").is_valid(&snapshot));
+    assert!(!schema_validator("workflow-definition-bindings-v1.schema.json").is_valid(&snapshot));
+    assert_eq!(
+        read_revision_bindings(&home.home, &id, 1).expect("the snapshot should read back"),
+        published.snapshot
+    );
+
+    // The snapshot is itself a bindings file.
+    let again = publish(
+        &home.home,
+        &tree,
+        PublishTarget::New,
+        Some(&BindingsFile::parse(&bytes).expect("the snapshot should parse as a file")),
+        "tester",
+    )
+    .expect("publishing with the snapshot as the file should succeed");
+    assert_ne!(again.record.id, id);
+    assert_eq!(again.revision.bindings, published.revision.bindings);
+}
+
+// REQ-WFDEF-20
+#[test]
+fn integration_binding_members_are_checked_against_their_integration_s_declarations() {
+    let tree = Tree::with(NESTED_ROOT).validated();
+    let resolve = |value: Value| {
+        resolve_bindings(
+            &tree.bindings,
+            &tree.required_integrations,
+            Some(&bindings(value)),
+            None,
+        )
+    };
+    let with_linear = |linear: Value| json!({"linear": linear, "github": {"repository": "r"}});
+    for (value, code, integration, key) in [
+        (
+            with_linear(json!({"tem": "AUTO"})),
+            "binding_undeclared",
+            Some("linear"),
+            Some("tem"),
+        ),
+        (
+            with_linear(json!({"team": {"kind": "state", "value": "AUTO"}})),
+            "binding_kind_mismatch",
+            Some("linear"),
+            Some("team"),
+        ),
+        (
+            with_linear(json!({"team": ""})),
+            "binding_value_invalid",
+            Some("linear"),
+            Some("team"),
+        ),
+        (
+            with_linear(json!({"team": ["AUTO"]})),
+            "binding_value_invalid",
+            Some("linear"),
+            Some("team"),
+        ),
+        (
+            with_linear(json!({"team": {"value": 7}})),
+            "binding_value_invalid",
+            Some("linear"),
+            Some("team"),
+        ),
+        (
+            json!({"linear": {"team": "AUTO"}}),
+            "binding_missing",
+            Some("github"),
+            Some("repository"),
+        ),
+        (
+            json!({"linear": {"team": "AUTO"}, "github": {"repository": "r"}, "team": "AUTO"}),
+            "binding_undeclared",
+            None,
+            Some("team"),
+        ),
+        (
+            json!({"linear": "AUTO", "github": {"repository": "r"}}),
+            "bindings_file_invalid",
+            Some("linear"),
+            None,
+        ),
+        (
+            with_linear(json!({"team": {"value": "AUTO", "other": 1}})),
+            "bindings_file_invalid",
+            Some("linear"),
+            Some("team"),
+        ),
+    ] {
+        let error = resolve(value).expect_err("the file should refuse");
+        assert_eq!(
+            (error.code(), error.integration(), error.key()),
+            (code, integration, key)
+        );
+    }
+
+    let engineering = Tree::engineering().validated();
+    let error = resolve_bindings(
+        &engineering.bindings,
+        &engineering.required_integrations,
+        Some(&bindings(json!({
+            "connection": "local",
+            "linearTeam": "AUTO",
+            "repository": "r",
+            "linear": {"team": "AUTO"},
+        }))),
+        None,
+    )
+    .expect_err("an integration the root does not declare bindings for should refuse");
+    assert_eq!(
+        (error.code(), error.integration(), error.key()),
+        ("binding_undeclared", None, Some("linear"))
+    );
+}
+
+// REQ-WFDEF-20
+#[test]
+fn a_half_migrated_root_takes_flat_members_and_an_integration_s_from_one_file() {
+    let half_migrated = ROOT_WORKFLOW.replacen(
+        "\n\nbindings:",
+        "\n  integrations:\n    linear:\n      bindings:\n        team: {kind: team}\n\nbindings:",
+        1,
+    );
+    let home = Home::new();
+    let published = publish(
+        &home.home,
+        &Tree::with(&half_migrated).validated(),
+        PublishTarget::Resolve,
+        Some(&bindings(json!({
+            "connection": "local",
+            "linearTeam": "AUTO",
+            "repository": "useful-machinery/platform",
+            "linear": {"team": "AUTO"},
+        }))),
+        "tester",
+    )
+    .expect("publish should succeed");
+    let snapshot = serde_json::from_slice::<Value>(&home.snapshot_bytes(&published.record.id, 1))
+        .expect("snapshot should be JSON");
+    assert_eq!(
+        snapshot,
+        json!({
+            "backlog": {"kind": "linear.state", "value": "Backlog"},
+            "canceled": {"kind": "linear.state", "value": "Canceled"},
+            "connection": {"kind": "connection", "value": "local"},
+            "done": {"kind": "linear.state", "value": "Done"},
+            "linear": {"team": {"kind": "team", "value": "AUTO"}},
+            "linearTeam": {"kind": "linear.team", "value": "AUTO"},
+            "ownedState": {"kind": "linear.state", "value": "Engineering"},
+            "repository": {"kind": "github.repository", "value": "useful-machinery/platform"},
+        })
+    );
+    assert!(schema_validator("workflow-definition-bindings-v2.schema.json").is_valid(&snapshot));
+}
+
+// REQ-WFDEF-21
+#[test]
+fn integration_bindings_are_required_carried_dropped_and_checked_by_integration_and_name() {
+    let home = Home::new();
+    let publish_nested = |root: &str, target: PublishTarget, file: Option<&BindingsFile>| {
+        publish(
+            &home.home,
+            &Tree::with(root).validated(),
+            target,
+            file,
+            "tester",
+        )
+    };
+    let error = publish_nested(NESTED_ROOT, PublishTarget::Resolve, None)
+        .expect_err("a first publish without a file should refuse");
+    assert_eq!(error.code(), "bindings_required");
+    assert!(!home.path("workflows").exists());
+
+    let first = publish_nested(
+        NESTED_ROOT,
+        PublishTarget::Resolve,
+        Some(&nested_bindings()),
+    )
+    .expect("first publish should succeed");
+    let carried = publish_nested(NESTED_ROOT, PublishTarget::Resolve, None)
+        .expect("a carried publish should succeed");
+    assert_eq!(carried.record.id, first.record.id);
+    assert_eq!(carried.revision.bindings, first.revision.bindings);
+    assert_eq!(carried.snapshot, first.snapshot);
+
+    let done_as_team = NESTED_ROOT
+        .replacen("done:       {kind: state,", "done:       {kind: team, ", 1)
+        .replacen("{state: $linear.done}", "{state: $linear.backlog}", 1);
+    let error = publish_nested(&done_as_team, PublishTarget::Resolve, None)
+        .expect_err("a carried value of another kind should refuse");
+    assert_eq!(
+        (error.code(), error.integration(), error.key()),
+        ("binding_kind_mismatch", Some("linear"), Some("done"))
+    );
+
+    let without_done = NESTED_ROOT
+        .replacen(
+            "        done:       {kind: state, default: \"Done\"}\n",
+            "",
+            1,
+        )
+        .replacen("      landed:    {state: $linear.done}\n", "", 1);
+    let dropped = publish_nested(&without_done, PublishTarget::Resolve, None)
+        .expect("a carried publish should drop what the root no longer declares");
+    let linear = &dropped.snapshot.integration_bindings()[&IntegrationProvider::Linear];
+    assert!(!linear.contains_key("done"));
+    assert_eq!(linear.len(), 4);
+    assert_eq!(linear["team"].value, "AUTO");
+
+    let other = Home::new();
+    let engineering = publish_engineering(&other, PublishTarget::Resolve);
+    let error = publish(
+        &other.home,
+        &Tree::with(NESTED_ROOT).validated(),
+        PublishTarget::To(engineering.record.id),
+        None,
+        "tester",
+    )
+    .expect_err("flat values carry no integration binding");
+    assert_eq!(
+        (error.code(), error.integration(), error.key()),
+        ("binding_missing", Some("github"), Some("repository"))
     );
 }
 
@@ -1122,6 +1411,107 @@ fn a_revision_s_resolution_record_is_optional_and_read_by_binding_key() {
     publish_engineering(&home, PublishTarget::Resolve);
     assert_eq!(home.home.revision_resolution(&id, 2).unwrap(), None);
     assert!(record.exists());
+}
+
+// REQ-WFDEF-32: the record's `linear` member holds the Linear integration's bindings by name,
+// read by reference key `linear.<name>` beside the flat keys; a `linear` member that is
+// itself `{id, name}` is the flat key `linear`'s entry, and no other member nests.
+#[test]
+fn a_resolution_record_reads_the_linear_integration_s_bindings_by_reference_key() {
+    let home = Home::new();
+    let id = publish_engineering(&home, PublishTarget::Resolve).record.id;
+    let record = home
+        .home
+        .definition_directory(&id)
+        .join("revisions/1/resolution.json");
+    let read = |value: Value| {
+        fs::write(&record, value.to_string()).expect("resolution record should be written");
+        home.home.revision_resolution(&id, 1)
+    };
+    let resolved = |value: Value| {
+        read(value)
+            .expect("the record should read")
+            .expect("the record should be present")
+    };
+
+    assert_eq!(
+        resolved(json!({
+            "linear": {
+                "team": {"id": "team-1", "name": "AUTO"},
+                "done": {"id": "state-done", "name": "Done"},
+            },
+            "extra": {"id": "x-1", "name": "X"},
+        })),
+        BTreeMap::from([
+            ("extra".to_owned(), "x-1".to_owned()),
+            ("linear.done".to_owned(), "state-done".to_owned()),
+            ("linear.team".to_owned(), "team-1".to_owned()),
+        ])
+    );
+    assert_eq!(
+        resolved(json!({"linear": {"id": "c-1", "name": "Workspace"}})),
+        BTreeMap::from([("linear".to_owned(), "c-1".to_owned())])
+    );
+
+    for invalid in [
+        json!({"linear": {"done": "state-done"}}),
+        json!({"linear": {"done": {"id": "", "name": "Done"}}}),
+        json!({"linear": {"not a key": {"id": "s", "name": "S"}}}),
+        json!({"github": {"repository": {"id": "r", "name": "R"}}}),
+    ] {
+        let error = read(invalid.clone()).expect_err("a record not of the shape should refuse");
+        assert_eq!(error.code(), "definition_record_invalid", "{invalid}");
+        assert_eq!(error.path(), Some(record.as_path()), "{invalid}");
+    }
+}
+
+// REQ-WFDEF-3: a snapshot answers each text value by the key a reference names after `$`,
+// an integration binding as `<id>.<name>` and a flat binding by its key; a `members` list is
+// no text value.
+#[test]
+fn a_snapshot_answers_its_text_values_by_reference_key() {
+    let home = Home::new();
+    let nested = publish(
+        &home.home,
+        &Tree::with(NESTED_ROOT).validated(),
+        PublishTarget::Resolve,
+        Some(&nested_bindings()),
+        "tester",
+    )
+    .expect("publish should succeed");
+    let values = nested.snapshot.text_values_by_reference();
+    assert_eq!(values.get("linear.team").map(String::as_str), Some("AUTO"));
+    assert_eq!(values.get("linear.done").map(String::as_str), Some("Done"));
+    assert_eq!(
+        values.get("github.repository").map(String::as_str),
+        Some("useful-machinery/platform")
+    );
+    assert!(!values.contains_key("team"), "{values:?}");
+
+    let half_migrated = MEMBER_ROOT.replacen(
+        "\nbindings:",
+        "\nrequires:\n  integrations:\n    linear:\n      bindings:\n        team: {kind: team}\nbindings:",
+        1,
+    );
+    let half = publish(
+        &home.home,
+        &Tree::with(&half_migrated).validated(),
+        PublishTarget::New,
+        Some(&bindings(json!({
+            "nightlyOwner": "prn_x",
+            "includedOwners": ["prn_a"],
+            "linear": {"team": "AUTO"},
+        }))),
+        "tester",
+    )
+    .expect("publish should succeed");
+    assert_eq!(
+        half.snapshot.text_values_by_reference(),
+        BTreeMap::from([
+            ("linear.team".to_owned(), "AUTO".to_owned()),
+            ("nightlyOwner".to_owned(), "prn_x".to_owned()),
+        ])
+    );
 }
 
 const CLOUD_ID: &str = "def_01k0z6r1w8f4jy2m7q9v3x5abc";

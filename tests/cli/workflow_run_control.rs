@@ -11,8 +11,8 @@ use super::workflow_continue::{
     completed, control, decide, decide_each, fan_out_tree, ordinals_of, partition_event, read_json,
     resume, status_document, wait_tree, wait_tree_with_json_questions, waiting_run,
 };
-use super::workflow_definition::Home;
-use super::workflow_mirror::{LinearStub, resolution, write_resolution};
+use super::workflow_definition::{Home, NESTED_ROOT, nested_bindings};
+use super::workflow_mirror::{LinearStub, nested_resolution, resolution, write_resolution};
 use super::workflow_run::{
     RunBundle, TreeBundle, assert_usage_error, isolated_command, progress_position,
     progress_records, run_record, tree_rejection, workflow_run_schema,
@@ -4536,8 +4536,42 @@ impl EngineeringWaitTree {
     fn publish_under(root: &str, engineering: &str) -> Self {
         let (_, blocks) = engineering.split_once("\nbindings:").unwrap();
         let (blocks, _) = blocks.split_once("\ninputs:").unwrap();
+        Self::publish_blocks(
+            root,
+            &format!("bindings:{blocks}"),
+            &serde_json::json!({
+                "connection": "local",
+                "linearTeam": "AUTO",
+                "repository": "useful-machinery/platform",
+            }),
+            &resolution(&[]),
+        )
+    }
+
+    /// The wait tree under the nested root's integrations, `triggers` and `mirror` blocks,
+    /// without its `requires.tools`, published with the nested bindings file and given the
+    /// nested resolution record.
+    fn publish_nested() -> Self {
+        let (_, blocks) = NESTED_ROOT.split_once("\n  integrations:").unwrap();
+        let (blocks, _) = blocks.split_once("\ninputs:").unwrap();
+        Self::publish_blocks(
+            WAIT_TREE_ROOT,
+            &format!("requires:\n  integrations:{blocks}"),
+            &nested_bindings(),
+            &nested_resolution(),
+        )
+    }
+
+    /// The wait tree with `root` as its `workflow.yaml` under a header of `blocks`, published
+    /// with the bindings file `bindings` and given the resolution record `resolution`.
+    fn publish_blocks(
+        root: &str,
+        blocks: &str,
+        bindings: &serde_json::Value,
+        resolution: &serde_json::Value,
+    ) -> Self {
         let header = format!(
-            "schemaVersion: 1\nname: engineering\nsubject: ticket\nbindings:{blocks}\ninputs:\n  ticket:\n    kind: text\n  baseBranch:\n    kind: text\n    default: main\n"
+            "schemaVersion: 1\nname: engineering\nsubject: ticket\n{blocks}\ninputs:\n  ticket:\n    kind: text\n  baseBranch:\n    kind: text\n    default: main\n"
         );
         let bundle = wait_tree();
         bundle.write_source(
@@ -4545,27 +4579,18 @@ impl EngineeringWaitTree {
             &root.replacen("schemaVersion: 1\n", &header, 1),
         );
         let files = tempfile::tempdir().unwrap();
-        let bindings = files.path().join("bindings.json");
-        fs::write(
-            &bindings,
-            serde_json::json!({
-                "connection": "local",
-                "linearTeam": "AUTO",
-                "repository": "useful-machinery/platform",
-            })
-            .to_string(),
-        )
-        .unwrap();
+        let bindings_file = files.path().join("bindings.json");
+        fs::write(&bindings_file, bindings.to_string()).unwrap();
         let home = Home::new();
         let report = home.json(&[
             "publish",
             bundle.source_root().to_str().unwrap(),
             "--bindings",
-            bindings.to_str().unwrap(),
+            bindings_file.to_str().unwrap(),
         ]);
         assert_eq!(report["outcome"], "published", "{report}");
         let definition = report["definition"]["id"].as_str().unwrap().to_owned();
-        write_resolution(&home, &definition, &resolution(&[]));
+        write_resolution(&home, &definition, resolution);
         Self {
             home,
             bundle,
@@ -4833,6 +4858,36 @@ fn a_delivered_departure_is_applied_from_the_fresh_issue_state() {
     );
     assert_eq!(refusal["observation"]["team"], "team-other", "{refusal}");
     assert_eq!(run_record(&moved)["state"], "waiting");
+}
+
+// REQ-LOCALRUN-208, REQ-WFDEF-37: a control trigger's `when` that names `$linear.canceled`
+// reads the integration binding's id from the resolution record's `linear` member, so the
+// fresh state still chooses `cancel` or `withdraw`.
+#[test]
+fn a_delivered_departure_reads_an_integration_binding_from_the_fresh_issue_state() {
+    let tree = EngineeringWaitTree::publish_nested();
+    let stub = LinearStub::start();
+    let later = "2026-11-10T10:00:01Z";
+
+    let run = tree.waiting(&stub, "AUTO-1");
+    stub.issue_state("Canceled");
+    applied(
+        &tree.event(&stub, &run, later, "state-backlog"),
+        &run,
+        "cancel",
+        "canceled",
+    );
+    assert_eq!(run_record(&run)["outcome"], "canceled");
+
+    stub.issue_state("Backlog");
+    let withdrawn = tree.waiting(&stub, "AUTO-2");
+    applied(
+        &tree.event(&stub, &withdrawn, later, "state-canceled"),
+        &withdrawn,
+        "withdraw",
+        "withdrawn",
+    );
+    assert_eq!(run_record(&withdrawn)["outcome"], "withdrawn");
 }
 
 // REQ-LOCALRUN-208: a delivered departure acts only for the claim's issue; one whose

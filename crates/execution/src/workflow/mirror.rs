@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::document::BindingKey;
 use super::local_run::{LocalRunDirectoryError, MIRROR_DIRECTORY};
 use super::schema_common::{parse_canonical_utc_timestamp, utc_timestamp};
 use super::wait::{NumberedRecords, WaitRecord};
@@ -189,7 +190,7 @@ fn is_variable_name(name: &str) -> bool {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MirrorGuard {
     pub operator: MirrorGuardOperator,
-    /// The binding key, without `$`.
+    /// The binding key as written, without `$`: a flat key or `<id>.<name>` (REQ-WFDEF-37).
     pub binding: String,
 }
 
@@ -234,7 +235,7 @@ impl MirrorGuard {
         };
         let binding = binding
             .strip_prefix('$')
-            .filter(|key| super::is_input_name(key))
+            .filter(|key| BindingKey::parse(key).is_some())
             .filter(|_| *subject == "issue.state")
             .ok_or(MirrorGuardError::Invalid)?;
         Ok(Self {
@@ -524,8 +525,10 @@ pub struct MirrorRun {
 }
 
 /// A run's mirror (REQ-LOCALRUN-193): the root's block, the issue identifier, the bound
-/// values of its revision's bindings snapshot by key (or why they cannot be had), the
-/// resolved provider ids by key when the revision has a resolution record, and the run
+/// values of its revision's bindings snapshot (or why they cannot be had), the resolved
+/// provider ids when the revision has a resolution record, both keyed by the text a
+/// reference names after `$` (a flat key, or `<id>.<name>` for an integration binding,
+/// REQ-WFDEF-37), and the run
 /// (`MirrorRun`): the operator, the run's id, URL and reference, and the run directory the
 /// records go under. With resolved ids the outcome's guard and state write go by id, else
 /// by the bound name (REQ-LOCALRUN-192). Each hook performs the block's write when the
@@ -557,7 +560,7 @@ impl Mirror {
     }
 
     /// The mirror matching and writing states by the provider ids of the revision's
-    /// resolution record (REQ-WFDEF-32), by binding key.
+    /// resolution record (REQ-WFDEF-32), by the reference key the bound values are keyed by.
     #[must_use]
     pub fn with_resolved_ids(mut self, resolved_ids: BTreeMap<String, String>) -> Self {
         self.resolved_ids = Some(resolved_ids);
@@ -1537,6 +1540,32 @@ mod tests {
                 MirrorGuard::parse(invalid),
                 Err(MirrorGuardError::Invalid),
                 "{invalid}"
+            );
+        }
+    }
+
+    // REQ-WFDEF-37: a guard takes a `$<id>.<name>` binding, the integration before the last
+    // `.`, and passes its key on as written.
+    #[test]
+    fn guards_take_an_integration_binding_as_written() {
+        assert_eq!(
+            MirrorGuard::parse("issue.state != $linear.ownedState"),
+            Ok(MirrorGuard {
+                operator: MirrorGuardOperator::NotEqual,
+                binding: "linear.ownedState".to_owned(),
+            })
+        );
+        for key in ["linear.canceled", "gitlab.com.group"] {
+            assert_eq!(
+                MirrorGuard::parse(&format!("issue.state == ${key}")).map(|guard| guard.binding),
+                Ok(key.to_owned())
+            );
+        }
+        for key in ["$linear.", "$.canceled", "$linear.Canceled"] {
+            assert_eq!(
+                MirrorGuard::parse(&format!("issue.state == {key}")),
+                Err(MirrorGuardError::Invalid),
+                "{key}"
             );
         }
     }

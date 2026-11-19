@@ -31,11 +31,17 @@ impl Published {
     /// `tree`, an engineering tree whose files a test may have rewritten, published as
     /// `engineering` publishes it.
     pub(super) fn publish(tree: Tree) -> Self {
+        let bindings = tree.engineering_bindings();
+        Self::publish_with(tree, &bindings)
+    }
+
+    /// `publish` with the bindings file at `bindings`.
+    pub(super) fn publish_with(tree: Tree, bindings: &str) -> Self {
         // The `design` stage runs `design.py` from the tree's `programs` directory.
         tree.write("scripts/design.py", STAGE_PROGRAM);
         executable(&Path::new(tree.path()).join("scripts/design.py"));
         let home = Home::new();
-        let report = home.publish(&tree, &["--bindings", &tree.engineering_bindings()]);
+        let report = home.publish(&tree, &["--bindings", bindings]);
         let id = report["definition"]["id"].as_str().unwrap().to_owned();
         let digest = report["revision"]["tree"].as_str().unwrap().to_owned();
         let scratch = tempfile::tempdir().unwrap();

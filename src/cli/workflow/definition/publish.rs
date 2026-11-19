@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
@@ -38,7 +39,7 @@ pub(super) struct Command {
     #[arg(
         long,
         value_name = "FILE",
-        help = "JSON object of binding values, resolved from the initial working directory"
+        help = "JSON object of binding values, an integration's nested under its id, resolved from the initial working directory"
     )]
     bindings: Option<PathBuf>,
 
@@ -265,8 +266,9 @@ impl Command {
 /// `--cloud-new` always, and a record with no `cloudId` asking Cloud for the project's
 /// identical definition first (REQ-CLOUDDEF-22). A refused read or publication of an
 /// existing definition never falls through to a create. The revision's bindings snapshot is
-/// sent whole, a `members` value as an array, with the tree's executable files; one fresh key
-/// covers the seal and the publication for the whole invocation.
+/// sent whole, a `members` value as an array, each integration's bindings under its id with
+/// their text values (no member when the root declares none), with the tree's executable
+/// files; one fresh key covers the seal and the publication for the whole invocation.
 fn publish_to_cloud(
     deployment: &Deployment,
     options: &CommonArgs<WorkflowJson, PrincipalAuthenticationArgs>,
@@ -292,6 +294,20 @@ fn publish_to_cloud(
         .map(|(binding, bound)| Ok((binding.clone(), serde_json::to_value(&bound.value)?)))
         .collect::<Result<WorkflowBindingValues, serde_json::Error>>()
         .context("encode the bindings snapshot")?;
+    let integration_bindings = published.snapshot.integration_bindings();
+    // A root that declares no integration binding sends no member, as before Cloud read it.
+    let integration_bindings = (!integration_bindings.is_empty()).then(|| {
+        integration_bindings
+            .iter()
+            .map(|(provider, group)| {
+                let values = group
+                    .iter()
+                    .map(|(name, bound)| (name.clone(), bound.value.clone()))
+                    .collect::<HashMap<_, _>>();
+                (provider.as_str().to_owned(), values)
+            })
+            .collect::<HashMap<_, _>>()
+    });
     // Every executable file, `[]` when none is, so clearing the last bit is published too.
     let executable_paths = tree
         .files
@@ -304,6 +320,7 @@ fn publish_to_cloud(
         digest: &published.revision.tree,
         files: &files,
         bindings: &bindings,
+        integration_bindings: integration_bindings.as_ref(),
         executable_paths: &executable_paths,
         existing: target.existing(published.record.cloud_id.as_deref()),
         reuse_identical: target.reuses_identical(published.record.cloud_id.as_deref()),
@@ -320,6 +337,9 @@ struct CloudSteps<'a> {
     digest: &'a str,
     files: &'a [WorkflowTreeFile<'a>],
     bindings: &'a WorkflowBindingValues,
+    /// Each integration's binding values by name, under its id; `None` when the root declares
+    /// no integration binding.
+    integration_bindings: Option<&'a HashMap<String, HashMap<String, String>>>,
     /// The tree's executable files, in bytewise order.
     executable_paths: &'a [String],
     /// The Cloud definition `--cloud-to` or the local record names, unless `--cloud-new`.
@@ -343,6 +363,7 @@ impl CloudSteps<'_> {
         let publication = WorkflowPublication {
             tree_digest: self.digest,
             bindings: Some(self.bindings),
+            integration_bindings: self.integration_bindings,
             executable_paths: Some(self.executable_paths),
         };
         // The create or publication is sent again once, under the same key, when Cloud
@@ -508,6 +529,13 @@ fn write_cloud_published(
                         .and_then(|detail| detail.current_revision)
                     {
                         writeln!(stderr, "cloud current revision: {current}")?;
+                    }
+                    if let Some(integration) = refusal
+                        .workflow
+                        .as_ref()
+                        .and_then(|detail| detail.integration.as_deref())
+                    {
+                        writeln!(stderr, "integration: {}", display(integration))?;
                     }
                     if let Some(key) = refusal
                         .workflow

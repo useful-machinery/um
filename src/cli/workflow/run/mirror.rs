@@ -32,7 +32,9 @@ pub(super) type Hook =
 /// an optional input the run was not given resolves to (REQ-WFFORMAT-84). A missing or non-text
 /// issue input, or a snapshot or resolution record that cannot be read, still makes a
 /// `Mirror`, whose every hook records the failure. A revision with a resolution record
-/// makes a mirror that matches and writes states by id (REQ-LOCALRUN-192).
+/// makes a mirror that matches and writes states by id (REQ-LOCALRUN-192). Both the snapshot's
+/// values and the record's ids are read by the key a reference names after `$`, so a
+/// `$linear.done` finds the `linear` integration's `done` binding (REQ-WFDEF-37).
 pub(super) fn mirror_for_run(
     home: Option<&WorkflowHome>,
     record: &WorkflowRunRecord,
@@ -73,14 +75,9 @@ pub(super) fn mirror_for_run(
     let (bindings, resolved_ids) = match (issue.as_ref(), read) {
         (Err(failure), _) => (Err(failure.clone()), None),
         (Ok(_), Err(failure)) => (Err(failure), None),
-        (Ok(_), Ok((snapshot, resolved_ids))) => (
-            Ok(snapshot
-                .bindings()
-                .iter()
-                .filter_map(|(key, bound)| Some((key.clone(), bound.value.as_text()?.to_owned())))
-                .collect()),
-            resolved_ids,
-        ),
+        (Ok(_), Ok((snapshot, resolved_ids))) => {
+            (Ok(snapshot.text_values_by_reference()), resolved_ids)
+        }
     };
     // REQ-LOCALRUN-191: the run's URL is the record's `external.url`, which a Cloud runner
     // sets to the run's page, else the run directory; its reference is that same external

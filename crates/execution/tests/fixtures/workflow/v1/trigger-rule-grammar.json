@@ -9,7 +9,11 @@
     "event.issue.blocked == false",
     "event.team_id.Field9 == $key_2",
     "event.team == $linearTeam and event.state == $ownedState",
-    "event.team == $linearTeam and event.state == $ownedState and event.issue.blocked == false"
+    "event.team == $linearTeam and event.state == $ownedState and event.issue.blocked == false",
+    "event.team == $linear.team",
+    "$linear.team == event.team",
+    "event.team == $linear.team and event.state == $linear.ownedState",
+    "event.group == $gitlab.com.group"
   ],
   "rejected": [
     "",

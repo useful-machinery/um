@@ -13,9 +13,9 @@ use ring::digest::{Context, SHA256};
 use serde::Serialize;
 
 use super::document::{
-    Binding, BindingKind, BusyBehavior, IntegrationAs, IntegrationProvider, OwnerDeclaration,
-    OwnerSource, RootBlocks, RootRequires, StartRule, StopBefore, Trigger, TriggerControlAction,
-    TriggerRule,
+    Binding, BindingKey, BindingKind, BusyBehavior, Integration, IntegrationBinding,
+    IntegrationProvider, OwnerDeclaration, OwnerSource, RootBlocks, RootRequires, StartRule,
+    StopBefore, Trigger, TriggerControlAction, TriggerRule,
 };
 use super::mirror::{MirrorBlock, MirrorGuard, MirrorGuardError, Template, hook_variables};
 use super::presentation_feed::normalize_terminal_scalar;
@@ -48,8 +48,9 @@ pub struct ValidatedTree {
     pub programs: Vec<String>,
     pub required_tools: Vec<String>,
     /// The root's declared integrations by provider id, each with the `as` that applies to
-    /// it: the entry's own, else `requires.as`, else none (REQ-WFDEF-14, REQ-WFDEF-34).
-    pub required_integrations: BTreeMap<IntegrationProvider, Option<IntegrationAs>>,
+    /// it (the entry's own, else `requires.as`, else none) as its `acting_as`, and its
+    /// bindings as declared (REQ-WFDEF-14, REQ-WFDEF-34, REQ-WFDEF-37).
+    pub required_integrations: BTreeMap<IntegrationProvider, Integration>,
     pub triggers: BTreeMap<String, TreeTrigger>,
     pub bindings: BTreeMap<String, Binding>,
     /// Every file the walk kept, by tree-relative path, for the run copy.
@@ -81,7 +82,8 @@ impl fmt::Debug for TreeFile {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TreeTrigger {
     pub kind: TreeTriggerKind,
-    /// The binding reference as written, `$` and the binding key; none for a schedule.
+    /// As written: the binding reference, `$` and the binding key, or the integration's id;
+    /// none for a schedule.
     pub source: Option<String>,
     /// None for a schedule.
     pub event: Option<String>,
@@ -165,7 +167,7 @@ impl TreeDiagnostic {
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct TreeLocation {
-    /// `tree`, `workflow`, `trigger`, `mirror`, `program` or `exclude`.
+    /// `tree`, `workflow`, `trigger`, `mirror`, `binding`, `program` or `exclude`.
     kind: &'static str,
     /// A tree-relative path.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -182,7 +184,8 @@ pub struct TreeLocation {
     trigger: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     binding: Option<String>,
-    /// The provider id of an integration a stage file's `requires` override names.
+    /// The provider id of an integration a stage file's `requires` override or a trigger's
+    /// source names, or the integration part of a `$<id>.<name>` reference as written.
     #[serde(skip_serializing_if = "Option::is_none")]
     integration: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -234,6 +237,16 @@ impl TreeLocation {
     fn integration(mut self, provider: &str) -> Self {
         self.integration = Some(provider.to_owned());
         self
+    }
+
+    /// The binding a reference's key names: the flat key, or the integration and the name.
+    fn reference(self, key: BindingKey<'_>) -> Self {
+        match key {
+            BindingKey::Flat(key) => self.binding(key),
+            BindingKey::Integration { integration, name } => {
+                self.integration(integration).binding(name)
+            }
+        }
     }
 
     fn input(mut self, input: &str) -> Self {
@@ -323,6 +336,7 @@ pub fn validate_workflow_tree(root: &Path) -> Result<ValidatedTree, Vec<TreeDiag
     if let Some(mirror) = &blocks.mirror {
         check_mirror(&root_workflow, &blocks, mirror, &mut diagnostics);
     }
+    check_bindings_declared_once(&blocks, &mut diagnostics);
     for program in &blocks.programs {
         if !walk.directories.contains(program.trim_end_matches('/')) {
             diagnostics.push(TreeDiagnostic::new(
@@ -353,7 +367,15 @@ pub fn validate_workflow_tree(root: &Path) -> Result<ValidatedTree, Vec<TreeDiag
         required_tools,
         required_integrations: integrations
             .into_iter()
-            .map(|(provider, integration)| (provider, integration.acting_as.or(acting_as)))
+            .map(|(provider, integration)| {
+                (
+                    provider,
+                    Integration {
+                        acting_as: integration.acting_as.or(acting_as),
+                        bindings: integration.bindings,
+                    },
+                )
+            })
             .collect(),
         programs: blocks.programs,
         triggers: blocks
@@ -659,9 +681,10 @@ fn check_triggers(
     }
 }
 
-/// A provider rule: its `source` names a `connection` binding, every `$key` in its `where`
-/// or a control's `when` is declared, neither holds a quoted literal, and each is in the
-/// grammar that evaluates it, a `where` Cloud's and a `when` the wait's (REQ-WFDEF-10).
+/// A provider rule: its `source` names a `connection` binding or a declared integration
+/// (REQ-WFDEF-38), every `$key` in its `where` or a control's `when` is declared, neither holds
+/// a quoted literal, and each is in the grammar that evaluates it, a `where` Cloud's and a
+/// `when` the wait's (REQ-WFDEF-10).
 fn check_rule(
     name: &str,
     rule: &TriggerRule,
@@ -669,14 +692,25 @@ fn check_rule(
     blocks: &RootBlocks,
     diagnostics: &mut Vec<TreeDiagnostic>,
 ) {
-    let source = rule.source.strip_prefix('$').unwrap_or(&rule.source);
-    check_binding(
-        blocks,
-        source,
-        BindingKind::Connection,
-        TreeLocation::trigger(name),
-        diagnostics,
-    );
+    match rule.source.strip_prefix('$') {
+        Some(key) => check_binding(
+            blocks,
+            key,
+            BindingKind::Connection,
+            TreeLocation::trigger(name),
+            diagnostics,
+        ),
+        // The schema closed a bare source to a provider id.
+        None if declared_integration(blocks, &rule.source).is_none() => {
+            diagnostics.push(TreeDiagnostic::new(
+                "integration_undeclared",
+                TreeLocation::trigger(name)
+                    .key("on.source")
+                    .integration(&rule.source),
+            ));
+        }
+        None => {}
+    }
 
     let expressions = [rule.condition.as_deref(), when].into_iter().flatten();
     let mut references = BTreeSet::new();
@@ -708,11 +742,12 @@ fn check_rule(
     }
     for key in references
         .into_iter()
-        .filter(|key| !blocks.bindings.contains_key(*key))
+        .map(BindingKey::split)
+        .filter(|key| declared_binding(blocks, *key).is_none())
     {
         diagnostics.push(TreeDiagnostic::new(
             "binding_undeclared",
-            TreeLocation::trigger(name).binding(key),
+            TreeLocation::trigger(name).reference(key),
         ));
     }
 
@@ -823,7 +858,8 @@ fn check_schedule(
     }
 }
 
-/// A binding reference in a trigger or the mirror names a declared binding of `kind`.
+/// A binding reference in a trigger or the mirror names a declared binding of `kind`: a flat
+/// one of that kind, or for `linear.state` a `state` binding under `linear` (REQ-WFDEF-37).
 fn check_binding(
     blocks: &RootBlocks,
     key: &str,
@@ -831,12 +867,88 @@ fn check_binding(
     location: TreeLocation,
     diagnostics: &mut Vec<TreeDiagnostic>,
 ) {
-    let code = match blocks.bindings.get(key) {
+    let key = BindingKey::split(key);
+    let code = match declared_binding(blocks, key) {
         None => "binding_undeclared",
-        Some(binding) if binding.kind != kind => "binding_kind_mismatch",
+        Some(declared) if !declared.fits(kind) => "binding_kind_mismatch",
         Some(_) => return,
     };
-    diagnostics.push(TreeDiagnostic::new(code, location.binding(key)));
+    diagnostics.push(TreeDiagnostic::new(code, location.reference(key)));
+}
+
+/// A binding the root declares, in its flat block or under one of its integrations.
+#[derive(Clone, Copy)]
+enum DeclaredBinding<'a> {
+    Flat(&'a Binding),
+    Integration(IntegrationProvider, &'a IntegrationBinding),
+}
+
+impl DeclaredBinding<'_> {
+    /// Whether the binding is of `kind`. An integration binding has a provider kind, so it is
+    /// never a `connection`, `member` or `members` binding.
+    fn fits(self, kind: BindingKind) -> bool {
+        match self {
+            Self::Flat(binding) => binding.kind == kind,
+            Self::Integration(provider, binding) => {
+                kind == BindingKind::LinearState
+                    && provider == IntegrationProvider::Linear
+                    && binding.kind == "state"
+            }
+        }
+    }
+}
+
+/// The declaration a reference's key names: a flat key in the `bindings` block, an
+/// integration key under `requires.integrations.<integration>.bindings`.
+fn declared_binding<'a>(
+    blocks: &'a RootBlocks,
+    key: BindingKey<'_>,
+) -> Option<DeclaredBinding<'a>> {
+    match key {
+        BindingKey::Flat(key) => blocks.bindings.get(key).map(DeclaredBinding::Flat),
+        BindingKey::Integration { integration, name } => {
+            let (provider, declared) = declared_integration(blocks, integration)?;
+            let binding = declared.bindings.get(name)?;
+            Some(DeclaredBinding::Integration(provider, binding))
+        }
+    }
+}
+
+/// The integration the root declares under `requires.integrations` with the id `id`.
+fn declared_integration<'a>(
+    blocks: &'a RootBlocks,
+    id: &str,
+) -> Option<(IntegrationProvider, &'a Integration)> {
+    blocks
+        .requires
+        .as_ref()?
+        .integrations
+        .iter()
+        .find(|(provider, _)| provider.as_str() == id)
+        .map(|(provider, integration)| (*provider, integration))
+}
+
+/// A flat key that is also a name an integration declares, or the id of an integration that
+/// declares bindings, is `binding_declared_twice`, once for each such integration
+/// (REQ-WFDEF-37): flat keys in bytewise order, integrations in id order.
+fn check_bindings_declared_once(blocks: &RootBlocks, diagnostics: &mut Vec<TreeDiagnostic>) {
+    let Some(requires) = &blocks.requires else {
+        return;
+    };
+    for key in blocks.bindings.keys() {
+        for (provider, integration) in &requires.integrations {
+            let declared = integration.bindings.contains_key(key)
+                || (!integration.bindings.is_empty() && provider.as_str() == key);
+            if declared {
+                diagnostics.push(TreeDiagnostic::new(
+                    "binding_declared_twice",
+                    TreeLocation::new("binding")
+                        .binding(key)
+                        .integration(provider.as_str()),
+                ));
+            }
+        }
+    }
 }
 
 /// `event.` and a dotted path of non-empty ASCII alphanumeric or `_` segments, the event
@@ -994,14 +1106,17 @@ fn root_exit_outcomes(workflow: &ValidatedWorkflow) -> BTreeSet<&str> {
     outcomes
 }
 
-/// Each `$` and the identifier characters that follow it, scanned lexically.
+/// Each `$` and the key that follows it, scanned lexically: ASCII alphanumerics, `.` and `_`,
+/// so a `$<id>.<name>` reference is read whole, less a trailing `.` (REQ-WFDEF-37).
 fn binding_references(expression: &str) -> impl Iterator<Item = &str> {
     expression.match_indices('$').map(|(index, _)| {
         let rest = &expression[index + 1..];
         let end = rest
-            .find(|character: char| !character.is_ascii_alphanumeric())
+            .find(|character: char| {
+                !(character.is_ascii_alphanumeric() || matches!(character, '.' | '_'))
+            })
             .unwrap_or(rest.len());
-        &rest[..end]
+        rest[..end].trim_end_matches('.')
     })
 }
 

@@ -145,6 +145,8 @@ struct RefusalDiagnostic<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     definitions: Option<&'a [String]>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    integration: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     binding: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
@@ -156,6 +158,7 @@ impl<'a> RefusalDiagnostic<'a> {
             code: error.code(),
             definition: error.id(),
             definitions: Some(error.ids()).filter(|ids| !ids.is_empty()),
+            integration: error.integration(),
             binding: error.key(),
             path: error.path().map(|path| path.to_string_lossy().into_owned()),
         }
@@ -183,6 +186,9 @@ fn write_human_refused(summary: &str, error: &DefinitionError) -> anyhow::Result
     if !error.ids().is_empty() {
         let ids = error.ids().iter().map(|id| display(id)).collect::<Vec<_>>();
         write!(stdout, "  definitions: {}", ids.join(", "))?;
+    }
+    if let Some(integration) = error.integration() {
+        write!(stdout, "  integration: {}", display(integration))?;
     }
     if let Some(key) = error.key() {
         write!(stdout, "  binding: {}", display(key))?;

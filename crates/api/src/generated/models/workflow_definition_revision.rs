@@ -31,6 +31,24 @@ pub struct WorkflowDefinitionRevision {
     pub bindings: std::collections::HashMap<String, models::WorkflowDefinitionBinding>,
     #[serde(rename = "resolution")]
     pub resolution: std::collections::HashMap<String, models::WorkflowDefinitionResolvedBinding>,
+    /// The bindings declared under each integration as published, integration id to binding name; absent when the revision holds none.
+    #[serde(
+        rename = "integrationBindings",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub integration_bindings: Option<
+        std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, models::WorkflowDefinitionIntegrationBinding>,
+        >,
+    >,
+    /// Each integration's account and its bindings' resolution, by integration id; absent when the revision holds none.
+    #[serde(
+        rename = "integrationResolution",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub integration_resolution:
+        Option<std::collections::HashMap<String, models::WorkflowDefinitionIntegrationResolution>>,
     #[serde(rename = "publishedAt")]
     pub published_at: String,
     #[serde(rename = "publishedBy")]
@@ -54,6 +72,8 @@ impl WorkflowDefinitionRevision {
             executable_paths: None,
             bindings,
             resolution,
+            integration_bindings: None,
+            integration_resolution: None,
             published_at,
             published_by,
         }

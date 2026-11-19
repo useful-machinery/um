@@ -374,7 +374,12 @@ fn engineering(mirrored: bool) -> Published {
 /// The engineering tree whose root's steps are `DESIGN_STAGE_STEPS`, with or without its
 /// `mirror` block.
 fn engineering_tree(mirrored: bool) -> Tree {
-    let tree = Tree::engineering();
+    design_stage(Tree::engineering(), mirrored)
+}
+
+/// `tree` with its root's steps replaced by `DESIGN_STAGE_STEPS`, with or without its
+/// `mirror` block.
+fn design_stage(tree: Tree, mirrored: bool) -> Tree {
     let root = fs::read_to_string(Path::new(tree.path()).join("workflow.yaml")).unwrap();
     let (header, _) = root.split_once("\nsteps:\n").unwrap();
     let header = if mirrored {
@@ -445,7 +450,23 @@ pub(super) fn write_resolution(home: &Home, definition: &str, resolution: &Value
 /// The resolution record of the engineering root's `linear.team` and `linear.state`
 /// bindings, by `STATES`' ids, without the keys in `omit`.
 pub(super) fn resolution(omit: &[&str]) -> Value {
-    let mut record = json!({"linearTeam": {"id": "team-auto", "name": "AUTO"}});
+    let mut record = resolved_states("linearTeam");
+    for key in omit {
+        record.as_object_mut().unwrap().remove(*key);
+    }
+    record
+}
+
+/// The resolution record of the nested root's `linear` `team` and `state` bindings, by
+/// `STATES`' ids, under the record's `linear` member.
+pub(super) fn nested_resolution() -> Value {
+    json!({"linear": resolved_states("team")})
+}
+
+/// The resolved team, under `team`, and the four states by their binding names, by
+/// `STATES`' ids.
+fn resolved_states(team: &str) -> Value {
+    let mut record = json!({team: {"id": "team-auto", "name": "AUTO"}});
     for (key, name) in [
         ("ownedState", "Engineering"),
         ("backlog", "Backlog"),
@@ -454,9 +475,6 @@ pub(super) fn resolution(omit: &[&str]) -> Value {
     ] {
         let id = STATES.iter().find(|(state, _)| *state == name).unwrap().1;
         record[key] = json!({"id": id, "name": name});
-    }
-    for key in omit {
-        record.as_object_mut().unwrap().remove(*key);
     }
     record
 }
@@ -828,6 +846,53 @@ fn a_resolution_record_moves_the_issue_by_state_id_and_run_url_is_the_external_u
     assert_eq!(
         write["action"],
         json!({"kind": "state", "state": "Done", "binding": "done"})
+    );
+}
+
+// REQ-LOCALRUN-191, REQ-WFDEF-32, REQ-WFDEF-37: a mirror state named `$linear.done` reads the
+// integration binding's value from the snapshot's `linear` member, and once a person renamed
+// the state, its id from the resolution record's.
+#[test]
+fn a_mirror_state_of_an_integration_binding_moves_the_issue_by_its_value_or_resolved_id() {
+    let tree = design_stage(Tree::nested(), true);
+    let bindings = tree.nested_bindings();
+    let published = Published::publish_with(tree, &bindings);
+    let stub = LinearStub::start();
+    let outcome = |run: &Path| {
+        let writes = mirror_writes(run);
+        let (name, write) = writes.last().unwrap().clone();
+        assert_eq!(name, "0003-outcome.json");
+        write
+    };
+
+    let run = create(&published, "AUTO-1", |command| stub.point(command));
+    assert_eq!(run_record(&run)["outcome"], "landed");
+    assert_eq!(stub.operations().last().unwrap(), "UpdateIssueState");
+    assert_eq!(
+        stub.bodies().last().unwrap()["variables"],
+        json!({"id": "issue-1", "input": {"stateId": "state-done"}})
+    );
+    let write = outcome(&run);
+    assert_eq!(write["outcome"], "written", "{write}");
+    assert_eq!(
+        write["action"],
+        json!({"kind": "state", "state": "Done", "binding": "linear.done"})
+    );
+
+    stub.rename_state("state-done", "Completed");
+    stub.clear();
+    let run = create(&published, "AUTO-2", |command| stub.point(command));
+    let write = outcome(&run);
+    assert_eq!(write["outcome"], "failed", "{write}");
+    assert_eq!(write["code"], "mirror_state_unknown", "{write}");
+
+    write_resolution(&published.home, &published.id, &nested_resolution());
+    stub.clear();
+    let run = create(&published, "AUTO-3", |command| stub.point(command));
+    assert_eq!(outcome(&run)["outcome"], "written");
+    assert_eq!(
+        stub.bodies().last().unwrap()["variables"],
+        json!({"id": "issue-1", "input": {"stateId": "state-done"}})
     );
 }
 

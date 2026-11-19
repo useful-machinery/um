@@ -1,0 +1,86 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://docs.usefulmachinery.com/schemas/workflow-definition-bindings-v2.schema.json",
+  "title": "Useful Machinery Workflow Definition Bindings Snapshot V2",
+  "description": "A revision's bindings.json: each binding of the root workflow's flat bindings block, keyed by its name, with its kind and the value bound for the environment, and, for each integration that declares bindings, a member keyed by the integration's id that holds that integration's bindings, each name with its provider-relative kind and its value. A members value is an array, empty included; every other value is a non-empty string. Every snapshot of the v1 shape has this shape. An empty object is the snapshot of a root workflow that declares no bindings.",
+  "type": "object",
+  "propertyNames": { "$ref": "#/$defs/Identifier" },
+  "properties": {
+    "linear": {
+      "anyOf": [
+        { "$ref": "#/$defs/BoundBinding" },
+        { "$ref": "#/$defs/LinearBindings" }
+      ]
+    },
+    "github": {
+      "anyOf": [
+        { "$ref": "#/$defs/BoundBinding" },
+        { "$ref": "#/$defs/GithubBindings" }
+      ]
+    }
+  },
+  "additionalProperties": { "$ref": "#/$defs/BoundBinding" },
+  "$defs": {
+    "Identifier": {
+      "type": "string",
+      "maxLength": 64,
+      "pattern": "^[a-z][A-Za-z0-9]*$"
+    },
+    "BindingKind": {
+      "enum": ["connection", "linear.team", "linear.state", "github.repository", "member", "members"]
+    },
+    "BoundBinding": {
+      "description": "A binding of the flat bindings block: its kind and the value bound for the environment.",
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "const": "members" },
+            "value": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "value"],
+          "properties": {
+            "kind": { "$ref": "#/$defs/BindingKind", "not": { "const": "members" } },
+            "value": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    },
+    "LinearBindings": {
+      "type": "object",
+      "description": "The linear integration's bindings, each name with a kind the linear provider lists and its value.",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/Identifier" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "value"],
+        "properties": {
+          "kind": { "enum": ["team", "state"] },
+          "value": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "GithubBindings": {
+      "type": "object",
+      "description": "The github integration's bindings, each name with a kind the github provider lists and its value.",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/Identifier" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["kind", "value"],
+        "properties": {
+          "kind": { "enum": ["repository"] },
+          "value": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  }
+}

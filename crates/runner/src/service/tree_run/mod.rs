@@ -55,8 +55,11 @@ use resume_loop::ResumeIntervals;
 
 const ROOT_WORKFLOW_FILE: &str = "workflow.yaml";
 const RESOLUTION_FILE: &str = "resolution.json";
-/// The binding kinds whose resolved provider ids the mirror uses (REQ-WFDEF-32).
+/// The flat binding kinds whose resolved provider ids the mirror uses (REQ-WFDEF-32).
 const RESOLVED_KINDS: [&str; 2] = ["linear.team", "linear.state"];
+/// The kinds of the `linear` integration's bindings whose resolved provider ids the mirror
+/// uses, recorded under the member `linear` (REQ-WFDEF-32).
+const RESOLVED_LINEAR_KINDS: [&str; 2] = ["team", "state"];
 
 /// The executable a tree run supervises, or the one its workflow-Git helper runs: this
 /// runner's own `useful` release.
@@ -617,29 +620,57 @@ fn first_step(tree: &Path, workflow_path: &str) -> Result<FirstStep, AssignmentD
         })
 }
 
-/// The revision's `resolution.json` (REQ-WFDEF-32): each `linear.team` and `linear.state`
-/// key the spec's resolution gives an id, as exactly `{id, name}`. A key resolved without
-/// a display name is named by its bound value; a key without an id is left out, so the
-/// mirror reports it `mirror_state_unknown` when it writes that state.
+/// The revision's `resolution.json` (REQ-WFDEF-32): each flat `linear.team` and
+/// `linear.state` key the spec's resolution gives an id and, under the member `linear`, each
+/// `team` and `state` binding of the `linear` integration's entry it gives one, each as
+/// exactly `{id, name}`. A member of the resolution is a flat entry exactly when its `kind`
+/// is a string; any other is an integration's entry keyed by its id. A binding resolved
+/// without a display name is named by its bound value; one without an id is left out, so the
+/// mirror reports it `mirror_state_unknown` when it writes that state. An integration's
+/// `account`, and every other integration's entry, are not written: the store refuses a
+/// record holding anything but these.
 fn resolution_record(resolution: &serde_json::Value) -> serde_json::Value {
-    let record = resolution
+    let linear = useful_execution::IntegrationProvider::Linear.as_str();
+    let mut record = serde_json::Map::new();
+    for (key, resolved) in resolution.as_object().into_iter().flatten() {
+        let entry = match resolved["kind"].as_str() {
+            Some(kind) if RESOLVED_KINDS.contains(&kind) => resolved_entry(resolved),
+            Some(_) => None,
+            None if key == linear => linear_bindings(resolved),
+            None => None,
+        };
+        if let Some(entry) = entry {
+            record.insert(key.clone(), entry);
+        }
+    }
+    serde_json::Value::Object(record)
+}
+
+/// The `linear` integration entry's `team` and `state` bindings that have an id, as name to
+/// `{id, name}`, or none when no binding has one.
+fn linear_bindings(entry: &serde_json::Value) -> Option<serde_json::Value> {
+    let bindings: serde_json::Map<_, _> = entry["bindings"]
         .as_object()
         .into_iter()
         .flatten()
-        .filter(|(_, resolved)| {
-            resolved["kind"]
+        .filter(|(_, binding)| {
+            binding["kind"]
                 .as_str()
-                .is_some_and(|kind| RESOLVED_KINDS.contains(&kind))
+                .is_some_and(|kind| RESOLVED_LINEAR_KINDS.contains(&kind))
         })
-        .filter_map(|(key, resolved)| {
-            let id = resolved["id"].as_str().filter(|id| !id.is_empty())?;
-            let name = [&resolved["name"], &resolved["value"]]
-                .into_iter()
-                .find_map(|name| name.as_str().filter(|name| !name.is_empty()))?;
-            Some((key.clone(), serde_json::json!({ "id": id, "name": name })))
-        })
+        .filter_map(|(name, binding)| Some((name.clone(), resolved_entry(binding)?)))
         .collect();
-    serde_json::Value::Object(record)
+    (!bindings.is_empty()).then_some(serde_json::Value::Object(bindings))
+}
+
+/// A resolved binding's `{id, name}`, named by its bound value when it has no display name,
+/// or none when it has no id.
+fn resolved_entry(resolved: &serde_json::Value) -> Option<serde_json::Value> {
+    let id = resolved["id"].as_str().filter(|id| !id.is_empty())?;
+    let name = [&resolved["name"], &resolved["value"]]
+        .into_iter()
+        .find_map(|name| name.as_str().filter(|name| !name.is_empty()))?;
+    Some(serde_json::json!({ "id": id, "name": name }))
 }
 
 /// `useful workflow run create` for the run: the run inputs, the start's owner, the stop step,

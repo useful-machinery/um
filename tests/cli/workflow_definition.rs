@@ -601,6 +601,113 @@ fn mirror_states_must_be_declared_linear_state_bindings() {
     assert_eq!(location["binding"], "linearTeam");
 }
 
+/// The engineering root with its bindings declared under the integrations they belong to.
+pub(super) const NESTED_ROOT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/crates/execution/tests/fixtures/workflow/v1/valid/root-integration-bindings.yaml"
+));
+
+/// The one rejection of the nested root with `from` replaced by `to` once.
+fn nested_rejection(from: &str, to: &str) -> (String, Value) {
+    assert!(NESTED_ROOT.contains(from), "{from:?}");
+    single_rejection(&NESTED_ROOT.replacen(from, to, 1), DESIGN_WORKFLOW)
+}
+
+// REQ-WFDEF-14, REQ-WFDEF-37, REQ-WFDEF-38: each integration's bindings are reported with it,
+// `{kind, default?, required}` as a flat binding is, and a trigger's source as written.
+#[test]
+fn validate_reports_each_integrations_bindings_and_its_source() {
+    let tree = Tree::nested();
+    let report = valid_report(tree.path());
+    let state = |default: &str| json!({"kind": "state", "default": default, "required": false});
+    assert_eq!(
+        report["requiresIntegrations"],
+        json!({
+            "github": {"bindings": {"repository": {"kind": "repository", "required": true}}},
+            "linear": {"bindings": {
+                "backlog": state("Backlog"),
+                "canceled": state("Canceled"),
+                "done": state("Done"),
+                "ownedState": state("Engineering"),
+                "team": {"kind": "team", "required": true},
+            }},
+        })
+    );
+    assert_eq!(report["bindings"], json!({}));
+    assert_eq!(report["triggers"]["start"]["source"], "linear");
+    assert_eq!(report["triggers"]["release"]["source"], "linear");
+
+    let human = validate(tree.path(), false);
+    assert_eq!(human.status.code(), Some(0), "{human:?}");
+    let stdout = String::from_utf8(human.stdout).expect("human output should be UTF-8");
+    let lines = stdout.lines().collect::<Vec<_>>();
+    for expected in [
+        ["linear.team", "team", "(required)"],
+        ["linear.ownedState", "state", "(default \"Engineering\")"],
+        ["github.repository", "repository", "(required)"],
+    ] {
+        assert!(
+            lines
+                .iter()
+                .any(|line| expected.iter().all(|part| line.contains(part))),
+            "missing {expected:?} in {stdout}"
+        );
+    }
+    for trigger in ["start", "release"] {
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains(&format!("{trigger}:")) && line.contains("on linear ")),
+            "missing {trigger} on linear in {stdout}"
+        );
+    }
+}
+
+// REQ-WFDEF-37, REQ-WFFORMAT-101, REQ-WFDEF-15: a mirror state or guard names an integration
+// binding as `$<id>.<name>`, of kind `state` under `linear`; a failure names the integration
+// and the binding, and a flat key declared under an integration too is declared twice.
+#[test]
+fn mirror_states_and_guards_take_linear_state_integration_bindings() {
+    let tree = Tree::nested();
+    let output = validate(tree.path(), true);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+
+    let assert_reference = |location: &Value, integration: &str, binding: &str| {
+        assert_eq!(location["integration"], integration, "{location}");
+        assert_eq!(location["binding"], binding, "{location}");
+    };
+    let (code, location) = nested_rejection("{state: $linear.done}", "{state: $linear.team}");
+    assert_eq!(code, "binding_kind_mismatch");
+    assert_outcome_location(&location, "onOutcome.state", "landed");
+    assert_reference(&location, "linear", "team");
+
+    let (code, location) = nested_rejection("{state: $linear.done}", "{state: $github.repository}");
+    assert_eq!(code, "binding_kind_mismatch");
+    assert_reference(&location, "github", "repository");
+
+    let (code, location) = nested_rejection("{state: $linear.done}", "{state: $linear.nope}");
+    assert_eq!(code, "binding_undeclared");
+    assert_reference(&location, "linear", "nope");
+
+    let (code, location) = nested_rejection(
+        "unless: issue.state != $linear.ownedState}",
+        "unless: issue.state != $linear.team}",
+    );
+    assert_eq!(code, "binding_kind_mismatch");
+    assert_outcome_location(&location, "onOutcome.unless", "withdrawn");
+    assert_reference(&location, "linear", "team");
+
+    let (code, location) = nested_rejection(
+        "\ntriggers:",
+        "\nbindings:\n  team: {kind: linear.team}\ntriggers:",
+    );
+    assert_eq!(code, "binding_declared_twice");
+    assert_eq!(
+        location,
+        json!({"kind": "binding", "binding": "team", "integration": "linear"})
+    );
+}
+
 // REQ-WFFORMAT-101, REQ-WFDEF-10
 #[test]
 fn mirror_guards_follow_the_guard_grammar() {
@@ -953,6 +1060,24 @@ impl Tree {
             }),
         )
     }
+
+    /// The engineering tree whose root declares its bindings under its integrations.
+    pub(super) fn nested() -> Self {
+        Self::with(NESTED_ROOT, DESIGN_WORKFLOW)
+    }
+
+    /// Writes `nested_bindings()` beside the tree: the bindings file of `nested`.
+    pub(super) fn nested_bindings(&self) -> String {
+        self.bindings_file("nested.json", &nested_bindings())
+    }
+}
+
+/// The values of the nested root's bindings without a default, under their integrations.
+pub(super) fn nested_bindings() -> Value {
+    json!({
+        "linear": {"team": "AUTO"},
+        "github": {"repository": "useful-machinery/platform"},
+    })
 }
 
 fn is_definition_id(id: &str) -> bool {
@@ -1164,6 +1289,7 @@ fn publish_refuses_missing_or_unusable_bindings() {
     );
     let missing = home.refused(&tree, &["--bindings", &partial], "binding_missing");
     assert_eq!(missing["binding"], "repository");
+    assert!(missing.get("integration").is_none(), "{missing}");
 
     let absent = tree
         .root
@@ -1175,6 +1301,61 @@ fn publish_refuses_missing_or_unusable_bindings() {
     assert_eq!(unreadable["path"], absent);
 
     assert!(home.workflow_entries().is_empty());
+    home.assert_no_runs();
+}
+
+// REQ-WFDEF-20, REQ-WFDEF-26, REQ-WFDEF-27: integration bindings nested under their id are
+// published, shown as `<id>.<name>`, and a refusal about one names the integration.
+#[test]
+fn integration_bindings_are_published_shown_and_refused_by_integration() {
+    let home = Home::new();
+    let tree = Tree::nested();
+
+    let without_team = tree.bindings_file(
+        "without-team.json",
+        &json!({"github": {"repository": "useful-machinery/platform"}}),
+    );
+    let missing = home.refused(&tree, &["--bindings", &without_team], "binding_missing");
+    assert_eq!(missing["integration"], "linear", "{missing}");
+    assert_eq!(missing["binding"], "team", "{missing}");
+    let human = home.human(&["publish", tree.path(), "--bindings", &without_team], 1);
+    let code_line = human
+        .lines()
+        .find(|line| line.starts_with("code: binding_missing"))
+        .unwrap_or_else(|| panic!("missing the code line in {human}"));
+    assert_contains_all(code_line, &["linear", "team"]);
+
+    let bare = tree.bindings_file(
+        "bare.json",
+        &json!({"linear": "AUTO", "github": {"repository": "useful-machinery/platform"}}),
+    );
+    let invalid = home.refused(&tree, &["--bindings", &bare], "bindings_file_invalid");
+    assert_eq!(invalid["path"], bare.as_str(), "{invalid}");
+    assert_eq!(invalid["integration"], "linear", "{invalid}");
+    assert!(invalid.get("binding").is_none(), "{invalid}");
+    assert!(home.workflow_entries().is_empty());
+
+    let nested = tree.nested_bindings();
+    let published = home.publish(&tree, &["--bindings", &nested]);
+    let id = text(&published["definition"]["id"], "definition id").to_owned();
+    let snapshot = read_json(
+        &home
+            .definition_directory(&id)
+            .join("revisions/1/bindings.json"),
+    );
+    assert!(
+        schema("workflow-definition-bindings-v2.schema.json").is_valid(&snapshot),
+        "{snapshot}"
+    );
+    assert_eq!(home.json(&["show", &id])["bindings"], snapshot);
+    assert_contains_all(
+        &home.human(&["show", &id], 0),
+        &[
+            "linear.team: AUTO (team)",
+            "linear.ownedState: Engineering (state)",
+            "github.repository: useful-machinery/platform (repository)",
+        ],
+    );
     home.assert_no_runs();
 }
 
@@ -1836,7 +2017,7 @@ struct GatewayState {
     lose_next_publication: bool,
     forbid_next_publication: bool,
     drop_next_publication_reply: bool,
-    keyed_problems: std::collections::VecDeque<(&'static str, u16, &'static str)>,
+    keyed_problems: std::collections::VecDeque<(&'static str, u16, &'static str, Value)>,
     fault: Option<Fault>,
     publications: std::collections::BTreeMap<String, (&'static str, Value)>,
 }
@@ -1891,7 +2072,8 @@ pub(super) enum Fault {
 const CAPABILITY_PASSWORD: &str = "unique-capability-password-sentinel";
 
 /// One Cloud definition the fake Gateway holds: its current revision, what that revision
-/// published (`publication_of` the request) and its settings.
+/// published (`publication_of` the request), its settings and whether its revisions hold
+/// integration bindings.
 #[derive(Clone, Default)]
 struct FakeDefinition {
     current: i64,
@@ -1899,6 +2081,7 @@ struct FakeDefinition {
     archived: bool,
     automatic_starts: bool,
     principal: Option<String>,
+    integrations: bool,
 }
 
 /// A loopback fake of the Gateway's tree and definition operations and of signed storage,
@@ -1960,11 +2143,23 @@ impl FakeGateway {
         status: u16,
         slug: &'static str,
     ) {
+        self.refuse_next_keyed_with(line, status, slug, Value::Null);
+    }
+
+    /// As [`Self::answer_next_keyed_with`], the problem carrying `workflow` as its safe facts
+    /// unless it is null.
+    pub(super) fn refuse_next_keyed_with(
+        &self,
+        line: &'static str,
+        status: u16,
+        slug: &'static str,
+        workflow: Value,
+    ) {
         self.state
             .lock()
             .unwrap()
             .keyed_problems
-            .push_back((line, status, slug));
+            .push_back((line, status, slug, workflow));
     }
 
     /// Answers the next request on the route `fault` names with it.
@@ -1978,6 +2173,18 @@ impl FakeGateway {
             id.to_owned(),
             FakeDefinition {
                 current,
+                ..FakeDefinition::default()
+            },
+        );
+    }
+
+    /// As [`Self::define`], each revision also holding `gateway_integrations`.
+    pub(super) fn define_with_integrations(&self, id: &str, current: i64) {
+        self.state.lock().unwrap().definitions.insert(
+            id.to_owned(),
+            FakeDefinition {
+                current,
+                integrations: true,
                 ..FakeDefinition::default()
             },
         );
@@ -2159,12 +2366,14 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
     }
     if request.header("idempotency-key").is_some()
         && request.path.starts_with(definitions.as_str())
-        && let Some((line, status, slug)) = state.keyed_problems.pop_front()
+        && let Some((line, status, slug, workflow)) = state.keyed_problems.pop_front()
     {
-        return super::problem_http_response(
-            line,
-            json!({"type": format!("{PROBLEMS}{slug}"), "title": "Unavailable", "status": status}),
-        );
+        let mut problem =
+            json!({"type": format!("{PROBLEMS}{slug}"), "title": "Unavailable", "status": status});
+        if !workflow.is_null() {
+            problem["workflow"] = workflow;
+        }
+        return super::problem_http_response(line, problem);
     }
     if route == format!("POST {definitions}") {
         if state.fault(Fault::CreateHtmlNotFound) {
@@ -2497,6 +2706,7 @@ fn publication_of(body: &Value) -> Value {
     json!({
         "treeDigest": body["treeDigest"],
         "bindings": body["bindings"],
+        "integrationBindings": body["integrationBindings"],
         "executablePaths": body["executablePaths"],
     })
 }
@@ -2644,6 +2854,8 @@ fn publish_cloud_creates_then_publishes_to_the_recorded_cloud_definition() {
     assert_eq!(created["bindings"]["ownedState"], "Engineering");
     // A home with no recorded Cloud definition asks Cloud for an identical one first.
     assert_eq!(created["reuseIdentical"], true);
+    // A root that declares no integration binding sends no integration values.
+    assert!(created.get("integrationBindings").is_none(), "{created}");
 
     // A second publish reads the recorded Cloud definition's revision and publishes to it.
     let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
@@ -2664,6 +2876,11 @@ fn publish_cloud_creates_then_publishes_to_the_recorded_cloud_definition() {
     );
     assert_eq!(requests[2].json()["expectedCurrentRevision"], 1);
     assert_eq!(requests[2].json()["treeDigest"], digest.as_str());
+    assert!(
+        requests[2].json().get("integrationBindings").is_none(),
+        "{}",
+        requests[2].json()
+    );
     assert_ne!(requests[2].header("idempotency-key"), Some(key.as_str()));
     assert_eq!(read_json(&record_path)["cloudId"], cloud_id.as_str());
 
@@ -2699,6 +2916,114 @@ fn publish_cloud_creates_then_publishes_to_the_recorded_cloud_definition() {
     );
     assert_eq!(read_json(&record_path)["cloudId"], other.as_str());
     assert_eq!(home.workflow_entries(), vec![id]);
+}
+
+// REQ-CLOUDDEF-14, REQ-CLOUDDEF-33: the create and the publication of a root that declares
+// bindings under its integrations send each integration's binding names with their values as
+// the local snapshot holds them, defaults applied, beside an empty flat block.
+#[test]
+fn publish_cloud_sends_each_integrations_binding_values() {
+    let home = Home::new();
+    let tree = Tree::nested();
+    let bindings = tree.nested_bindings();
+    let gateway = FakeGateway::new();
+    let definitions = format!(
+        "/api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions"
+    );
+    let expected = json!({
+        "linear": {
+            "team": "AUTO",
+            "ownedState": "Engineering",
+            "backlog": "Backlog",
+            "canceled": "Canceled",
+            "done": "Done",
+        },
+        "github": {"repository": "useful-machinery/platform"},
+    });
+
+    let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let first = report(&output);
+    let cloud_id = cloud_definition(&first);
+    let created = requests
+        .iter()
+        .find(|request| request.route() == format!("POST {definitions}"))
+        .expect("the create")
+        .json();
+    assert_eq!(created["integrationBindings"], expected, "{created}");
+    assert_eq!(created["bindings"], json!({}), "{created}");
+
+    let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let published = requests
+        .iter()
+        .find(|request| request.route() == format!("POST {definitions}/{cloud_id}/revisions"))
+        .expect("the publication")
+        .json();
+    assert_eq!(published["integrationBindings"], expected, "{published}");
+    assert_eq!(published["bindings"], json!({}), "{published}");
+}
+
+// REQ-CLOUDDEF-14, REQ-CLOUDDEF-34: a refusal about an integration binding names the
+// integration and the binding, and one about the integration itself names it alone, in the
+// human report and in `--json`'s `workflow` facts.
+#[test]
+fn publish_cloud_reports_the_integration_a_refusal_names() {
+    let home = Home::new();
+    let tree = Tree::nested();
+    let bindings = tree.nested_bindings();
+    let gateway = FakeGateway::new();
+    let both = json!({"integration": "linear", "bindingKey": "team"});
+    let alone = json!({"integration": "linear"});
+
+    gateway.refuse_next_keyed_with(
+        "422 Unprocessable Entity",
+        422,
+        "binding-unresolved",
+        both.clone(),
+    );
+    let (output, _) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &[]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_contains_all(&stderr, &["binding-unresolved", "linear", "team"]);
+
+    gateway.refuse_next_keyed_with(
+        "422 Unprocessable Entity",
+        422,
+        "binding-unresolved",
+        both.clone(),
+    );
+    let (output, _) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let refused = report(&output);
+    assert_eq!(refused["outcome"], "cloud_failed", "{refused}");
+    assert_eq!(
+        refused["cloud"]["problem"], "binding-unresolved",
+        "{refused}"
+    );
+    assert_eq!(refused["cloud"]["workflow"], both, "{refused}");
+
+    gateway.refuse_next_keyed_with(
+        "422 Unprocessable Entity",
+        422,
+        "binding-unresolved",
+        alone.clone(),
+    );
+    let (output, _) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &[]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_contains_all(&stderr, &["binding-unresolved", "linear"]);
+    assert!(!stderr.contains("team"), "{stderr}");
+
+    gateway.refuse_next_keyed_with(
+        "422 Unprocessable Entity",
+        422,
+        "binding-unresolved",
+        alone.clone(),
+    );
+    let (output, _) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(report(&output)["cloud"]["workflow"], alone);
 }
 
 // REQ-CLOUDDEF-14
@@ -3549,9 +3874,10 @@ fn gateway_tree_digest(number: i64) -> String {
     format!("sha256:{number:0>64}")
 }
 
-/// Revision `number` of `id`, with one Linear team binding and its resolution.
-fn gateway_revision(id: &str, number: i64) -> Value {
-    json!({
+/// Revision `number` of `id`, with one Linear team binding and its resolution and, when the
+/// definition's revisions hold them, `gateway_integrations`.
+fn gateway_revision(id: &str, number: i64, integrations: bool) -> Value {
+    let mut revision = json!({
         "definitionId": id,
         "number": number,
         "treeDigest": gateway_tree_digest(number),
@@ -3561,7 +3887,55 @@ fn gateway_revision(id: &str, number: i64) -> Value {
         }},
         "publishedAt": CLOUD_TIME,
         "publishedBy": CLOUD_PUBLISHER,
-    })
+    });
+    if integrations {
+        let (bindings, resolution) = gateway_integrations();
+        revision["integrationBindings"] = bindings;
+        revision["integrationResolution"] = resolution;
+    }
+    revision
+}
+
+/// The Linear connection a revision's `linear` integration resolved through.
+const CLOUD_LINEAR_ACCOUNT: &str = "lcn_01k0z6r1w8f4jy2m7q9v3x5abc";
+/// The installation a revision's `github` integration resolved through.
+const CLOUD_GITHUB_ACCOUNT: &str = "ghi_01k0z6r1w8f4jy2m7q9v3x5abc";
+/// The team a revision's `linear.team` resolved to.
+const CLOUD_INTEGRATION_TEAM_ID: &str = "3a71d0b2-team-engineering";
+
+/// A revision's `integrationBindings` and `integrationResolution`: `linear` with `team` and
+/// `ownedState`, `github` with `repository`, each with its account.
+fn gateway_integrations() -> (Value, Value) {
+    (
+        json!({
+            "linear": {
+                "team": {"kind": "team", "value": "ENG"},
+                "ownedState": {"kind": "state", "value": "Engineering"},
+            },
+            "github": {"repository": {"kind": "repository", "value": "useful-machinery/platform"}},
+        }),
+        json!({
+            "linear": {
+                "account": {"id": CLOUD_LINEAR_ACCOUNT, "name": "Useful"},
+                "bindings": {
+                    "team": {
+                        "kind": "team", "value": "ENG",
+                        "id": CLOUD_INTEGRATION_TEAM_ID, "name": "Engineering",
+                    },
+                    "ownedState": {
+                        "kind": "state", "value": "Engineering",
+                        "id": "5c09e7f4-state-engineering", "name": "Engineering",
+                    },
+                },
+            },
+            "github": {
+                "account": {"id": CLOUD_GITHUB_ACCOUNT},
+                "bindings": {
+                    "repository": {"kind": "repository", "value": "useful-machinery/platform"},
+                },
+            },
+        }),
+    )
 }
 
 /// The definition list, the revision reads and the setting changes; an enable without an
@@ -3591,7 +3965,7 @@ fn respond_settings(
         ("GET", "revisions") => {
             let items = (1..=definition.current)
                 .rev()
-                .map(|number| gateway_revision(id, number))
+                .map(|number| gateway_revision(id, number, definition.integrations))
                 .collect::<Vec<_>>();
             return Some(super::json_http_response("200 OK", json!({"items": items})));
         }
@@ -3599,7 +3973,7 @@ fn respond_settings(
             let number = action.strip_prefix("revisions/")?.parse().ok()?;
             return Some(super::json_http_response(
                 "200 OK",
-                gateway_revision(id, number),
+                gateway_revision(id, number, definition.integrations),
             ));
         }
         ("POST", "enable") if definition.principal.is_none() => {
@@ -3795,6 +4169,81 @@ fn cloud_group_lists_shows_and_administers_cloud_definitions() {
         );
     }
     assert!(home.workflow_entries().is_empty());
+}
+
+// REQ-CLOUDDEF-15, REQ-CLOUDDEF-8: `show` of a revision holding integration bindings prints,
+// after the flat resolution, each integration's account with its id and each of its bindings
+// as `<id>.<name>` with its value, kind and resolved id; `--json` carries both members as
+// Cloud returned them.
+#[test]
+fn cloud_show_prints_each_integrations_account_and_bindings() {
+    let home = Home::new();
+    let gateway = FakeGateway::new();
+    let id = format!("{CLOUD_ID_STEM}c");
+    gateway.define_with_integrations(&id, 1);
+    let show = |json: bool| {
+        let mut args = vec![
+            "workflow",
+            "definition",
+            "cloud",
+            "show",
+            CLOUD_ORGANIZATION,
+            id.as_str(),
+            "--project-id",
+            CLOUD_PROJECT,
+            "--allow-insecure-http",
+        ];
+        if json {
+            args.push("--json");
+        }
+        let (output, _) = gateway.run(&home, &args);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        output
+    };
+
+    let stdout = String::from_utf8(show(false).stdout).expect("UTF-8 report");
+    let lines = stdout.lines().collect::<Vec<_>>();
+    let at = |what: &dyn Fn(&str) -> bool| {
+        lines
+            .iter()
+            .position(|line| what(line))
+            .unwrap_or_else(|| panic!("no such line in {stdout}"))
+    };
+    let flat = at(&|line| line.starts_with("linearTeam") && line.contains(CLOUD_TEAM_ID));
+    let linear_account = at(&|line| line.contains(CLOUD_LINEAR_ACCOUNT));
+    let github_account = at(&|line| line.contains(CLOUD_GITHUB_ACCOUNT));
+    let team = at(&|line| line.starts_with("linear.team"));
+    let state = at(&|line| line.starts_with("linear.ownedState"));
+    let repository = at(&|line| line.starts_with("github.repository"));
+    assert_contains_all(lines[linear_account], &["linear", "Useful"]);
+    assert_contains_all(lines[github_account], &["github"]);
+    assert_contains_all(
+        lines[team],
+        &["ENG", "(team)", CLOUD_INTEGRATION_TEAM_ID, "Engineering"],
+    );
+    assert_contains_all(
+        lines[repository],
+        &["useful-machinery/platform", "(repository)"],
+    );
+    assert!(
+        flat < github_account
+            && github_account < repository
+            && repository < linear_account
+            && linear_account < state
+            && state < team,
+        "{stdout}"
+    );
+
+    let shown = report(&show(true));
+    let (bindings, resolution) = gateway_integrations();
+    assert_eq!(
+        shown["revision"]["integrationBindings"], bindings,
+        "{shown}"
+    );
+    assert_eq!(
+        shown["revision"]["integrationResolution"], resolution,
+        "{shown}"
+    );
 }
 
 /// The problems Cloud answers when it is temporarily unable to serve a request, each with its

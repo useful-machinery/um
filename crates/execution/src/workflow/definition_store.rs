@@ -26,7 +26,10 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
 use super::canonical_json;
-use super::document::{Binding, BindingKind, BindingValue};
+use super::document::{
+    Binding, BindingKey, BindingKind, BindingValue, Integration, IntegrationBinding,
+    IntegrationProvider,
+};
 use super::schema_common::{
     DIGEST_PREFIX, digest_hex, is_identifier, is_prefixed_ulid, lowercase_hex, utc_timestamp,
 };
@@ -145,7 +148,8 @@ impl WorkflowHome {
     }
 
     /// Revision `revision`'s resolution record of definition `id` (REQ-WFDEF-32): the
-    /// provider id resolved for each binding key it names, or `None` when the revision has
+    /// provider id resolved for each binding it names, by the reference key
+    /// [`BindingsSnapshot::text_values_by_reference`] answers values by, or `None` when the revision has
     /// no `resolution.json`. A revision the record does not list, or a record that cannot be
     /// read or is not of the record's shape, is `definition_record_invalid`.
     pub fn revision_resolution(
@@ -168,32 +172,52 @@ impl WorkflowHome {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(source) => return Err(invalid("resolution record unreadable", Some(source))),
         };
-        serde_json::from_slice::<BTreeMap<String, ResolvedBinding>>(&bytes)
-            .ok()
-            .filter(|resolution| {
-                resolution.iter().all(|(key, resolved)| {
-                    is_identifier(key) && !resolved.id.is_empty() && !resolved.name.is_empty()
-                })
-            })
-            .map(|resolution| {
-                Some(
-                    resolution
-                        .into_iter()
-                        .map(|(key, resolved)| (key, resolved.id))
-                        .collect(),
-                )
-            })
+        resolved_ids(&bytes)
+            .map(Some)
             .ok_or_else(|| invalid("resolution record is not of the record's shape", None))
     }
 }
 
-/// One member of a revision's `resolution.json` (REQ-WFDEF-32): the provider's id for the
+/// The ids of a `resolution.json` by the key a reference names each binding by: a flat key's
+/// entry under the key, and the `linear` integration's under `linear.<name>` from the member
+/// `linear`, an object from name to entry, told from the flat key `linear`'s own entry by
+/// whether its `id` is a string. No other member nests (REQ-WFDEF-32).
+fn resolved_ids(bytes: &[u8]) -> Option<BTreeMap<String, String>> {
+    let linear = IntegrationProvider::Linear;
+    let mut ids = BTreeMap::new();
+    for (key, member) in serde_json::from_slice::<BTreeMap<String, Value>>(bytes).ok()? {
+        if key == linear.as_str() && !member.get("id").is_some_and(Value::is_string) {
+            for (name, resolved) in
+                serde_json::from_value::<BTreeMap<String, Value>>(member).ok()?
+            {
+                let id = ResolvedBinding::id(resolved).filter(|_| is_identifier(&name))?;
+                ids.insert(BindingAt::under(linear, &name).reference_key(), id);
+            }
+        } else {
+            let id = ResolvedBinding::id(member).filter(|_| is_identifier(&key))?;
+            ids.insert(key, id);
+        }
+    }
+    Some(ids)
+}
+
+/// One entry of a revision's `resolution.json` (REQ-WFDEF-32): the provider's id for the
 /// bound value and the name it had when Cloud resolved it.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ResolvedBinding {
     id: String,
     name: String,
+}
+
+impl ResolvedBinding {
+    /// The id of `entry` when it is an entry of non-empty strings.
+    fn id(entry: Value) -> Option<String> {
+        serde_json::from_value::<Self>(entry)
+            .ok()
+            .filter(|resolved| !resolved.id.is_empty() && !resolved.name.is_empty())
+            .map(|resolved| resolved.id)
+    }
 }
 
 /// `definition.json`, exactly `contracts/jsonschema/workflow-definition-v1.schema.json`.
@@ -258,14 +282,81 @@ impl RevisionRecord {
     }
 }
 
-/// A revision's `bindings.json` (REQ-WFDEF-3): every declared binding with its kind and value.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(transparent)]
-pub struct BindingsSnapshot(BTreeMap<String, BoundBinding>);
+/// A revision's `bindings.json` (REQ-WFDEF-3): every declared binding with its kind and value,
+/// the flat block's by key and each integration's under its id. Only an integration that
+/// declares bindings has a group, so the snapshot of a root that declares no integration
+/// binding is the flat block alone.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BindingsSnapshot {
+    flat: BTreeMap<String, BoundBinding>,
+    integrations: BTreeMap<IntegrationProvider, BTreeMap<String, BoundIntegrationBinding>>,
+}
+
+/// One member of the snapshot object: a flat binding, or an integration's group.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum SnapshotMember<'a> {
+    Bound(&'a BoundBinding),
+    Group(&'a BTreeMap<String, BoundIntegrationBinding>),
+}
+
+impl Serialize for BindingsSnapshot {
+    /// One JSON object: a flat key to its binding, an integration's id to its group.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.flat
+            .iter()
+            .map(|(key, bound)| (key.as_str(), SnapshotMember::Bound(bound)))
+            .chain(
+                self.integrations
+                    .iter()
+                    .map(|(provider, group)| (provider.as_str(), SnapshotMember::Group(group))),
+            )
+            .collect::<BTreeMap<_, _>>()
+            .serialize(serializer)
+    }
+}
 
 impl BindingsSnapshot {
+    /// The flat block's bindings, which the Cloud request is built from.
     pub fn bindings(&self) -> &BTreeMap<String, BoundBinding> {
-        &self.0
+        &self.flat
+    }
+
+    /// Each integration's bindings by name, only for an integration that declares bindings.
+    pub fn integration_bindings(
+        &self,
+    ) -> &BTreeMap<IntegrationProvider, BTreeMap<String, BoundIntegrationBinding>> {
+        &self.integrations
+    }
+
+    /// Every text value by the key a reference names its binding by after `$` (REQ-WFDEF-37):
+    /// a flat key as it is and an integration binding as `<id>.<name>`, the keys
+    /// [`WorkflowHome::revision_resolution`] answers ids by. A `members` list is no text value.
+    pub fn text_values_by_reference(&self) -> BTreeMap<String, String> {
+        self.members()
+            .filter_map(|(at, _, value)| Some((at.reference_key(), value.as_text()?.to_owned())))
+            .collect()
+    }
+
+    /// Every binding with where it is declared, its kind as text and its value.
+    fn members(&self) -> impl Iterator<Item = (BindingAt<'_>, &str, BindingValue)> {
+        let flat = self.flat.iter().map(|(key, bound)| {
+            (
+                BindingAt::flat(key),
+                bound.kind.as_str(),
+                bound.value.clone(),
+            )
+        });
+        let grouped = self.integrations.iter().flat_map(|(provider, group)| {
+            group.iter().map(|(name, bound)| {
+                (
+                    BindingAt::under(*provider, name),
+                    bound.kind.as_str(),
+                    BindingValue::Text(bound.value.clone()),
+                )
+            })
+        });
+        flat.chain(grouped)
     }
 
     /// The snapshot file's bytes: keys in bytewise order, no insignificant whitespace.
@@ -276,13 +367,34 @@ impl BindingsSnapshot {
         Ok(bytes)
     }
 
+    /// A member whose `kind` is a string is a flat binding, any other an integration's group
+    /// keyed by the provider's id: names that are identifiers to objects of a non-empty
+    /// `kind` and a non-empty string `value`.
     fn parse(bytes: &[u8]) -> Option<Self> {
-        let snapshot = serde_json::from_slice::<Self>(bytes).ok()?;
-        snapshot
-            .0
-            .iter()
-            .all(|(key, bound)| is_identifier(key) && bound.value.fits(bound.kind))
-            .then_some(snapshot)
+        let object = serde_json::from_slice::<BTreeMap<String, Value>>(bytes).ok()?;
+        let mut snapshot = Self::default();
+        for (key, member) in object {
+            if member.get("kind").is_some_and(Value::is_string) {
+                let bound = serde_json::from_value::<BoundBinding>(member).ok()?;
+                if !is_identifier(&key) || !bound.value.fits(bound.kind) {
+                    return None;
+                }
+                snapshot.flat.insert(key, bound);
+                continue;
+            }
+            let provider = serde_json::from_value(Value::String(key)).ok()?;
+            let group =
+                serde_json::from_value::<BTreeMap<String, BoundIntegrationBinding>>(member).ok()?;
+            let valid = !group.is_empty()
+                && group.iter().all(|(name, bound)| {
+                    is_identifier(name) && !bound.kind.is_empty() && !bound.value.is_empty()
+                });
+            if !valid {
+                return None;
+            }
+            snapshot.integrations.insert(provider, group);
+        }
+        Some(snapshot)
     }
 }
 
@@ -294,18 +406,24 @@ pub struct BoundBinding {
     pub value: BindingValue,
 }
 
-/// A `--bindings` file (REQ-WFDEF-20): a JSON object keyed by binding key whose members
-/// are the value, or an object of `value` with an optional `kind`. Values are checked
-/// against the root's declarations by [`resolve_bindings`].
-#[derive(Clone, Eq, PartialEq)]
-pub struct BindingsFile {
-    members: BTreeMap<String, FileMember>,
+/// An integration binding in the snapshot: its provider-relative kind as the root declares it
+/// and its value, a non-empty string.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundIntegrationBinding {
+    pub kind: String,
+    pub value: String,
 }
 
+/// A `--bindings` file (REQ-WFDEF-20): a JSON object whose members are flat bindings by key,
+/// each the value or an object of `value` with an optional `kind`, and, for an integration
+/// that declares bindings, an object under its id of such members by name. Which a member is,
+/// and whether it fits, is judged against the root's declarations by [`resolve_bindings`].
 #[derive(Clone, Eq, PartialEq)]
-struct FileMember {
-    kind: Option<String>,
-    value: Value,
+pub struct BindingsFile {
+    /// The file it was read from, which `bindings_file_invalid` names; absent when parsed.
+    path: Option<PathBuf>,
+    members: BTreeMap<String, Value>,
 }
 
 impl fmt::Debug for BindingsFile {
@@ -324,132 +442,328 @@ impl BindingsFile {
         let bytes = read_bounded(path, MAXIMUM_BINDINGS_BYTES).map_err(|source| {
             DefinitionError::BindingsFileInvalid {
                 path: Some(path.to_owned()),
+                integration: None,
                 key: None,
                 reason: "unreadable",
                 source: Some(source),
             }
         })?;
-        Self::parse(&bytes).map_err(|error| match error {
-            DefinitionError::BindingsFileInvalid {
-                key,
-                reason,
-                source,
-                ..
-            } => DefinitionError::BindingsFileInvalid {
-                path: Some(path.to_owned()),
-                key,
-                reason,
-                source,
-            },
-            other => other,
-        })
+        Self::from_bytes(&bytes, Some(path))
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Self, DefinitionError> {
-        let invalid = |key: Option<&str>, reason| DefinitionError::BindingsFileInvalid {
-            path: None,
+        Self::from_bytes(bytes, None)
+    }
+
+    fn from_bytes(bytes: &[u8], path: Option<&Path>) -> Result<Self, DefinitionError> {
+        let mut file = Self {
+            path: path.map(Path::to_owned),
+            members: BTreeMap::new(),
+        };
+        let Ok(Value::Object(members)) = serde_json::from_slice::<Value>(bytes) else {
+            return Err(file.invalid(None, None, "not a JSON object"));
+        };
+        file.members = members.into_iter().collect();
+        Ok(file)
+    }
+
+    fn invalid(
+        &self,
+        integration: Option<IntegrationProvider>,
+        key: Option<&str>,
+        reason: &'static str,
+    ) -> DefinitionError {
+        DefinitionError::BindingsFileInvalid {
+            path: self.path.clone(),
+            integration,
             key: key.map(str::to_owned),
             reason,
             source: None,
-        };
-        let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(bytes) else {
-            return Err(invalid(None, "not a JSON object"));
-        };
-        let mut members = BTreeMap::new();
-        for (key, member) in object {
-            let member = match member {
-                Value::Object(mut fields) => {
-                    if fields
-                        .keys()
-                        .any(|field| field != "kind" && field != "value")
-                    {
-                        return Err(invalid(
-                            Some(&key),
-                            "a member field other than kind and value",
+        }
+    }
+
+    /// The value of the member at `at`, flat or under an integration: the bare value, or an
+    /// object of `value` and an optional string `kind`, which must be the declared kind.
+    fn judge(
+        &self,
+        at: BindingAt<'_>,
+        member: &Value,
+        declared: Declared<'_>,
+    ) -> Result<BindingValue, DefinitionError> {
+        let (kind, value) = match member {
+            Value::Object(fields) => {
+                if fields
+                    .keys()
+                    .any(|field| field != "kind" && field != "value")
+                {
+                    return Err(self.invalid(
+                        at.integration,
+                        Some(at.key),
+                        "a member field other than kind and value",
+                    ));
+                }
+                let kind = match fields.get("kind") {
+                    None => None,
+                    Some(Value::String(kind)) => Some(kind.as_str()),
+                    Some(_) => {
+                        return Err(self.invalid(
+                            at.integration,
+                            Some(at.key),
+                            "a member kind that is not a string",
                         ));
                     }
-                    let kind = match fields.remove("kind") {
-                        None => None,
-                        Some(Value::String(kind)) => Some(kind),
-                        Some(_) => {
-                            return Err(invalid(Some(&key), "a member kind that is not a string"));
-                        }
-                    };
-                    let Some(value) = fields.remove("value") else {
-                        return Err(invalid(Some(&key), "a member object without a value"));
-                    };
-                    FileMember { kind, value }
-                }
-                value => FileMember { kind: None, value },
-            };
-            members.insert(key, member);
-        }
-        Ok(Self { members })
+                };
+                let value = fields.get("value").ok_or_else(|| {
+                    self.invalid(
+                        at.integration,
+                        Some(at.key),
+                        "a member object without a value",
+                    )
+                })?;
+                (kind, value)
+            }
+            value => (None, value),
+        };
+        declared.admit(at, kind, BindingValue::deserialize(value).ok())
     }
 }
 
-/// The snapshot of the `declared` bindings (REQ-WFDEF-20, REQ-WFDEF-21): from `file` when
-/// given, otherwise from the `carried` snapshot with keys no longer declared dropped; a
-/// declared binding neither supplies takes its default.
+/// Where a binding is declared: the flat block, or an integration's bindings.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct BindingAt<'a> {
+    integration: Option<IntegrationProvider>,
+    key: &'a str,
+}
+
+impl<'a> BindingAt<'a> {
+    fn flat(key: &'a str) -> Self {
+        Self {
+            integration: None,
+            key,
+        }
+    }
+
+    fn under(integration: IntegrationProvider, key: &'a str) -> Self {
+        Self {
+            integration: Some(integration),
+            key,
+        }
+    }
+
+    /// The key a reference names the binding by after `$`, joined by [`BindingKey`].
+    fn reference_key(self) -> String {
+        match self.integration {
+            None => BindingKey::Flat(self.key),
+            Some(integration) => BindingKey::Integration {
+                integration: integration.as_str(),
+                name: self.key,
+            },
+        }
+        .to_string()
+    }
+
+    fn undeclared(self) -> DefinitionError {
+        DefinitionError::BindingUndeclared {
+            integration: self.integration,
+            key: self.key.to_owned(),
+        }
+    }
+
+    fn kind_mismatch(self) -> DefinitionError {
+        DefinitionError::BindingKindMismatch {
+            integration: self.integration,
+            key: self.key.to_owned(),
+        }
+    }
+
+    fn value_invalid(self) -> DefinitionError {
+        DefinitionError::BindingValueInvalid {
+            integration: self.integration,
+            key: self.key.to_owned(),
+        }
+    }
+
+    fn missing(self) -> DefinitionError {
+        DefinitionError::BindingMissing {
+            integration: self.integration,
+            key: self.key.to_owned(),
+        }
+    }
+}
+
+/// A declared binding as resolution judges a value for it.
+#[derive(Clone, Copy)]
+enum Declared<'a> {
+    Flat(&'a Binding),
+    Integration(&'a IntegrationBinding),
+}
+
+impl<'a> Declared<'a> {
+    fn kind(self) -> &'a str {
+        match self {
+            Self::Flat(binding) => binding.kind.as_str(),
+            Self::Integration(binding) => &binding.kind,
+        }
+    }
+
+    fn default(self) -> Option<BindingValue> {
+        match self {
+            Self::Flat(binding) => binding.default.clone(),
+            Self::Integration(binding) => binding.default.clone().map(BindingValue::Text),
+        }
+    }
+
+    /// `value` for the binding at `at` when the `kind` given with it, if any, is the declared
+    /// kind and it fits that kind: for an integration binding, a non-empty string.
+    fn admit(
+        self,
+        at: BindingAt<'_>,
+        kind: Option<&str>,
+        value: Option<BindingValue>,
+    ) -> Result<BindingValue, DefinitionError> {
+        if kind.is_some_and(|kind| kind != self.kind()) {
+            return Err(at.kind_mismatch());
+        }
+        value
+            .filter(|value| match self {
+                Self::Flat(binding) => value.fits(binding.kind),
+                Self::Integration(_) => value.as_text().is_some_and(|text| !text.is_empty()),
+            })
+            .ok_or_else(|| at.value_invalid())
+    }
+}
+
+/// The root's declared bindings: the flat block and each integration's.
+#[derive(Clone, Copy)]
+struct Declarations<'a> {
+    flat: &'a BTreeMap<String, Binding>,
+    integrations: &'a BTreeMap<IntegrationProvider, Integration>,
+}
+
+impl<'a> Declarations<'a> {
+    fn get(self, at: BindingAt<'_>) -> Option<Declared<'a>> {
+        match at.integration {
+            None => self.flat.get(at.key).map(Declared::Flat),
+            Some(provider) => self
+                .integrations
+                .get(&provider)?
+                .bindings
+                .get(at.key)
+                .map(Declared::Integration),
+        }
+    }
+
+    /// The integration whose id is `key`, when it declares bindings.
+    fn integration(self, key: &str) -> Option<IntegrationProvider> {
+        self.integrations
+            .iter()
+            .find(|(provider, integration)| {
+                provider.as_str() == key && !integration.bindings.is_empty()
+            })
+            .map(|(provider, _)| *provider)
+    }
+
+    /// Every declared binding: the flat block in key order, then the integrations in id
+    /// order and each one's names in bytewise order.
+    fn all(self) -> impl Iterator<Item = (BindingAt<'a>, Declared<'a>)> {
+        let flat = self
+            .flat
+            .iter()
+            .map(|(key, binding)| (BindingAt::flat(key), Declared::Flat(binding)));
+        let grouped = self
+            .integrations
+            .iter()
+            .flat_map(|(provider, integration)| {
+                integration.bindings.iter().map(|(name, binding)| {
+                    (
+                        BindingAt::under(*provider, name),
+                        Declared::Integration(binding),
+                    )
+                })
+            });
+        flat.chain(grouped)
+    }
+}
+
+/// The snapshot of the bindings the root declares, flat (`declared`) and under its
+/// `integrations` (REQ-WFDEF-20, REQ-WFDEF-21): from `file` when given, otherwise from the
+/// `carried` snapshot with bindings no longer declared dropped; a declared binding neither
+/// supplies takes its default.
 pub(crate) fn resolve_bindings(
     declared: &BTreeMap<String, Binding>,
+    integrations: &BTreeMap<IntegrationProvider, Integration>,
     file: Option<&BindingsFile>,
     carried: Option<&BindingsSnapshot>,
 ) -> Result<BindingsSnapshot, DefinitionError> {
-    let mut supplied = BTreeMap::<&str, BindingValue>::new();
+    let declarations = Declarations {
+        flat: declared,
+        integrations,
+    };
+    let mut supplied = BTreeMap::<BindingAt<'_>, BindingValue>::new();
     if let Some(file) = file {
         for (key, member) in &file.members {
-            let binding = declared
-                .get(key)
-                .ok_or_else(|| DefinitionError::BindingUndeclared { key: key.clone() })?;
-            if member
-                .kind
-                .as_deref()
-                .is_some_and(|kind| kind != binding.kind.as_str())
-            {
-                return Err(DefinitionError::BindingKindMismatch { key: key.clone() });
+            // A declared flat key is a flat member; otherwise the id of an integration that
+            // declares bindings holds that integration's members.
+            let at = BindingAt::flat(key);
+            let members = match declarations.integration(key) {
+                Some(provider) if declarations.get(at).is_none() => {
+                    let Value::Object(group) = member else {
+                        return Err(file.invalid(
+                            Some(provider),
+                            None,
+                            "an integration member that is not an object",
+                        ));
+                    };
+                    group
+                        .iter()
+                        .map(|(name, member)| (BindingAt::under(provider, name), member))
+                        .collect()
+                }
+                _ => vec![(at, member)],
+            };
+            for (at, member) in members {
+                let declared = declarations.get(at).ok_or_else(|| at.undeclared())?;
+                supplied.insert(at, file.judge(at, member, declared)?);
             }
-            let value = BindingValue::deserialize(&member.value)
-                .ok()
-                .filter(|value| value.fits(binding.kind))
-                .ok_or_else(|| DefinitionError::BindingValueInvalid { key: key.clone() })?;
-            supplied.insert(key, value);
         }
     } else if let Some(carried) = carried {
-        for (key, bound) in &carried.0 {
-            let Some(binding) = declared.get(key) else {
+        for (at, kind, value) in carried.members() {
+            let Some(declared) = declarations.get(at) else {
                 continue;
             };
-            if bound.kind != binding.kind {
-                return Err(DefinitionError::BindingKindMismatch { key: key.clone() });
-            }
-            if !bound.value.fits(bound.kind) {
-                return Err(DefinitionError::BindingValueInvalid { key: key.clone() });
-            }
-            supplied.insert(key, bound.value.clone());
+            supplied.insert(at, declared.admit(at, Some(kind), Some(value))?);
         }
     }
-    let mut snapshot = BTreeMap::new();
-    for (key, binding) in declared {
-        let value = match supplied.remove(key.as_str()) {
-            Some(value) => value,
-            None => binding
-                .default
-                .clone()
-                .ok_or_else(|| DefinitionError::BindingMissing { key: key.clone() })?,
-        };
-        if !value.fits(binding.kind) {
-            return Err(DefinitionError::BindingValueInvalid { key: key.clone() });
+    let mut snapshot = BindingsSnapshot::default();
+    for (at, declared) in declarations.all() {
+        let value = supplied
+            .remove(&at)
+            .or_else(|| declared.default())
+            .ok_or_else(|| at.missing())?;
+        let value = declared.admit(at, None, Some(value))?;
+        match (declared, at.integration, value) {
+            (Declared::Flat(binding), _, value) => {
+                snapshot.flat.insert(
+                    at.key.to_owned(),
+                    BoundBinding {
+                        kind: binding.kind,
+                        value,
+                    },
+                );
+            }
+            (Declared::Integration(binding), Some(provider), BindingValue::Text(value)) => {
+                snapshot.integrations.entry(provider).or_default().insert(
+                    at.key.to_owned(),
+                    BoundIntegrationBinding {
+                        kind: binding.kind.clone(),
+                        value,
+                    },
+                );
+            }
+            (Declared::Integration(_), _, _) => return Err(at.value_invalid()),
         }
-        snapshot.insert(
-            key.clone(),
-            BoundBinding {
-                kind: binding.kind,
-                value,
-            },
-        );
     }
-    Ok(BindingsSnapshot(snapshot))
+    Ok(snapshot)
 }
 
 /// Which record a publish adds its revision to (REQ-WFDEF-19).
@@ -525,18 +839,26 @@ pub fn publish(
                 Some(_) => None,
                 None => Some(read_current_bindings(existing)?),
             };
-            resolve_bindings(&tree.bindings, bindings, carried.as_ref())?
+            resolve_bindings(
+                &tree.bindings,
+                &tree.required_integrations,
+                bindings,
+                carried.as_ref(),
+            )?
         }
         None => {
+            let declarations = Declarations {
+                flat: &tree.bindings,
+                integrations: &tree.required_integrations,
+            };
             if bindings.is_none()
-                && tree
-                    .bindings
-                    .values()
-                    .any(|binding| binding.default.is_none())
+                && declarations
+                    .all()
+                    .any(|(_, declared)| declared.default().is_none())
             {
                 return Err(DefinitionError::BindingsRequired);
             }
-            resolve_bindings(&tree.bindings, bindings, None)?
+            resolve_bindings(&tree.bindings, &tree.required_integrations, bindings, None)?
         }
     };
     let snapshot_bytes = snapshot
@@ -742,8 +1064,8 @@ impl WorkflowHome {
     }
 }
 
-/// A refused or failed definition command, with the id, ids, binding key or path it
-/// concerns and never the contents of a tree file, bindings file or record (REQ-WFDEF-27).
+/// A refused or failed definition command, with the id, ids, binding key (and its integration,
+/// for an integration binding) or path it concerns and never the contents of a tree file, bindings file or record (REQ-WFDEF-27).
 #[derive(Debug)]
 pub enum DefinitionError {
     HomeUnavailable,
@@ -764,23 +1086,32 @@ pub enum DefinitionError {
         reason: &'static str,
         source: Option<io::Error>,
     },
+    /// `integration` is the integration whose member of the file is refused, `key` the
+    /// binding's name under it or the flat key.
     BindingsFileInvalid {
         path: Option<PathBuf>,
+        integration: Option<IntegrationProvider>,
         key: Option<String>,
         reason: &'static str,
         source: Option<io::Error>,
     },
     BindingsRequired,
+    /// In each binding refusal `integration` is absent for a flat binding and `key` is the
+    /// flat key or the binding's name under the integration.
     BindingUndeclared {
+        integration: Option<IntegrationProvider>,
         key: String,
     },
     BindingKindMismatch {
+        integration: Option<IntegrationProvider>,
         key: String,
     },
     BindingValueInvalid {
+        integration: Option<IntegrationProvider>,
         key: String,
     },
     BindingMissing {
+        integration: Option<IntegrationProvider>,
         key: String,
     },
     /// Another publish holds the definition's lock, or made `revisions/<n>` without it.
@@ -851,14 +1182,29 @@ impl DefinitionError {
         }
     }
 
-    /// The binding key the error concerns.
+    /// The binding the error concerns: the flat key, or the name under its integration.
     pub fn key(&self) -> Option<&str> {
         match self {
-            Self::BindingUndeclared { key }
-            | Self::BindingKindMismatch { key }
-            | Self::BindingValueInvalid { key }
-            | Self::BindingMissing { key } => Some(key),
+            Self::BindingUndeclared { key, .. }
+            | Self::BindingKindMismatch { key, .. }
+            | Self::BindingValueInvalid { key, .. }
+            | Self::BindingMissing { key, .. } => Some(key),
             Self::BindingsFileInvalid { key, .. } => key.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// The id of the integration whose binding, or member of the bindings file, the error
+    /// concerns; absent for a flat binding.
+    pub fn integration(&self) -> Option<&'static str> {
+        match self {
+            Self::BindingUndeclared { integration, .. }
+            | Self::BindingKindMismatch { integration, .. }
+            | Self::BindingValueInvalid { integration, .. }
+            | Self::BindingMissing { integration, .. }
+            | Self::BindingsFileInvalid { integration, .. } => {
+                integration.map(IntegrationProvider::as_str)
+            }
             _ => None,
         }
     }
@@ -903,36 +1249,52 @@ impl fmt::Display for DefinitionError {
                 path.display()
             ),
             Self::BindingsFileInvalid {
-                path, key, reason, ..
+                path,
+                integration,
+                key,
+                reason,
+                ..
             } => {
                 formatter.write_str("the bindings file")?;
                 if let Some(path) = path {
                     write!(formatter, " {}", path.display())?;
                 }
                 formatter.write_str(" is not a JSON object of bindings")?;
-                if let Some(key) = key {
-                    write!(formatter, " at {key}")?;
+                match (integration, key) {
+                    (_, Some(key)) => write!(formatter, " at {}", named(*integration, key))?,
+                    (Some(integration), None) => write!(formatter, " at {}", integration.as_str())?,
+                    (None, None) => {}
                 }
                 write!(formatter, ": {reason}")
             }
             Self::BindingsRequired => formatter
                 .write_str("the root declares a binding without a default; pass a bindings file"),
-            Self::BindingUndeclared { key } => {
-                write!(formatter, "the root declares no binding {key}")
-            }
-            Self::BindingKindMismatch { key } => {
+            Self::BindingUndeclared { integration, key } => {
                 write!(
                     formatter,
-                    "the kind given for {key} is not the declared kind"
+                    "the root declares no binding {}",
+                    named(*integration, key)
                 )
             }
-            Self::BindingValueInvalid { key } => {
+            Self::BindingKindMismatch { integration, key } => {
                 write!(
                     formatter,
-                    "the value of {key} does not fit its declared kind"
+                    "the kind given for {} is not the declared kind",
+                    named(*integration, key)
                 )
             }
-            Self::BindingMissing { key } => write!(formatter, "no value is bound for {key}"),
+            Self::BindingValueInvalid { integration, key } => {
+                write!(
+                    formatter,
+                    "the value of {} does not fit its declared kind",
+                    named(*integration, key)
+                )
+            }
+            Self::BindingMissing { integration, key } => write!(
+                formatter,
+                "no value is bound for {}",
+                named(*integration, key)
+            ),
             Self::PublishConflict { id } => {
                 write!(formatter, "another publish of {id} is in progress")
             }
@@ -955,6 +1317,11 @@ impl fmt::Display for DefinitionError {
             ),
         }
     }
+}
+
+/// A binding as a refusal names it: by its reference key, the flat key or `<id>.<name>`.
+fn named(integration: Option<IntegrationProvider>, key: &str) -> String {
+    BindingAt { integration, key }.reference_key()
 }
 
 impl std::error::Error for DefinitionError {

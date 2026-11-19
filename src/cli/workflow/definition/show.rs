@@ -133,6 +133,18 @@ fn write_human(shown: &Shown) -> anyhow::Result<()> {
             bound.kind.as_str()
         )?;
     }
+    for (provider, group) in shown.bindings.integration_bindings() {
+        for (name, bound) in group {
+            writeln!(
+                stdout,
+                "{}.{}: {} ({})",
+                display(provider.as_str()),
+                display(name),
+                display(&bound.value),
+                display(&bound.kind)
+            )?;
+        }
+    }
     writeln!(stdout, "── live runs ──")?;
     if shown.runs.is_empty() {
         writeln!(stdout, "No live runs.")?;

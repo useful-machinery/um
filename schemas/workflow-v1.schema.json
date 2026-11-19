@@ -971,9 +971,9 @@
     },
     "BindingReference": {
       "type": "string",
-      "maxLength": 65,
-      "pattern": "^\\$[a-z][A-Za-z0-9]*$",
-      "description": "A reference to a declared binding, written `$` followed by the binding key."
+      "maxLength": 130,
+      "pattern": "^\\$([a-z][a-z0-9_.]*\\.)?[a-z][A-Za-z0-9]*$",
+      "description": "A reference to a declared binding, written `$` followed by the binding key, or `$<integration>.<name>` for a binding declared under an integration."
     },
     "BindingKind": {
       "enum": ["connection", "linear.team", "linear.state", "github.repository", "member", "members"]
@@ -1015,9 +1015,13 @@
         "as": { "$ref": "#/$defs/IntegrationAs" },
         "integrations": {
           "type": "object",
-          "description": "The services the workflow needs, by provider id; declared only, read by no run.",
+          "description": "The services the workflow needs, by provider id, each with bindings of the kinds its provider lists, which a reference names as `$<integration>.<name>`.",
           "minProperties": 1,
           "propertyNames": { "$ref": "#/$defs/IntegrationProvider" },
+          "properties": {
+            "linear": { "$ref": "#/$defs/LinearIntegration" },
+            "github": { "$ref": "#/$defs/GithubIntegration" }
+          },
           "additionalProperties": { "$ref": "#/$defs/Integration" }
         }
       }
@@ -1030,18 +1034,17 @@
       "description": "Whose credentials act for an integration: a member's or the organization's.",
       "enum": ["member", "org"]
     },
-    "IntegrationBinding": {
-      "type": "object",
-      "description": "An integration binding's kind, a lowercase name whose vocabulary is not yet fixed.",
-      "additionalProperties": false,
-      "required": ["kind"],
-      "properties": {
-        "kind": { "type": "string", "maxLength": 64, "pattern": "^[a-z][a-z0-9_]*$" }
-      }
-    },
     "Integration": {
       "type": "object",
-      "description": "One declared integration: an optional as overriding requires.as, and optional bindings.",
+      "description": "A declared integration whose provider lists no binding kinds: an optional as overriding requires.as.",
+      "additionalProperties": false,
+      "properties": {
+        "as": { "$ref": "#/$defs/IntegrationAs" }
+      }
+    },
+    "LinearIntegration": {
+      "type": "object",
+      "description": "The linear integration: an optional as overriding requires.as, and optional bindings, each a kind the linear provider lists and an optional default.",
       "additionalProperties": false,
       "properties": {
         "as": { "$ref": "#/$defs/IntegrationAs" },
@@ -1049,7 +1052,37 @@
           "type": "object",
           "minProperties": 1,
           "propertyNames": { "$ref": "#/$defs/Identifier" },
-          "additionalProperties": { "$ref": "#/$defs/IntegrationBinding" }
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind"],
+            "properties": {
+              "kind": { "enum": ["team", "state"] },
+              "default": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "GithubIntegration": {
+      "type": "object",
+      "description": "The github integration: an optional as overriding requires.as, and optional bindings, each a kind the github provider lists and an optional default.",
+      "additionalProperties": false,
+      "properties": {
+        "as": { "$ref": "#/$defs/IntegrationAs" },
+        "bindings": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "$ref": "#/$defs/Identifier" },
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["kind"],
+            "properties": {
+              "kind": { "enum": ["repository"] },
+              "default": { "type": "string" }
+            }
+          }
         }
       }
     },
@@ -1088,7 +1121,13 @@
       "additionalProperties": false,
       "required": ["source", "event"],
       "properties": {
-        "source": { "$ref": "#/$defs/BindingReference" },
+        "source": {
+          "description": "A binding reference, or the provider id of an integration the root declares.",
+          "oneOf": [
+            { "$ref": "#/$defs/BindingReference" },
+            { "$ref": "#/$defs/IntegrationProvider" }
+          ]
+        },
         "event": { "$ref": "#/$defs/EventName" },
         "where": { "type": "string", "minLength": 1 }
       }

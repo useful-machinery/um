@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
@@ -141,10 +142,67 @@ pub struct Integration {
     pub bindings: BTreeMap<String, IntegrationBinding>,
 }
 
-/// An integration binding: a kind whose vocabulary is not yet fixed (REQ-WFDEF-34).
+/// An integration binding (REQ-WFDEF-34): a kind its provider lists, which the schema
+/// closes per provider before this is decoded, and an optional default.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IntegrationBinding {
     pub kind: String,
+    pub default: Option<String>,
+}
+
+/// The key of a binding reference, the text after `$` (REQ-WFDEF-37): flat when it holds no
+/// `.`, otherwise the integration before its last `.` and the binding's name after it, so a
+/// provider id that holds a dot, such as `gitlab.com`, stays unambiguous. Every reader of a
+/// reference splits it here, and `Display` joins it back: a name is an identifier and holds no
+/// `.`, so the joined key splits to the same pair.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BindingKey<'a> {
+    /// A key of the root's flat `bindings` block.
+    Flat(&'a str),
+    /// A binding declared under `requires.integrations.<integration>.bindings`.
+    Integration { integration: &'a str, name: &'a str },
+}
+
+impl<'a> BindingKey<'a> {
+    /// Splits `key` at its last `.`, whether or not it is well formed.
+    pub fn split(key: &'a str) -> Self {
+        match key.rsplit_once('.') {
+            Some((integration, name)) => Self::Integration { integration, name },
+            None => Self::Flat(key),
+        }
+    }
+
+    /// The split of a well-formed key, the text the schema's `BindingReference` admits after
+    /// `$`: an identifier, or a lowercase dotted integration name, `.` and an identifier.
+    pub fn parse(key: &'a str) -> Option<Self> {
+        let split = Self::split(key);
+        let well_formed = match split {
+            Self::Flat(key) => useful_support::is_identifier(key),
+            Self::Integration { integration, name } => {
+                useful_support::is_identifier(name)
+                    && integration
+                        .bytes()
+                        .next()
+                        .is_some_and(|byte| byte.is_ascii_lowercase())
+                    && integration.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'_' | b'.')
+                    })
+            }
+        };
+        well_formed.then_some(split)
+    }
+}
+
+impl fmt::Display for BindingKey<'_> {
+    /// The key as a reference writes it after `$`: the flat key, or `<integration>.<name>`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Flat(key) => formatter.write_str(key),
+            Self::Integration { integration, name } => write!(formatter, "{integration}.{name}"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -235,7 +293,8 @@ pub enum Trigger {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TriggerRule {
-    /// A binding reference, `$` followed by the binding key.
+    /// As written: a binding reference, `$` followed by the binding key, or the bare id of a
+    /// declared integration (REQ-WFDEF-38).
     pub source: String,
     pub event: String,
     pub condition: Option<String>,

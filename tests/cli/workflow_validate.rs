@@ -578,6 +578,39 @@ fn a_requires_integrations_declaration_validates_and_reports_nothing_more() {
     assert!(remedy.contains("requires.integrations.jira"), "{remedy}");
 }
 
+// REQ-WFDEF-34
+#[test]
+fn an_integration_binding_takes_a_kind_its_provider_lists_and_an_optional_default() {
+    let block = |binding: &str| {
+        format!(
+            "requires:\n  integrations:\n    linear:\n      bindings:\n        team: {binding}\n"
+        )
+    };
+    let bundle = WorkflowBundle::valid();
+    let source = fs::read_to_string(bundle.workflow_path()).expect("workflow should be readable");
+
+    bundle.replace_workflow(&format!("{source}{}", block("{kind: repository}")));
+    let refused = validate(&bundle, true);
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let report: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    let diagnostics = report["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0]["code"], "invalid_workflow_structure");
+    assert_eq!(
+        diagnostics[0]["location"],
+        serde_json::json!({
+            "kind": "workflow",
+            "field": "requires.integrations.linear.bindings.team.kind",
+            "rule": "enum",
+            "expected": ["team", "state"],
+        })
+    );
+
+    bundle.replace_workflow(&format!("{source}{}", block("{kind: team, default: AUTO}")));
+    let accepted = validate(&bundle, true);
+    assert_eq!(accepted.status.code(), Some(0), "{accepted:?}");
+}
+
 // REQ-WFFORMAT-80, REQ-WFFORMAT-102
 #[test]
 fn undeclared_node_environment_passthrough_names_the_step() {

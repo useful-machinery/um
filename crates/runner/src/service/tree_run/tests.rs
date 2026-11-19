@@ -45,7 +45,7 @@ use useful_runner_protocol::{
     RunnerUnableReason, SourceDisplayRepositoryV1RunnerProjection, TreeExit, TriggerDelivery,
     TriggerDeliveryAction, TriggerDeliveryApplication, TriggerDeliveryOutcome,
     TriggerIssueObservation, ValidationFacts, WorkflowTreeFileV1RunnerProjection,
-    decode_cloud_frame, encode_runner_frame,
+    WorkflowTreeV1RunnerProjection, decode_cloud_frame, encode_runner_frame,
 };
 
 const TREE_DIGEST: &str = "sha256:4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945";
@@ -527,6 +527,22 @@ fn injected_useful(directory: &Path) -> PathBuf {
     useful
 }
 
+/// An offered tree's files and the `useful` that publishes and runs it, written or found
+/// for the fixture's temporary directory: by default the injected script.
+struct OfferedTree {
+    files: &'static [TreeFile],
+    useful: fn(&Path) -> PathBuf,
+}
+
+impl From<&'static [TreeFile]> for OfferedTree {
+    fn from(files: &'static [TreeFile]) -> Self {
+        Self {
+            files,
+            useful: injected_useful,
+        }
+    }
+}
+
 struct Fixture {
     _temporary: tempfile::TempDir,
     /// The repository every workspace checkout clones.
@@ -594,7 +610,7 @@ fn fixture_bounded(
 }
 
 /// `fixture_bounded`, each workspace checked out through the broker `source_broker`
-/// makes for the fixture repository, the offer's tree being `files`.
+/// makes for the fixture repository, the offer's tree and its `useful` being `tree`.
 #[expect(
     clippy::too_many_arguments,
     reason = "each fixture variant names the parameters it varies through its wrapper"
@@ -607,8 +623,9 @@ fn fixture_sourced(
     recorder: Option<Arc<crate::telemetry::Recorder>>,
     bound: Duration,
     source_broker: impl FnOnce(&Path) -> Arc<dyn SourceCredentialBroker>,
-    files: &'static [TreeFile],
+    tree: impl Into<OfferedTree>,
 ) -> Fixture {
+    let OfferedTree { files, useful } = tree.into();
     let temporary = tempfile::tempdir().unwrap();
     let source = temporary.path().join("source");
     let work = temporary.path().join("work");
@@ -627,7 +644,7 @@ fn fixture_sourced(
     run_fixture_git(&source, &["add", "."]);
     run_fixture_git(&source, &["commit", "--quiet", "-m", "fixture"]);
     let commit = run_fixture_git(&source, &["rev-parse", "HEAD"]);
-    let useful = injected_useful(temporary.path());
+    let useful = useful(temporary.path());
 
     let (endpoint, capability_requests) = capability_server(files);
     let config = Config::new(
@@ -1709,6 +1726,204 @@ async fn resolution_is_written_before_create_and_the_finish_reports_the_mirror()
             mirror: writes.into_iter().map(mirror_result).collect(),
             claim_release: true,
         }
+    );
+}
+
+/// The `workflowTree` of the protocol fixture's offer of a revision whose block holds the
+/// `linear` and `github` integrations' bindings beside flat ones.
+fn integration_bindings_tree() -> WorkflowTreeV1RunnerProjection {
+    let CloudFrame::AssignmentOffer { execution_spec, .. } = decode_cloud_frame(include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer-workflow-tree-integration-bindings.json"
+    )))
+    .unwrap() else {
+        panic!("expected an assignment offer");
+    };
+    execution_spec.workflow_tree.unwrap()
+}
+
+/// The resolution record of `integration_bindings_tree`: its flat Linear key and, under
+/// `linear`, the `linear` integration's bindings, each with the id Cloud resolved.
+fn integration_record() -> Value {
+    json!({
+        "linearTeam": {"id": "team_8c1b", "name": "Engineering"},
+        "linear": {
+            "team": {"id": "team_3d9e", "name": "Automation"},
+            "ownedState": {"id": "state_71c0", "name": "Engineering"},
+        },
+    })
+}
+
+// REQ-WFDEF-32, REQ-RUNNERENROLL-91: the record takes each flat `linear.team` and
+// `linear.state` key resolved to an id and, under the member `linear`, each `team` and
+// `state` binding of the `linear` integration resolved to one; an integration's account,
+// a binding without an id and every other integration's entry are left out.
+#[test]
+fn resolution_record_takes_the_linear_integrations_resolved_bindings() {
+    assert_eq!(
+        super::resolution_record(&integration_bindings_tree().resolution),
+        integration_record()
+    );
+    for (resolution, record) in [
+        (
+            json!({"linear": {"bindings": {
+                "team": {"kind": "team", "value": "AUTO", "id": "team_3d9e"},
+                "done": {"kind": "state", "value": "Done"},
+                "repo": {"kind": "repository", "value": "acme/platform", "id": "repo_9f1"},
+            }}}),
+            json!({"linear": {"team": {"id": "team_3d9e", "name": "AUTO"}}}),
+        ),
+        (
+            json!({"linear": {"account": {"id": "org_5f2a", "name": "Acme"}}}),
+            json!({}),
+        ),
+        (
+            json!({"linear": {
+                "account": {"id": "org_5f2a"},
+                "bindings": {"team": {"kind": "team", "value": "AUTO", "id": ""}},
+            }}),
+            json!({}),
+        ),
+        (
+            json!({"github": {
+                "account": {"id": "inst_40211"},
+                "bindings": {"repository": {
+                    "kind": "repository", "value": "acme/platform", "id": "repo_9f1", "name": "platform",
+                }},
+            }}),
+            json!({}),
+        ),
+        (
+            json!({"linear": {"kind": "linear.team", "value": "ENG", "id": "team_8c1b", "name": "Engineering"}}),
+            json!({"linear": {"id": "team_8c1b", "name": "Engineering"}}),
+        ),
+    ] {
+        assert_eq!(
+            super::resolution_record(&resolution),
+            record,
+            "{resolution:#}"
+        );
+    }
+}
+
+// REQ-WFDEF-20, REQ-WFDEF-32, REQ-RUNNERENROLL-91: the publish is given the block's
+// bindings as they came, each integration's group under its id, and `run create` finds the
+// record of the flat key and the `linear` integration's bindings.
+#[tokio::test]
+async fn integration_bindings_are_published_as_offered_and_their_ids_recorded() {
+    let mut fixture = fixture(TREE_DIGEST, "exited", "\"landed\"");
+    let offered = integration_bindings_tree();
+    let tree = fixture.offer.execution_spec.workflow_tree.as_mut().unwrap();
+    tree.bindings = offered.bindings.clone();
+    tree.resolution = offered.resolution;
+    execute(&mut fixture).await;
+
+    let read = |name: &str| -> Value {
+        serde_json::from_slice(&fs::read(fixture.log.join(name)).unwrap()).unwrap()
+    };
+    assert_eq!(read("bindings.json"), offered.bindings);
+    assert_eq!(read("resolution.json"), integration_record());
+}
+
+/// A root that declares the `linear` integration's bindings `team` and `done` beside one flat
+/// `linear.state` binding, and runs one `cmd` step.
+const INTEGRATION_TREE_FILES: &[TreeFile] = &[TreeFile {
+    path: "workflow.yaml",
+    bytes: b"schemaVersion: 1\nname: build\nrequires:\n  integrations:\n    linear:\n      bindings:\n        team: {kind: team}\n        done: {kind: state}\nbindings:\n  ownedState: {kind: linear.state}\nsteps:\n  build:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n",
+    executable: false,
+}];
+
+// REQ-WFDEF-20, REQ-WFDEF-32, REQ-RUNNERENROLL-91: the release's own publish takes a block
+// holding the `linear` integration's bindings as the revision's bindings file, and the
+// store's readers answer the record the runner writes beside it by `linear.<name>`.
+#[tokio::test]
+async fn the_built_publish_takes_integration_bindings_and_the_store_reads_their_ids() {
+    let scratch = tempfile::tempdir().unwrap();
+    for file in INTEGRATION_TREE_FILES {
+        fs::write(scratch.path().join(file.path), file.bytes).unwrap();
+    }
+    let validated = useful_execution::validate_workflow_tree(scratch.path()).unwrap();
+    let digest = format!(
+        "{}:{}",
+        validated.digest.algorithm.as_str(),
+        validated.digest.value
+    );
+    let mut fixture = fixture_sourced(
+        &digest,
+        "exited",
+        "\"landed\"",
+        &[],
+        None,
+        super::command::SHORT_COMMAND_BOUND,
+        fixture_source_broker,
+        OfferedTree {
+            files: INTEGRATION_TREE_FILES,
+            useful: |_| built_useful(),
+        },
+    );
+    let tree = fixture.offer.execution_spec.workflow_tree.as_mut().unwrap();
+    tree.digest = digest;
+    tree.stop_before = None;
+    tree.bindings = json!({
+        "ownedState": {"kind": "linear.state", "value": "In Progress"},
+        "linear": {
+            "team": {"kind": "team", "value": "AUTO"},
+            "done": {"kind": "state", "value": "Done"},
+        },
+    });
+    tree.resolution = json!({
+        "ownedState": {"kind": "linear.state", "value": "In Progress", "id": "state_1a7", "name": "In Progress"},
+        "linear": {
+            "account": {"id": "org_5f2a", "name": "Acme"},
+            "bindings": {
+                "team": {"kind": "team", "value": "AUTO", "id": "team_3d9e", "name": "Automation"},
+                "done": {"kind": "state", "value": "Done", "id": "state_d0e", "name": "Done"},
+            },
+        },
+    });
+    // Accepted: the publish took the block as its bindings file and reported the offered
+    // digest.
+    assert_eq!(
+        prepare_offered(&mut fixture.manager, &fixture.offer).await,
+        None
+    );
+
+    let home = fixture
+        ._temporary
+        .path()
+        .join("work")
+        .join(BOOT)
+        .join(&fixture.offer.assignment_id)
+        .join("private/home");
+    let definition = super::command::only_entry(&home.join("workflows")).unwrap();
+    let id = definition.file_name().unwrap().to_str().unwrap();
+    let store = useful_execution::WorkflowHome::from_lookup(|name| {
+        (name == "USEFUL_HOME").then(|| home.clone().into_os_string())
+    })
+    .unwrap();
+    let texts = |pairs: [(&str, &str); 3]| {
+        pairs
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        useful_execution::read_revision_bindings(&store, id, 1)
+            .unwrap()
+            .text_values_by_reference(),
+        texts([
+            ("linear.done", "Done"),
+            ("linear.team", "AUTO"),
+            ("ownedState", "In Progress"),
+        ])
+    );
+    assert_eq!(
+        store.revision_resolution(id, 1).unwrap(),
+        Some(texts([
+            ("linear.done", "state_d0e"),
+            ("linear.team", "team_3d9e"),
+            ("ownedState", "state_1a7"),
+        ]))
     );
 }
 

@@ -1,0 +1,11 @@
+schemaVersion: 1
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: ["true"]
+requires:
+  integrations:
+    linear:
+      bindings:
+        team: {kind: repository}

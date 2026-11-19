@@ -22,6 +22,9 @@ pub struct WorkflowProblemDetail {
     pub current_revision: Option<i32>,
     #[serde(rename = "bindingKey", skip_serializing_if = "Option::is_none")]
     pub binding_key: Option<String>,
+    /// The integration a `binding-missing` or `binding-unresolved` refusal is about; with `bindingKey` naming the binding under it, alone when the integration itself is at fault. A `definition-not-startable` refusal whose `startCheck` is `connection` names here the integration whose account is not active, with no `bindingKey`.
+    #[serde(rename = "integration", skip_serializing_if = "Option::is_none")]
+    pub integration: Option<String>,
     #[serde(rename = "startCheck", skip_serializing_if = "Option::is_none")]
     pub start_check: Option<StartCheck>,
     #[serde(rename = "triggerKey", skip_serializing_if = "Option::is_none")]
@@ -46,6 +49,7 @@ impl WorkflowProblemDetail {
         WorkflowProblemDetail {
             current_revision: None,
             binding_key: None,
+            integration: None,
             start_check: None,
             trigger_key: None,
             holder_run_id: None,

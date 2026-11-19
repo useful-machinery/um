@@ -52,6 +52,10 @@ pub enum RunnerFrame {
         /// Advertises `treeWithdraw: 1`: this runner applies a `withdraw` control, so Cloud
         /// may send it one (REQ-RUNNERENROLL-123).
         tree_withdraw: bool,
+        /// Advertises `treeIntegrationBindings: 1`: this runner reads integration bindings
+        /// and an integration's account in a tree block, so Cloud may offer it a run whose
+        /// revision holds one (REQ-COMPAT-18).
+        tree_integration_bindings: bool,
     },
     WorkspaceInventoryComplete {
         envelope: RunnerEnvelope,
@@ -1036,7 +1040,8 @@ pub struct WorkflowTreeV1RunnerProjection {
     /// The bindings snapshot, an object in the bindings file's shape.
     pub bindings: Value,
     /// The revision's resolution by binding key: each binding's kind and value and, for a
-    /// Linear team or state, the provider id and display name Cloud resolved.
+    /// Linear team or state, the provider id and display name Cloud resolved. Under an
+    /// integration's id it holds that integration's account and its bindings' resolved ids.
     pub resolution: Value,
     pub owner: Option<String>,
     pub stop_before: Option<String>,
@@ -1448,6 +1453,7 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
             tree_execution,
             tree_continuation,
             tree_withdraw,
+            tree_integration_bindings,
         } => {
             let mut payload = json!({ "runnerVersion": runner_version });
             if *tree_execution {
@@ -1458,6 +1464,9 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
             }
             if *tree_withdraw {
                 payload["treeWithdraw"] = json!(1);
+            }
+            if *tree_integration_bindings {
+                payload["treeIntegrationBindings"] = json!(1);
             }
             if let Some(root) = recovery_root {
                 payload["workspaceRecoveryVersion"] = json!(1);
@@ -3351,6 +3360,7 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
             "treeExecution",
             "treeContinuation",
             "treeWithdraw",
+            "treeIntegrationBindings",
         ],
         "workspace_inventory" => &["discovery", "diagnostic"],
         "execution_transition" | "execution_interrupted" => &["diagnostic"],
@@ -3636,6 +3646,11 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer-workflow-tree.json"
         )),
+        // REQ-CLOUDDEF-16
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer-workflow-tree-integration-bindings.json"
+        )),
         // REQ-COMPAT-18
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -3712,6 +3727,11 @@ mod tests {
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/valid/hello-tree-withdraw.json"
+        )),
+        // REQ-RUNNERENROLL-91, REQ-COMPAT-18
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/valid/hello-tree-integration-bindings.json"
         )),
         // REQ-RUNNERENROLL-90
         include_bytes!(concat!(
@@ -3903,6 +3923,11 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/invalid/hello-tree-withdraw-unknown.json"
         )),
+        // REQ-RUNNERENROLL-91, REQ-COMPAT-18
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/hello-tree-integration-bindings-unknown.json"
+        )),
         // REQ-RUNNERENROLL-90
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -4069,6 +4094,7 @@ mod tests {
             tree_execution: true,
             tree_continuation: false,
             tree_withdraw: false,
+            tree_integration_bindings: false,
         };
 
         let encoded = encode_runner_frame(&frame).unwrap();
@@ -4086,6 +4112,7 @@ mod tests {
             tree_execution: true,
             tree_continuation: true,
             tree_withdraw: false,
+            tree_integration_bindings: false,
         };
         let encoded = encode_runner_frame(&continuing).unwrap();
         assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
@@ -4095,17 +4122,34 @@ mod tests {
         assert!(value["payload"].get("treeWithdraw").is_none());
 
         let withdrawing = RunnerFrame::Hello {
+            envelope: envelope.clone(),
+            runner_version: "0.2.0".to_owned(),
+            recovery_root: None,
+            tree_execution: true,
+            tree_continuation: true,
+            tree_withdraw: true,
+            tree_integration_bindings: false,
+        };
+        let encoded = encode_runner_frame(&withdrawing).unwrap();
+        assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
+        let value: Value = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(value["payload"]["treeWithdraw"], 1);
+        // REQ-RUNNERENROLL-91, REQ-COMPAT-18
+        assert!(value["payload"].get("treeIntegrationBindings").is_none());
+
+        let integrating = RunnerFrame::Hello {
             envelope,
             runner_version: "0.2.0".to_owned(),
             recovery_root: None,
             tree_execution: true,
             tree_continuation: true,
             tree_withdraw: true,
+            tree_integration_bindings: true,
         };
-        let encoded = encode_runner_frame(&withdrawing).unwrap();
+        let encoded = encode_runner_frame(&integrating).unwrap();
         assert!(matches!(decode_frame(&encoded), Ok(ValidatedFrame::Runner)));
         let value: Value = serde_json::from_slice(&encoded).unwrap();
-        assert_eq!(value["payload"]["treeWithdraw"], 1);
+        assert_eq!(value["payload"]["treeIntegrationBindings"], 1);
     }
 
     // REQ-COMPAT-18
@@ -4707,6 +4751,27 @@ mod tests {
             tree.run_url.as_deref(),
             Some("https://usefulmachinery.com/acme/runs/run_01k0z6r1w8f4jy2m7q9v3x5abp")
         );
+    }
+
+    // REQ-CLOUDDEF-16: the projection carries the block's bindings and resolution as Cloud
+    // sent them, an integration's group and account included, and a flat block as before.
+    #[test]
+    fn tree_offer_projects_integration_bindings_and_their_resolution_as_sent() {
+        for name in [
+            "cloud-assignment-offer-workflow-tree.json",
+            "cloud-assignment-offer-workflow-tree-integration-bindings.json",
+        ] {
+            let fixture = valid_runner_fixture(name);
+            let CloudFrame::AssignmentOffer { execution_spec, .. } =
+                decode_cloud_frame(&serde_json::to_vec(&fixture).unwrap()).unwrap()
+            else {
+                panic!("expected an assignment offer from {name}");
+            };
+            let tree = execution_spec.workflow_tree.expect("workflow tree");
+            let sent = &fixture["payload"]["executionSpec"]["workflowTree"];
+            assert_eq!(tree.bindings, sent["bindings"], "{name} bindings");
+            assert_eq!(tree.resolution, sent["resolution"], "{name} resolution");
+        }
     }
 
     // REQ-TRIGGER-136

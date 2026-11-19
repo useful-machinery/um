@@ -76,10 +76,10 @@ pub use workflow::coordinator::{
     ClassifiedCommitError, CommitFailure, CommitFailureClass, CoordinationError, CoordinatorClock,
 };
 pub use workflow::definition_store::{
-    BindingsFile, BindingsSnapshot, BoundBinding, DefinitionError, DefinitionRecord, EnabledChange,
-    PublishTarget, Published, RevisionRecord, StoredDefinition, WorkflowHome, check_definition_id,
-    list_definitions, publish, read_current_bindings, read_definition, read_revision_bindings,
-    set_enabled,
+    BindingsFile, BindingsSnapshot, BoundBinding, BoundIntegrationBinding, DefinitionError,
+    DefinitionRecord, EnabledChange, PublishTarget, Published, RevisionRecord, StoredDefinition,
+    WorkflowHome, check_definition_id, list_definitions, publish, read_current_bindings,
+    read_definition, read_revision_bindings, set_enabled,
 };
 pub use workflow::diagnostic::StepDiagnosticLog;
 pub use workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
@@ -88,8 +88,10 @@ pub use workflow::document::BindingValue;
 pub use workflow::document::FailurePolicy;
 pub use workflow::document::FinalizationTrigger;
 pub use workflow::document::RootBlocks;
+pub use workflow::document::{
+    BindingKey, Integration, IntegrationAs, IntegrationBinding, IntegrationProvider,
+};
 pub use workflow::document::{BusyBehavior, OwnerDeclaration, OwnerSource, StopBefore};
-pub use workflow::document::{Integration, IntegrationAs, IntegrationBinding, IntegrationProvider};
 pub use workflow::evidence::{BlockedDetail, Prerequisite};
 pub use workflow::evidence::{
     FailedChild, FailingNode, FailingNodeState, FailureDetail, InheritedDetail,

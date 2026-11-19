@@ -299,7 +299,8 @@ impl Command {
 }
 
 /// The run's revision as the control trigger reads it: the root workflow of its tree and the
-/// bound value of each binding, by resolved id or by name.
+/// bound value of each binding, by resolved id or by name, each by the key a reference names
+/// after `$`, `<id>.<name>` for an integration binding (REQ-WFDEF-37).
 struct Revision {
     workflow: ResolvedWorkflow,
     resolution: Option<BTreeMap<String, String>>,
@@ -343,10 +344,7 @@ impl Revision {
             .map_err(stored_failure("resolution record"))?;
         let names = read_revision_bindings(&home, definition, revision)
             .map_err(stored_failure("bindings snapshot"))?
-            .bindings()
-            .iter()
-            .filter_map(|(key, bound)| Some((key.clone(), bound.value.as_text()?.to_owned())))
-            .collect();
+            .text_values_by_reference();
         Ok(Self {
             workflow,
             resolution,
