@@ -124,6 +124,87 @@ pub(crate) trait AssignmentGate: Send + Sync {
     fn while_still(&self, change: &mut dyn FnMut()) -> bool;
 }
 
+/// Whether the setup has ended and how many of the threads it started still
+/// run.
+#[derive(Default)]
+struct ThreadCount {
+    ended: bool,
+    running: usize,
+}
+
+/// The setup's threads, counted under one lock that the end also takes, so
+/// no thread starts after the end and the wait for none sees every thread
+/// that did (INV-RUNNER-41).
+struct SetupThreads(tokio::sync::watch::Sender<ThreadCount>);
+
+impl SetupThreads {
+    fn new() -> Self {
+        Self(tokio::sync::watch::Sender::new(ThreadCount::default()))
+    }
+
+    fn ended(&self) -> bool {
+        self.0.borrow().ended
+    }
+
+    /// Counts a thread about to start, answering what uncounts it when
+    /// dropped; `None`, counting nothing, once the setup has ended.
+    fn start(self: &Arc<Self>) -> Option<SetupThread> {
+        self.0
+            .send_if_modified(|count| {
+                if count.ended {
+                    return false;
+                }
+                count.running += 1;
+                true
+            })
+            .then(|| SetupThread(Arc::clone(self)))
+    }
+
+    fn end(&self) {
+        self.0.send_modify(|count| count.ended = true);
+    }
+
+    /// Resolves once no thread the setup started still runs.
+    async fn none_running(&self) {
+        // The sender is `self`, so the wait cannot see it closed.
+        let _ = self
+            .0
+            .subscribe()
+            .wait_for(|count| count.running == 0)
+            .await;
+    }
+}
+
+/// One counted setup thread, uncounted when dropped: when the thread has run,
+/// or with its unstarted closure when it could not start.
+struct SetupThread(Arc<SetupThreads>);
+
+impl Drop for SetupThread {
+    fn drop(&mut self) {
+        self.0
+            .0
+            .send_modify(|count| count.running = count.running.saturating_sub(1));
+    }
+}
+
+/// The gate of the periodic and `sync` passes: the service's, until the setup
+/// is ended, after which a running pass makes no further request, install,
+/// removal or check (INV-RUNNER-41).
+struct EndableGate {
+    service: Arc<dyn AssignmentGate>,
+    threads: Arc<SetupThreads>,
+}
+
+impl AssignmentGate for EndableGate {
+    fn none_working(&self) -> bool {
+        !self.threads.ended() && self.service.none_working()
+    }
+
+    fn while_still(&self, change: &mut dyn FnMut()) -> bool {
+        !self.threads.ended() && self.service.while_still(change)
+    }
+}
+
 /// The gate of the pass an admission makes for itself while the runner holds
 /// no other run: the assignment it is admitting has been offered nothing yet,
 /// so each request, install and removal runs at once (REQ-GRANT-49,
@@ -240,11 +321,14 @@ impl SetupDependencies {
 type Clock = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
 
 /// Agent-login setup bound to one serving process. Passes never overlap: a
-/// pass asked for while another runs waits for it and then runs.
+/// pass asked for while another runs waits for it and then runs. It counts
+/// the threads its setups run on and can be ended, after which it starts
+/// none and a running one stops at its next step (INV-RUNNER-41).
 pub(crate) struct AgentLoginSetup {
     dependencies: SetupDependencies,
-    /// The gate of the periodic and `sync` passes.
-    gate: Arc<dyn AssignmentGate>,
+    /// The gate of the periodic and `sync` passes, which holds the setup's
+    /// threads.
+    gate: EndableGate,
     clock: Clock,
     /// Held through every pass, admission, refresh and marking of an
     /// assignment's end, so none interleaves with another's writes. It
@@ -281,7 +365,10 @@ impl AgentLoginSetup {
         ));
         Self {
             dependencies,
-            gate,
+            gate: EndableGate {
+                service: gate,
+                threads: Arc::new(SetupThreads::new()),
+            },
             clock: Arc::new(clock),
             pass: Mutex::new(None),
             uses: Arc::default(),
@@ -316,9 +403,24 @@ impl AgentLoginSetup {
             .follow_credential(endpoint, credential);
     }
 
+    /// Ends the setup (INV-RUNNER-41): a later `set_up` answers `Busy`
+    /// without a thread, and a setup still running makes no further Cloud
+    /// request, install, removal or login check.
+    pub(crate) fn close(&self) {
+        self.gate.threads.end();
+    }
+
+    /// Resolves once no thread a setup started still runs, each counted as
+    /// gone only after it has dropped its reference to the setup, whose gate
+    /// may hold the runner's work root (INV-RUNNER-41).
+    pub(crate) async fn threads_exited(&self) {
+        self.gate.threads.none_running().await;
+    }
+
     /// Runs one setup for `caller` on a thread of its own, since its
     /// requests, file writes and checks block, and answers what it did:
-    /// `Busy` at once while a run the runner holds is working.
+    /// `Busy` at once while a run the runner holds is working, or once the
+    /// setup has ended.
     pub(crate) async fn set_up(self: &Arc<Self>, caller: SetupCaller) -> SetupAnswer {
         self.set_up_on(caller, |setup| {
             std::thread::Builder::new()
@@ -341,10 +443,20 @@ impl AgentLoginSetup {
         caller: SetupCaller,
         spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>,
     ) -> SetupAnswer {
+        let Some(thread) = self.gate.threads.start() else {
+            return SetupAnswer {
+                outcome: SetupOutcome::Busy(None),
+                unanswered: Vec::new(),
+            };
+        };
         let setup = Arc::clone(self);
         let (sender, receiver) = tokio::sync::oneshot::channel();
+        // The thread is uncounted only after it has let the setup go, and
+        // also when it cannot start, which drops the closure unrun.
         let started = spawn(Box::new(move || {
             let _ = sender.send(setup.set_up_blocking(caller));
+            drop(setup);
+            drop(thread);
         }));
         let failed = || SetupAnswer {
             outcome: SetupOutcome::Failed,
@@ -372,7 +484,7 @@ impl AgentLoginSetup {
             let earlier = ReadinessDocument::load(&self.dependencies.readiness_path)
                 .ok()
                 .flatten();
-            let (outcome, record) = self.pass_recording(self.gate.as_ref());
+            let (outcome, record) = self.pass_recording(&self.gate);
             (outcome, earlier, record)
         };
         let (first, mut record) = match (&outcome, record) {
@@ -476,7 +588,7 @@ impl AgentLoginSetup {
 
     fn run_pass_blocking(&self) -> SetupOutcome {
         let _pass = self.pass.lock().unwrap_or_else(PoisonError::into_inner);
-        self.pass_under(self.gate.as_ref())
+        self.pass_under(&self.gate)
     }
 
     /// `set_up_admission_beside` while the runner holds no other run.

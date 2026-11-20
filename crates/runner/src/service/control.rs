@@ -80,7 +80,8 @@ pub(super) struct ControlContext {
 /// after it had recorded an install or removal: answers that readiness with
 /// each login whose check gave no answer, `runner_busy` when a run the
 /// runner holds is working, or has a command in flight where the setup had
-/// a login to install or remove (REQ-GRANT-40), and `state_update_failed`
+/// a login to install or remove (REQ-GRANT-40), or once a rejoined service
+/// has ended the setup (INV-RUNNER-41), and `state_update_failed`
 /// when the readiness could not be recorded. The live status carries no
 /// check's answer.
 pub(super) async fn set_up_agent_logins(

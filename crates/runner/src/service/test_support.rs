@@ -174,6 +174,17 @@ pub(crate) fn with_watchdog<F: Future>(
     watchdog_at(Location::caller(), FIXTURE_WAIT_BASE, future)
 }
 
+/// `with_watchdog` over `base` rather than `FIXTURE_WAIT_BASE`, for a wait a test needs to
+/// see elapse: a case that requires `future` to stay pending for `base`, scaled by the
+/// host's load, requires the expiry.
+#[track_caller]
+pub(crate) fn with_bound<F: Future>(
+    base: Duration,
+    future: F,
+) -> impl Future<Output = Result<F::Output, WatchdogExpired>> {
+    watchdog_at(Location::caller(), base, future)
+}
+
 fn watchdog_at<F: Future>(
     location: &Location<'_>,
     base: Duration,

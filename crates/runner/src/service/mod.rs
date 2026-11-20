@@ -547,8 +547,10 @@ pub(crate) fn run_workflow_git_helper() -> bool {
 }
 
 /// Serves `config` until a stop or an end. Every task the run started, the
-/// blocking pool's included, is gone when it returns, so the work root it
-/// leased can be leased again by the next run.
+/// blocking pool's included, ends with its runtime, and a run that ends
+/// `Rejoined` has first waited for the threads of its agent-login setup,
+/// which the runtime does not own (INV-RUNNER-41), so the work root it
+/// leased can be leased again by the next run once it returns.
 pub(crate) fn run(
     config: Config,
     service_version: &str,
@@ -1302,27 +1304,24 @@ async fn connection_loop_with_work_root(
                             shutdown,
                         ))
                         .await?;
-                        match answer {
-                            RefusalAnswer::Parked => {}
-                            RefusalAnswer::Shutdown => {
-                                shutdown_deadline = Some(begin_shutdown(
-                                    &live_status,
-                                    &assignment_manager,
-                                    &sleeper,
-                                )?);
-                                shutting_down = true;
-                                continue;
-                            }
-                            RefusalAnswer::Ended(end) => {
-                                ending = end;
-                                shutdown_deadline = Some(begin_shutdown(
-                                    &live_status,
-                                    &assignment_manager,
-                                    &sleeper,
-                                )?);
-                                shutting_down = true;
-                                continue;
-                            }
+                        let end = match answer {
+                            RefusalAnswer::Parked => None,
+                            RefusalAnswer::Shutdown => Some(ServiceEnd::Stopped),
+                            RefusalAnswer::Ended(end) => Some(
+                                Box::pin(end_after_setup(
+                                    end,
+                                    agent_login_setup.as_deref(),
+                                    shutdown,
+                                ))
+                                .await,
+                            ),
+                        };
+                        if let Some(end) = end {
+                            ending = end;
+                            shutdown_deadline =
+                                Some(begin_shutdown(&live_status, &assignment_manager, &sleeper)?);
+                            shutting_down = true;
+                            continue;
                         }
                     }
                     tokio::select! {
@@ -1524,6 +1523,28 @@ async fn answer_refusal(
                 }
             }
         }
+    }
+}
+
+/// The end a refused credential's answer `end` leaves the service with. The
+/// process serves the rejoined runner next on the same work root, so a
+/// `Rejoined` end first ends the agent-login `setup` and waits until no
+/// thread of it still runs and holds the root; a stop signal during the wait
+/// ends the service `Stopped` instead, waiting for none (INV-RUNNER-41).
+/// Every other end exits the process, which ends the threads.
+async fn end_after_setup(
+    end: ServiceEnd,
+    setup: Option<&AgentLoginSetup>,
+    shutdown: &mut dyn Shutdown,
+) -> ServiceEnd {
+    let Some(setup) = setup.filter(|_| end == ServiceEnd::Rejoined) else {
+        return end;
+    };
+    setup.close();
+    tokio::select! {
+        biased;
+        () = shutdown.wait() => ServiceEnd::Stopped,
+        () = setup.threads_exited() => end,
     }
 }
 
@@ -5424,14 +5445,19 @@ mod tests {
             controlled_sleeper, deterministic_frame_source, effect_acknowledgement,
             effect_observation_acknowledgement, fake_agent_login_material, fake_agent_login_setup,
             fake_codex_answer, fake_codex_authorized, fixture_lease_clock, fixture_listener,
-            observation_acknowledgement, scripted_connector, sleep_request, welcome, with_watchdog,
+            observation_acknowledgement, scripted_connector, sleep_request, welcome, with_bound,
+            with_watchdog,
         };
         use super::super::workspace::WorkRootLease;
         use super::super::{
             AGENT_LOGIN_SETUP_INTERVAL, Backoff, ConnectionLoopDependencies, Connector,
-            ServiceError, WebSocketConnector, run_connection_loop_with_work_root,
+            JoinKeyMode, RejoinAnswer, ServiceEnd, ServiceError, WebSocketConnector,
+            run_connection_loop_in_mode,
         };
-        use super::{acknowledge_runner_frame, next_semantic_assignment_frame};
+        use super::{
+            acknowledge_runner_frame, held_join_key, next_semantic_assignment_frame,
+            refuse_every_upgrade,
+        };
         use crate::agent_login::cloud::{CloudFailure, LoginStatus};
         use crate::agent_login::readiness::{LoginReadiness, ReadinessDocument, readiness_path};
         use crate::control_protocol::{AgentLoginProvider, AgentLoginState};
@@ -5448,9 +5474,9 @@ mod tests {
             capture: TestCapture,
             sleeps: tokio::sync::mpsc::UnboundedReceiver<(Duration, SleepRelease)>,
             pending_setup: Option<SleepRelease>,
-            task: tokio::task::JoinHandle<Result<(), ServiceError>>,
+            task: tokio::task::JoinHandle<Result<ServiceEnd, ServiceError>>,
             shutdown: ControlledShutdownTrigger,
-            _config: ConfigFixture,
+            config: ConfigFixture,
         }
 
         impl SetupService {
@@ -5458,6 +5484,16 @@ mod tests {
                 endpoint: &str,
                 connector: impl Connector + 'static,
                 cloud: Arc<FakeAgentLoginCloud>,
+            ) -> Self {
+                Self::spawn_in_mode(endpoint, connector, cloud, JoinKeyMode::None)
+            }
+
+            /// `spawn`, for a start in `join_key`'s mode.
+            fn spawn_in_mode(
+                endpoint: &str,
+                connector: impl Connector + 'static,
+                cloud: Arc<FakeAgentLoginCloud>,
+                join_key: JoinKeyMode,
             ) -> Self {
                 let config =
                     ConfigFixture::new(endpoint, test_credential(), true).expect("configure");
@@ -5490,12 +5526,13 @@ mod tests {
                     WorkRootLease::acquire_for_test(config.assignment().work_root(), &boot_id)
                         .expect("acquire work root");
                 let task = tokio::spawn(async move {
-                    run_connection_loop_with_work_root(
+                    run_connection_loop_in_mode(
                         dependencies,
                         &connector,
                         Backoff::with_fixed_unit(1.0),
                         shutdown.as_mut(),
                         work_root,
+                        join_key,
                     )
                     .await
                 });
@@ -5507,7 +5544,7 @@ mod tests {
                     pending_setup: None,
                     task,
                     shutdown: shutdown_trigger,
-                    _config: config,
+                    config,
                 }
             }
 
@@ -5849,6 +5886,110 @@ mod tests {
             assert_eq!(service.codex().state, AgentLoginState::Revoked);
             service.stop().await;
             gateway.abort();
+        }
+
+        /// How long a rejoined service has to stay running while its setup's
+        /// request is held. Without the wait for the setup's thread the
+        /// service ends within milliseconds of the rejoin's answer; with it,
+        /// it cannot end at all until the request is released.
+        const HELD_SETUP_BOUND: Duration = Duration::from_secs(1);
+
+        /// A service started with a held join key whose rejoin succeeds, at an
+        /// endpoint that refuses every upgrade, once its first agent-login pass
+        /// waits on the status request `held` holds and its rejoin object has
+        /// been dropped, so the rejoin has been answered.
+        struct HeldRejoin {
+            service: SetupService,
+            cloud: Arc<FakeAgentLoginCloud>,
+            held: std::sync::mpsc::SyncSender<()>,
+            server: tokio::task::JoinHandle<()>,
+        }
+
+        impl HeldRejoin {
+            async fn start() -> Self {
+                let (listener, endpoint) = fixture_listener().await;
+                let cloud = FakeAgentLoginCloud::new(fake_codex_authorized(1));
+                let (held, arrival) = cloud.hold_next_status_arrival();
+                let (join_key, calls) = held_join_key(&[RejoinAnswer::Rejoined]);
+                let service = SetupService::spawn_in_mode(
+                    &endpoint,
+                    WebSocketConnector,
+                    Arc::clone(&cloud),
+                    join_key,
+                );
+                with_watchdog(tokio::task::spawn_blocking(move || arrival.recv()))
+                    .await
+                    .expect("the setup did not ask Cloud")
+                    .unwrap()
+                    .expect("the setup asked Cloud");
+                // Refused only now: the upgrade waits in the listener's
+                // backlog until the pass's request has arrived, so the setup
+                // ends with its request in flight, not before it asks.
+                let server = refuse_every_upgrade(listener);
+                calls.wait_until_dropped().await;
+                Self {
+                    service,
+                    cloud,
+                    held,
+                    server,
+                }
+            }
+        }
+
+        // INV-RUNNER-41, REQ-RUNNERENROLL-127
+        #[tokio::test]
+        async fn a_rejoined_service_ends_only_once_its_setup_thread_has_let_the_work_root_go() {
+            let HeldRejoin {
+                mut service,
+                cloud,
+                held,
+                server,
+            } = HeldRejoin::start().await;
+
+            with_bound(HELD_SETUP_BOUND, &mut service.task)
+                .await
+                .expect_err("the rejoined service ended while its setup's request was held");
+            drop(held);
+            let end = with_watchdog(&mut service.task)
+                .await
+                .expect("the rejoined service did not end once its setup's request was released")
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(end, ServiceEnd::Rejoined);
+            // The service that serves the rejoined runner leases the same
+            // work root at once.
+            WorkRootLease::acquire_for_test(
+                service.config.assignment().work_root(),
+                "rbt_00000000000000000000000009",
+            )
+            .expect("the ended service's setup still holds its work root");
+            // The ended setup asked Cloud for no delivery after its request.
+            assert_eq!(cloud.status_requests(), 1);
+            assert_eq!(cloud.deliveries(), 0);
+            server.abort();
+        }
+
+        // INV-RUNNER-41
+        #[tokio::test]
+        async fn a_stop_while_a_rejoined_service_waits_for_its_setup_ends_it_as_stopped() {
+            let HeldRejoin {
+                mut service,
+                cloud: _cloud,
+                held,
+                server,
+            } = HeldRejoin::start().await;
+
+            service.shutdown.notify_one();
+            let end = with_watchdog(&mut service.task)
+                .await
+                .expect("the stop did not end the service while its setup's request was held")
+                .unwrap()
+                .unwrap();
+
+            assert_eq!(end, ServiceEnd::Stopped);
+            drop(held);
+            server.abort();
         }
     }
 }

@@ -5,6 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 
+use futures_util::FutureExt as _;
+
 use super::*;
 use crate::agent_login::ProviderSource;
 use crate::agent_login::check::LoginCheckOutcome;
@@ -17,7 +19,7 @@ use crate::agent_login::readiness::readiness_path;
 use crate::control_protocol::{AgentLoginCheckCause, CredentialSource};
 use crate::service::{
     CountedGate, FAKE_AGENT_LOGIN_ID, FAKE_AGENT_LOGIN_SENTINEL, FakeAgentLoginCloud,
-    FakeLoginCheck, fake_agent_login_material, fake_codex_authorized,
+    FakeLoginCheck, fake_agent_login_material, fake_codex_authorized, with_watchdog,
 };
 use crate::telemetry::{TestCapture, test_recorder};
 
@@ -806,6 +808,56 @@ async fn a_pass_that_cannot_read_or_replace_its_record_or_start_records_why() {
     assert_eq!(outcome.outcome, SetupOutcome::Failed);
     assert_eq!(fixture.cloud.status_requests(), 0);
     fixture.assert_pass_failure("agent_login_setup_spawn_failed", "io_error");
+}
+
+// INV-RUNNER-41
+#[tokio::test]
+async fn an_ended_setup_stops_its_pass_and_is_waited_for_until_its_thread_lets_it_go() {
+    let fixture = Fixture::new(fake_codex_authorized(1));
+    let (held, arrival) = fixture.cloud.hold_next_status_arrival();
+    // The pass's future borrows the fixture's setup; only its thread holds a
+    // reference of its own.
+    let mut pass = std::pin::pin!(fixture.setup.set_up(SetupCaller::Schedule));
+    assert_eq!(pass.as_mut().now_or_never(), None);
+    tokio::task::spawn_blocking(move || arrival.recv())
+        .await
+        .unwrap()
+        .expect("the pass asked Cloud");
+
+    fixture.setup.close();
+    let mut exited = std::pin::pin!(fixture.setup.threads_exited());
+    assert_eq!(exited.as_mut().now_or_never(), None);
+    drop(held);
+    with_watchdog(exited)
+        .await
+        .expect("the ended setup's thread did not exit once its request was answered");
+
+    // Cloud authorized a login the pass would fetch, but the ended setup
+    // asked for no delivery, and its thread let the setup go before it
+    // exited.
+    assert_eq!(fixture.cloud.status_requests(), 1);
+    assert_eq!(fixture.cloud.deliveries(), 0);
+    assert_eq!(Arc::strong_count(&fixture.setup), 1);
+    let outcome = with_watchdog(pass).await.unwrap().outcome;
+    assert!(matches!(outcome, SetupOutcome::Busy(_)), "{outcome:?}");
+
+    // An ended setup starts no thread.
+    let mut spawned = false;
+    let answer = fixture
+        .setup
+        .set_up_on(SetupCaller::Sync, |_| {
+            spawned = true;
+            Ok(())
+        })
+        .await;
+    assert_eq!(
+        answer,
+        SetupAnswer {
+            outcome: SetupOutcome::Busy(None),
+            unanswered: Vec::new(),
+        }
+    );
+    assert!(!spawned);
 }
 
 // REQ-GRANT-38, REQ-GRANT-40, REQ-TELEMETRY-45
