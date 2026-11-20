@@ -38,10 +38,6 @@ const FILE_MODE: u32 = 0o600;
 pub(crate) const JOURNAL_FILE: &str = ".runner-enrollment.json";
 const LOCK_FILE: &str = ".runner-state.lock";
 const REGISTRATION_FILE: &str = ".runner-registration.json";
-/// The host's record of the runners its rejoins replaced (INV-RUNNER-37).
-const REPLACED_RUNNERS_FILE: &str = ".runner-replaced.json";
-/// The most runners the replaced-runner record lists.
-const REPLACED_RUNNERS_LIMIT: usize = 16;
 /// The temporary files of the runner's protected host documents.
 const STATE_TEMPORARY_PREFIX: &str = ".runner-state.tmp";
 const LOCK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -1572,74 +1568,6 @@ impl RunnerStateAccess {
         drop(lock);
         Ok(())
     }
-
-    /// The runners this host's rejoins replaced, oldest first, read under the
-    /// state lock (INV-RUNNER-37): empty when no rejoin has written the record.
-    pub(crate) fn replaced_runners(&self) -> Result<Vec<String>, ReplacedRunnersError> {
-        let lock =
-            StateLock::acquire_beside(&self.path).map_err(ReplacedRunnersError::StateLock)?;
-        let path = replaced_runners_path(&self.path).map_err(ReplacedRunnersError::StateLock)?;
-        let bytes =
-            read_private_document(&path, STATE_LIMIT).map_err(ReplacedRunnersError::Unreadable)?;
-        drop(lock);
-        let Some(bytes) = bytes else {
-            return Ok(Vec::new());
-        };
-        ReplacedRunnersRecord::parse(&bytes)
-            .map(|record| record.replaced_runner_ids)
-            .ok_or(ReplacedRunnersError::Invalid)
-    }
-}
-
-/// Why the host's replaced-runner record could not be read.
-#[derive(Debug)]
-pub(crate) enum ReplacedRunnersError {
-    /// The state lock beside the record could not be taken.
-    StateLock(EnrollmentError),
-    /// The record is not a private regular file the runner could read.
-    Unreadable(PrivateFileFailure),
-    /// The record does not parse or fails its checks.
-    Invalid,
-}
-
-impl ReplacedRunnersError {
-    /// The closed name of the cause, for telemetry.
-    pub(crate) const fn cause(&self) -> &'static str {
-        match self {
-            Self::StateLock(_) => "state_lock",
-            Self::Unreadable(_) => "unreadable",
-            Self::Invalid => "invalid",
-        }
-    }
-}
-
-impl fmt::Display for ReplacedRunnersError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::StateLock(error) => {
-                write!(
-                    formatter,
-                    "the replaced-runner record cannot be locked: {error}"
-                )
-            }
-            Self::Unreadable(failure) => write!(
-                formatter,
-                "the replaced-runner record cannot be read: {}: {}",
-                failure.requirement, failure.error
-            ),
-            Self::Invalid => formatter.write_str("the replaced-runner record is invalid"),
-        }
-    }
-}
-
-impl Error for ReplacedRunnersError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        match self {
-            Self::StateLock(error) => Some(error),
-            Self::Unreadable(failure) => Some(&failure.error),
-            Self::Invalid => None,
-        }
-    }
 }
 
 fn load_operator_config(path: &Path) -> Result<OperatorConfig, EnrollmentError> {
@@ -2058,8 +1986,7 @@ fn persist_enrollment_state(
 
 // Replaces the enrolled state of `replaced_runner_id` with the answer to its
 // rejoin: a fresh state holding the journal's secret as the answer's
-// credential, without a pending credential or a promotion, after recording
-// `replaced_runner_id` in the host's replaced-runner record. State that already
+// credential, without a pending credential or a promotion. State that already
 // holds this enrollment is done; state that names neither runner is refused.
 fn persist_rejoined_state(
     path: &Path,
@@ -2077,7 +2004,6 @@ fn persist_rejoined_state(
     if existing.runner_id != replaced_runner_id {
         return Err(EnrollmentError::RunnerMismatch);
     }
-    record_replaced_runner(path, replaced_runner_id)?;
     let enrolled_at = now_rfc3339()?;
     let state = RunnerState {
         schema_version: 1,
@@ -2094,68 +2020,6 @@ fn persist_rejoined_state(
         updated_at: enrolled_at,
     };
     atomic_write_json(path, &PersistedRunnerState::from(&state))
-}
-
-/// The runners this host's rejoins replaced, oldest first, kept in
-/// `REPLACED_RUNNERS_FILE` beside the state.
-#[derive(Deserialize, Serialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct ReplacedRunnersRecord {
-    schema_version: u8,
-    replaced_runner_ids: Vec<String>,
-}
-
-impl ReplacedRunnersRecord {
-    /// The record in `bytes`, or `None` when it does not parse or fails its
-    /// checks: schema version 1 and at most `REPLACED_RUNNERS_LIMIT` runner
-    /// IDs.
-    fn parse(bytes: &[u8]) -> Option<Self> {
-        let record: Self = serde_json::from_slice(bytes).ok()?;
-        (record.schema_version == 1
-            && record.replaced_runner_ids.len() <= REPLACED_RUNNERS_LIMIT
-            && record
-                .replaced_runner_ids
-                .iter()
-                .all(|id| valid_typed_id(id, "rnr_")))
-        .then_some(record)
-    }
-}
-
-/// The host's replaced-runner record, beside the state file.
-fn replaced_runners_path(state_path: &Path) -> Result<PathBuf, EnrollmentError> {
-    Ok(state_directory(state_path)?.join(REPLACED_RUNNERS_FILE))
-}
-
-// Adds `replaced_runner_id` to the host's replaced-runner record before a
-// rejoin replaces the state, under the caller's state lock. A record that does
-// not parse or check starts a new list; one that cannot be read or written is
-// the rejoin's error, so the state is not replaced.
-fn record_replaced_runner(
-    state_path: &Path,
-    replaced_runner_id: &str,
-) -> Result<(), EnrollmentError> {
-    let path = replaced_runners_path(state_path)?;
-    let mut replaced_runner_ids = read_private_file_if_present(&path, STATE_LIMIT)?
-        .and_then(|bytes| ReplacedRunnersRecord::parse(&bytes))
-        .map(|record| record.replaced_runner_ids)
-        .unwrap_or_default();
-    if !replaced_runner_ids
-        .iter()
-        .any(|id| id == replaced_runner_id)
-    {
-        replaced_runner_ids.push(replaced_runner_id.to_owned());
-    }
-    let excess = replaced_runner_ids
-        .len()
-        .saturating_sub(REPLACED_RUNNERS_LIMIT);
-    replaced_runner_ids.drain(..excess);
-    atomic_write_json(
-        &path,
-        &ReplacedRunnersRecord {
-            schema_version: 1,
-            replaced_runner_ids,
-        },
-    )
 }
 
 fn enrollment_already_persisted(

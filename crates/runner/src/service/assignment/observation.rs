@@ -346,16 +346,6 @@ pub(in crate::service) enum AssignmentObservation {
         attempt_id: String,
         report: ExecutionReport,
     },
-    WorkspaceRegistration {
-        assignment_id: String,
-        payload: serde_json::Value,
-    },
-    DiscoveryInventory {
-        payload: serde_json::Value,
-    },
-    DiscoveryComplete {
-        work_root_id: String,
-    },
     WorkspaceRetention {
         assignment_id: String,
         attempt_id: String,
@@ -380,10 +370,8 @@ impl AssignmentObservation {
             Self::CancellationApplied(application) => &application.assignment_id,
             Self::LeaseRenewalRequested { assignment_id, .. }
             | Self::Execution { assignment_id, .. }
-            | Self::WorkspaceRetention { assignment_id, .. }
-            | Self::WorkspaceRegistration { assignment_id, .. } => assignment_id,
+            | Self::WorkspaceRetention { assignment_id, .. } => assignment_id,
             Self::Artifact { request, .. } => request.assignment_id(),
-            Self::DiscoveryInventory { .. } | Self::DiscoveryComplete { .. } => "",
         }
     }
 
@@ -391,31 +379,15 @@ impl AssignmentObservation {
         matches!(self, Self::Execution { report, .. } if report.is_terminal())
     }
 
-    /// The boot's scan of its work root: replayed on every session, but owed to no
-    /// run. A boot that ends before reporting it leaves nothing behind, since the
-    /// next boot scans and reports again (REQ-RUNNERENROLL-84, REQ-RUNNERENROLL-85).
-    pub(super) fn is_boot_inventory(&self) -> bool {
-        matches!(
-            self,
-            Self::DiscoveryInventory { .. } | Self::DiscoveryComplete { .. }
-        )
-    }
-
     pub(super) fn is_condition_evidence_transition(&self) -> bool {
         matches!(self, Self::Execution { report, .. } if report.is_condition_evidence_transition())
     }
 
     /// Whether the observation is owed to no run and so may be refused rather than use
-    /// the slots and bytes reserved for mandatory execution observations: registration,
-    /// discovery, and a progress report for steps alone (REQ-RUNNERENROLL-88).
+    /// the slots and bytes reserved for mandatory execution observations: a progress
+    /// report for steps alone (REQ-RUNNERENROLL-88).
     pub(super) fn is_optional(&self) -> bool {
-        match self {
-            Self::WorkspaceRegistration { .. }
-            | Self::DiscoveryInventory { .. }
-            | Self::DiscoveryComplete { .. } => true,
-            Self::Execution { report, .. } => report.is_steps_only(),
-            _ => false,
-        }
+        matches!(self, Self::Execution { report, .. } if report.is_steps_only())
     }
 
     pub(in crate::service) fn runner_frame(&self, envelope: RunnerEnvelope) -> RunnerFrame {
@@ -482,17 +454,6 @@ impl AssignmentObservation {
                 attempt_id,
                 report,
             } => report.runner_frame(envelope, assignment_id.clone(), attempt_id.clone()),
-            Self::WorkspaceRegistration { payload, .. } | Self::DiscoveryInventory { payload } => {
-                RunnerFrame::WorkspaceInventory {
-                    envelope,
-                    payload: payload.clone(),
-                }
-            }
-            Self::DiscoveryComplete { work_root_id } => RunnerFrame::WorkspaceInventoryComplete {
-                envelope,
-                work_root_id: work_root_id.clone(),
-                inventory_through_sequence: 0, // replaced at the serialized emission boundary
-            },
             Self::WorkspaceRetention {
                 assignment_id,
                 attempt_id,

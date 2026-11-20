@@ -26,8 +26,6 @@ pub struct RunFailure {
     pub detail: std::collections::HashMap<String, serde_json::Value>,
     #[serde(rename = "diagnostic", skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<Box<models::RunnerDiagnostic>>,
-    #[serde(rename = "recoveryReason", skip_serializing_if = "Option::is_none")]
-    pub recovery_reason: Option<models::RecoveryReason>,
 }
 
 impl RunFailure {
@@ -41,7 +39,6 @@ impl RunFailure {
             state,
             detail,
             diagnostic: None,
-            recovery_reason: None,
         }
     }
 }

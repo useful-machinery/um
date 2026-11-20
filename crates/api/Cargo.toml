@@ -29,7 +29,6 @@ time.workspace = true
 tokio.workspace = true
 url.workspace = true
 zeroize.workspace = true
-serde_repr = "0.1.20"
 
 [dev-dependencies]
 useful-test-support.workspace = true

@@ -148,22 +148,6 @@ impl ObservationOutbox {
             .collect()
     }
 
-    pub(super) fn discard_unsent_registration(&self, id: u64) -> bool {
-        let mut state = self.lock();
-        let Some(index) = state.entries.iter().position(|entry| {
-            entry.id == id
-                && !entry.encoded
-                && !entry.transport_owned
-                && matches!(
-                    entry.observation,
-                    AssignmentObservation::WorkspaceRegistration { .. }
-                )
-        }) else {
-            return false;
-        };
-        state.entries.remove(index).is_some()
-    }
-
     pub(super) fn acknowledge(&self, id: u64) -> Option<AssignmentObservation> {
         let mut state = self.lock();
         let index = state.entries.iter().position(|entry| entry.id == id)?;
@@ -299,13 +283,12 @@ impl ObservationOutbox {
         self.lock().entries.iter().any(|entry| entry.id == id)
     }
 
-    /// Every replayable run observation has reached a session. Boot inventory is
-    /// replayable too but is not an obligation: it never holds shutdown or exit.
+    /// Every replayable observation has reached a session.
     pub(super) fn replay_obligations_dispatched(&self) -> bool {
         self.lock()
             .entries
             .iter()
-            .filter(|entry| entry.replayable && !entry.observation.is_boot_inventory())
+            .filter(|entry| entry.replayable)
             .all(|entry| entry.encoded)
     }
 

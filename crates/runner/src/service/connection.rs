@@ -20,10 +20,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async_with_conf
 use crate::service::artifact_delivery::ArtifactCloudResponse;
 use crate::service::assignment::{
     ArtifactRequestKind, AssignmentCancel, AssignmentManager, AssignmentManagerFailure,
-    AssignmentObservation, AssignmentOffer, AssignmentPrepare, AssignmentRelease,
-    AssignmentRenewal, AssignmentRunControl, AssignmentStart, AssignmentStartAuthorization,
-    AssignmentTriggerDelivery, PendingAssignmentObservation, RetainedObservationFrame,
-    WelcomePolicyFailure,
+    AssignmentOffer, AssignmentPrepare, AssignmentRelease, AssignmentRenewal, AssignmentRunControl,
+    AssignmentStart, AssignmentStartAuthorization, AssignmentTriggerDelivery,
+    PendingAssignmentObservation, RetainedObservationFrame, WelcomePolicyFailure,
 };
 use crate::service::config::Config;
 use crate::service::control::LiveStatus;
@@ -273,12 +272,6 @@ impl<'a> ProtocolLog<'a> {
                 assignment_id,
                 ..
             } => (envelope, "execution_finished", None, Some(assignment_id)),
-            RunnerFrame::WorkspaceInventory { envelope, .. } => {
-                (envelope, "workspace_inventory", None, None)
-            }
-            RunnerFrame::WorkspaceInventoryComplete { envelope, .. } => {
-                (envelope, "workspace_inventory_complete", None, None)
-            }
             RunnerFrame::WorkspaceRetentionReport {
                 envelope,
                 assignment_id,
@@ -404,30 +397,6 @@ impl<'a> ProtocolLog<'a> {
                     ],
                 )
             }
-            CloudFrame::WorkspaceRegistration {
-                envelope,
-                acknowledged_message_id,
-                acknowledged_sequence,
-                rejection,
-                ..
-            } => (
-                envelope,
-                if rejection.is_some() {
-                    "workspace_registration_rejected"
-                } else {
-                    "workspace_registered"
-                },
-                vec![
-                    KeyValue::new(
-                        telemetry::attribute::PROTOCOL_ACKNOWLEDGED_MESSAGE_ID,
-                        acknowledged_message_id.clone(),
-                    ),
-                    KeyValue::new(
-                        telemetry::attribute::PROTOCOL_ACKNOWLEDGED_SEQUENCE,
-                        telemetry::integer(*acknowledged_sequence),
-                    ),
-                ],
-            ),
             CloudFrame::ObservationAck {
                 envelope,
                 acknowledged_message_id,
@@ -1445,14 +1414,6 @@ enum PendingObservationKind {
     AssignmentObservation {
         id: u64,
     },
-    Discovery {
-        id: u64,
-    },
-    WorkspaceRegistration {
-        id: u64,
-        work_root_id: String,
-        workspace_id: String,
-    },
     ArtifactObservation {
         id: u64,
         delivery_id: u64,
@@ -2222,9 +2183,7 @@ where
                 .iter()
                 .filter_map(|pending| match &pending.kind {
                     PendingObservationKind::AssignmentObservation { id }
-                    | PendingObservationKind::WorkspaceRegistration { id, .. }
-                    | PendingObservationKind::ArtifactObservation { id, .. }
-                    | PendingObservationKind::Discovery { id } => Some(*id),
+                    | PendingObservationKind::ArtifactObservation { id, .. } => Some(*id),
                     PendingObservationKind::EffectReceipt => None,
                 })
                 .collect();
@@ -2239,23 +2198,6 @@ where
                 .pending_observations(&in_flight_ids, available);
             if !pending.is_empty() {
                 for observation in pending {
-                    // A permanently unanswered best-effort registration must
-                    // never fill the last slot needed by ordinary work. Drop
-                    // it before assigning a wire sequence, not after sending.
-                    if matches!(
-                        &observation.observation,
-                        AssignmentObservation::WorkspaceRegistration { .. }
-                    ) && in_flight.len() >= OBSERVATION_WINDOW - 1
-                    {
-                        if assignment_manager
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .discard_unsent_registration(observation.id)
-                        {
-                            super::record_optional_recovery_failure(recorder, "workspace_registration_unacknowledged", serde_json::json!({"errorType": "workspace_registration_unacknowledged", "stage": "observation_window"}).to_string());
-                        }
-                        continue;
-                    }
                     if !assignment_manager
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2468,66 +2410,12 @@ where
                 progress.opening_acknowledged = true;
                 record_progress(connection_event, progress);
             }
-            CloudFrame::WorkspaceRegistration {
-                acknowledged_message_id,
-                acknowledged_sequence,
-                work_root_id,
-                workspace_id,
-                rejection,
-                ..
-            } => {
-                let Some(position) = in_flight
-                    .iter()
-                    .position(|pending| pending.message_id == acknowledged_message_id)
-                else {
-                    return Err(protocol_violation(
-                        &mut writer,
-                        sleeper,
-                        &mut protocol,
-                        progress,
-                        ConnectionCause::UnexpectedObservationAcknowledgement,
-                    )
-                    .await);
-                };
-                let pending = &in_flight[position];
-                if pending.message_id != acknowledged_message_id
-                    || pending.sequence != acknowledged_sequence
-                    || !matches!(&pending.kind, PendingObservationKind::WorkspaceRegistration { work_root_id: root, workspace_id: workspace, .. } if root == &work_root_id && workspace == &workspace_id)
-                {
-                    return Err(protocol_violation(
-                        &mut writer,
-                        sleeper,
-                        &mut protocol,
-                        progress,
-                        ConnectionCause::MismatchedEffectAcknowledgement,
-                    )
-                    .await);
-                }
-                if let Some(PendingObservation {
-                    kind: PendingObservationKind::WorkspaceRegistration { id, .. },
-                    ..
-                }) = in_flight.remove(position)
-                {
-                    assignment_manager
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .acknowledge_observation(id);
-                }
-                if let Some(reason) = rejection {
-                    super::record_optional_recovery_failure(recorder, "workspace_registration_rejected", serde_json::json!({"errorType": "workspace_registration_rejected", "reason": reason}).to_string());
-                }
-            }
             CloudFrame::ObservationAck {
                 acknowledged_message_id,
                 acknowledged_sequence,
                 ..
             } => {
-                let Some(position) = in_flight.iter().position(|pending| {
-                    !matches!(
-                        pending.kind,
-                        PendingObservationKind::WorkspaceRegistration { .. }
-                    )
-                }) else {
+                let Some(pending) = in_flight.front() else {
                     return Err(protocol_violation(
                         &mut writer,
                         sleeper,
@@ -2537,7 +2425,6 @@ where
                     )
                     .await);
                 };
-                let pending = &in_flight[position];
                 if acknowledged_message_id != pending.message_id
                     || acknowledged_sequence != pending.sequence
                 {
@@ -2551,7 +2438,7 @@ where
                     .await);
                 }
                 let kind = pending.kind.clone();
-                let pending = in_flight.remove(position).ok_or_else(|| {
+                let pending = in_flight.pop_front().ok_or_else(|| {
                     ConnectionError::terminal(
                         progress,
                         ConnectionCause::UnexpectedObservationAcknowledgement,
@@ -2585,14 +2472,7 @@ where
                         record_progress(connection_event, progress);
                         active_effect_event.finish(Outcome::Success, None);
                     }
-                    PendingObservationKind::WorkspaceRegistration { .. } => {
-                        return Err(ConnectionError::terminal(
-                            progress,
-                            ConnectionCause::UnexpectedObservationAcknowledgement,
-                        ));
-                    }
-                    PendingObservationKind::AssignmentObservation { id }
-                    | PendingObservationKind::Discovery { id } => {
+                    PendingObservationKind::AssignmentObservation { id } => {
                         assignment_manager
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2900,32 +2780,13 @@ async fn send_assignment_observation<W>(
 where
     W: Sink<Message, Error = WebSocketError> + Unpin,
 {
-    let kind = match &pending.observation {
-        AssignmentObservation::DiscoveryInventory { .. }
-        | AssignmentObservation::DiscoveryComplete { .. } => {
-            PendingObservationKind::Discovery { id: pending.id }
-        }
-        AssignmentObservation::WorkspaceRegistration { payload, .. } => {
-            PendingObservationKind::WorkspaceRegistration {
-                id: pending.id,
-                work_root_id: payload["workRootId"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-                workspace_id: payload["workspaceId"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .to_owned(),
-            }
-        }
-        _ => match pending.artifact_request() {
-            Some((delivery_id, request_kind)) => PendingObservationKind::ArtifactObservation {
-                id: pending.id,
-                delivery_id,
-                request_kind,
-            },
-            None => PendingObservationKind::AssignmentObservation { id: pending.id },
+    let kind = match pending.artifact_request() {
+        Some((delivery_id, request_kind)) => PendingObservationKind::ArtifactObservation {
+            id: pending.id,
+            delivery_id,
+            request_kind,
         },
+        None => PendingObservationKind::AssignmentObservation { id: pending.id },
     };
     let emission = if pending.retained_frame.is_none() {
         Some(next_sequence.lock_emission().await)
@@ -2938,26 +2799,7 @@ where
     };
     let sequence = envelope.sequence;
     let message_id = envelope.message_id.clone();
-    let mut frame = pending.observation.runner_frame(envelope.clone());
-    if matches!(
-        pending.observation,
-        AssignmentObservation::DiscoveryInventory { .. }
-    ) {
-        assignment_manager
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .mark_discovery_inventory(envelope.sequence);
-    }
-    if let RunnerFrame::WorkspaceInventoryComplete {
-        inventory_through_sequence,
-        ..
-    } = &mut frame
-    {
-        *inventory_through_sequence = assignment_manager
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .discovery_watermark();
-    }
+    let frame = pending.observation.runner_frame(envelope.clone());
     let encoded = match pending.retained_frame {
         Some(retained) => retained.encoded,
         None => {
@@ -3087,29 +2929,6 @@ where
     })
 }
 
-pub(crate) fn recovery_hello(
-    mut encoded: Vec<u8>,
-    root: Option<serde_json::Value>,
-) -> Result<Vec<u8>, ConnectionError> {
-    if let Some(root) = root {
-        let mut frame: serde_json::Value = serde_json::from_slice(&encoded).map_err(|_| {
-            ConnectionError::terminal(
-                ConnectionProgress::unacknowledged(),
-                ConnectionCause::EncodeOpeningHello,
-            )
-        })?;
-        frame["payload"]["workspaceRecoveryVersion"] = serde_json::json!(1);
-        frame["payload"]["workspaceRecoveryRoot"] = root;
-        encoded = serde_json::to_vec(&frame).map_err(|_| {
-            ConnectionError::terminal(
-                ConnectionProgress::unacknowledged(),
-                ConnectionCause::EncodeOpeningHello,
-            )
-        })?;
-    }
-    Ok(encoded)
-}
-
 pub(crate) fn opening_hello(
     frame_source: &dyn FrameSource,
     runner_id: &str,
@@ -3133,7 +2952,6 @@ pub(crate) fn opening_hello(
             sent_at,
         },
         runner_version: runner_version.to_owned(),
-        recovery_root: None,
         tree_execution: true,
         // It adopts a retained tree run on a continuation offer (REQ-RUNNERENROLL-89).
         tree_continuation: true,
@@ -3191,11 +3009,10 @@ mod tests {
     use crate::service::assignment::{
         ArtifactRequestKind, AssignmentManager, AssignmentOffer, AssignmentRootPreparer,
         test_support::{
-            artifact_delivery, enqueue_finalization_terminal, enqueue_fixture_registration,
-            enqueue_lease_clock_failure_report, enqueue_transitions, hold_lease_time,
-            install_root_preparer, install_running_renewal_fixture, manager as manager_fixture,
-            manager_with_dependencies, observation_retained, preparation_expires_at,
-            request_lease_renewal,
+            artifact_delivery, enqueue_finalization_terminal, enqueue_lease_clock_failure_report,
+            enqueue_transitions, hold_lease_time, install_root_preparer,
+            install_running_renewal_fixture, manager as manager_fixture, manager_with_dependencies,
+            observation_retained, preparation_expires_at, request_lease_renewal,
         },
     };
     use crate::service::config::Config;
@@ -3444,209 +3261,6 @@ mod tests {
             );
         }
         window
-    }
-
-    #[tokio::test]
-    async fn discovery_completion_follows_acknowledged_inventory_and_uses_its_wire_sequence() {
-        let context = EstablishedTestContext::new();
-        let root = "rwr_01k0z6r1w8f4jy2m7q9v3x5abc";
-        let fixture: serde_json::Value = serde_json::from_str(include_str!("../../../../tests/fixtures/runner-protocol/v1/valid/runner-workspace-discovery-unavailable.json")).unwrap();
-        context
-            .assignment_manager
-            .lock()
-            .unwrap()
-            .begin_discovery(root.into(), vec![fixture["payload"].clone()]);
-        let mut next_sequence = 2;
-        let (inbound, mut outbound, established) =
-            established_fixture(&context, &mut next_sequence);
-        let peer = async {
-            let _opening = with_watchdog(outbound.recv()).await.expect("opening hello");
-            inbound.send(welcome());
-            inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
-            let Some(Message::Text(first)) =
-                with_watchdog(outbound.recv()).await.expect("discovery")
-            else {
-                panic!("missing discovery")
-            };
-            let first: serde_json::Value = serde_json::from_str(&first).unwrap();
-            assert_eq!(first["type"], "workspace_inventory");
-            assert_eq!(first["payload"]["presence"], "unavailable");
-            assert!(first["payload"]["lastClaimGeneration"].is_null());
-            inbound.send(observation_acknowledgement(
-                first["messageId"].as_str().unwrap(),
-                first["sequence"].as_u64().unwrap(),
-            ));
-            let Some(Message::Text(last)) =
-                with_watchdog(outbound.recv()).await.expect("completion")
-            else {
-                panic!("missing completion")
-            };
-            let last: serde_json::Value = serde_json::from_str(&last).unwrap();
-            assert_eq!(last["type"], "workspace_inventory_complete");
-            assert_eq!(
-                last["payload"]["inventoryThroughSequence"],
-                first["sequence"]
-            );
-            inbound.send(observation_acknowledgement(
-                last["messageId"].as_str().unwrap(),
-                last["sequence"].as_u64().unwrap(),
-            ));
-            inbound.send(Message::Close(None));
-        };
-        let (outcome, ()) = with_watchdog(async { tokio::join!(established, peer) })
-            .await
-            .expect("discovery transport");
-        outcome.expect("discovery transport closed unexpectedly");
-    }
-
-    #[tokio::test]
-    async fn empty_discovery_marks_zero_without_inventing_an_inventory_entry() {
-        let context = EstablishedTestContext::new();
-        context
-            .assignment_manager
-            .lock()
-            .unwrap()
-            .begin_discovery("rwr_01k0z6r1w8f4jy2m7q9v3x5abc".into(), vec![]);
-        let mut next_sequence = 2;
-        let (inbound, mut outbound, established) =
-            established_fixture(&context, &mut next_sequence);
-        let peer = async {
-            let _opening = with_watchdog(outbound.recv()).await.expect("opening hello");
-            inbound.send(welcome());
-            inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
-            let Some(Message::Text(marker)) = with_watchdog(outbound.recv())
-                .await
-                .expect("empty completion")
-            else {
-                panic!("missing empty marker")
-            };
-            let marker: serde_json::Value = serde_json::from_str(&marker).unwrap();
-            assert_eq!(marker["type"], "workspace_inventory_complete");
-            assert_eq!(marker["payload"]["inventoryThroughSequence"], 0);
-            inbound.send(observation_acknowledgement(
-                marker["messageId"].as_str().unwrap(),
-                marker["sequence"].as_u64().unwrap(),
-            ));
-            inbound.send(Message::Close(None));
-        };
-        let (outcome, ()) = with_watchdog(async { tokio::join!(established, peer) })
-            .await
-            .expect("empty transport");
-        outcome.expect("empty transport closed unexpectedly");
-    }
-
-    #[tokio::test]
-    async fn unanswered_registrations_leave_a_window_slot_for_required_observations() {
-        let context = EstablishedTestContext::new();
-        for _ in 0..40 {
-            enqueue_fixture_registration(&context.assignment_manager.lock().unwrap());
-        }
-        enqueue_transitions(&context.assignment_manager.lock().unwrap(), 1);
-        let mut next_sequence = 2;
-        let (inbound, mut outbound, established) =
-            established_fixture(&context, &mut next_sequence);
-        let peer = async {
-            let window = open_and_fill_observation_window(&inbound, &mut outbound).await;
-            assert!(
-                window[..OBSERVATION_WINDOW - 1]
-                    .iter()
-                    .all(|frame| frame["type"] == "workspace_inventory")
-            );
-            let mandatory = &window[OBSERVATION_WINDOW - 1];
-            assert_eq!(mandatory["type"], "execution_transition");
-            inbound.send(observation_acknowledgement(
-                mandatory["messageId"].as_str().expect("mandatory ID"),
-                mandatory["sequence"].as_u64().expect("mandatory sequence"),
-            ));
-            inbound.send(Message::Ping(b"mandatory-progress".to_vec().into()));
-            assert!(matches!(
-                with_watchdog(outbound.recv())
-                    .await
-                    .expect("mandatory progress timed out"),
-                Some(Message::Pong(_))
-            ));
-            inbound.send(Message::Close(None));
-        };
-        let (result, ()) = with_watchdog(async { tokio::join!(established, peer) })
-            .await
-            .expect("optional window timed out");
-        result.expect("required observation was gated by optional registrations");
-    }
-
-    #[tokio::test]
-    async fn delayed_workspace_reply_does_not_gate_later_mandatory_acknowledgements() {
-        let context = EstablishedTestContext::new();
-        let registration_id =
-            enqueue_fixture_registration(&context.assignment_manager.lock().unwrap());
-        enqueue_transitions(&context.assignment_manager.lock().unwrap(), 2);
-        let mut next_sequence = 2;
-        let (inbound, mut outbound, established) =
-            established_fixture(&context, &mut next_sequence);
-        let peer = async {
-            let _hello = with_watchdog(outbound.recv())
-                .await
-                .expect("opening hello timed out");
-            inbound.send(welcome());
-            inbound.send(observation_acknowledgement(OPENING_MESSAGE_ID, 1));
-            let mut frames = Vec::new();
-            for _ in 0..3 {
-                let message = with_watchdog(outbound.recv())
-                    .await
-                    .expect("pending frame timed out")
-                    .expect("pending frame missing");
-                let Message::Text(text) = message else {
-                    panic!("expected observation text")
-                };
-                frames.push(
-                    serde_json::from_str::<serde_json::Value>(&text).expect("decode observation"),
-                );
-            }
-            assert_eq!(frames[0]["type"], "workspace_inventory");
-            assert_eq!(frames[1]["type"], "execution_transition");
-            assert_eq!(frames[2]["type"], "execution_transition");
-            for frame in &frames[1..] {
-                inbound.send(observation_acknowledgement(
-                    frame["messageId"].as_str().expect("message ID"),
-                    frame["sequence"].as_u64().expect("sequence"),
-                ));
-            }
-            inbound.send(Message::Ping(b"mandatory-acks".to_vec().into()));
-            assert!(matches!(
-                with_watchdog(outbound.recv())
-                    .await
-                    .expect("mandatory-ack barrier timed out"),
-                Some(Message::Pong(_))
-            ));
-            assert!(observation_retained(
-                &context.assignment_manager.lock().unwrap(),
-                registration_id
-            ));
-            let mut reply: serde_json::Value = serde_json::from_str(include_str!(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../tests/fixtures/runner-protocol/v1/valid/cloud-workspace-registered.json"
-            )))
-            .expect("decode registration reply");
-            reply["payload"]["acknowledgedMessageId"] = frames[0]["messageId"].clone();
-            reply["payload"]["acknowledgedSequence"] = frames[0]["sequence"].clone();
-            reply["payload"]["originRunnerBootId"] = serde_json::json!(BOOT_ID);
-            inbound.send(Message::Text(reply.to_string().into()));
-            inbound.send(Message::Ping(b"registration-ack".to_vec().into()));
-            assert!(matches!(
-                with_watchdog(outbound.recv())
-                    .await
-                    .expect("registration-ack barrier timed out"),
-                Some(Message::Pong(_))
-            ));
-            assert!(!observation_retained(
-                &context.assignment_manager.lock().unwrap(),
-                registration_id
-            ));
-            inbound.send(Message::Close(None));
-        };
-        let (result, ()) = with_watchdog(async { tokio::join!(established, peer) })
-            .await
-            .expect("out-of-order acknowledgement transcript timed out");
-        result.expect("out-of-order acknowledgement rejected");
     }
 
     async fn buffer_assignment_offer(

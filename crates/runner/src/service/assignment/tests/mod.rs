@@ -1735,10 +1735,7 @@ async fn wait_for_terminal(manager: &mut AssignmentManager) -> Vec<ExecutionRepo
                     | AssignmentObservation::CancellationApplied(_)
                     | AssignmentObservation::LeaseRenewalRequested { .. }
                     | AssignmentObservation::WorkspaceRetention { .. }
-                    | AssignmentObservation::WorkspaceRegistration { .. }
-                    | AssignmentObservation::Artifact { .. }
-                    | AssignmentObservation::DiscoveryInventory { .. }
-                    | AssignmentObservation::DiscoveryComplete { .. } => None,
+                    | AssignmentObservation::Artifact { .. } => None,
                 })
                 .collect();
         }
@@ -4767,26 +4764,6 @@ async fn shutdown_starts_finishing_cleanup_before_the_five_second_reserve() {
     assert!(manager.shutdown_complete());
 }
 
-// REQ-RUNNERENROLL-85
-#[tokio::test]
-async fn shutdown_completes_while_boot_inventory_is_still_unreported() {
-    let (_temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
-    manager.begin_discovery("rwr_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(), Vec::new());
-    assert!(
-        !manager
-            .pending_observations(&BTreeSet::new(), 10)
-            .is_empty(),
-        "the boot's inventory completion must be queued for the next session"
-    );
-
-    manager.begin_shutdown().unwrap();
-
-    assert!(
-        manager.shutdown_complete(),
-        "inventory a boot has not reported is not outstanding work"
-    );
-}
-
 // REQ-RUNNERENROLL-73
 #[tokio::test]
 async fn shutdown_requests_runner_cancellation_for_running_work() {
@@ -5932,27 +5909,6 @@ async fn accepted_runner_assignment_enables_stopped_spawn_registration() {
 }
 
 #[tokio::test]
-async fn ordinary_admission_prepares_recovery_journal_without_a_start_gate() {
-    let workflow =
-        "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
-    let (_temporary, mut manager) = manager_fixture(workflow);
-    manager
-        .work_root
-        .enable_recovery(
-            &manager.runner_id,
-            crate::service::recovery::host_fixture::fixture_host(),
-        )
-        .unwrap();
-    let offered = offer("bg");
-    offer_then_prepare(&mut manager, &offered).await;
-    assert!(
-        matches!(held_assignment(&manager), Some(HeldAssignment::Accepted(accepted))
-        if accepted.process_guards.recovery_journal()
-            && accepted.identity.assignment_id == offered.assignment_id)
-    );
-}
-
-#[tokio::test]
 async fn lease_terminal_delivery_uses_the_welcomed_budget_without_reporting() {
     let workflow =
         "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
@@ -6810,45 +6766,6 @@ async fn runner_reservation_consumes_carried_capacity_without_node_arithmetic() 
         Err(environment_unavailable())
     );
     assert_eq!(outbox.lock().entries.len(), 32);
-}
-
-// REQ-RUNNERENROLL-84: discovery cannot use execution's reserved slots.
-#[test]
-fn optional_discovery_leaves_outbox_capacity_for_execution() {
-    let outbox = ObservationOutbox::new();
-    for _ in 0..(MAXIMUM_SERVICE_OBSERVATIONS - OBSERVATION_RESERVE_BASE) {
-        outbox
-            .enqueue(AssignmentObservation::Execution {
-                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
-                attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
-                report: ExecutionReport::Started,
-            })
-            .unwrap();
-    }
-    let frame: serde_json::Value = serde_json::from_str(include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../tests/fixtures/runner-protocol/v1/valid/runner-workspace-discovery-present.json"
-    )))
-    .unwrap();
-    assert!(matches!(
-        outbox.enqueue(AssignmentObservation::DiscoveryInventory {
-            payload: frame["payload"].clone(),
-        }),
-        Err(OutboxFailure::Capacity)
-    ));
-    assert!(matches!(
-        outbox.enqueue(AssignmentObservation::DiscoveryComplete {
-            work_root_id: "rwr_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
-        }),
-        Err(OutboxFailure::Capacity)
-    ));
-    outbox
-        .enqueue(AssignmentObservation::Execution {
-            assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
-            attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
-            report: ExecutionReport::Started,
-        })
-        .unwrap();
 }
 
 // REQ-RUNNERENROLL-88: a progress report for steps alone cannot use the slots a run's own

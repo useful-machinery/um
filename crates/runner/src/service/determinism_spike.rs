@@ -977,7 +977,6 @@ fn deterministic_connection_loop_dependencies(
         lease_clock: fixture_lease_clock(),
         boot_id,
         source_broker: None,
-        recovery_host: super::recovery::host_fixture::fixture_host(),
         agent_login_setup: None,
     }
 }

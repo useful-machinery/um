@@ -539,21 +539,21 @@ impl CleanupCancellation {
 }
 
 #[derive(Clone)]
-pub(super) struct WorkRootAuthority {
-    pub(super) shared: Arc<WorkRootAuthorityShared>,
+struct WorkRootAuthority {
+    shared: Arc<WorkRootAuthorityShared>,
 }
 
-pub(super) struct WorkRootAuthorityShared {
+struct WorkRootAuthorityShared {
     path: PathBuf,
     device: u64,
     inode: u64,
-    pub(super) directory_lock: File,
+    directory_lock: File,
     lock_path: PathBuf,
     lock_file: File,
 }
 
 impl WorkRootAuthority {
-    pub(super) fn validate(&self) -> Result<(), ()> {
+    fn validate(&self) -> Result<(), ()> {
         let opened_root = self.shared.directory_lock.metadata().map_err(|_| ())?;
         let linked_root = fs::symlink_metadata(&self.shared.path).map_err(|_| ())?;
         if !safe_owned_directory(&opened_root)
@@ -568,42 +568,8 @@ impl WorkRootAuthority {
         verify_lock_identity(&self.shared.lock_path, &self.shared.lock_file).map_err(|_| ())
     }
 
-    pub(super) fn work_root(&self) -> &Path {
+    fn work_root(&self) -> &Path {
         &self.shared.path
-    }
-
-    pub(super) fn authenticate_recovery_link(
-        &self,
-        link: &super::recovery::Link,
-    ) -> Result<PathBuf, ()> {
-        self.validate()?;
-        let boot_path = self.work_root().join(&link.boot_id);
-        let mut boot = OwnedTree::capture_root(&self.shared.directory_lock, boot_path)?;
-        let (format, marker) = RetainedFormat::capture_boot(Arc::clone(boot.directory()?))?;
-        if format.marker_name != OWNERSHIP_MARKER_NAME {
-            return Err(());
-        }
-        boot.install_marker(marker);
-        let mut assignment = OwnedTree::capture_child(&boot, boot.path.join(&link.assignment_id))?;
-        assignment.install_marker(
-            format.capture_marker(Arc::clone(assignment.directory()?), ASSIGNMENT_MARKER)?,
-        );
-        if !matches!(assignment.validate(false)?, TreePresence::Present) {
-            return Err(());
-        }
-        let record = format.read_attempt(assignment.directory()?.as_ref())?;
-        if record.assignment_id != link.assignment_id
-            || record.run_id != link.run_id
-            || record.attempt_id != link.attempt_id
-        {
-            return Err(());
-        }
-        let private = assignment.path.join("private");
-        let metadata = fs::symlink_metadata(&private).map_err(|_| ())?;
-        if !safe_owned_directory(&metadata) {
-            return Err(());
-        }
-        Ok(private)
     }
 
     fn sync(&self) -> Result<(), ()> {
@@ -621,10 +587,10 @@ impl Drop for WorkRootAuthorityShared {
 }
 
 #[derive(Clone, Eq, PartialEq)]
-pub(super) struct AttemptRecord {
-    pub(super) assignment_id: String,
-    pub(super) run_id: String,
-    pub(super) attempt_id: String,
+struct AttemptRecord {
+    assignment_id: String,
+    run_id: String,
+    attempt_id: String,
     disposition: RetentionReason,
 }
 
@@ -885,7 +851,6 @@ struct CleanupEngine {
     cancellation: Arc<CleanupCancellation>,
     authority: WorkRootAuthority,
     serialized: Arc<Mutex<()>>,
-    recovery: Arc<std::sync::OnceLock<super::recovery::RecoveryStore>>,
 }
 
 fn claim_absent_at(directory: &OwnedFd) -> bool {
@@ -908,37 +873,6 @@ impl CleanupEngine {
         if self.cancellation.is_cancelled() {
             return CleanupResult::Preempted;
         }
-        let recovery_record = statat(
-            &self.authority.shared.directory_lock,
-            ".useful-recovery-root-v1.json",
-            AtFlags::SYMLINK_NOFOLLOW,
-        );
-        if !matches!(recovery_record, Err(Errno::NOENT)) && self.recovery.get().is_none() {
-            return CleanupResult::Retained;
-        }
-        if tree.path.parent() != Some(self.authority.work_root())
-            && self
-                .recovery
-                .get()
-                .is_some_and(|store| !store.may_clean_tree(tree.path()))
-        {
-            return CleanupResult::Retained;
-        }
-        if tree.path.parent() == Some(self.authority.work_root())
-            && tree
-                .path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(valid_boot_id)
-            && self.recovery.get().is_some_and(|store| {
-                tree.path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_none_or(|boot| store.boot_has_unresolved_anchors(boot))
-            })
-        {
-            return CleanupResult::Retained;
-        }
         // Both direct assignment cleanup and workspace-only cleanup must refuse
         // a retained workspace while another assignment holds its durable claim.
         // An inaccessible parent is a safety failure, not absence of a claim.
@@ -948,27 +882,6 @@ impl CleanupEngine {
                 .as_ref()
                 .is_some_and(|directory| !claim_absent_at(directory.as_ref()))
                 || !claim_absent_at(link.parent.as_ref()))
-        {
-            return CleanupResult::Quarantined(CleanupFailure::Safety);
-        }
-        let anchor_directory = if tree
-            .path
-            .file_name()
-            .is_some_and(|name| name == "workspace")
-        {
-            tree.link().map(|link| link.parent.as_ref())
-        } else if tree
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(valid_assignment_id)
-        {
-            tree.directory().ok().map(|directory| directory.as_ref())
-        } else {
-            None
-        };
-        if anchor_directory
-            .is_some_and(|directory| !super::recovery::claim_absent_for_cleanup(directory))
         {
             return CleanupResult::Quarantined(CleanupFailure::Safety);
         }
@@ -1022,39 +935,12 @@ impl CleanupEngine {
         }
     }
 
-    // A released assignment tree directly beneath a boot directory may be
-    // an ordinary recovery origin. Retirement is best effort: recovery
-    // already tolerates a cataloged origin whose assignment is absent.
-    fn retire_released_origin(&self, tree: &OwnedTree) {
-        let Some(store) = self.recovery.get() else {
-            return;
-        };
-        let Some(boot) = tree.path.parent() else {
-            return;
-        };
-        if boot.parent() != Some(self.authority.work_root()) {
-            return;
-        }
-        let (Some(boot_id), Some(assignment_id)) = (
-            boot.file_name().and_then(|name| name.to_str()),
-            tree.path.file_name().and_then(|name| name.to_str()),
-        ) else {
-            return;
-        };
-        if valid_boot_id(boot_id) && valid_assignment_id(assignment_id) {
-            let _ = store.retire_released_origin(boot_id, assignment_id);
-        }
-    }
-
     fn finish_removal(&self, tree: &OwnedTree, proof: CleanupAuthorityProof) -> CleanupResult {
         if tree.sync_parent().is_err() {
             return CleanupResult::Quarantined(CleanupFailure::Safety);
         }
         match proof.clear(&self.authority) {
-            Ok(()) => {
-                self.retire_released_origin(tree);
-                CleanupResult::Released
-            }
+            Ok(()) => CleanupResult::Released,
             Err(()) => CleanupResult::Quarantined(CleanupFailure::Safety),
         }
     }
@@ -1572,7 +1458,6 @@ pub(super) struct WorkRootLease {
     retained: Arc<AtomicBool>,
     startup_retained: Vec<RetainedWorkspace>,
     workspace_release_spawner: Arc<dyn WorkspaceReleaseSpawner>,
-    recovery: Arc<std::sync::OnceLock<super::recovery::RecoveryStore>>,
     _authority: WorkRootAuthority,
 }
 
@@ -1624,7 +1509,6 @@ impl WorkRootLease {
             .validate()
             .map_err(|()| WorkRootError::UnsafeWorkRoot)?;
         let cancellation = Arc::new(CleanupCancellation::default());
-        let recovery = Arc::new(std::sync::OnceLock::new());
         let engine = CleanupEngine {
             remover: filesystem.remover,
             sleeper: filesystem.sleeper,
@@ -1632,7 +1516,6 @@ impl WorkRootLease {
             cancellation: Arc::clone(&cancellation),
             authority: authority.clone(),
             serialized: Arc::new(Mutex::new(())),
-            recovery: Arc::clone(&recovery),
         };
 
         filesystem.hook.before_child_enumeration();
@@ -1687,7 +1570,6 @@ impl WorkRootLease {
             retained: Arc::new(AtomicBool::new(false)),
             startup_retained,
             workspace_release_spawner: filesystem.workspace_release_spawner,
-            recovery,
             _authority: authority,
         }))
     }
@@ -2011,12 +1893,7 @@ impl WorkRootLease {
     pub(super) fn release_boot_root_pending(&self) -> PendingRelease {
         let completion = ReleaseCompletion::new();
         let pending = completion.pending();
-        if self.retained.load(Ordering::Acquire)
-            || self.recovery().is_some_and(|store| {
-                self.boot_id()
-                    .is_none_or(|boot| store.boot_has_unresolved_anchors(boot))
-            })
-        {
+        if self.retained.load(Ordering::Acquire) {
             completion.complete(CleanupResult::Retained);
             return pending;
         }
@@ -2040,51 +1917,6 @@ impl WorkRootLease {
 
     pub(super) fn cancel_cleanup(&self) {
         self.cancellation.cancel();
-    }
-
-    #[cfg(test)]
-    pub(super) fn enable_recovery(
-        &self,
-        runner_id: &str,
-        host: Arc<dyn super::recovery::RecoveryHost>,
-    ) -> Result<(), super::recovery::RecoveryError> {
-        self.enable_recovery_replacing(runner_id, &[], host)
-    }
-
-    /// Opens the work root's recovery store for `runner_id`. A root record
-    /// that names a runner in `replaced`, the runners this host's rejoins
-    /// replaced, is replaced for `runner_id` when it authenticates as that
-    /// runner's root (INV-RUNNER-37).
-    pub(super) fn enable_recovery_replacing(
-        &self,
-        runner_id: &str,
-        replaced: &[String],
-        host: Arc<dyn super::recovery::RecoveryHost>,
-    ) -> Result<(), super::recovery::RecoveryError> {
-        let _cleanup = self
-            .engine
-            .serialized
-            .lock()
-            .map_err(|_| super::recovery::RecoveryError::Record("cleanup lock"))?;
-        if self.cancellation.is_cancelled() {
-            return Err(super::recovery::RecoveryError::Record("startup stopped"));
-        }
-        let store = super::recovery::RecoveryStore::open(
-            self._authority.clone(),
-            runner_id,
-            self.boot_id()
-                .ok_or(super::recovery::RecoveryError::Record("boot ID"))?,
-            replaced,
-            Arc::clone(&self.engine.serialized),
-            host,
-        )?;
-        self.recovery
-            .set(store)
-            .map_err(|_| super::recovery::RecoveryError::Record("already initialized"))
-    }
-
-    pub(super) fn recovery(&self) -> Option<&super::recovery::RecoveryStore> {
-        self.recovery.get()
     }
 
     pub(super) fn startup_retained(&self) -> &[RetainedWorkspace] {
@@ -2511,7 +2343,7 @@ pub(super) struct AssignmentRoot {
     pub(super) continuation_proven_at: Option<String>,
     pub(super) settlement_snapshot: Option<serde_json::Value>,
     pub(super) retained_private_roots: std::collections::BTreeMap<String, PathBuf>,
-    pub(super) attempt_record: AttemptRecord,
+    attempt_record: AttemptRecord,
     recorder: Option<Arc<crate::telemetry::Recorder>>,
     retained: Arc<AtomicBool>,
     engine: CleanupEngine,
@@ -3278,6 +3110,68 @@ mod tests {
         assert!(previous_path.is_dir());
     }
 
+    // REQ-WORKSPACE-43, INV-RUNNER-43
+    #[test]
+    fn an_earlier_releases_recovery_root_record_changes_no_cleanup_or_claim() {
+        for record in [
+            &br#"{"schemaVersion":1,"runnerId":"rnr_01k0z6r1w8f4jy2m7q9v3x5abe"}"#[..],
+            b"not json",
+        ] {
+            let directory = private_work_root();
+            let record_path = directory.path().join(".useful-recovery-root-v1.json");
+            fs::write(&record_path, record).unwrap();
+            fs::set_permissions(&record_path, Permissions::from_mode(PRIVATE_FILE_MODE)).unwrap();
+            let owner = WorkRootLease::acquire_for_test(directory.path(), BOOT_A).unwrap();
+
+            let succeeded = owner
+                .create_assignment_for_attempt(
+                    "asn_01k0z6r1w8f4jy2m7q9v3x5abf",
+                    "run_01k0z6r1w8f4jy2m7q9v3x5abf",
+                    "atm_01k0z6r1w8f4jy2m7q9v3x5abf",
+                    None,
+                )
+                .unwrap();
+            let succeeded_path = succeeded.assignment_tree.path().to_path_buf();
+            fs::write(succeeded.workspace.path().join("owned"), b"delivered").unwrap();
+            assert_eq!(
+                succeeded
+                    .release_pending(ProcessQuiescence::Proven, WorkspaceDisposition::Remove)
+                    .wait(),
+                CleanupResult::Released
+            );
+            assert!(!succeeded_path.exists());
+
+            let (_previous, previous_path) = retained_failed_assignment(&owner);
+            assert!(previous_path.is_dir());
+            let next = "asn_01k0z6r1w8f4jy2m7q9v3x5abd";
+            let next_attempt = "atm_01k0z6r1w8f4jy2m7q9v3x5abd";
+            let mut claimed = owner
+                .create_assignment_for_attempt(
+                    next,
+                    "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                    next_attempt,
+                    None,
+                )
+                .unwrap();
+            assert!(
+                owner
+                    .claim_retained_for_attempt(
+                        &mut claimed,
+                        RetainedClaimRequest {
+                            assignment_id: next,
+                            run_id: "run_01k0z6r1w8f4jy2m7q9v3x5abc",
+                            attempt_id: next_attempt,
+                            prior_assignment_id: ASSIGNMENT,
+                            prior_attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc",
+                            recorded_root: &previous_path,
+                        },
+                    )
+                    .is_ok()
+            );
+            assert_eq!(fs::read(&record_path).unwrap(), record);
+        }
+    }
+
     // REQ-RUNNERENROLL-65
     #[test]
     fn contention_precedes_enumeration_and_independent_roots_remain_usable() {
@@ -3689,7 +3583,7 @@ mod tests {
         assert_eq!(failed_remover.calls.load(Ordering::Relaxed), 6);
     }
 
-    // REQ-RUNNERENROLL-69
+    // REQ-RUNNERENROLL-69, REQ-WORKSPACE-43
     #[test]
     fn retained_attempt_survives_restart_with_identity_and_original_bytes() {
         for legacy in [false, true] {
@@ -3725,6 +3619,17 @@ mod tests {
             first.release_boot_root_pending().wait(),
             CleanupResult::Retained
         );
+        // REQ-WORKSPACE-43: an earlier release's recovery records in a retained
+        // run's `private` directory are left as they are.
+        let private = root.path().join(BOOT_A).join(ASSIGNMENT).join("private");
+        let earlier_records = [
+            private.join(".useful-recovery-manifest-v1.json"),
+            private.join("process-guards-v2.json"),
+        ];
+        for record in &earlier_records {
+            fs::write(record, b"an earlier release's record").unwrap();
+            fs::set_permissions(record, Permissions::from_mode(PRIVATE_FILE_MODE)).unwrap();
+        }
         drop(assignment);
         drop(first);
         if legacy {
@@ -3745,6 +3650,8 @@ mod tests {
                 .join(BOOT_A)
                 .join(ASSIGNMENT)
                 .join(format.attempt_name),
+            earlier_records[0].clone(),
+            earlier_records[1].clone(),
         ];
         let before: Vec<_> = evidence
             .iter()

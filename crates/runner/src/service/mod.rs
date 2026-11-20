@@ -10,7 +10,6 @@ mod conversation;
 mod determinism_spike;
 mod execution;
 mod lease_clock;
-mod recovery;
 mod run_inputs;
 mod source;
 #[cfg(test)]
@@ -440,7 +439,6 @@ struct ConnectionLoopDependencies {
     lease_clock: LeaseClock,
     boot_id: String,
     source_broker: Option<Arc<dyn source::SourceCredentialBroker>>,
-    recovery_host: Arc<dyn recovery::RecoveryHost>,
     /// Agent-login setup, for a runner with protected state to record its
     /// readiness beside.
     agent_login_setup: Option<SetupDependencies>,
@@ -601,7 +599,6 @@ async fn run_until_cancelled(
             lease_clock,
             boot_id,
             source_broker: None,
-            recovery_host: Arc::new(recovery::SystemRecoveryHost),
             agent_login_setup,
         },
         &WebSocketConnector,
@@ -633,7 +630,6 @@ async fn run_until_cancelled_with_dependencies(
             lease_clock,
             boot_id,
             source_broker,
-            recovery_host: recovery::host_fixture::fixture_host(),
             agent_login_setup: None,
         },
         &WebSocketConnector,
@@ -710,45 +706,6 @@ where
             }
             Err(_) => return Err(ServiceError::BuildRuntime),
         };
-    // Recovery is optional for ordinary work. An invalid/missing host binding
-    // cannot be treated as a newly initialized recovery root on this boot.
-    let recovery_root = Arc::clone(&work_root);
-    let recovery_host = Arc::clone(&dependencies.recovery_host);
-    let runner_id = dependencies.config.credential().runner_id().to_owned();
-    let recovery_recorder = Arc::clone(&dependencies.recorder);
-    let state_access = dependencies.config.state_access().cloned();
-    // Verify before advertising a root. Failure is optional for ordinary
-    // work, but must not be reported as an exhaustive inventory.
-    let _ = tokio::task::spawn_blocking(move || {
-        // The runners this host's rejoins replaced, whose root record the
-        // open may replace for this runner (INV-RUNNER-37). A record that
-        // cannot be read replaces nothing.
-        let replaced = state_access
-            .map_or(Ok(Vec::new()), |access| access.replaced_runners())
-            .unwrap_or_else(|error| {
-                record_optional_recovery_failure(
-                    &recovery_recorder,
-                    "local_recovery_record_invalid",
-                    serde_json::json!({
-                        "errorType": "local_recovery_record_invalid",
-                        "stage": "replaced_runner_record",
-                        "cause": error.cause(),
-                    })
-                    .to_string(),
-                );
-                Vec::new()
-            });
-        if let Err(error) =
-            recovery_root.enable_recovery_replacing(&runner_id, &replaced, recovery_host)
-        {
-            record_optional_recovery_failure(
-                &recovery_recorder,
-                error.error_type(),
-                error.diagnostic(),
-            );
-        }
-    })
-    .await;
     record_startup_retention(&dependencies.recorder, work_root.startup_retained());
     let result = Box::pin(run_connection_loop_in_mode(
         dependencies,
@@ -824,24 +781,8 @@ async fn connection_loop_with_work_root(
         lease_clock,
         boot_id,
         source_broker,
-        recovery_host: _,
         agent_login_setup,
     } = dependencies;
-    let recovery_root = Arc::clone(&work_root);
-    let discovery_recorder = Arc::clone(&recorder);
-    let discovery = tokio::task::spawn_blocking(move || {
-        recovery_root.recovery().map(|store| {
-            store.discovery(|error| {
-                record_optional_recovery_failure(
-                    &discovery_recorder,
-                    error.error_type(),
-                    error.diagnostic(),
-                );
-            })
-        })
-    })
-    .await
-    .map_err(|_| ServiceError::BuildRuntime)?;
     let assignment_dependencies = AssignmentDependencies::production(
         &config,
         &boot_id,
@@ -855,21 +796,6 @@ async fn connection_loop_with_work_root(
         lease_clock,
         assignment_dependencies,
     )));
-    // Keep the manager's large owned state off the connection future's stack
-    // across later await points. The local scan ran off the current-thread runtime.
-    {
-        let mut manager = assignment_manager
-            .lock()
-            .map_err(|_| ServiceError::AssignmentShutdown)?;
-        match discovery {
-            Some(Ok((root, entries))) => manager.begin_discovery(root, entries),
-            Some(Err(error)) => {
-                record_optional_recovery_failure(&recorder, error.error_type(), error.diagnostic());
-                manager.unavailable_discovery();
-            }
-            None => manager.unavailable_discovery(),
-        }
-    }
     let live_status = Arc::new(LiveStatus::new(
         boot_id.clone(),
         config.credential().credential_id().to_owned(),
@@ -934,20 +860,13 @@ async fn connection_loop_with_work_root(
     let mut opening_sequence = 1;
     let sequence = Sequence::new(2);
     let mut opening_message_id = frame_source.public_id("rmsg_");
-    let mut opening = connection::recovery_hello(
-        opening_hello(
-            frame_source.as_ref(),
-            config.credential().runner_id(),
-            &boot_id,
-            opening_message_id.clone(),
-            opening_sequence,
-            recorder.service_version(),
-        )
-        .map_err(ServiceError::Connection)?,
-        assignment_manager
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .recovery_root(),
+    let mut opening = opening_hello(
+        frame_source.as_ref(),
+        config.credential().runner_id(),
+        &boot_id,
+        opening_message_id.clone(),
+        opening_sequence,
+        recorder.service_version(),
     )
     .map_err(ServiceError::Connection)?;
     let mut attempt = 1_u64;
@@ -1385,20 +1304,13 @@ async fn connection_loop_with_work_root(
         if progress.opening_acknowledged {
             opening_message_id = frame_source.public_id("rmsg_");
             opening_sequence = sequence.next().map_err(ServiceError::Connection)?;
-            opening = connection::recovery_hello(
-                opening_hello(
-                    frame_source.as_ref(),
-                    config.credential().runner_id(),
-                    &boot_id,
-                    opening_message_id.clone(),
-                    opening_sequence,
-                    recorder.service_version(),
-                )
-                .map_err(ServiceError::Connection)?,
-                assignment_manager
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .recovery_root(),
+            opening = opening_hello(
+                frame_source.as_ref(),
+                config.credential().runner_id(),
+                &boot_id,
+                opening_message_id.clone(),
+                opening_sequence,
+                recorder.service_version(),
             )
             .map_err(ServiceError::Connection)?;
         }
@@ -1819,20 +1731,13 @@ impl ReloadDependencies {
             .next()
             .map_err(|error| candidate_control_error(&connection_event, error))?;
         let opening_message_id = self.frame_source.public_id("rmsg_");
-        let opening = connection::recovery_hello(
-            opening_hello(
-                self.frame_source.as_ref(),
-                config.credential().runner_id(),
-                &self.boot_id,
-                opening_message_id.clone(),
-                opening_sequence,
-                self.recorder.service_version(),
-            )
-            .map_err(|error| candidate_control_error(&connection_event, error))?,
-            self.assignment_manager
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .recovery_root(),
+        let opening = opening_hello(
+            self.frame_source.as_ref(),
+            config.credential().runner_id(),
+            &self.boot_id,
+            opening_message_id.clone(),
+            opening_sequence,
+            self.recorder.service_version(),
         )
         .map_err(|error| candidate_control_error(&connection_event, error))?;
         let candidate = connection::authenticate_candidate(
@@ -2099,22 +2004,6 @@ fn record_untested_harnesses(recorder: &Recorder, config: &Config) {
     }
 }
 
-fn record_optional_recovery_failure(
-    recorder: &Recorder,
-    error_type: &'static str,
-    diagnostic: String,
-) {
-    recorder
-        .start(
-            "runner.workspace_recovery",
-            [
-                KeyValue::new(telemetry::attribute::ERROR_TYPE, error_type),
-                KeyValue::new("diagnostic", diagnostic),
-            ],
-        )
-        .finish(Outcome::Failure);
-}
-
 fn record_non_admitting_failure(recorder: &Recorder, error_type: &'static str) {
     recorder
         .start(
@@ -2217,35 +2106,6 @@ mod tests {
             assert!(error.requires_operator_recovery());
         }
         assert!(!ServiceError::BuildRuntime.requires_operator_recovery());
-    }
-
-    #[test]
-    fn recovery_file_system_cause_is_an_io_error_not_a_transport_fact() {
-        use super::recovery::RecoveryError;
-
-        let parse = |error: RecoveryError| -> serde_json::Value {
-            serde_json::from_str(&error.diagnostic()).unwrap()
-        };
-        assert_eq!(
-            parse(RecoveryError::Identity(io::Error::from(
-                io::ErrorKind::NotFound
-            ))),
-            serde_json::json!({
-                "errorType": "local_recovery_identity_unavailable",
-                "stage": "host_identity",
-                "ioError": "not_found",
-            })
-        );
-        assert_eq!(
-            parse(RecoveryError::Commit(io::Error::from(
-                io::ErrorKind::PermissionDenied
-            ))),
-            serde_json::json!({
-                "errorType": "local_recovery_commit_failed",
-                "stage": "record_commit",
-                "ioError": "permission_denied",
-            })
-        );
     }
 
     // REQ-RUNNERENROLL-72
@@ -2390,7 +2250,6 @@ mod tests {
             lease_clock: fixture_lease_clock(),
             boot_id: boot_id.clone(),
             source_broker: None,
-            recovery_host: super::recovery::host_fixture::fixture_host(),
             agent_login_setup: None,
         };
         let remover = Arc::new(FailingBootRemover {
@@ -2840,17 +2699,13 @@ mod tests {
                     Some(Ok(Message::Text(frame))) => {
                         let frame: serde_json::Value =
                             serde_json::from_str(&frame).expect("decode current observation");
-                        if frame["type"] == "workspace_inventory" {
-                            reject_fixture_registration(&mut current, &frame).await;
-                        } else {
-                            assert_eq!(frame["type"], "assignment_preparation_progress");
-                            acknowledge_runner_frame(
-                                &mut current,
-                                &frame,
-                                "acknowledge preparation progress",
-                            )
-                            .await;
-                        }
+                        assert_eq!(frame["type"], "assignment_preparation_progress");
+                        acknowledge_runner_frame(
+                            &mut current,
+                            &frame,
+                            "acknowledge preparation progress",
+                        )
+                        .await;
                     }
                     Some(Ok(_)) => {}
                     Some(Err(error)) => panic!("current connection failed: {error}"),
@@ -2881,9 +2736,6 @@ mod tests {
                 // acknowledgement was still buffered on the retired transport.
                 // Acknowledge every expected observation in FIFO order instead
                 // of assuming the accepted observation is replayed first.
-                if frame["type"] == "workspace_inventory" {
-                    reject_fixture_registration(&mut pending, &frame).await;
-                }
                 if matches!(
                     frame["type"].as_str(),
                     Some(
@@ -3435,12 +3287,8 @@ mod tests {
                             continue;
                         };
                         let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
-                        if frame["type"] == "workspace_inventory" {
-                            reject_fixture_registration(&mut socket, &frame).await;
-                        } else {
-                            acknowledge_runner_frame(&mut socket, &frame, "acknowledge observation")
-                                .await;
-                        }
+                        acknowledge_runner_frame(&mut socket, &frame, "acknowledge observation")
+                            .await;
                     }
                 }
             }
@@ -3545,6 +3393,8 @@ mod tests {
                 panic!("pending connection omitted hello");
             };
             let pending_hello: serde_json::Value = serde_json::from_str(&pending_hello).unwrap();
+            // INV-RUNNER-42: the credential-promotion hello advertises no recovery.
+            assert_hello_advertises_no_recovery(&pending_hello);
             sequences_sent
                 .send((
                     latest_current_sequence,
@@ -3964,28 +3814,6 @@ mod tests {
             .unwrap_or_else(|error| panic!("{description}: {error}"));
     }
 
-    async fn reject_fixture_registration(socket: &mut FixtureSocket, frame: &serde_json::Value) {
-        socket
-            .send(Message::Text(
-                serde_json::json!({
-                    "protocolVersion": 1, "direction": "cloud_to_runner",
-                    "messageId": "cmsg_01k0z6r1w8f4jy2m7q9v3x5abh",
-                    "sentAt": "2026-10-18T00:00:00Z",
-                    "type": "workspace_registration_rejected", "payloadVersion": 1,
-                    "payload": {"schemaVersion": 1,
-                        "acknowledgedMessageId": frame["messageId"],
-                        "acknowledgedSequence": frame["sequence"],
-                        "workRootId": frame["payload"]["workRootId"],
-                        "workspaceId": frame["payload"]["workspaceId"],
-                        "reason": "origin_not_eligible"}
-                })
-                .to_string()
-                .into(),
-            ))
-            .await
-            .expect("reject optional registration");
-    }
-
     async fn next_semantic_assignment_frame(
         socket: &mut FixtureSocket,
         expected_type: &str,
@@ -4018,12 +3846,7 @@ mod tests {
             };
             let frame: serde_json::Value =
                 serde_json::from_str(&frame).expect("decode assignment observation");
-            if frame["type"] == "workspace_inventory" {
-                // Best-effort registration may race any ordinary assignment
-                // observation. It is not an execution-start prerequisite.
-                reject_fixture_registration(socket, &frame).await;
-                continue;
-            }
+            assert_ne!(frame["type"], "workspace_inventory");
             if frame["type"] == "assignment_preparation_progress" {
                 if acknowledge_progress {
                     acknowledge_runner_frame(socket, &frame, "acknowledge preparation progress")
@@ -4244,9 +4067,8 @@ mod tests {
             .events()
             .into_iter()
             .filter(|event| {
-                event["event.name"] != "runner.workspace_recovery"
-                    && (event["event.name"] != "runner.gateway_connection"
-                        || event["um.connection.attempt"] == 1)
+                event["event.name"] != "runner.gateway_connection"
+                    || event["um.connection.attempt"] == 1
             })
             .collect();
         assert_eq!(events.len(), expected_event_count);
@@ -4467,120 +4289,72 @@ mod tests {
         assert!(!names.contains(&"runner.harness_untested"));
     }
 
-    #[tokio::test]
-    async fn empty_scan_keeps_verified_root_with_pending_or_acknowledged_completion() {
-        for acknowledge in [false, true] {
-            let (listener, endpoint) = fixture_listener().await;
-            let (disconnected, observed_disconnect) = tokio::sync::oneshot::channel();
-            let server = tokio::spawn(async move {
-                let mut socket = accept_fixture_socket(&listener).await;
-                let Some(Ok(Message::Text(first))) = socket.next().await else {
-                    panic!("missing opening hello")
-                };
-                let first: serde_json::Value = serde_json::from_str(&first).unwrap();
-                let root = &first["payload"]["workspaceRecoveryRoot"];
-                assert_eq!(root["bindingState"], "verified");
-                socket.send(welcome()).await.unwrap();
-                socket
-                    .send(observation_acknowledgement(
-                        first["messageId"].as_str().unwrap(),
-                        first["sequence"].as_u64().unwrap(),
-                    ))
-                    .await
-                    .unwrap();
-                let Some(Ok(Message::Text(marker))) = socket.next().await else {
-                    panic!("missing empty inventory completion")
-                };
-                let marker: serde_json::Value = serde_json::from_str(&marker).unwrap();
-                assert_eq!(marker["type"], "workspace_inventory_complete");
-                assert_eq!(marker["payload"]["inventoryThroughSequence"], 0);
-                if acknowledge {
-                    socket
-                        .send(observation_acknowledgement(
-                            marker["messageId"].as_str().unwrap(),
-                            marker["sequence"].as_u64().unwrap(),
-                        ))
-                        .await
-                        .unwrap();
-                    // Pong is a causal barrier: the runner processed the
-                    // preceding acknowledgement before this disconnect.
-                    socket
-                        .send(Message::Ping(b"scan-ack".to_vec().into()))
-                        .await
-                        .unwrap();
-                    let Some(Ok(Message::Pong(payload))) = socket.next().await else {
-                        panic!("runner did not process completed scan ack")
-                    };
-                    assert_eq!(payload.as_ref(), b"scan-ack");
-                }
-                drop(socket);
-                disconnected.send(()).unwrap();
+    // The hello members through which a runner advertised recovery.
+    fn assert_hello_advertises_no_recovery(hello: &serde_json::Value) {
+        assert_eq!(hello["type"], "hello");
+        let payload = hello["payload"].as_object().expect("hello payload");
+        assert!(!payload.contains_key("workspaceRecoveryVersion"));
+        assert!(!payload.contains_key("workspaceRecoveryRoot"));
+    }
 
-                let mut socket = accept_fixture_socket(&listener).await;
-                let Some(Ok(Message::Text(second))) = socket.next().await else {
-                    panic!("missing reconnect hello")
-                };
-                let second: serde_json::Value = serde_json::from_str(&second).unwrap();
-                assert_eq!(second["type"], "hello");
-                assert_eq!(second["payload"]["workspaceRecoveryRoot"], *root);
-                assert!(
-                    second["sequence"].as_u64().unwrap() > marker["sequence"].as_u64().unwrap()
-                );
-                if !acknowledge {
-                    socket.send(welcome()).await.unwrap();
-                    socket
-                        .send(observation_acknowledgement(
-                            second["messageId"].as_str().unwrap(),
-                            second["sequence"].as_u64().unwrap(),
-                        ))
-                        .await
-                        .unwrap();
-                    let Some(Ok(Message::Text(replayed))) = socket.next().await else {
-                        panic!("pending completion was not replayed")
-                    };
-                    let replayed: serde_json::Value = serde_json::from_str(&replayed).unwrap();
-                    assert_eq!(replayed, marker);
-                }
-            });
-            let (sleeper, mut sleep_requests) = controlled_sleeper();
-            let (service, _capture, _shutdown) = spawn_fixture_service(&endpoint, sleeper);
-            with_watchdog(observed_disconnect).await.unwrap().unwrap();
-            backoff_request(&mut sleep_requests).await.1.release();
-            let result = with_watchdog(server).await;
-            abort_service(service).await;
-            result.unwrap().unwrap();
-        }
+    // INV-RUNNER-42
+    #[tokio::test]
+    async fn a_start_over_a_work_root_advertises_and_reports_no_recovery() {
+        let (listener, endpoint) = fixture_listener().await;
+        let (disconnected, observed_disconnect) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut socket = accept_fixture_socket(&listener).await;
+            let Some(Ok(Message::Text(first))) = socket.next().await else {
+                panic!("missing opening hello")
+            };
+            let first: serde_json::Value = serde_json::from_str(&first).unwrap();
+            assert_hello_advertises_no_recovery(&first);
+            socket.send(welcome()).await.unwrap();
+            socket
+                .send(observation_acknowledgement(
+                    first["messageId"].as_str().unwrap(),
+                    first["sequence"].as_u64().unwrap(),
+                ))
+                .await
+                .unwrap();
+            // Pong is a causal barrier: the runner sent nothing between the
+            // acknowledged hello and this ping, so no inventory came first.
+            socket
+                .send(Message::Ping(b"no-inventory".to_vec().into()))
+                .await
+                .unwrap();
+            let Some(Ok(Message::Pong(payload))) = socket.next().await else {
+                panic!("runner sent a frame before answering the barrier")
+            };
+            assert_eq!(payload.as_ref(), b"no-inventory");
+            drop(socket);
+            disconnected.send(()).unwrap();
+
+            let mut socket = accept_fixture_socket(&listener).await;
+            let Some(Ok(Message::Text(second))) = socket.next().await else {
+                panic!("missing reconnect hello")
+            };
+            let second: serde_json::Value = serde_json::from_str(&second).unwrap();
+            assert_hello_advertises_no_recovery(&second);
+        });
+        let (sleeper, mut sleep_requests) = controlled_sleeper();
+        let (service, _capture, _shutdown) = spawn_fixture_service(&endpoint, sleeper);
+        with_watchdog(observed_disconnect).await.unwrap().unwrap();
+        backoff_request(&mut sleep_requests).await.1.release();
+        let result = with_watchdog(server).await;
+        abort_service(service).await;
+        result.unwrap().unwrap();
     }
 
     const REPLACED_RUNNER: &str = "rnr_01k0z6r1w8f4jy2m7q9v3x5abe";
+    const RECOVERY_ROOT_RECORD: &str = ".useful-recovery-root-v1.json";
 
-    // Leaves the fixture's work root with the recovery root record of
-    // `REPLACED_RUNNER`, written by an earlier boot, and answers its work-root
-    // ID.
-    fn prepare_replaced_runners_work_root(fixture: &RotationFixture) -> String {
-        let work_root = fixture.config.assignment().work_root();
-        let lease =
-            WorkRootLease::acquire_for_test(work_root, "rbt_01k0z6r1w8f4jy2m7q9v3x5abc").unwrap();
-        lease
-            .enable_recovery(
-                REPLACED_RUNNER,
-                super::recovery::host_fixture::fixture_host(),
-            )
-            .unwrap();
-        drop(lease);
-        let record: serde_json::Value = serde_json::from_slice(
-            &fs::read(work_root.join(".useful-recovery-root-v1.json")).unwrap(),
-        )
-        .unwrap();
-        record["workRootId"].as_str().unwrap().to_owned()
-    }
-
-    // The opening hello's `workspaceRecoveryRoot`, once the service completed
-    // the handshake the listener offers, and the service's records.
-    async fn opening_recovery_root(
+    // Runs the service through the one handshake the listener offers, stops it,
+    // and answers the service's records.
+    async fn serve_one_handshake(
         fixture: &RotationFixture,
         listener: tokio::net::TcpListener,
-    ) -> (serde_json::Value, TestCapture) {
+    ) -> TestCapture {
         let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
         let (hello_sent, hello_received) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
@@ -4597,75 +4371,108 @@ mod tests {
                 ))
                 .await
                 .unwrap();
-            hello_sent.send(hello).unwrap();
-            while let Some(Ok(message)) = socket.next().await {
-                let Message::Text(frame) = message else {
-                    continue;
-                };
-                let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
-                if frame["type"] == "workspace_inventory_complete" {
-                    socket
-                        .send(observation_acknowledgement(
-                            frame["messageId"].as_str().unwrap(),
-                            frame["sequence"].as_u64().unwrap(),
-                        ))
-                        .await
-                        .unwrap();
-                }
-            }
+            hello_sent.send(()).unwrap();
+            while let Some(Ok(_)) = socket.next().await {}
         });
         let (service, capture, shutdown_trigger) =
             spawn_configured_service(fixture.config.clone(), fixture_sleeper());
-        let hello = with_watchdog(hello_received).await.unwrap().unwrap();
+        // The runner binds its control socket before it sends its hello.
+        with_watchdog(hello_received).await.unwrap().unwrap();
         wait_for_connection_state(&socket_path, ConnectionState::Connected).await;
         shutdown_trigger.notify_one();
         with_watchdog(service).await.unwrap().unwrap().unwrap();
         with_watchdog(server).await.unwrap().unwrap();
-        (hello["payload"]["workspaceRecoveryRoot"].clone(), capture)
+        capture
     }
 
-    // REQ-RUNNERENROLL-129
+    // REQ-WORKSPACE-43, INV-RUNNER-43, REQ-RUNNERENROLL-129
     #[tokio::test]
-    async fn a_rejoined_host_advertises_a_new_verified_work_root() {
-        let (listener, endpoint) = fixture_listener().await;
-        let fixture = RotationFixture::without_pending(&endpoint);
-        let replaced_root = prepare_replaced_runners_work_root(&fixture);
-        let record = fixture.state_path.with_file_name(".runner-replaced.json");
-        fs::write(
-            &record,
-            serde_json::to_vec(&serde_json::json!({
-                "schemaVersion": 1,
-                "replacedRunnerIds": [REPLACED_RUNNER]
-            }))
-            .unwrap(),
-        )
+    async fn a_start_neither_writes_nor_reads_a_recovery_root_record() {
+        let replaced = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 1,
+            "runnerId": REPLACED_RUNNER
+        }))
         .unwrap();
-        fs::set_permissions(&record, fs::Permissions::from_mode(0o600)).unwrap();
+        for record in [None, Some(replaced.as_slice()), Some(&b"not json"[..])] {
+            let (listener, endpoint) = fixture_listener().await;
+            let fixture = RotationFixture::without_pending(&endpoint);
+            let path = fixture
+                .config
+                .assignment()
+                .work_root()
+                .join(RECOVERY_ROOT_RECORD);
+            if let Some(record) = record {
+                fs::write(&path, record).unwrap();
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
 
-        let (root, _capture) = opening_recovery_root(&fixture, listener).await;
+            let capture = serve_one_handshake(&fixture, listener).await;
 
-        assert_eq!(root["bindingState"], "verified");
-        let work_root_id = root["workRootId"].as_str().unwrap();
-        assert!(work_root_id.starts_with("rwr_"));
-        assert_ne!(work_root_id, replaced_root);
+            match record {
+                None => assert_eq!(
+                    fs::symlink_metadata(&path).unwrap_err().kind(),
+                    io::ErrorKind::NotFound
+                ),
+                Some(record) => assert_eq!(fs::read(&path).unwrap(), record),
+            }
+            assert!(
+                capture
+                    .records()
+                    .iter()
+                    .all(|record| record["event.name"] != "runner.workspace_recovery")
+            );
+        }
     }
 
-    // REQ-RUNNERENROLL-129
+    // INV-RUNNER-43
     #[tokio::test]
-    async fn a_work_root_of_a_runner_no_rejoin_replaced_is_advertised_unavailable() {
+    async fn an_ordinary_assignment_journals_to_v1_and_writes_no_recovery_record() {
         let (listener, endpoint) = fixture_listener().await;
         let fixture = RotationFixture::without_pending(&endpoint);
-        prepare_replaced_runners_work_root(&fixture);
+        let (source_broker, offer) = fixture.accepted_source();
+        let (accepted_sent, accepted_received) = tokio::sync::oneshot::channel();
+        let (close_sent, close) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (socket, accepted) = accept_offered_assignment(&listener, offer).await;
+            accepted_sent.send(accepted).unwrap();
+            let _ = close.await;
+            drop(socket);
+        });
+        let (service, _capture, _shutdown_trigger) = spawn_configured_service_with_source(
+            fixture.config.clone(),
+            fixture_sleeper(),
+            Some(source_broker),
+            None,
+        );
+        let accepted = with_watchdog(accepted_received).await.unwrap().unwrap();
 
-        let (root, capture) = opening_recovery_root(&fixture, listener).await;
-
-        assert_eq!(root["bindingState"], "unavailable");
-        let failure = capture
-            .records()
-            .into_iter()
-            .find(|record| record["event.name"] == "runner.workspace_recovery")
-            .expect("recovery failure record");
-        assert_eq!(failure["error.type"], "local_recovery_record_invalid");
+        let work_root = fixture.config.assignment().work_root();
+        let boots: Vec<_> = fs::read_dir(work_root)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("rbt_"))
+            .collect();
+        assert_eq!(boots.len(), 1);
+        let private = boots[0]
+            .path()
+            .join(accepted["payload"]["assignmentId"].as_str().unwrap())
+            .join("private");
+        assert!(private.join("process-guards-v1.json").is_file());
+        for absent in [
+            private.join("process-guards-v2.json"),
+            private.join(".useful-recovery-manifest-v1.json"),
+            work_root.join(RECOVERY_ROOT_RECORD),
+        ] {
+            assert_eq!(
+                fs::symlink_metadata(&absent).unwrap_err().kind(),
+                io::ErrorKind::NotFound,
+                "{}",
+                absent.display()
+            );
+        }
+        close_sent.send(()).unwrap();
+        abort_service(service).await;
+        server.abort();
     }
 
     #[tokio::test]
@@ -4694,10 +4501,6 @@ mod tests {
                 .as_u64()
                 .expect("first opening sequence");
             assert_eq!(first_sequence, 1);
-            assert_eq!(
-                first_hello["payload"]["workspaceRecoveryRoot"]["bindingState"],
-                "verified"
-            );
 
             socket.send(welcome()).await.expect("send welcome");
             socket
@@ -4743,10 +4546,6 @@ mod tests {
             assert_eq!(second_hello["sequence"], effect_sequence + 2);
             assert_eq!(second_hello["sentAt"], "2026-07-23T00:00:00Z");
             assert_eq!(
-                second_hello["payload"]["workspaceRecoveryRoot"],
-                first_hello["payload"]["workspaceRecoveryRoot"]
-            );
-            assert_eq!(
                 second_hello["payload"]["runnerVersion"],
                 crate::telemetry::TEST_SERVICE_VERSION
             );
@@ -4786,9 +4585,8 @@ mod tests {
         );
         assert_eq!(event["um.runner.opening_acknowledged"], true);
         assert_eq!(event["um.runner.handshake_completed"], true);
-        let sent = event["um.runner.text_frames_sent"].as_u64().unwrap();
-        assert!((3..=4).contains(&sent)); // verified roots also send an empty discovery marker
-        assert_eq!(event["um.cloud.text_frames_received"], sent);
+        assert_eq!(event["um.cloud.text_frames_received"], 3);
+        assert_eq!(event["um.runner.text_frames_sent"], 3);
         assert_eq!(event["um.runner.effects_received"], 1);
         assert_eq!(event["um.runner.effect_acknowledgements_confirmed"], 0);
         assert_eq!(
@@ -4904,21 +4702,13 @@ mod tests {
                 .await
                 .expect("send assignment offer");
             let _acknowledgement = effect_acknowledgement(&mut socket).await;
+            let pending_liveness_timer =
+                sleep_request(&mut sleep_requests, Duration::from_secs(2)).await;
             drop(second_liveness_timer);
-            // A verified startup root adds a discovery-ack liveness timer;
-            // drive all pending timers until the unacknowledged effect closes.
-            let mut close = Box::pin(expect_close_frame(&mut socket));
-            for _ in 0..3 {
-                tokio::select! {
-                    frame = &mut close => {
-                        assert_eq!(frame.code, CloseCode::Away);
-                        return sleep_requests;
-                    }
-                    timer = sleep_request(&mut sleep_requests, Duration::from_secs(2)) => timer.release(),
-                }
-            }
-            let frame = close.await;
-            assert_eq!(frame.code, CloseCode::Away);
+            pending_liveness_timer.release();
+
+            let close = expect_close_frame(&mut socket).await;
+            assert_eq!(close.code, CloseCode::Away);
             sleep_requests
         });
 
@@ -5003,14 +4793,8 @@ mod tests {
 
             while let Some(frame) = socket.next().await {
                 match frame {
-                    Ok(Message::Text(raw)) => {
-                        let frame: serde_json::Value =
-                            serde_json::from_str(&raw).expect("decode observation");
-                        if frame["type"] != "workspace_inventory" {
-                            panic!(
-                                "repeated shutdown signal produced another mandatory observation"
-                            );
-                        }
+                    Ok(Message::Text(_)) => {
+                        panic!("repeated shutdown signal produced another observation");
                     }
                     Ok(_) => {}
                     Err(_) => break,
@@ -5237,10 +5021,6 @@ mod tests {
                 Some(Ok(Message::Text(frame))) => {
                     let frame: serde_json::Value =
                         serde_json::from_str(&frame).expect("decode runner frame");
-                    if frame["type"] == "workspace_inventory" {
-                        reject_fixture_registration(socket, &frame).await;
-                        continue;
-                    }
                     if let (Some(message_id), Some(sequence)) =
                         (frame["messageId"].as_str(), frame["sequence"].as_u64())
                     {
@@ -5514,7 +5294,6 @@ mod tests {
                     lease_clock: fixture_lease_clock(),
                     boot_id: boot_id.clone(),
                     source_broker: Some(unavailable_source_broker()),
-                    recovery_host: super::super::recovery::host_fixture::fixture_host(),
                     agent_login_setup: Some(fake_agent_login_setup(
                         Arc::clone(&cloud),
                         home.path(),

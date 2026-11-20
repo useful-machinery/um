@@ -557,18 +557,6 @@ pub(super) fn write_run_continuation(out: &mut impl Write, run: &Run) -> anyhow:
         "\nportable result: {}",
         super::enum_text(&run.portable_result)?
     )?;
-    if let Some(recovery) = run.workspace_recovery.as_deref() {
-        writeln!(
-            out,
-            "workspace recovery: {}",
-            super::enum_text(&recovery.status)?
-        )?;
-        if let Some(reason) = recovery.reason.as_ref() {
-            writeln!(out, "  reason: {}", super::enum_text(reason)?)?;
-        }
-    } else {
-        writeln!(out, "workspace recovery: not recorded")?;
-    }
     let Some(continuation) = run.continuation.as_deref() else {
         return Ok(());
     };
@@ -621,21 +609,6 @@ pub(super) fn write_run_continuation(out: &mut impl Write, run: &Run) -> anyhow:
         )?;
     }
     let workspace = &continuation.workspace;
-    if let Some(recovery) = workspace.recovery.as_deref() {
-        writeln!(
-            out,
-            "  retained workspace: {} (root {}, origin boot {})",
-            recovery.workspace_id, recovery.work_root_id, recovery.origin_runner_boot_id
-        )?;
-        if let Some(failure) = recovery.failure.as_ref() {
-            writeln!(
-                out,
-                "  recovery failure: {} ({})",
-                super::enum_text(&failure.code)?,
-                super::enum_text(&failure.recovery_reason)?
-            )?;
-        }
-    }
     writeln!(
         out,
         "  preparation: {}",
@@ -671,19 +644,27 @@ pub(super) fn write_run_continuation(out: &mut impl Write, run: &Run) -> anyhow:
 mod tests {
     use super::*;
 
-    // REQ-CONTINUE-55
+    // REQ-CONTINUE-61
     #[test]
-    fn human_continuation_reads_retained_recovery_without_inventing_legacy_identity() {
+    fn human_continuation_prints_no_workspace_recovery() {
         let mut value: serde_json::Value = serde_json::from_str(include_str!(
             "../../../crates/api/tests/fixtures/run-continuation-pending.json"
         ))
         .unwrap();
-        let legacy: useful_api::RunContinuationEnvelope =
+        let plain: useful_api::RunContinuationEnvelope =
             serde_json::from_value(value.clone()).unwrap();
         let mut output = Vec::new();
-        write_run_continuation(&mut output, &legacy.run).unwrap();
-        let legacy_text = String::from_utf8(output).unwrap();
-        assert!(!legacy_text.contains("rws_"));
+        write_run_continuation(&mut output, &plain.run).unwrap();
+        let plain_text = String::from_utf8(output).unwrap();
+        for marker in ["portable result:", "continuation:", "preparation:"] {
+            assert!(plain_text.contains(marker), "missing {marker}");
+        }
+        assert!(
+            !plain_text
+                .lines()
+                .any(|line| line.contains("workspace recovery")),
+            "{plain_text}"
+        );
 
         value["run"]["workspaceRecovery"] = serde_json::json!({
             "schemaVersion":1,"status":"not_established","reason":"registration_rejected"
@@ -703,11 +684,12 @@ mod tests {
         write_run_continuation(&mut output, &seeded.run).unwrap();
         let text = String::from_utf8(output).unwrap();
         for marker in [
-            "rws_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "workspace recovery",
+            "rws_",
             "host_identity_mismatch",
             "registration_rejected",
         ] {
-            assert!(text.contains(marker), "missing {marker}");
+            assert!(!text.contains(marker), "printed {marker}: {text}");
         }
     }
 

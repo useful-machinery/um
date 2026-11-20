@@ -25,8 +25,6 @@ pub struct RunInterruption {
     pub executor_fault: Option<ExecutorFault>,
     #[serde(rename = "stopConfirmed")]
     pub stop_confirmed: bool,
-    #[serde(rename = "recoveryReason", skip_serializing_if = "Option::is_none")]
-    pub recovery_reason: Option<models::RecoveryReason>,
 }
 
 impl RunInterruption {
@@ -41,7 +39,6 @@ impl RunInterruption {
             cause,
             executor_fault,
             stop_confirmed,
-            recovery_reason: None,
         }
     }
 }

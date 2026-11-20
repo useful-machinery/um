@@ -2859,7 +2859,6 @@ impl PendingLocalContinuation {
             reason
         };
         let record = super::publication::ContinuationRecordV1 {
-            schema_version: None,
             request: super::publication::ContinuationRequestV1 {
                 from_steps: from.clone(),
                 definition: match replacement_path {
@@ -2885,7 +2884,6 @@ impl PendingLocalContinuation {
                 .collect(),
             definition_source: source,
             workspace: super::publication::ContinuationWorkspaceV1 {
-                recovery: None,
                 execution_root: admitted
                     .execution()
                     .root()

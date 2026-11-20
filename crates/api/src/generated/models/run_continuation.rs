@@ -15,12 +15,8 @@
 use crate::generated::models;
 use serde::{Deserialize, Serialize};
 
-use serde_repr::{Deserialize_repr, Serialize_repr};
-
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunContinuation {
-    #[serde(rename = "schemaVersion", skip_serializing_if = "Option::is_none")]
-    pub schema_version: Option<SchemaVersion>,
     #[serde(rename = "request")]
     pub request: Box<models::RunContinuationRequest>,
     #[serde(rename = "fromSteps")]
@@ -45,7 +41,6 @@ impl RunContinuation {
         workspace: models::RunContinuationWorkspace,
     ) -> RunContinuation {
         RunContinuation {
-            schema_version: None,
             request: Box::new(request),
             from_steps,
             reexecuted_steps,
@@ -53,30 +48,5 @@ impl RunContinuation {
             definition_source: Box::new(definition_source),
             workspace: Box::new(workspace),
         }
-    }
-}
-#[repr(i64)]
-#[derive(
-    Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize_repr, Deserialize_repr,
-)]
-pub enum SchemaVersion {
-    Variant2 = 2,
-}
-
-impl std::fmt::Display for SchemaVersion {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::Variant2 => "2",
-            }
-        )
-    }
-}
-
-impl Default for SchemaVersion {
-    fn default() -> SchemaVersion {
-        Self::Variant2
     }
 }

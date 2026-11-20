@@ -1756,9 +1756,6 @@ fn write_observation_human(
         if let Some(reason) = &decline.reason {
             writeln!(out, "  reason: {}", enum_text(reason)?)?;
         }
-        if let Some(reason) = &decline.recovery_reason {
-            writeln!(out, "  recovery reason: {}", enum_text(reason)?)?;
-        }
         writeln!(out, "  runner: {}", decline.runner_id)?;
         writeln!(out, "  declined at: {}", decline.declined_at)?;
     }
@@ -1840,9 +1837,6 @@ fn write_run_terminal_issue(out: &mut impl Write, run: &Run) -> anyhow::Result<(
         writeln!(out, "  state: {}", enum_text(&failure.state)?)?;
         let detail = serde_json::to_value(&failure.detail)?;
         writeln!(out, "  detail: {}", visible_text(&detail.to_string()))?;
-        if let Some(reason) = &failure.recovery_reason {
-            writeln!(out, "  recovery reason: {}", enum_text(reason)?)?;
-        }
     }
     if run.rejection.is_some() {
         writeln!(out)?;
@@ -2030,9 +2024,6 @@ fn write_run_human(deployment: &str, heading: &str, run: &Run) -> anyhow::Result
     if let Some(interruption) = run.interruption.as_deref() {
         writeln!(stdout, "  phase: {}", enum_text(&interruption.phase)?)?;
         writeln!(stdout, "  cause: {}", enum_text(&interruption.cause)?)?;
-        if let Some(reason) = &interruption.recovery_reason {
-            writeln!(stdout, "  recovery reason: {}", enum_text(reason)?)?;
-        }
         writeln!(
             stdout,
             "  executor fault: {}",
@@ -2640,9 +2631,9 @@ mod tests {
             .collect()
     }
 
-    // REQ-DIAG-29, REQ-DIAG-42: a failure and a rejection print without their runner
-    // diagnostic, except that a rejection prints, under its reason and before its recovery
-    // reason, each validation fact its diagnostic holds, escaped.
+    // REQ-DIAG-29, REQ-DIAG-42, REQ-RUN-105: a failure and a rejection print without their
+    // runner diagnostic, except that a rejection prints, under its reason, each validation
+    // fact its diagnostic holds, escaped, and nothing of a recovery reason it carries.
     #[test]
     fn terminal_run_human_output_includes_primary_issue_or_rejection() {
         let mut failed = serde_json::to_value(run(RunState::Failed)).unwrap();
@@ -2708,7 +2699,6 @@ mod tests {
                 "validation location: step_workflow",
                 "validation path: workflow.yaml",
                 "validation step: parts",
-                "recovery reason: workspace_not_found",
             ],
             "{text}"
         );

@@ -1079,7 +1079,6 @@ mod tests {
             RunFailure::ContinuationAcceptanceUnknown,
             RunFailure::ContinuationAdmissionInvalid(vec![ContinuationAdmissionViolation {
                 code: "node_unknown",
-                recovery_reason: None,
                 node: None,
                 producer: None,
                 reference: None,

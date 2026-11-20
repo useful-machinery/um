@@ -129,8 +129,6 @@ pub struct WorkflowRunFinalizationCancellation {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ContinuationRecordV1 {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) schema_version: Option<u8>,
     pub(crate) request: ContinuationRequestV1,
     pub(crate) from_steps: Vec<String>,
     pub(crate) reexecuted_steps: Vec<String>,
@@ -243,7 +241,6 @@ pub fn cloud_continuation_record(
     }))
     .map_err(|_| CloudContinuationRecordError)?;
     let record = ContinuationRecordV1 {
-        schema_version: None,
         request,
         from_steps,
         reexecuted_steps,
@@ -348,8 +345,6 @@ pub(crate) enum ContinuationDefinitionSourceV1 {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct ContinuationWorkspaceV1 {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) recovery: Option<ContinuationRecoveryV1>,
     pub(crate) execution_root: String,
     pub(crate) prior_execution_root: String,
     // Pre-staged local records omitted preparation; they were ready at admission.
@@ -360,83 +355,6 @@ pub(crate) struct ContinuationWorkspaceV1 {
     pub(crate) prior_settlement_snapshot: Option<WorkspaceSnapshotV1>,
     pub(crate) modified: WorkspaceModifiedV1,
     pub(crate) quiescence: Option<ContinuationQuiescenceV1>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ContinuationRecoveryV1 {
-    pub(crate) schema_version: u8,
-    pub(crate) workspace_id: String,
-    pub(crate) work_root_id: String,
-    pub(crate) runner_id: String,
-    pub(crate) origin_runner_boot_id: String,
-    #[serde(deserialize_with = "deserialize_nullable_option")]
-    pub(crate) target_runner_boot_id: Option<String>,
-    #[serde(deserialize_with = "deserialize_nullable_option")]
-    pub(crate) claiming_assignment_id: Option<String>,
-    #[serde(deserialize_with = "deserialize_nullable_option")]
-    pub(crate) claim_generation: Option<u64>,
-    #[serde(deserialize_with = "deserialize_nullable_option")]
-    pub(crate) failure: Option<ContinuationRecoveryFailureV1>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct ContinuationRecoveryFailureV1 {
-    pub(crate) code: RecoveryFailureCodeV1,
-    pub(crate) recovery_reason: RecoveryReasonV1,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RecoveryFailureCodeV1 {
-    RetainedWorkspaceUnavailable,
-    OwnershipUnproven,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RecoveryReasonV1 {
-    WorkspaceNotFound,
-    RecoveryRecordUnsupported,
-    RecoveryNotEstablished,
-    RecoveryRecordInvalid,
-    WorkspaceIdentityMismatch,
-    HostIdentityMismatch,
-    RootIdentityUnavailable,
-    HostIdentityUnavailable,
-    PriorOwnerUnproven,
-    ProcessJournalInvalid,
-    ClaimGenerationStale,
-    ClaimGenerationExhausted,
-    RecoveryEvidenceUnavailable,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(crate) struct WorkspaceRecoveryStatusV1 {
-    pub(crate) schema_version: u8,
-    pub(crate) status: WorkspaceRecoveryStateV1,
-    #[serde(deserialize_with = "deserialize_nullable_option")]
-    pub(crate) reason: Option<WorkspaceRecoveryReasonV1>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum WorkspaceRecoveryStateV1 {
-    Pending,
-    Established,
-    NotEstablished,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum WorkspaceRecoveryReasonV1 {
-    RegistrationUnacknowledged,
-    RegistrationRejected,
-    LocalRecoveryRecordUnavailable,
-    RecoveryNotSupported,
-    ExecutionNotStarted,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -848,10 +766,6 @@ pub struct WorkflowResultV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) continuation: Option<ContinuationRecordV1>,
-    // A sealed Cloud result carries this only when the Cloud start decision
-    // writer supplies it. Historical and local results retain byte omission.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) workspace_recovery: Option<WorkspaceRecoveryStatusV1>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) output_producers: BTreeMap<String, BTreeMap<String, OutputProducer>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -3183,7 +3097,6 @@ fn build_result_with_provenance(
         schema_version: 1,
         attempt_number: run.attempt_number,
         continuation: run.continuation.clone(),
-        workspace_recovery: None,
         output_producers: run.output_producers.clone(),
         export_sources,
         workflow: WorkflowIdentityV1 {

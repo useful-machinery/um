@@ -41,7 +41,6 @@ pub enum RunnerFrame {
     Hello {
         envelope: RunnerEnvelope,
         runner_version: String,
-        recovery_root: Option<Value>,
         /// Advertises `treeExecution: 1`: this runner executes published trees
         /// (REQ-RUNNERENROLL-91).
         tree_execution: bool,
@@ -59,15 +58,6 @@ pub enum RunnerFrame {
         /// Advertises `holdsWaitingRuns: 1`: this runner takes another run while every run it
         /// holds waits, so Cloud may offer it one (REQ-RUNNERENROLL-64, REQ-COMPAT-22).
         holds_waiting_runs: bool,
-    },
-    WorkspaceInventoryComplete {
-        envelope: RunnerEnvelope,
-        work_root_id: String,
-        inventory_through_sequence: u64,
-    },
-    WorkspaceInventory {
-        envelope: RunnerEnvelope,
-        payload: Value,
     },
     WorkspaceRetentionReport {
         envelope: RunnerEnvelope,
@@ -1362,14 +1352,6 @@ pub enum CloudFrame {
         acknowledged_message_id: String,
         acknowledged_sequence: u64,
     },
-    WorkspaceRegistration {
-        envelope: CloudEnvelope,
-        acknowledged_message_id: String,
-        acknowledged_sequence: u64,
-        work_root_id: String,
-        workspace_id: String,
-        rejection: Option<String>,
-    },
     ArtifactCarrierRegistration {
         envelope: CloudEnvelope,
         response: ArtifactRegistrationResponse,
@@ -1549,7 +1531,6 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
         RunnerFrame::Hello {
             envelope,
             runner_version,
-            recovery_root,
             tree_execution,
             tree_continuation,
             tree_withdraw,
@@ -1572,23 +1553,7 @@ pub fn encode_runner_frame(frame: &RunnerFrame) -> Result<Vec<u8>, EncodeError> 
             if *holds_waiting_runs {
                 payload["holdsWaitingRuns"] = json!(1);
             }
-            if let Some(root) = recovery_root {
-                payload["workspaceRecoveryVersion"] = json!(1);
-                payload["workspaceRecoveryRoot"] = root.clone();
-            }
             runner_frame_value(envelope, "hello", payload)
-        }
-        RunnerFrame::WorkspaceInventoryComplete {
-            envelope,
-            work_root_id,
-            inventory_through_sequence,
-        } => runner_frame_value(
-            envelope,
-            "workspace_inventory_complete",
-            json!({ "schemaVersion": 1, "workRootId": work_root_id, "inventoryThroughSequence": inventory_through_sequence }),
-        ),
-        RunnerFrame::WorkspaceInventory { envelope, payload } => {
-            runner_frame_value(envelope, "workspace_inventory", payload.clone())
         }
         RunnerFrame::WorkspaceRetentionReport {
             envelope,
@@ -2116,11 +2081,6 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
         return Err(DecodeError::InvalidFrame("sizeClass"));
     }
     validate_protocol_schema(&value)?;
-    // The canonical schema admits retained V1 recovery frames, but the
-    // unactivated runtime must not silently project their V2 fields away.
-    if unactivated_recovery_frame(&value) {
-        return Err(DecodeError::InvalidFrame("workspaceRecoveryVersion"));
-    }
     validate_closed_shape(&value)?;
     let generated = generated_frame(value)?;
 
@@ -2131,11 +2091,13 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             &frame.direction,
             frame.sent_at,
         ),
-        generated::RunnerProtocolVersion1::RunnerWorkspaceInventory(frame) => {
-            validated_runner_frame!(frame)
-        }
-        generated::RunnerProtocolVersion1::RunnerWorkspaceInventoryComplete(frame) => {
-            validated_runner_frame!(frame)
+        // The schema keeps these frames for published runners (INV-RUNNER-42); this runner
+        // neither sends nor accepts them. `validate_closed_shape` refuses their type first,
+        // so this arm exists for the exhaustive match.
+        generated::RunnerProtocolVersion1::RunnerWorkspaceInventory(_)
+        | generated::RunnerProtocolVersion1::RunnerWorkspaceInventoryComplete(_)
+        | generated::RunnerProtocolVersion1::CloudWorkspaceRegistrationRejected(_) => {
+            Err(DecodeError::InvalidFrame("type"))
         }
         generated::RunnerProtocolVersion1::RunnerWorkspaceRetentionReport(frame) => {
             validated_runner_frame!(frame)
@@ -2155,9 +2117,6 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             validated_runner_frame!(frame)
         }
         generated::RunnerProtocolVersion1::RunnerContinuationReady(frame) => {
-            if frame.payload.schema_version.is_some() || frame.payload.recovery.is_some() {
-                return Err(DecodeError::InvalidFrame("workspaceRecoveryVersion"));
-            }
             validated_runner_frame!(frame)
         }
         generated::RunnerProtocolVersion1::RunnerAssignmentAccepted(frame) => {
@@ -2191,10 +2150,6 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             validated_runner_frame!(frame)
         }
         generated::RunnerProtocolVersion1::RunnerExecutionStarted(frame) => {
-            if frame.payload.schema_version.is_some() || frame.payload.workspace_recovery.is_some()
-            {
-                return Err(DecodeError::InvalidFrame("workspaceRecoveryVersion"));
-            }
             validated_runner_frame!(frame)
         }
         generated::RunnerProtocolVersion1::RunnerExecutionTransition(frame) => {
@@ -2270,28 +2225,6 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
                 },
             }))
         }
-        generated::RunnerProtocolVersion1::CloudWorkspaceRegistered(frame) => {
-            let envelope = validated_cloud_envelope!(frame)?;
-            Ok(cloud(CloudFrame::WorkspaceRegistration {
-                envelope,
-                acknowledged_message_id: frame.payload.acknowledged_message_id.to_string(),
-                acknowledged_sequence: frame.payload.acknowledged_sequence.0.get(),
-                work_root_id: frame.payload.work_root_id.to_string(),
-                workspace_id: frame.payload.workspace_id.to_string(),
-                rejection: None,
-            }))
-        }
-        generated::RunnerProtocolVersion1::CloudWorkspaceRegistrationRejected(frame) => {
-            let envelope = validated_cloud_envelope!(frame)?;
-            Ok(cloud(CloudFrame::WorkspaceRegistration {
-                envelope,
-                acknowledged_message_id: frame.payload.acknowledged_message_id.to_string(),
-                acknowledged_sequence: frame.payload.acknowledged_sequence.0.get(),
-                work_root_id: frame.payload.work_root_id.to_string(),
-                workspace_id: frame.payload.workspace_id.to_string(),
-                rejection: Some(frame.payload.reason.to_string()),
-            }))
-        }
         generated::RunnerProtocolVersion1::CloudObservationAck(frame) => {
             let envelope = validated_cloud_envelope!(frame)?;
             Ok(cloud(CloudFrame::ObservationAck {
@@ -2333,16 +2266,6 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             }))
         }
         generated::RunnerProtocolVersion1::CloudAssignmentOffer(frame) => {
-            if frame
-                .payload
-                .continuation
-                .as_ref()
-                .is_some_and(|continuation| {
-                    continuation.schema_version.is_some() || continuation.recovery.is_some()
-                })
-            {
-                return Err(DecodeError::InvalidFrame("workspaceRecoveryVersion"));
-            }
             let envelope = validated_cloud_envelope!(frame)?;
             let execution_spec = frame.payload.execution_spec;
             let schema_version = match *execution_spec.schema_version {
@@ -2623,10 +2546,6 @@ fn decode_frame(bytes: &[u8]) -> Result<ValidatedFrame, DecodeError> {
             }))
         }
         generated::RunnerProtocolVersion1::CloudExecutionStartAuthorized(frame) => {
-            if frame.payload.schema_version.is_some() || frame.payload.workspace_recovery.is_some()
-            {
-                return Err(DecodeError::InvalidFrame("workspaceRecoveryVersion"));
-            }
             let envelope = validated_cloud_envelope!(frame)?;
             Ok(cloud(CloudFrame::ExecutionStartAuthorized {
                 envelope,
@@ -2795,8 +2714,6 @@ fn generated_frame(value: Value) -> Result<generated::RunnerProtocolVersion1, De
     match frame_type {
         "hello" => variant(value, Frame::RunnerHello),
         "workspace_retention_report" => variant(value, Frame::RunnerWorkspaceRetentionReport),
-        "workspace_inventory" => variant(value, Frame::RunnerWorkspaceInventory),
-        "workspace_inventory_complete" => variant(value, Frame::RunnerWorkspaceInventoryComplete),
         "effect_acknowledged" => variant(value, Frame::RunnerEffectAcknowledged),
         "assignment_preparing" => variant(value, Frame::RunnerAssignmentPreparing),
         "assignment_preparation_progress" => {
@@ -2826,10 +2743,6 @@ fn generated_frame(value: Value) -> Result<generated::RunnerProtocolVersion1, De
         "artifact_result_confirm" => variant(value, Frame::RunnerArtifactResultConfirm),
         "welcome" => variant(value, Frame::CloudWelcome),
         "observation_ack" => variant(value, Frame::CloudObservationAck),
-        "workspace_registered" => variant(value, Frame::CloudWorkspaceRegistered),
-        "workspace_registration_rejected" => {
-            variant(value, Frame::CloudWorkspaceRegistrationRejected)
-        }
         "artifact_carrier_registration" => variant(value, Frame::CloudArtifactCarrierRegistration),
         "artifact_carrier_confirmation" => variant(value, Frame::CloudArtifactCarrierConfirmation),
         "artifact_result_registration" => variant(value, Frame::CloudArtifactResultRegistration),
@@ -3211,20 +3124,6 @@ fn validate_protocol_schema(value: &Value) -> Result<(), DecodeError> {
     }
 }
 
-fn unactivated_recovery_frame(value: &Value) -> bool {
-    let kind = value.get("type").and_then(Value::as_str);
-    let payload = value.get("payload");
-    match kind {
-        Some("assignment_offer") => payload
-            .and_then(|body| body.get("continuation"))
-            .is_some_and(|continuation| continuation.get("schemaVersion").is_some()),
-        Some("continuation_ready" | "execution_started" | "execution_start_authorized") => {
-            payload.is_some_and(|body| body.get("schemaVersion").is_some())
-        }
-        _ => false,
-    }
-}
-
 fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
     let object = value
         .as_object()
@@ -3272,45 +3171,6 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
         .ok_or(DecodeError::InvalidFrame("payload"))?;
     let payload_keys: &[&str] = match frame_type {
         "hello" => &["runnerVersion"],
-        "workspace_inventory_complete" => {
-            &["schemaVersion", "workRootId", "inventoryThroughSequence"]
-        }
-        "workspace_inventory" => &[
-            "schemaVersion",
-            "workRootId",
-            "workspaceId",
-            "runId",
-            "priorAttemptId",
-            "priorAssignmentId",
-            "originRunnerBootId",
-            "originAssignmentId",
-            "originAttemptId",
-            "executionRoot",
-            "observedClaim",
-            "lastClaimGeneration",
-            "presence",
-            "recoveryReason",
-        ],
-        "workspace_registered" => &[
-            "schemaVersion",
-            "acknowledgedMessageId",
-            "acknowledgedSequence",
-            "workRootId",
-            "workspaceId",
-            "runId",
-            "originRunnerBootId",
-            "originAssignmentId",
-            "originAttemptId",
-            "executionRoot",
-        ],
-        "workspace_registration_rejected" => &[
-            "schemaVersion",
-            "acknowledgedMessageId",
-            "acknowledgedSequence",
-            "workRootId",
-            "workspaceId",
-            "reason",
-        ],
         "workspace_retention_report" => &[
             "assignmentId",
             "attemptId",
@@ -3472,15 +3332,12 @@ fn validate_closed_shape(value: &Value) -> Result<(), DecodeError> {
     };
     let optional_keys: &[&str] = match frame_type {
         "hello" => &[
-            "workspaceRecoveryVersion",
-            "workspaceRecoveryRoot",
             "treeExecution",
             "treeContinuation",
             "treeWithdraw",
             "treeIntegrationBindings",
             "holdsWaitingRuns",
         ],
-        "workspace_inventory" => &["discovery", "diagnostic"],
         "execution_transition" | "execution_interrupted" => &["diagnostic"],
         "execution_finished" => &[
             "diagnostic",
@@ -4079,6 +3936,26 @@ mod tests {
             env!("CARGO_MANIFEST_DIR"),
             "/../../tests/fixtures/runner-protocol/v1/invalid/runner-assignment-rejected-validation-path-absolute.json"
         )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/runner-assignment-rejected-recovery-decline.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/runner-continuation-ready-recovery.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/runner-execution-started-workspace-recovery.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/cloud-execution-start-authorized-workspace-recovery.json"
+        )),
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../tests/fixtures/runner-protocol/v1/invalid/cloud-assignment-offer-continuation-recovery.json"
+        )),
     ];
 
     // INV-CONTRACT-7
@@ -4101,26 +3978,31 @@ mod tests {
 
     // INV-RUNNER-1
     #[test]
-    fn discovery_wire_fixtures_are_live_without_enabling_admission() {
-        for fixture in [
-            include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/runner-protocol/v1/valid/runner-recovery-hello.json")).as_slice(),
-            include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/runner-protocol/v1/valid/runner-workspace-inventory-complete.json")).as_slice(),
-        ] {
-            assert!(serde_json::from_slice::<generated::RunnerProtocolVersion1>(fixture).is_ok());
-            let result = decode_frame(fixture);
-            assert!(matches!(result, Ok(ValidatedFrame::Runner)), "{:?}", result.err());
-        }
-    }
-
-    // INV-CONTRACT-7
-    // INV-RUNNER-1
-    #[test]
-    fn initial_inventory_fixture_is_live() {
-        let fixture = include_bytes!(concat!(
+    fn runner_codec_refuses_the_recovery_frames_the_schema_keeps_for_published_runners() {
+        assert!(decode_cloud_frame(include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../tests/fixtures/runner-protocol/v1/valid/runner-workspace-inventory-present.json"
-        ));
-        assert!(matches!(decode_frame(fixture), Ok(ValidatedFrame::Runner)));
+            "/../../tests/fixtures/runner-protocol/v1/valid/cloud-workspace-registration-rejected.json"
+        )))
+        .is_err());
+        for fixture in [
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/runner-protocol/v1/valid/runner-recovery-hello.json"
+            ))
+            .as_slice(),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/runner-protocol/v1/valid/runner-workspace-inventory-present.json"
+            ))
+            .as_slice(),
+            include_bytes!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../tests/fixtures/runner-protocol/v1/valid/runner-workspace-inventory-complete.json"
+            ))
+            .as_slice(),
+        ] {
+            assert!(decode_frame(fixture).is_err());
+        }
     }
 
     #[test]
@@ -4198,21 +4080,6 @@ mod tests {
     }
 
     #[test]
-    fn origin_registration_replies_decode_as_correlated_closed_frames() {
-        for (fixture, rejected) in [
-            (include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/runner-protocol/v1/valid/cloud-workspace-registered.json")).as_slice(), false),
-            (include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/fixtures/runner-protocol/v1/valid/cloud-workspace-registration-rejected.json")).as_slice(), true),
-        ] {
-            let CloudFrame::WorkspaceRegistration { acknowledged_message_id, acknowledged_sequence, rejection, .. } = decode_cloud_frame(fixture).unwrap() else {
-                panic!("wrong registration reply");
-            };
-            assert_eq!(acknowledged_message_id, "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc");
-            assert_eq!(acknowledged_sequence, 2);
-            assert_eq!(rejection.is_some(), rejected);
-        }
-    }
-
-    #[test]
     fn encode_runner_frame_round_trips_through_generated_validation() {
         let envelope = RunnerEnvelope {
             message_id: "rmsg_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
@@ -4224,7 +4091,6 @@ mod tests {
         let frame = RunnerFrame::Hello {
             envelope: envelope.clone(),
             runner_version: "0.2.0".to_owned(),
-            recovery_root: None,
             tree_execution: true,
             tree_continuation: false,
             tree_withdraw: false,
@@ -4243,7 +4109,6 @@ mod tests {
         let continuing = RunnerFrame::Hello {
             envelope: envelope.clone(),
             runner_version: "0.2.0".to_owned(),
-            recovery_root: None,
             tree_execution: true,
             tree_continuation: true,
             tree_withdraw: false,
@@ -4260,7 +4125,6 @@ mod tests {
         let withdrawing = RunnerFrame::Hello {
             envelope: envelope.clone(),
             runner_version: "0.2.0".to_owned(),
-            recovery_root: None,
             tree_execution: true,
             tree_continuation: true,
             tree_withdraw: true,
@@ -4279,7 +4143,6 @@ mod tests {
         let integrating = RunnerFrame::Hello {
             envelope: envelope.clone(),
             runner_version: "0.2.0".to_owned(),
-            recovery_root: None,
             tree_execution: true,
             tree_continuation: true,
             tree_withdraw: true,
@@ -4295,7 +4158,6 @@ mod tests {
         let holding = RunnerFrame::Hello {
             envelope,
             runner_version: "0.2.0".to_owned(),
-            recovery_root: None,
             tree_execution: true,
             tree_continuation: true,
             tree_withdraw: true,

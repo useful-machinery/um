@@ -26,8 +26,6 @@ pub struct RunPlacementDecline {
     pub runner_id: String,
     #[serde(rename = "declinedAt")]
     pub declined_at: String,
-    #[serde(rename = "recoveryReason", skip_serializing_if = "Option::is_none")]
-    pub recovery_reason: Option<models::RecoveryReason>,
     #[serde(rename = "diagnostic", skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<Box<models::RunnerDiagnostic>>,
 }
@@ -39,7 +37,6 @@ impl RunPlacementDecline {
             reason: None,
             runner_id,
             declined_at,
-            recovery_reason: None,
             diagnostic: None,
         }
     }

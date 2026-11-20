@@ -151,8 +151,6 @@ pub struct Run {
     pub rejection: Option<Box<models::RunRejection>>,
     #[serde(rename = "artifactDelivery", deserialize_with = "Option::deserialize")]
     pub artifact_delivery: Option<Box<models::RunArtifactDelivery>>,
-    #[serde(rename = "workspaceRecovery", skip_serializing_if = "Option::is_none")]
-    pub workspace_recovery: Option<Box<models::WorkspaceRecoveryStatus>>,
     /// Whether a portable Artifact Set has been successfully committed for this attempt. Absent includes pre-engine-result interruption and does not assert that any uncommitted upload or output was verified.
     #[serde(rename = "portableResult")]
     pub portable_result: PortableResult,
@@ -236,7 +234,6 @@ impl Run {
             failure: failure.map(Box::new),
             rejection: rejection.map(Box::new),
             artifact_delivery: artifact_delivery.map(Box::new),
-            workspace_recovery: None,
             portable_result,
             continuation: continuation.map(Box::new),
             observation: None,

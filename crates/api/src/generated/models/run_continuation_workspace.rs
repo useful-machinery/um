@@ -17,8 +17,6 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Default, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RunContinuationWorkspace {
-    #[serde(rename = "recovery", skip_serializing_if = "Option::is_none")]
-    pub recovery: Option<Box<models::ContinuationRecovery>>,
     #[serde(rename = "executionRoot")]
     pub execution_root: String,
     #[serde(rename = "priorExecutionRoot")]
@@ -49,7 +47,6 @@ impl RunContinuationWorkspace {
         quiescence: Option<models::RunContinuationWorkspaceQuiescence>,
     ) -> RunContinuationWorkspace {
         RunContinuationWorkspace {
-            recovery: None,
             execution_root,
             prior_execution_root,
             preparation,

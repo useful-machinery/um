@@ -425,9 +425,6 @@ fn write_cancel_context(
             if let Some(fault) = interruption.executor_fault.as_ref() {
                 writeln!(out, "executor fault: {}", super::enum_text(fault)?)?;
             }
-            if let Some(reason) = interruption.recovery_reason.as_ref() {
-                writeln!(out, "recovery reason: {}", super::enum_text(reason)?)?;
-            }
             writeln!(
                 out,
                 "stop confirmed: {}",
@@ -613,8 +610,8 @@ pub(crate) fn write_held_with(
 
 /// The block saying why Cloud rejected a run, nothing when it did not: its reason, under it
 /// each validation fact its runner diagnostic holds, in the order code, location, path and
-/// step (REQ-DIAG-29, REQ-DIAG-42), and its recovery reason when it has one. It prints no
-/// other diagnostic member and escapes every value: a fact is untrusted runner text.
+/// step (REQ-DIAG-29, REQ-DIAG-42). It prints no other diagnostic member and escapes every
+/// value: a fact is untrusted runner text.
 pub(crate) fn write_rejection(out: &mut impl Write, run: &Run) -> io::Result<()> {
     let Some(rejection) = run.rejection.as_deref() else {
         return Ok(());
@@ -632,12 +629,6 @@ pub(crate) fn write_rejection(out: &mut impl Write, run: &Run) -> io::Result<()>
                 writeln!(out, "  {label}: {}", visible_text(fact))?;
             }
         }
-    }
-    if let Some(reason) = rejection.recovery_reason {
-        let reason = useful_support::wire_name(reason).ok_or_else(|| {
-            io::Error::other("Cloud run recovery reason is not a contracted string")
-        })?;
-        writeln!(out, "  recovery reason: {}", visible_text(&reason))?;
     }
     Ok(())
 }

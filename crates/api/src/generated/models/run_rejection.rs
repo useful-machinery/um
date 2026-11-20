@@ -19,8 +19,6 @@ use serde::{Deserialize, Serialize};
 pub struct RunRejection {
     #[serde(rename = "reason")]
     pub reason: String,
-    #[serde(rename = "recoveryReason", skip_serializing_if = "Option::is_none")]
-    pub recovery_reason: Option<models::RecoveryReason>,
     #[serde(rename = "diagnostic", skip_serializing_if = "Option::is_none")]
     pub diagnostic: Option<Box<models::RunnerDiagnostic>>,
 }
@@ -29,7 +27,6 @@ impl RunRejection {
     pub fn new(reason: String) -> RunRejection {
         RunRejection {
             reason,
-            recovery_reason: None,
             diagnostic: None,
         }
     }

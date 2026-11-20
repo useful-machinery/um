@@ -1857,15 +1857,9 @@ fn an_expired_key_is_held_only_for_the_unanswered_rejoin_staged_with_it() {
     assert_rejoined(&fixture, &response, &requests[1]);
 }
 
-// The host's replaced-runner record, beside the state file.
+// The replaced-runner record an earlier release kept beside the state file.
 fn replaced_record_path(fixture: &EnrollmentFixture) -> PathBuf {
     fixture.state_path.with_file_name(".runner-replaced.json")
-}
-
-fn write_replaced_record(fixture: &EnrollmentFixture, bytes: &[u8], mode: u32) {
-    let path = replaced_record_path(fixture);
-    fs::write(&path, bytes).expect("write replaced-runner record");
-    fs::set_permissions(&path, Permissions::from_mode(mode)).expect("set record mode");
 }
 
 fn replaced_record(runner_ids: &[&str]) -> Vec<u8> {
@@ -1876,29 +1870,16 @@ fn replaced_record(runner_ids: &[&str]) -> Vec<u8> {
     .expect("encode replaced-runner record")
 }
 
-// The record is the user's private regular file listing exactly `expected`.
-fn assert_replaced_runners(fixture: &EnrollmentFixture, expected: &[&str]) {
-    let path = replaced_record_path(fixture);
-    let metadata = fs::symlink_metadata(&path).expect("inspect replaced-runner record");
-    assert!(metadata.file_type().is_file());
-    assert_eq!(metadata.mode() & 0o7777, 0o600);
-    let document: serde_json::Value =
-        serde_json::from_slice(&fs::read(&path).expect("read replaced-runner record"))
-            .expect("decode replaced-runner record");
-    assert_eq!(
-        document,
-        serde_json::json!({"schemaVersion": 1, "replacedRunnerIds": expected})
-    );
-}
-
-// A rejoin of `RUNNER_ID` answered 201 over `record`, the replaced-runner
-// record on disk before it, if any.
-fn rejoin_over_record(record: Option<&[u8]>) -> EnrollmentFixture {
+// A rejoin of `RUNNER_ID` answered 201 over `record`, the bytes and mode of
+// a replaced-runner record on disk before it, if any.
+fn rejoin_over_record(record: Option<(&[u8], u32)>) -> EnrollmentFixture {
     let server = ScriptedHttpServer::respond(rejoin_response());
     let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
     fixture.write_joined_state();
-    if let Some(record) = record {
-        write_replaced_record(&fixture, record, 0o600);
+    if let Some((bytes, mode)) = record {
+        let path = replaced_record_path(&fixture);
+        fs::write(&path, bytes).expect("write replaced-runner record");
+        fs::set_permissions(&path, Permissions::from_mode(mode)).expect("set record mode");
     }
     let held = fixture.hold(join_key(&server, JOIN_KEY_ID, &future_time()));
     let response = rejoined(held.rejoin_once());
@@ -1906,194 +1887,22 @@ fn rejoin_over_record(record: Option<&[u8]>) -> EnrollmentFixture {
     fixture
 }
 
-// INV-RUNNER-37
+// REQ-WORKSPACE-43, INV-RUNNER-43
 #[test]
-fn a_rejoin_records_the_runner_it_replaces() {
+fn a_rejoin_neither_writes_nor_reads_a_replaced_runner_record() {
     let fixture = rejoin_over_record(None);
-    assert_replaced_runners(&fixture, &[RUNNER_ID]);
-
-    let fixture = rejoin_over_record(Some(&replaced_record(&[OTHER_RUNNER_ID])));
-    assert_replaced_runners(&fixture, &[OTHER_RUNNER_ID, RUNNER_ID]);
-
-    let earlier: Vec<String> = (0..16)
-        .map(|index| format!("rnr_01k0z6r1w8f4jy2m7q9v3x5{index:03}"))
-        .collect();
-    let earlier: Vec<&str> = earlier.iter().map(String::as_str).collect();
-    let fixture = rejoin_over_record(Some(&replaced_record(&earlier)));
-    let mut kept = earlier[1..].to_vec();
-    kept.push(RUNNER_ID);
-    assert_replaced_runners(&fixture, &kept);
-}
-
-// INV-RUNNER-37
-#[test]
-fn a_rejoin_starts_a_new_record_over_one_that_does_not_check() {
-    let seventeen: Vec<String> = (0..17)
-        .map(|index| format!("rnr_01k0z6r1w8f4jy2m7q9v3x5{index:03}"))
-        .collect();
-    let seventeen: Vec<&str> = seventeen.iter().map(String::as_str).collect();
-    for record in [
-        b"not a record".to_vec(),
-        serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 2,
-            "replacedRunnerIds": [OTHER_RUNNER_ID]
-        }))
-        .expect("encode record"),
-        serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 1,
-            "replacedRunnerIds": [OTHER_RUNNER_ID],
-            "clearedAt": "2026-08-07T12:00:00Z"
-        }))
-        .expect("encode record"),
-        replaced_record(&seventeen),
-        replaced_record(&[OTHER_RUNNER_ID, CREDENTIAL_ID]),
-    ] {
-        let fixture = rejoin_over_record(Some(&record));
-        assert_replaced_runners(&fixture, &[RUNNER_ID]);
-    }
-}
-
-// INV-RUNNER-37
-#[test]
-fn a_rejoin_that_replaces_no_state_records_no_runner() {
-    for (response, answered) in [
-        (empty_response("503 Service Unavailable"), false),
-        (empty_response("410 Gone"), true),
-    ] {
-        let server = ScriptedHttpServer::respond(response);
-        let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
-        fixture.write_joined_state();
-        let held = fixture.hold(join_key(&server, JOIN_KEY_ID, &future_time()));
-        let outcome = held.rejoin_once();
-        if answered {
-            assert!(
-                matches!(
-                    outcome,
-                    Err(EnrollmentError::JoinRefused {
-                        refusal: JoinRefusal::Gone,
-                        ..
-                    })
-                ),
-                "{outcome:?}"
-            );
-        } else {
-            assert_eq!(unanswered(outcome), AmbiguousCause::CloudUnavailable(503));
-        }
-        server.finish_one();
-        assert!(!replaced_record_path(&fixture).exists());
-    }
-
-    let server = ScriptedHttpServer::respond(enrollment_response());
-    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
-    let outcome = join_unless_enrolled(
-        &fixture.config_path,
-        join_key(&server, JOIN_KEY_ID, &future_time()),
-        |_| {},
-    )
-    .expect("join a host with no state");
-    assert!(matches!(outcome, JoinOutcome::Joined(_)));
-    server.finish_one();
-    assert!(fixture.state_path.exists());
     assert!(!replaced_record_path(&fixture).exists());
-}
 
-// INV-RUNNER-37
-#[test]
-fn a_resent_rejoin_does_not_record_its_runner_twice() {
-    // The start that sent the rejoin stopped after it recorded the runner and
-    // before it replaced the state.
-    let server = ScriptedHttpServer::respond_in_sequence(vec![
-        empty_response("503 Service Unavailable"),
-        rejoin_response(),
-    ]);
-    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
-    fixture.write_joined_state();
-    let held = fixture.hold(join_key(&server, JOIN_KEY_ID, &future_time()));
-    unanswered(held.rejoin_once());
-    write_replaced_record(&fixture, &replaced_record(&[RUNNER_ID]), 0o600);
-
-    let response = rejoined(held.rejoin_once());
-
-    let requests = server.finish();
-    assert_eq!(requests.len(), 2);
-    assert_rejoined(&fixture, &response, &requests[1]);
-    assert_replaced_runners(&fixture, &[RUNNER_ID]);
-}
-
-// INV-RUNNER-37
-#[test]
-fn a_record_that_is_not_private_keeps_the_state_and_the_journal() {
-    let server = ScriptedHttpServer::respond(rejoin_response());
-    let fixture = EnrollmentFixture::new(&server, ACTIVATION_ID, future_time());
-    let state = fixture.write_joined_state();
-    let record = replaced_record(&[OTHER_RUNNER_ID]);
-    write_replaced_record(&fixture, &record, 0o644);
-    let held = fixture.hold(join_key(&server, JOIN_KEY_ID, &future_time()));
-
-    let outcome = held.rejoin_once();
-
-    assert!(
-        matches!(outcome, Err(EnrollmentError::UnsafePath(_))),
-        "{outcome:?}"
-    );
-    server.finish_one();
-    assert_eq!(fs::read(&fixture.state_path).expect("reread state"), state);
-    assert!(fixture.journal_path().exists());
-    let path = replaced_record_path(&fixture);
-    assert_eq!(fs::read(&path).expect("reread record"), record);
-    let mode = fs::symlink_metadata(&path).expect("inspect record").mode() & 0o7777;
-    assert_eq!(mode, 0o644);
-}
-
-fn read_replaced_runners(fixture: &EnrollmentFixture) -> Result<Vec<String>, ReplacedRunnersError> {
-    load_runner_service_configuration(&fixture.config_path)
-        .expect("load the enrolled host")
-        .state_access
-        .replaced_runners()
-}
-
-// INV-RUNNER-37
-#[test]
-fn the_service_reads_the_runners_the_rejoins_replaced() {
-    let fixture = rejoin_over_record(Some(&replaced_record(&[OTHER_RUNNER_ID])));
-    assert_eq!(
-        read_replaced_runners(&fixture).expect("read the record a rejoin wrote"),
-        [OTHER_RUNNER_ID, RUNNER_ID]
-    );
-
-    fs::remove_file(replaced_record_path(&fixture)).expect("remove the record");
-    assert_eq!(
-        read_replaced_runners(&fixture).expect("read an absent record"),
-        Vec::<String>::new()
-    );
-}
-
-// INV-RUNNER-37
-#[test]
-fn the_service_reads_no_list_from_a_record_that_does_not_check() {
-    let fixture = rejoin_over_record(None);
-    for record in [
-        b"not a record".to_vec(),
-        serde_json::to_vec(&serde_json::json!({
-            "schemaVersion": 2,
-            "replacedRunnerIds": [OTHER_RUNNER_ID]
-        }))
-        .expect("encode record"),
-        replaced_record(&[OTHER_RUNNER_ID, CREDENTIAL_ID]),
+    for (bytes, mode) in [
+        (replaced_record(&[OTHER_RUNNER_ID]), 0o600),
+        (b"not a record".to_vec(), 0o644),
     ] {
-        write_replaced_record(&fixture, &record, 0o600);
-        let error = read_replaced_runners(&fixture).expect_err("a record that does not check");
-        assert!(matches!(error, ReplacedRunnersError::Invalid), "{error:?}");
-        assert_eq!(error.cause(), "invalid");
+        let fixture = rejoin_over_record(Some((&bytes, mode)));
+        let path = replaced_record_path(&fixture);
+        assert_eq!(fs::read(&path).expect("reread record"), bytes);
+        let found = fs::symlink_metadata(&path).expect("inspect record").mode() & 0o7777;
+        assert_eq!(found, mode);
     }
-
-    write_replaced_record(&fixture, &replaced_record(&[OTHER_RUNNER_ID]), 0o644);
-    let error = read_replaced_runners(&fixture).expect_err("a record that is not private");
-    assert!(
-        matches!(error, ReplacedRunnersError::Unreadable(_)),
-        "{error:?}"
-    );
-    assert_eq!(error.cause(), "unreadable");
 }
 
 // REQ-RUNNERENROLL-106

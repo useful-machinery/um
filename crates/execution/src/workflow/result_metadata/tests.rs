@@ -256,67 +256,25 @@ fn encode(value: &Value) -> Vec<u8> {
     bytes
 }
 
-// INV-ENGINE-14
+// REQ-CONTINUE-21
 #[test]
-fn cloud_result_recovery_decisions_are_closed_and_legacy_bytes_stay_absent() {
-    let legacy = cloud_metadata_only_result_fixture();
-    let legacy_bytes = encode(&legacy);
-    let parsed: WorkflowResultV1 = serde_json::from_slice(&legacy_bytes).unwrap();
-    assert_eq!(validate_with_invariant(&parsed), Ok(()));
-    assert!(
-        serde_json::to_value(parsed)
-            .unwrap()
-            .get("workspaceRecovery")
-            .is_none()
-    );
-
-    let mut seeded = legacy.clone();
-    seeded["workspaceRecovery"] = json!({
-        "schemaVersion": 1, "status": "not_established", "reason": "registration_rejected"
-    });
-    let parsed: WorkflowResultV1 = serde_json::from_value(seeded.clone()).unwrap();
-    assert_eq!(validate_with_invariant(&parsed), Ok(()));
-    seeded["workspaceRecovery"]["reason"] = Value::Null;
-    let invalid: WorkflowResultV1 = serde_json::from_value(seeded.clone()).unwrap();
-    assert_eq!(
-        validate_with_invariant(&invalid),
-        Err(RunResultInvariant::ResultStructure)
-    );
-    seeded["workspaceRecovery"]
-        .as_object_mut()
-        .unwrap()
-        .remove("reason");
-    assert!(serde_json::from_value::<WorkflowResultV1>(seeded).is_err());
-
-    let mut local = result_fixture();
-    local["workspaceRecovery"] = json!({"schemaVersion":1,"status":"established","reason":null});
-    let local: WorkflowResultV1 = serde_json::from_value(local).unwrap();
-    assert_eq!(
-        validate_with_invariant(&local),
-        Err(RunResultInvariant::ResultStructure)
-    );
-}
-
-// INV-ENGINE-14
-#[test]
-fn seeded_cloud_continuation_recovery_reader_keeps_legacy_and_rejects_unbound_claims() {
-    let mut seeded = continuation_result_fixture();
+fn result_reader_declares_no_recovery_member() {
+    let mut cloud_continuation = continuation_result_fixture();
     let cloud = cloud_result_fixture();
-    seeded["workflow"]["provenance"] = cloud["workflow"]["provenance"].clone();
-    seeded["execution"] = cloud["execution"].clone();
+    cloud_continuation["workflow"]["provenance"] = cloud["workflow"]["provenance"].clone();
+    cloud_continuation["execution"] = cloud["execution"].clone();
     let prior_id = "atm_01k0z6r1w8f4jy2m7q9v3x5abc";
-    seeded["steps"][0]["detail"]["priorAttemptId"] = json!(prior_id);
-    seeded["outputProducers"]["produce"]["message"]["attemptId"] = json!(prior_id);
-    let legacy: WorkflowResultV1 = serde_json::from_value(seeded.clone()).unwrap();
-    assert_eq!(validate_with_invariant(&legacy), Ok(()));
-    assert!(
-        serde_json::to_value(legacy).unwrap()["continuation"]
-            .get("schemaVersion")
-            .is_none()
-    );
+    cloud_continuation["steps"][0]["detail"]["priorAttemptId"] = json!(prior_id);
+    cloud_continuation["outputProducers"]["produce"]["message"]["attemptId"] = json!(prior_id);
+    let parsed: WorkflowResultV1 = serde_json::from_value(cloud_continuation.clone()).unwrap();
+    assert_eq!(validate_with_invariant(&parsed), Ok(()));
 
-    seeded["continuation"]["schemaVersion"] = json!(2);
-    seeded["continuation"]["workspace"]["recovery"] = json!({
+    let mut versioned = cloud_continuation.clone();
+    versioned["continuation"]["schemaVersion"] = json!(2);
+    assert!(serde_json::from_value::<WorkflowResultV1>(versioned).is_err());
+
+    let mut recovery = cloud_continuation;
+    recovery["continuation"]["workspace"]["recovery"] = json!({
         "schemaVersion":1,
         "workspaceId":"rws_01k0z6r1w8f4jy2m7q9v3x5abc",
         "workRootId":"rwr_01k0z6r1w8f4jy2m7q9v3x5abc",
@@ -326,19 +284,14 @@ fn seeded_cloud_continuation_recovery_reader_keeps_legacy_and_rejects_unbound_cl
         "claimingAssignmentId":"asn_01k0z6r1w8f4jy2m7q9v3x5abc",
         "claimGeneration":1,"failure":null
     });
-    let parsed: WorkflowResultV1 = serde_json::from_value(seeded.clone()).unwrap();
-    assert_eq!(validate_with_invariant(&parsed), Ok(()));
-    seeded["continuation"]["workspace"]["recovery"]["claimGeneration"] = Value::Null;
-    let unbound: WorkflowResultV1 = serde_json::from_value(seeded.clone()).unwrap();
-    assert_eq!(
-        validate_with_invariant(&unbound),
-        Err(RunResultInvariant::Continuation)
-    );
-    seeded["continuation"]["workspace"]["recovery"]
-        .as_object_mut()
-        .unwrap()
-        .remove("failure");
-    assert!(serde_json::from_value::<WorkflowResultV1>(seeded).is_err());
+    assert!(serde_json::from_value::<WorkflowResultV1>(recovery).is_err());
+
+    let mut workspace_recovery = cloud_metadata_only_result_fixture();
+    assert!(serde_json::from_value::<WorkflowResultV1>(workspace_recovery.clone()).is_ok());
+    workspace_recovery["workspaceRecovery"] = json!({
+        "schemaVersion": 1, "status": "not_established", "reason": "registration_rejected"
+    });
+    assert!(serde_json::from_value::<WorkflowResultV1>(workspace_recovery).is_err());
 }
 
 #[test]

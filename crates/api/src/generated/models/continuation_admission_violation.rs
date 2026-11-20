@@ -19,8 +19,6 @@ use serde::{Deserialize, Serialize};
 pub struct ContinuationAdmissionViolation {
     #[serde(rename = "code")]
     pub code: Code,
-    #[serde(rename = "recoveryReason", skip_serializing_if = "Option::is_none")]
-    pub recovery_reason: Option<models::RecoveryReason>,
     #[serde(rename = "node", skip_serializing_if = "Option::is_none")]
     pub node: Option<String>,
     #[serde(rename = "producer", skip_serializing_if = "Option::is_none")]
@@ -35,7 +33,6 @@ impl ContinuationAdmissionViolation {
     pub fn new(code: Code) -> ContinuationAdmissionViolation {
         ContinuationAdmissionViolation {
             code,
-            recovery_reason: None,
             node: None,
             producer: None,
             reference: None,
@@ -53,8 +50,6 @@ pub enum Code {
     RetainedWorkspaceUnavailable,
     #[serde(rename = "ownership_unproven")]
     OwnershipUnproven,
-    #[serde(rename = "runner_discovering")]
-    RunnerDiscovering,
     #[serde(rename = "continuation_inputs_unsatisfied")]
     ContinuationInputsUnsatisfied,
     #[serde(rename = "continuation_nodes_unsatisfied")]
