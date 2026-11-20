@@ -337,6 +337,7 @@ async fn all_harness_assignment_uses_each_snapshot_with_its_own_configuration() 
     }
 }
 
+// REQ-AGENT-40
 #[tokio::test]
 async fn all_harness_assignment_attributes_a_claude_failure_to_its_step() {
     let (temporary, mut manager) = manager_fixture_with_harnesses(
@@ -359,7 +360,7 @@ async fn all_harness_assignment_attributes_a_claude_failure_to_its_step() {
             if workflow_event["eventType"] == "step_state_changed"
                 && workflow_event["stepId"] == "claude"
                 && workflow_event["to"] == "failed"
-                && workflow_event["detail"]["code"] == "harness_protocol_failed"
+                && workflow_event["detail"]["code"] == "harness_failed"
     )));
     assert!(matches!(
         reports.last(),

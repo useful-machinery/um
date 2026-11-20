@@ -7,6 +7,8 @@ fn main() -> ExitCode {
         useful_execution::run_child_guard_worker()
     } else if useful_execution::result_validation_worker_requested() {
         useful_execution::run_result_validation_worker()
+    } else if useful_execution::result_tool_worker_requested() {
+        useful_execution::run_result_tool_worker()
     } else {
         ExecutionOutcome::Failed
     };

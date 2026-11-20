@@ -9,14 +9,10 @@ use rustix::fs::{
 };
 use rustix::io::{Errno, dup};
 
-use serde::Serialize;
-
 use super::agent::{
     AgentCompatibilityProfile, AgentInvocationIdentity, AgentOutcome,
     AgentProtocolRejectionDiagnostic,
 };
-use super::agent_stream_excerpt::RejectedStreamExcerpt;
-use super::claude_code::ClaudeCodeStreamJsonV1TrackedWork;
 use super::private_staging::{open_directory_path, remove_open_tree_at};
 
 const DIAGNOSTICS_DIRECTORY: &str = "diagnostics";
@@ -423,39 +419,17 @@ impl AgentDiagnosticSession {
         if let AgentOutcome::Failed(failure) = outcome
             && let Some(rejection) = failure.protocol_rejection()
         {
-            let _ = self.retain_protocol_rejection(
-                rejection,
-                failure.stream_excerpt(),
-                failure.tracked_work(),
-            );
+            let _ = self.retain_protocol_rejection(rejection);
         }
     }
 
-    /// Writes the diagnostic's members and, beside them, the stream excerpt's `rejectedLine`
-    /// and `precedingLines` and the parser's `trackedWork`.
+    /// Writes the diagnostic's members.
     pub(crate) fn retain_protocol_rejection(
         &self,
         diagnostic: &AgentProtocolRejectionDiagnostic,
-        excerpt: Option<&RejectedStreamExcerpt>,
-        tracked_work: Option<&ClaudeCodeStreamJsonV1TrackedWork>,
     ) -> Result<(), AgentDiagnosticSessionError> {
-        #[derive(Serialize)]
-        struct RetainedProtocolRejection<'a> {
-            #[serde(flatten)]
-            diagnostic: &'a AgentProtocolRejectionDiagnostic,
-            #[serde(flatten, skip_serializing_if = "Option::is_none")]
-            excerpt: Option<&'a RejectedStreamExcerpt>,
-            #[serde(rename = "trackedWork", skip_serializing_if = "Option::is_none")]
-            tracked_work: Option<&'a ClaudeCodeStreamJsonV1TrackedWork>,
-        }
-
         self.verify_path_binding()?;
-        let retained = RetainedProtocolRejection {
-            diagnostic,
-            excerpt,
-            tracked_work,
-        };
-        let mut bytes = serde_json::to_vec_pretty(&retained)
+        let mut bytes = serde_json::to_vec_pretty(diagnostic)
             .map_err(|error| AgentDiagnosticSessionError::at("diagnostic I/O", error))?;
         bytes.push(b'\n');
         if bytes.len() > MAXIMUM_PROTOCOL_REJECTION_BYTES {
@@ -691,7 +665,6 @@ fn sync_directory(directory: &OwnedFd) -> Result<(), AgentDiagnosticSessionError
 
 #[cfg(test)]
 mod tests {
-    use std::num::{NonZeroU64, NonZeroUsize};
     use std::os::fd::OwnedFd;
     use std::os::unix::fs::PermissionsExt as _;
 
@@ -699,15 +672,8 @@ mod tests {
 
     use super::*;
     use crate::workflow::agent::{AgentOutcome, AgentValueKind, WorkflowRunId};
-    use crate::workflow::agent_stream_excerpt::RetainedStreamLine;
-    use crate::workflow::claude_code::{
-        ClaudeCodeStreamJsonV1Parser, ClaudeCodeStreamJsonV1ProtocolLimits,
-    };
     use crate::workflow::pi::{PiJsonV1Parser, PiJsonV1ProcessCompletion};
     use crate::workflow::runtime::{ActionId, TransitionSequence};
-
-    const CLAUDE_CODE_VERSION: &str =
-        crate::claude_code::CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION;
 
     fn diagnostic_store(temporary: &tempfile::TempDir) -> (PathBuf, AgentDiagnosticSessionStore) {
         diagnostic_store_for_attempt(temporary, 1)
@@ -817,6 +783,7 @@ mod tests {
         }
     }
 
+    // REQ-AGENT-42
     #[test]
     fn protocol_rejection_is_retained_beside_its_invocation_correlation() {
         let temporary = tempfile::tempdir().unwrap();
@@ -834,9 +801,7 @@ mod tests {
             panic!("invalid session header must fail");
         };
         let rejection = failure.protocol_rejection().unwrap();
-        allocated
-            .retain_protocol_rejection(rejection, None, None)
-            .unwrap();
+        allocated.retain_protocol_rejection(rejection).unwrap();
 
         assert!(allocated.directory().join(METADATA_FILE).is_file());
         let retained: serde_json::Value = serde_json::from_slice(
@@ -846,103 +811,6 @@ mod tests {
         assert_eq!(retained, serde_json::to_value(rejection).unwrap());
         assert_eq!(retained["profile"], "PiJsonV1");
         assert_eq!(retained["detail"]["reason"], "session_header_invalid");
-    }
-
-    fn retained_protocol_rejection(
-        allocated: &AgentDiagnosticSession,
-    ) -> (usize, serde_json::Value) {
-        let bytes = std::fs::read(allocated.directory().join(PROTOCOL_REJECTION_FILE)).unwrap();
-        (bytes.len(), serde_json::from_slice(&bytes).unwrap())
-    }
-
-    // REQ-AGENT-42, REQ-AGENT-71
-    #[test]
-    fn claude_rejection_is_retained_with_its_stream_excerpt_beside_the_diagnostic() {
-        let temporary = tempfile::tempdir().unwrap();
-        let (_, store) = diagnostic_store(&temporary);
-        let identity = invocation_identity();
-        let allocate = || {
-            store
-                .allocate(
-                    &identity,
-                    AgentCompatibilityProfile::ClaudeCodeStreamJsonV1,
-                    CLAUDE_CODE_VERSION,
-                )
-                .unwrap()
-        };
-        let allocated = allocate();
-        let session = "00000000-0000-4000-8000-0000000000c1";
-        let mut parser = ClaudeCodeStreamJsonV1Parser::profile(
-            Arc::from("/execution/worktree"),
-            Arc::from("model"),
-            Arc::from(session),
-            Arc::from(CLAUDE_CODE_VERSION),
-            AgentValueKind::None,
-            NonZeroU64::MIN,
-        );
-        let init = json!({
-            "type": "system",
-            "subtype": "init",
-            "cwd": "/execution/worktree",
-            "session_id": session,
-            "model": "model",
-            "permissionMode": "bypassPermissions",
-            "claude_code_version": CLAUDE_CODE_VERSION,
-        });
-        assert!(
-            parser
-                .push_stdout(format!("{init}\nnot-json\n").as_bytes(), drop)
-                .is_err()
-        );
-        let outcome = parser.finish(true);
-        let AgentOutcome::Failed(failure) = &outcome else {
-            panic!("an undecodable frame must fail");
-        };
-        allocated.retain_protocol_rejection_from(&outcome);
-
-        let (bytes, retained) = retained_protocol_rejection(&allocated);
-        assert!(bytes < MAXIMUM_PROTOCOL_REJECTION_BYTES);
-        let mut expected = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
-        let excerpt = serde_json::to_value(failure.stream_excerpt().unwrap()).unwrap();
-        expected
-            .as_object_mut()
-            .unwrap()
-            .extend(excerpt.as_object().unwrap().clone());
-        let tracked_work = serde_json::to_value(failure.tracked_work().unwrap()).unwrap();
-        expected
-            .as_object_mut()
-            .unwrap()
-            .insert(String::from("trackedWork"), tracked_work);
-        assert_eq!(retained, expected);
-        assert_eq!(retained["rejectedLine"]["text"], "not-json");
-        assert_eq!(retained["precedingLines"][0]["text"], init.to_string());
-        assert_eq!(retained["trackedWork"]["backgroundCommands"], json!([]));
-        assert_eq!(retained["trackedWork"]["subagentTasks"], json!([]));
-
-        // The largest excerpt the profile admits, every byte escaped, is still written.
-        let limits = ClaudeCodeStreamJsonV1ProtocolLimits::profile();
-        let line =
-            |bytes: NonZeroUsize| RetainedStreamLine::retain(&vec![b'"'; bytes.get()], bytes);
-        let maximal = RejectedStreamExcerpt::new(
-            Some(line(limits.maximum_rejected_line_bytes())),
-            (0..limits.retained_preceding_lines().get())
-                .map(|_| line(limits.maximum_preceding_line_bytes()))
-                .collect(),
-        );
-        let maximal_allocation = allocate();
-        maximal_allocation
-            .retain_protocol_rejection(
-                failure.protocol_rejection().unwrap(),
-                Some(&maximal),
-                failure.tracked_work(),
-            )
-            .unwrap();
-        let (bytes, retained) = retained_protocol_rejection(&maximal_allocation);
-        assert!(bytes > 16 * 1024 && bytes <= MAXIMUM_PROTOCOL_REJECTION_BYTES);
-        assert_eq!(
-            retained["rejectedLine"]["text"].as_str().map(str::len),
-            Some(limits.maximum_rejected_line_bytes().get())
-        );
     }
 
     #[test]

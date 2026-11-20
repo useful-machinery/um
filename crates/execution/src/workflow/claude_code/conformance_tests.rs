@@ -17,24 +17,27 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::process::Command;
 
 use super::super::test_support::host_scaled_watchdog;
-use super::adapter::{ClaudeCodeStreamJsonV1Adapter, premature_candidate_feedback};
-use super::lifecycle_matrix::{self, enforcement_nags, tool_names};
+use super::adapter::{ClaudeCodeStreamJsonV1Adapter, QUIET_BOUND, QUIET_BOUND_FORCE_DELAY};
+use super::adapter_tests::{
+    StagedClock, adapter_warnings, positive_integer_schema, result_mode, type_schema,
+    wait_for_turn_completed,
+};
+use super::outcome::{Ending, StepFacts, decide};
+use super::reader::StreamReader;
 use super::test_support::{
-    BACKGROUND_SUBAGENT_DESCRIPTION, BACKGROUND_SUBAGENT_PROMPT, BACKGROUND_SUBAGENT_RESPONSE,
-    BackgroundSubagent, ControlledProviderRequest, FixtureSignal, LoopbackBlock, LoopbackProvider,
-    MODEL, PendingClock, RecordingObservationSink, RunningProductionClaudeCode,
-    RunningStartedClaudeCode, SUBAGENT_OUTSTANDING, SyntheticClaudeCodeRoot, WATCHDOG,
-    admitted_adapter, assert_backgrounded_subagent_activity, assistant_text,
-    backgrounded_subagent_statuses, conformance_executable, conformance_limits,
-    exclusive_conformance_executable, invocation_identity, launched_agent_id,
-    next_request_or_outcome, subagent_statuses, version_probe_environment,
-    wait_for_completed_turns,
+    BackgroundSubagent, FixtureSignal, LoopbackBlock, LoopbackProvider, MODEL, PendingClock,
+    RESULT_TOOL, RecordingObservationSink, RunningProductionClaudeCode, RunningStartedClaudeCode,
+    SyntheticClaudeCodeRoot, WATCHDOG, admitted_adapter, assert_backgrounded_subagent_activity,
+    assistant_text, conformance_executable, conformance_limits, exclusive_conformance_executable,
+    invocation_identity, next_request_or_outcome, submission, version_probe_environment,
 };
 use super::*;
 use crate::workflow::admission::{CancellationReason, CancellationSource};
 use crate::workflow::agent::{
-    AgentAdapter, AgentInvocation, AgentInvocationStaging, AgentProcessContext, AgentPrompt,
-    AgentValueMode, StagedAgentAttachment, agent_start_channel,
+    AgentAdapter, AgentFailureCause, AgentHarnessFailureDetail, AgentInvocation,
+    AgentInvocationStaging, AgentLifecycleMilestone, AgentObservation, AgentOutcome,
+    AgentProcessContext, AgentPrompt, AgentValueKind, AgentValueMode, CanonicalHarnessFailure,
+    CompletedAgentInvocation, StagedAgentAttachment, agent_start_channel, failed_agent_outcome,
 };
 use crate::workflow::agent_diagnostics::AgentDiagnosticSession;
 use crate::workflow::diagnostic::StepDiagnosticLog;
@@ -48,7 +51,14 @@ const NATIVE_INSTRUCTION_MARKER: &str = "LIV2293_NATIVE_INSTRUCTION_MARKER";
 const NATIVE_SKILL_MARKER: &str = "LIV2293_NATIVE_SKILL_MARKER";
 const NATIVE_PLUGIN_MARKER: &str = "LIV2293_NATIVE_PLUGIN_MARKER";
 const NATIVE_MCP_MARKER: &str = "LIV2293_NATIVE_MCP_MARKER";
+const TESTING_SUBAGENT_PROMPT: &str = "Run the controlled test suite in the background.";
+const TESTING_SUBAGENT_DESCRIPTION: &str = "Run the tests";
 const DIRECT_SESSION_ID: &str = "00000000-0000-4000-8000-000000000001";
+const FIRST_TEXT_BLOCK: &str = "first text block";
+const SECOND_TEXT_BLOCK: &str = "second text block";
+/// What the pinned release's `result` carries for a final message of several text blocks:
+/// the last block's text alone (REQ-AGENT-26).
+const SEVERAL_BLOCK_RESPONSE: &str = SECOND_TEXT_BLOCK;
 
 async fn launch_response_lifecycle(
     executable: PathBuf,
@@ -77,25 +87,6 @@ async fn launch_recorded_response_lifecycle(
         AgentValueMode::Response {
             output: Arc::from("response"),
         },
-        observations.clone(),
-    )
-    .await_started()
-    .await
-}
-
-/// A Result-mode launch with the lifecycle matrix's schema, which any candidate is checked
-/// against and a positive integer satisfies.
-async fn launch_recorded_result_lifecycle(
-    executable: PathBuf,
-    root: &SyntheticClaudeCodeRoot,
-    provider: &LoopbackProvider,
-    observations: &RecordingObservationSink,
-) -> RunningStartedClaudeCode {
-    RunningProductionClaudeCode::launch(
-        executable,
-        root,
-        provider,
-        lifecycle_matrix::value_mode(lifecycle_matrix::Mode::Result),
         observations.clone(),
     )
     .await_started()
@@ -181,6 +172,7 @@ fn assert_retained_native_session(root: &SyntheticClaudeCodeRoot, expected: &[&s
 
 // REQ-AGENT-4
 // INV-HARNESS-10
+// INV-HARNESS-25
 #[test]
 #[ignore = "requires pinned harness"]
 fn pinned_real_claude_code_00_qualification_anchor_is_exact() {
@@ -209,6 +201,7 @@ fn pinned_real_claude_code_00_qualification_anchor_is_exact() {
     );
 }
 
+// INV-HARNESS-25
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthetic_root() {
@@ -240,7 +233,6 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
                 "command": format!("{} {}", std::env::var("USEFUL_CLAUDE_CODE_CONFORMANCE_SHELL").unwrap(), concurrent_hook.display())
             }));
         fs::write(settings_path, serde_json::to_vec(&settings).unwrap()).unwrap();
-        let expected_cwd = fs::canonicalize(root.project()).unwrap();
         let message = "Complete the deterministic synthetic exchange.";
 
         let mut command = Command::new(executable);
@@ -320,20 +312,15 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
         assert!(!output.stderr.is_empty());
         assert!(!provider.has_pending_request());
 
-        let mut parser = ClaudeCodeStreamJsonV1Parser::profile(
-            Arc::from(expected_cwd.to_str().unwrap()),
-            Arc::from(MODEL),
-            Arc::from(DIRECT_SESSION_ID),
-            Arc::from(QUALIFICATION_VERSION),
-            crate::workflow::agent::AgentValueKind::Response,
+        let mut reader = StreamReader::new(
+            AgentValueKind::Response,
             NonZeroU64::new(1024).unwrap(),
         );
         let mut native_observations = Vec::new();
         for chunk in output.stdout.chunks(7) {
-            parser
-                .push_stdout(chunk, |observation| native_observations.push(observation))
-                .unwrap();
+            reader.push(chunk, |observation| native_observations.push(observation));
         }
+        reader.finish(|observation| native_observations.push(observation));
         let init: Value = serde_json::from_slice(
             output.stdout.split(|byte| *byte == b'\n').next().unwrap(),
         )
@@ -359,12 +346,24 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
             observation,
             AgentObservation::ToolResult { call_id, is_error: true, .. } if call_id == mcp_call
         )));
-        assert!(parser.session_id().is_some());
-        assert_eq!(parser.completed_exchanges(), 1);
+        assert_eq!(
+            reader
+                .initialization()
+                .and_then(|initialization| initialization.claude_code_version.as_deref()),
+            Some(QUALIFICATION_VERSION)
+        );
         let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
-            parser.finish(true)
+            decide(StepFacts {
+                cancellation: None,
+                own_failure: None,
+                started: true,
+                value_kind: AgentValueKind::Response,
+                deciding_result: reader.deciding_result().cloned(),
+                accepted: None,
+                ending: Ending::Exited { success: true },
+            })
         else {
-            panic!("exact binary response must complete through the production parser");
+            panic!("exact binary response must complete through the reader and the rule");
         };
         assert_eq!(response.as_str(), RESPONSE);
         provider.shutdown().await;
@@ -372,6 +371,9 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
     .await;
 }
 
+// REQ-AGENT-26
+// REQ-AGENT-35
+// INV-HARNESS-25
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_claude_code_02_production_driver_returns_one_normalized_response() {
@@ -487,7 +489,15 @@ async fn pinned_real_claude_code_02_production_driver_returns_one_normalized_res
             request.body(),
             "caller-controlled-name"
         ));
-        request.release_text(RESPONSE);
+        // The final message carries several text blocks around a reasoning block.
+        request.release_blocks(vec![
+            LoopbackBlock::text(FIRST_TEXT_BLOCK),
+            LoopbackBlock::thinking(&["between the text blocks"]),
+            LoopbackBlock::text(SECOND_TEXT_BLOCK),
+        ]);
+        // The adapter holds standard input open and no adapter deadline fires on the pending
+        // clock, so the step can end only by Claude Code's own idle exit after the turn
+        // (REQ-AGENT-35).
         execution.await.unwrap();
 
         let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
@@ -495,127 +505,38 @@ async fn pinned_real_claude_code_02_production_driver_returns_one_normalized_res
         else {
             panic!("production exact-binary adapter must return one response outcome");
         };
-        assert_eq!(response.as_str(), RESPONSE);
-        assert_eq!(observations.concatenated_text(assistant_text), RESPONSE);
+        assert_eq!(response.as_str(), SEVERAL_BLOCK_RESPONSE);
+        assert_eq!(
+            observations.concatenated_text(assistant_text),
+            format!("{FIRST_TEXT_BLOCK}{SECOND_TEXT_BLOCK}")
+        );
         let diagnostic = diagnostics.get("agent").unwrap();
         assert!(diagnostic.standard_output().bytes().is_empty());
         assert!(!diagnostic.standard_error().bytes().is_empty());
         assert_eq!(diagnostic.standard_error().truncation(), None);
         assert!(diagnostic.standard_error().fully_drained());
-        assert!(!observations.snapshot().iter().any(|observation| matches!(
-            observation.observation(),
-            AgentObservation::UnrecognizedHarnessEvent { .. }
-        )));
-        assert!(!provider.has_pending_request());
-        assert_retained_native_session(
-            &root,
-            &["Complete through the production Scherzo adapter.", RESPONSE],
-        );
-        provider.shutdown().await;
-    })
-    .await;
-}
-
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_03_corrects_a_result_in_one_production_conversation() {
-    let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog("pinned Claude Code result-correction", WATCHDOG, async {
-        let mut provider = LoopbackProvider::start().await;
-        let root = SyntheticClaudeCodeRoot::new();
-        let admitted_root = AdmittedExecutionRoot::admit(root.project()).unwrap();
-        let working_directory = admitted_root.select_working_directory(None).unwrap();
-        let value_mode = lifecycle_matrix::value_mode(lifecycle_matrix::Mode::Result);
-        let limits = conformance_limits();
-        let observations = RecordingObservationSink::default();
-        let invocation = AgentInvocation::new(
-            invocation_identity("claude-code-result-conformance", "agent"),
-            admitted_adapter(executable, MODEL),
-            AgentProcessContext::new(working_directory, root.environment_snapshot(&provider)),
-            AgentInvocationStaging::new(root.private().to_owned()),
-            AgentDiagnosticSession::claude_code_fixture(root.private().join("diagnostics/session")),
-            AgentPrompt::new(
-                Arc::from(fs::read_to_string(root.system_prompt()).unwrap()),
-                Arc::from("Return the requested structured result."),
-            ),
-            Arc::from([]),
-            value_mode.clone(),
-            limits,
-            CancellationSource::new(),
-            ProcessGuardRegistry::default(),
-            observations.clone(),
-        );
-        let adapter = ClaudeCodeStreamJsonV1Adapter::with_worker(
-            StepDiagnosticLog::default(),
-            NonZeroU64::new(1024).unwrap(),
-            PendingClock,
-            NoopExecutionObserver,
-            super::adapter_tests::InlineValidationWorker,
-        );
-        let (started, start) = agent_start_channel();
-        let (terminal, outcome) = tokio::sync::oneshot::channel();
-        let mut execution = tokio::spawn(async move {
-            let _ = terminal.send(adapter.invoke(invocation, started).await);
-        });
-
-        start.receive().await.unwrap();
-        let first = provider.next_request().await;
-        assert!(contains_exact_string(first.body(), "StructuredOutput"));
-        first.release_structured_output(json!({"result": -1}));
-
-        let second = tokio::select! {
-            request = provider.next_request() => request,
-            joined = &mut execution => {
-                joined.unwrap();
-                panic!("adapter ended before correction request: {:?}", outcome.await);
-            }
-        };
-        assert!(contains_exact_value(second.body(), &json!({"result": -1})));
-        assert!(contains_string_fragment(
-            second.body(),
-            "Result rejected by the workflow schema:"
-        ));
-        // The corrected candidate follows a thinking block, as a Claude model with extended
-        // thinking submits it; reaching the accepted result proves a thinking sibling leaves
-        // the candidate standalone on the exact binary.
-        second.release_blocks(vec![
-            LoopbackBlock::thinking(&["correcting the result "]),
-            LoopbackBlock::tool_use(STRUCTURED_OUTPUT_TOOL_NAME, json!({"result": 7})),
-        ]);
-        execution.await.unwrap();
-
-        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) =
-            outcome.await.unwrap()
-        else {
-            panic!("exact binary corrected result must complete");
-        };
-        assert_eq!(result.value(), &json!(7));
-        let observations = observations.snapshot();
-        assert_eq!(
-            observations
-                .iter()
-                .filter(|observation| matches!(
-                    observation.observation(),
-                    AgentObservation::ValueRejected {
-                        kind: AgentValueKind::Result,
-                        ..
-                    }
-                ))
-                .count(),
-            1
-        );
-        assert!(observations.iter().any(|observation| matches!(
-            observation.observation(),
-            AgentObservation::Lifecycle {
-                milestone: AgentLifecycleMilestone::HarnessQuiescent,
-            }
-        )));
+        // Thinking makes Claude Code interleave `system/thinking_tokens` estimates, which the
+        // reader leaves unrecognized; nothing else in the exchange is.
+        let unrecognized = observations
+            .snapshot()
+            .iter()
+            .filter_map(|observation| match observation.observation() {
+                AgentObservation::UnrecognizedHarnessEvent { event }
+                    if event["subtype"] != "thinking_tokens" =>
+                {
+                    Some(Arc::clone(event))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(unrecognized.is_empty(), "{unrecognized:?}");
         assert!(!provider.has_pending_request());
         assert_retained_native_session(
             &root,
             &[
-                "Return the requested structured result.",
-                "Result rejected by the workflow schema:",
+                "Complete through the production Scherzo adapter.",
+                FIRST_TEXT_BLOCK,
+                SECOND_TEXT_BLOCK,
             ],
         );
         provider.shutdown().await;
@@ -623,11 +544,398 @@ async fn pinned_real_claude_code_03_corrects_a_result_in_one_production_conversa
     .await;
 }
 
+// SC-AGENT-3
+// REQ-AGENT-84
+// INV-HARNESS-25
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_03_result_tool_corrects_a_rejected_value_in_one_turn() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
+    host_scaled_watchdog("pinned Claude Code result correction", WATCHDOG, async {
+        let mut provider = LoopbackProvider::start().await;
+        let root = SyntheticClaudeCodeRoot::new();
+        let observations = RecordingObservationSink::default();
+        let running = RunningProductionClaudeCode::launch(
+            executable,
+            &root,
+            &provider,
+            result_mode(positive_integer_schema()),
+            observations.clone(),
+        )
+        .await_started()
+        .await;
+        let mut terminal = running.terminal;
+
+        let first = next_request_or_outcome(&mut provider, &mut terminal).await;
+        assert!(first.offers_result_tool());
+        first.release_submission(json!(0));
+        let correction = next_request_or_outcome(&mut provider, &mut terminal).await;
+        let (rejected, feedback) = correction.tool_answer();
+        assert!(rejected, "the rejected submission was answered as accepted");
+        // The corrected value follows a reasoning block, as a model with extended thinking
+        // submits it.
+        correction.release_blocks(vec![
+            LoopbackBlock::thinking(&["correcting the result"]),
+            LoopbackBlock::tool_use(RESULT_TOOL, submission(json!(7))),
+        ]);
+        let accepted = next_request_or_outcome(&mut provider, &mut terminal).await;
+        assert!(
+            !accepted.tool_answer().0,
+            "the valid submission was rejected"
+        );
+        accepted.release_text("submitted");
+        let outcome = terminal.await.unwrap();
+        running.task.await.unwrap();
+
+        assert_eq!(result_value(outcome), json!(7));
+        let rejections = value_rejections(&observations);
+        assert_eq!(rejections.len(), 1, "{rejections:?}");
+        // Claude Code trims the answer's trailing newline.
+        assert_eq!(feedback.trim_end(), rejections[0].trim_end());
+        // One `system/init` for the whole exchange: the correction stays in the turn.
+        assert_eq!(
+            milestones(&observations, AgentLifecycleMilestone::SessionEstablished),
+            1
+        );
+        assert!(!provider.has_pending_request());
+        assert_retained_native_session(&root, &["Complete the controlled lifecycle exchange."]);
+        provider.shutdown().await;
+    })
+    .await;
+}
+
+// SC-AGENT-7
+// REQ-AGENT-35
+// REQ-AGENT-64
+// REQ-AGENT-85
+// INV-HARNESS-25
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_03b_the_last_submission_after_a_backgrounded_subagent_stands() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
+    host_scaled_watchdog(
+        "pinned Claude Code backgrounded-subagent result",
+        WATCHDOG,
+        async {
+            let mut provider = LoopbackProvider::start().await;
+            let root = SyntheticClaudeCodeRoot::new();
+            let subagent = BackgroundSubagent::new(&root);
+            let observations = RecordingObservationSink::default();
+            let running = RunningProductionClaudeCode::launch(
+                executable,
+                &root,
+                &provider,
+                result_mode(positive_integer_schema()),
+                observations.clone(),
+            )
+            .await_started()
+            .await;
+            let mut terminal = running.terminal;
+
+            // A is submitted while the subagent runs, and the agent ends its turn.
+            subagent
+                .start(&mut provider, &mut terminal)
+                .await
+                .release_submission(json!(3));
+            let answered = next_request_or_outcome(&mut provider, &mut terminal).await;
+            assert!(!answered.tool_answer().0, "A was rejected");
+            answered.release_text("waiting for the subagent");
+            wait_for_turn_completed(&observations).await;
+            assert!(matches!(
+                terminal.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+
+            // The subagent's end begins a turn, in which B is submitted.
+            subagent
+                .finish(&mut provider, &mut terminal)
+                .await
+                .release_submission(json!(7));
+            let answered = next_request_or_outcome(&mut provider, &mut terminal).await;
+            assert!(!answered.tool_answer().0, "B was rejected");
+            answered.release_text("final response");
+            let outcome = terminal.await.unwrap();
+            running.task.await.unwrap();
+
+            assert_eq!(result_value(outcome), json!(7));
+            assert_backgrounded_subagent_activity(&observations);
+            assert!(!provider.has_pending_request());
+            assert_retained_native_session(&root, &["waiting for the subagent", "final response"]);
+            provider.shutdown().await;
+        },
+    )
+    .await;
+}
+
+// REQ-AGENT-32
+// REQ-AGENT-84
+// INV-HARNESS-25
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_03c_a_string_and_a_null_come_back_as_written() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
+    // Two launches, each ending by the idle exit.
+    host_scaled_watchdog("pinned Claude Code value fidelity", WATCHDOG * 2, async {
+        for (schema, value) in [("string", json!("7")), ("null", Value::Null)] {
+            let mut provider = LoopbackProvider::start().await;
+            let root = SyntheticClaudeCodeRoot::new();
+            let running = RunningProductionClaudeCode::launch(
+                executable.clone(),
+                &root,
+                &provider,
+                result_mode(type_schema(schema)),
+                RecordingObservationSink::default(),
+            )
+            .await_started()
+            .await;
+            let mut terminal = running.terminal;
+            next_request_or_outcome(&mut provider, &mut terminal)
+                .await
+                .release_submission(value.clone());
+            let answered = next_request_or_outcome(&mut provider, &mut terminal).await;
+            assert!(
+                !answered.tool_answer().0,
+                "the {schema} submission was rejected"
+            );
+            answered.release_text("submitted");
+            let outcome = terminal.await.unwrap();
+            running.task.await.unwrap();
+            assert_eq!(result_value(outcome), value, "{schema}");
+            assert!(!provider.has_pending_request());
+            provider.shutdown().await;
+        }
+    })
+    .await;
+}
+
+// REQ-AGENT-35
+// INV-HARNESS-25
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_03d_a_main_thread_background_command_begins_the_submitting_turn() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
+    host_scaled_watchdog("pinned Claude Code background command", WATCHDOG, async {
+        let mut provider = LoopbackProvider::start().await;
+        let root = SyntheticClaudeCodeRoot::new();
+        let ready = FixtureSignal::create(root.private().join("background-ready"));
+        let blocker = root.private().join("background-blocker");
+        mkfifo(&blocker, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+        let operations = root.private().join("sandbox-operations");
+        fs::create_dir_all(operations.join("empty")).unwrap();
+        fs::write(operations.join("edit.txt"), b"before\n").unwrap();
+        fs::write(operations.join("remove.txt"), b"remove me\n").unwrap();
+        // The synthetic root's /usr/bin:/bin PATH has no coreutils on NixOS.
+        // Supply only this command's pinned tools without changing fixture isolation.
+        let tools_path = std::env::var("USEFUL_CLAUDE_CODE_CONFORMANCE_TOOLS_PATH")
+            .expect("CLI Devenv must supply the native conformance tools");
+        let observations = RecordingObservationSink::default();
+        let running = RunningProductionClaudeCode::launch(
+            executable,
+            &root,
+            &provider,
+            result_mode(positive_integer_schema()),
+            observations.clone(),
+        )
+        .await_started()
+        .await;
+        let mut terminal = running.terminal;
+        next_request_or_outcome(&mut provider, &mut terminal).await.release_tool_use(
+            "Bash",
+            json!({
+                "command": format!(
+                    "export PATH='{tools_path}'; printf 'ready\\n' > '{}' && IFS= read -r done < '{}' && sed -i 's/before/after/' '{}/edit.txt' && rm '{}/remove.txt' && rmdir '{}/empty' && printf 'background finished\\n'",
+                    ready.path().display(), blocker.display(), operations.display(), operations.display(), operations.display()
+                ),
+                "description": "Run a controlled background command",
+                "run_in_background": true,
+            }),
+        );
+        // The tool returns a task identity before its child is released, and the agent
+        // ends its turn without a submission.
+        let next = next_request_or_outcome(&mut provider, &mut terminal).await;
+        assert_eq!(ready.receive().await, b"ready\n");
+        next.release_text("first response");
+        wait_for_turn_completed(&observations).await;
+        assert!(matches!(
+            terminal.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        tokio::task::spawn_blocking(move || fs::write(blocker, b"done\n").unwrap())
+            .await
+            .unwrap();
+
+        // The command's end begins the turn in which the agent submits.
+        next_request_or_outcome(&mut provider, &mut terminal)
+            .await
+            .release_submission(json!(7));
+        let answered = next_request_or_outcome(&mut provider, &mut terminal).await;
+        assert!(!answered.tool_answer().0, "the submission was rejected");
+        answered.release_text("final response");
+        let outcome = terminal.await.unwrap();
+        running.task.await.unwrap();
+
+        assert_eq!(result_value(outcome), json!(7));
+        assert_eq!(fs::read(operations.join("edit.txt")).unwrap(), b"after\n");
+        assert!(!operations.join("remove.txt").exists());
+        assert!(!operations.join("empty").exists());
+        assert!(!provider.has_pending_request());
+        assert_retained_native_session(&root, &["first response", "final response"]);
+        provider.shutdown().await;
+    })
+    .await;
+}
+
+// SC-AGENT-8
+// REQ-AGENT-35
+// INV-HARNESS-25
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_03e_a_subagents_own_background_command_is_waited_for() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
+    host_scaled_watchdog(
+        "pinned Claude Code subagent background command",
+        WATCHDOG,
+        async {
+            let mut provider = LoopbackProvider::start().await;
+            let root = SyntheticClaudeCodeRoot::new();
+            let tests = BackgroundSubagent::named(&root, "subagent-tests");
+            let observations = RecordingObservationSink::default();
+            let running = RunningProductionClaudeCode::launch(
+                executable,
+                &root,
+                &provider,
+                result_mode(positive_integer_schema()),
+                observations.clone(),
+            )
+            .await_started()
+            .await;
+            let mut terminal = running.terminal;
+
+            // The agent launches a subagent in the background, which starts its tests as a
+            // background command and ends. 2.1.321 stops a foreground subagent's background
+            // command when the subagent ends, so only a backgrounded one outlives it.
+            next_request_or_outcome(&mut provider, &mut terminal)
+                .await
+                .release_tool_use(
+                    "Agent",
+                    json!({
+                        "description": TESTING_SUBAGENT_DESCRIPTION,
+                        "prompt": TESTING_SUBAGENT_PROMPT,
+                        "subagent_type": "general-purpose",
+                        "run_in_background": true,
+                    }),
+                );
+            // The agent's turn is held until the subagent has reported, so that its report
+            // reaches the agent in a turn of its own.
+            let mut held_turn = None;
+            let mut command_started = false;
+            let mut reported = false;
+            while held_turn.is_none() || !reported {
+                let request = next_request_or_outcome(&mut provider, &mut terminal).await;
+                if !request.opens_with(TESTING_SUBAGENT_PROMPT) {
+                    assert!(held_turn.is_none(), "the agent asked twice in its turn");
+                    held_turn = Some(request);
+                } else if command_started {
+                    tests.await_ready().await;
+                    request.release_text("the tests are running in the background");
+                    reported = true;
+                } else {
+                    let mut command = tests.blocking_command();
+                    command["run_in_background"] = json!(true);
+                    request.release_tool_use("Bash", command);
+                    command_started = true;
+                }
+            }
+            held_turn.unwrap().release_text("waiting for the subagent");
+
+            // The subagent's report begins a turn, which the agent ends without a submission;
+            // Claude Code keeps running for the subagent's command.
+            let woken = next_request_or_outcome(&mut provider, &mut terminal).await;
+            assert!(!woken.opens_with(TESTING_SUBAGENT_PROMPT));
+            woken.release_text("still waiting for the tests");
+
+            // The command's end resumes the subagent, whose report wakes the agent.
+            tests.release();
+            let mut resumed = false;
+            let woken = loop {
+                let request = next_request_or_outcome(&mut provider, &mut terminal).await;
+                if !request.opens_with(TESTING_SUBAGENT_PROMPT) {
+                    break request;
+                }
+                request.release_text("the tests passed");
+                resumed = true;
+            };
+            assert!(
+                resumed,
+                "the agent was woken before the subagent was resumed"
+            );
+            woken.release_submission(json!(7));
+            let answered = next_request_or_outcome(&mut provider, &mut terminal).await;
+            assert!(!answered.tool_answer().0, "the submission was rejected");
+            answered.release_text("final response");
+            let outcome = terminal.await.unwrap();
+            running.task.await.unwrap();
+
+            assert_eq!(result_value(outcome), json!(7));
+            assert!(!provider.has_pending_request());
+            assert_retained_native_session(
+                &root,
+                &["still waiting for the tests", "final response"],
+            );
+            provider.shutdown().await;
+        },
+    )
+    .await;
+}
+
+// REQ-AGENT-31
+// REQ-AGENT-84
+// REQ-AGENT-86
+// INV-HARNESS-25
+#[tokio::test]
+#[ignore = "requires pinned harness"]
+async fn pinned_real_claude_code_03f_a_turn_without_a_submission_fails_missing_result() {
+    let (executable, _exclusive) = exclusive_conformance_executable().await;
+    host_scaled_watchdog("pinned Claude Code missing result", WATCHDOG, async {
+        let mut provider = LoopbackProvider::start().await;
+        let root = SyntheticClaudeCodeRoot::new();
+        let running = RunningProductionClaudeCode::launch(
+            executable,
+            &root,
+            &provider,
+            result_mode(positive_integer_schema()),
+            RecordingObservationSink::default(),
+        )
+        .await_started()
+        .await;
+        let mut terminal = running.terminal;
+        next_request_or_outcome(&mut provider, &mut terminal)
+            .await
+            .release_text(RESPONSE);
+        // Nothing reminds the agent: the provider sees no further request before the exit.
+        let outcome = tokio::select! {
+            outcome = &mut terminal => outcome.unwrap(),
+            request = provider.next_request() => {
+                panic!("Claude Code asked again after a turn without a submission: {}", request.body())
+            }
+        };
+        running.task.await.unwrap();
+        assert_eq!(outcome, failed_agent_outcome(AgentFailureCause::MissingResult));
+        assert!(!provider.has_pending_request());
+        assert_retained_native_session(&root, &[RESPONSE]);
+        provider.shutdown().await;
+    })
+    .await;
+}
+
+// REQ-AGENT-70
+// INV-HARNESS-25
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_claude_code_04_production_no_value_and_native_failure_are_typed() {
     let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog("pinned Claude Code no-value/failure", WATCHDOG, async {
+    // Two launches, each ending by Claude Code's own exit.
+    host_scaled_watchdog("pinned Claude Code no-value/failure", WATCHDOG * 2, async {
         let mut success_provider = LoopbackProvider::start().await;
         let success_root = SyntheticClaudeCodeRoot::new();
         let success = RunningProductionClaudeCode::launch(
@@ -680,12 +988,24 @@ async fn pinned_real_claude_code_04_production_no_value_and_native_failure_are_t
                 }
             }
         };
-        assert_eq!(
-            outcome,
-            failed_agent_outcome(AgentFailureCause::HarnessFailed {
-                detail: AgentHarnessFailureDetail::ModelError,
-            })
-        );
+        let AgentOutcome::Failed(failure) = &outcome else {
+            panic!("a native model error must fail the step, got {outcome:?}");
+        };
+        let AgentFailureCause::HarnessFailed {
+            detail:
+                AgentHarnessFailureDetail::Classified {
+                    canonical: CanonicalHarnessFailure::ModelError,
+                    diagnostic,
+                },
+        } = failure.cause()
+        else {
+            panic!("a native model error must be classified, got {outcome:?}");
+        };
+        // 2.1.321 names the class of a 400 `invalid_request_error` `unknown` in its api-error
+        // message and the turn's `terminal_reason` `api_error`.
+        assert_eq!(diagnostic.harness_error, Some("other"), "{outcome:?}");
+        assert_eq!(diagnostic.http_status, Some(400), "{outcome:?}");
+        assert_eq!(diagnostic.resets_at, None);
         assert!(!failure_provider.has_pending_request());
         assert_retained_native_session(
             &failure_root,
@@ -696,66 +1016,58 @@ async fn pinned_real_claude_code_04_production_no_value_and_native_failure_are_t
     .await;
 }
 
+// INV-HARNESS-25
 #[tokio::test]
 #[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_04b_provider_overload_retries_and_stream_error_fails_closed() {
+async fn pinned_real_claude_code_04b_provider_overload_and_stream_error_are_retried() {
     let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog("pinned Claude Code overload probe", WATCHDOG, async {
+    // Two launches, each ending by Claude Code's own exit.
+    host_scaled_watchdog("pinned Claude Code overload probe", WATCHDOG * 2, async {
+        // A stream error after thinking, before the message ends, is retried by Claude
+        // Code: the damaged exchange is no protocol failure, and the retry's answer is the
+        // response.
         let mut provider = LoopbackProvider::start().await;
         let root = SyntheticClaudeCodeRoot::new();
         let observations = RecordingObservationSink::default();
         let running =
-            launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;
-        provider
-            .next_request()
+            launch_recorded_response_lifecycle(executable.clone(), &root, &provider, &observations)
+                .await;
+        let mut terminal = running.terminal;
+        next_request_or_outcome(&mut provider, &mut terminal)
             .await
             .release_overload_after_thinking();
-        let outcome = running.finish().await;
-        let AgentOutcome::Failed(failure) = outcome else {
-            panic!("damaged native exchange must fail closed, got {outcome:?}");
+        let retry = next_request_or_outcome(&mut provider, &mut terminal).await;
+        assert!(retry.used_placeholder_key());
+        retry.release_text(RESPONSE);
+        let outcome = terminal.await.unwrap();
+        running.task.await.unwrap();
+        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
+            panic!("a retried stream error must produce the retry's response, got {outcome:?}");
         };
-        assert_eq!(failure.cause(), &AgentFailureCause::HarnessProtocolFailed);
-        let rejection = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
-        assert_eq!(rejection["detail"]["reason"], "message_transition_invalid");
-        assert!(observations.concatenated_text(assistant_text).is_empty());
+        assert_eq!(response.as_str(), RESPONSE);
         assert!(!provider.has_pending_request());
-        // Native failure before transcript creation is allowed, but the owned links
-        // must never leave an ambient resumable conversation behind.
-        let ambient_paths = root.ambient_session_paths(DIRECT_SESSION_ID);
-        for ambient in &ambient_paths {
-            assert!(!ambient.exists());
-        }
-        // The adapter removes the ambient project directory it created once it
-        // is empty, so one that remains holds an entry the harness left.
-        assert!(
-            !ambient_paths[0].parent().unwrap().exists(),
-            "ambient project history retained an unrelated entry"
-        );
+        assert_retained_native_session(&root, &[RESPONSE]);
         provider.shutdown().await;
 
-        // An overload before stream initialization can be retried by Claude Code;
-        // the adapter still accepts only the final completed exchange as response.
+        // An overload before stream initialization is retried the same way.
         let mut retry_provider = LoopbackProvider::start().await;
         let retry_root = SyntheticClaudeCodeRoot::new();
         let retry_observations = RecordingObservationSink::default();
         let retry_running = launch_recorded_response_lifecycle(
-            conformance_executable(),
+            executable,
             &retry_root,
             &retry_provider,
             &retry_observations,
         )
         .await;
-        retry_provider.next_request().await.release_overload();
-        let terminal = retry_running.terminal;
-        tokio::pin!(terminal);
-        let retry_outcome = tokio::select! {
-            request = retry_provider.next_request() => {
-                assert!(request.used_placeholder_key());
-                request.release_text(RESPONSE);
-                terminal.await.unwrap()
-            }
-            outcome = &mut terminal => outcome.unwrap(),
-        };
+        let mut terminal = retry_running.terminal;
+        next_request_or_outcome(&mut retry_provider, &mut terminal)
+            .await
+            .release_overload();
+        let request = next_request_or_outcome(&mut retry_provider, &mut terminal).await;
+        assert!(request.used_placeholder_key());
+        request.release_text(RESPONSE);
+        let retry_outcome = terminal.await.unwrap();
         retry_running.task.await.unwrap();
         let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = retry_outcome
         else {
@@ -773,86 +1085,8 @@ async fn pinned_real_claude_code_04b_provider_overload_retries_and_stream_error_
     .await;
 }
 
-// SC-AGENT-7
-// REQ-AGENT-75
-// REQ-AGENT-70
-// UM-3076: a native failure with a backgrounded subagent outstanding. In Result mode the
-// lead launches a builder in the background and its own next request fails natively; the
-// adapter closes stdin, the builder runs on, and the turn its notification begins ends the
-// step with the classified model error, not with a rejection of that turn's init.
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_04c_native_failure_with_a_backgrounded_subagent_outstanding_is_the_model_error()
- {
-    let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog(
-        "pinned Claude Code native-failure-with-subagent",
-        WATCHDOG,
-        async {
-            let mut provider = LoopbackProvider::start().await;
-            let root = SyntheticClaudeCodeRoot::new();
-            let subagent = BackgroundSubagent::new(&root);
-            let observations = RecordingObservationSink::default();
-            let running =
-                launch_recorded_result_lifecycle(executable, &root, &provider, &observations).await;
-            let mut terminal = running.terminal;
-
-            // The main thread's request after the launch is rejected by the provider, as is
-            // every bounded native retry (as in `04`), until the turn ends as a native failure.
-            subagent
-                .start(&mut provider, &mut terminal)
-                .await
-                .release_invalid_request();
-            let mut attempts = 1;
-            loop {
-                tokio::select! {
-                    request = next_request_or_outcome(&mut provider, &mut terminal) => {
-                        assert!(!request.opens_with(BACKGROUND_SUBAGENT_PROMPT));
-                        attempts += 1;
-                        assert!(attempts <= 8, "native invalid-request recovery must be bounded");
-                        request.release_invalid_request();
-                    }
-                    () = wait_for_completed_turns(&observations, 1) => break,
-                }
-            }
-            // The failed turn ended the exchange, not the invocation: the subagent still runs.
-            assert!(matches!(
-                terminal.try_recv(),
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-            ));
-
-            // Released, the subagent closes its own turn and its notification begins a main
-            // turn, whose init ends the stream with the native failure. A main-thread request
-            // Claude Code gets off before the group is forced is answered and never parsed.
-            subagent.release().await;
-            let outcome = loop {
-                tokio::select! {
-                    request = provider.next_request() => {
-                        if request.opens_with(BACKGROUND_SUBAGENT_PROMPT) {
-                            request.release_text(BACKGROUND_SUBAGENT_RESPONSE);
-                        } else {
-                            request.release_text("after the failure");
-                        }
-                    }
-                    outcome = &mut terminal => break outcome.unwrap(),
-                }
-            };
-            running.task.await.unwrap();
-            assert_eq!(
-                outcome,
-                failed_agent_outcome(AgentFailureCause::HarnessFailed {
-                    detail: AgentHarnessFailureDetail::ModelError,
-                })
-            );
-            // The subagent's completion was observed after the failed turn: the drain went on
-            // and the notified turn, not the end of the stream, met the failure.
-            assert_backgrounded_subagent_activity(&observations);
-            provider.shutdown().await;
-        },
-    )
-    .await;
-}
-
+// INV-HARNESS-8
+// INV-HARNESS-25
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_claude_code_05_cancels_a_blocked_provider_request() {
@@ -872,7 +1106,9 @@ async fn pinned_real_claude_code_05_cancels_a_blocked_provider_request() {
                     .request_cancellation(CancellationReason::UserRequest)
             );
             running.process_control.interrupt();
+            let process_group = running.process_group.clone();
             assert_user_cancelled(running).await;
+            assert!(process_group_is_quiescent(process_group.get()));
             drop(blocked_request);
             assert!(!provider.has_pending_request());
             assert_retained_native_session(&root, &["Complete the controlled lifecycle exchange."]);
@@ -882,6 +1118,8 @@ async fn pinned_real_claude_code_05_cancels_a_blocked_provider_request() {
     .await;
 }
 
+// INV-HARNESS-8
+// INV-HARNESS-25
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_claude_code_06_cancels_a_stubborn_bash_descendant() {
@@ -911,7 +1149,7 @@ async fn pinned_real_claude_code_06_cancels_a_stubborn_bash_descendant() {
                 }),
             );
             let child = process_id(&child.receive().await);
-            let process_group = getpgid(Some(child)).unwrap();
+            let child_group = getpgid(Some(child)).unwrap();
 
             assert!(
                 running
@@ -919,9 +1157,11 @@ async fn pinned_real_claude_code_06_cancels_a_stubborn_bash_descendant() {
                     .request_cancellation(CancellationReason::UserRequest)
             );
             running.process_control.interrupt();
+            let process_group = running.process_group.clone();
 
             assert_user_cancelled(running).await;
-            assert!(process_group_is_quiescent(process_group));
+            assert!(process_group_is_quiescent(process_group.get()));
+            assert!(process_group_is_quiescent(child_group));
             assert!(!provider.has_pending_request());
             assert_retained_native_session(&root, &["Complete the controlled lifecycle exchange."]);
             provider.shutdown().await;
@@ -930,6 +1170,8 @@ async fn pinned_real_claude_code_06_cancels_a_stubborn_bash_descendant() {
     .await;
 }
 
+// INV-HARNESS-8
+// INV-HARNESS-25
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires pinned harness"]
@@ -960,7 +1202,7 @@ async fn pinned_real_claude_code_06b_headless_term_and_cont_quiesce_owned_work()
             }),
         );
         let child = process_id(&child.receive().await);
-        let process_group = getpgid(Some(child)).unwrap();
+        let child_group = getpgid(Some(child)).unwrap();
         let status = fs::read_to_string(format!("/proc/{}/status", child.as_raw_pid())).unwrap();
         let parent: i32 = status
             .lines()
@@ -987,9 +1229,17 @@ async fn pinned_real_claude_code_06b_headless_term_and_cont_quiesce_owned_work()
             Ok(()) | Err(rustix::io::Errno::SRCH) => {}
             Err(error) => panic!("native SIGCONT failed: {error}"),
         }
+        let process_group = running.process_group.clone();
         let outcome = running.finish().await;
-        assert!(matches!(outcome, AgentOutcome::Failed(_)), "{outcome:?}");
-        assert!(process_group_is_quiescent(process_group));
+        // Terminated in its turn, Claude Code reported no successful end of one.
+        assert_eq!(
+            outcome,
+            failed_agent_outcome(AgentFailureCause::HarnessFailed {
+                detail: AgentHarnessFailureDetail::UnsuccessfulExit,
+            })
+        );
+        assert!(process_group_is_quiescent(process_group.get()));
+        assert!(process_group_is_quiescent(child_group));
         assert!(!provider.has_pending_request());
         assert_retained_native_session(&root, &["Complete the controlled lifecycle exchange."]);
         provider.shutdown().await;
@@ -997,110 +1247,8 @@ async fn pinned_real_claude_code_06b_headless_term_and_cont_quiesce_owned_work()
     .await;
 }
 
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_07_retains_forwarded_subagent_activity() {
-    let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog("pinned Claude Code subagent-retention", WATCHDOG, async {
-        for subagent_type in ["general-purpose", "fork"] {
-            let mut provider = LoopbackProvider::start().await;
-            let root = SyntheticClaudeCodeRoot::new();
-            let running = launch_response_lifecycle(executable.clone(), &root, &provider).await;
-
-            provider.next_request().await.release_tool_use(
-                "Agent",
-                json!({"description": "Run a controlled subagent",
-                    "prompt": "Return the exact subagent retained marker.",
-                    "subagent_type": subagent_type,
-                    "run_in_background": false,
-                }),
-            );
-            let mut terminal = running.terminal;
-            tokio::select! {
-                request = provider.next_request() => request.release_text("subagent retained marker"),
-                outcome = &mut terminal => panic!("{subagent_type} stopped before child request: {outcome:?}"),
-            }
-            provider.next_request().await.release_text(RESPONSE);
-            let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
-                terminal.await.unwrap()
-            else {
-                panic!("{subagent_type} exchange must complete through the production adapter");
-            };
-            running.task.await.unwrap();
-            assert_eq!(response.as_str(), RESPONSE);
-            assert_retained_native_session(&root, &["subagent retained marker", RESPONSE]);
-            let subagents = root.retained_resources().join("subagents");
-            let retained = fs::read_dir(subagents)
-                .unwrap()
-                .map(|entry| fs::read_to_string(entry.unwrap().path()).unwrap())
-                .collect::<Vec<_>>();
-            assert!(!retained.is_empty());
-            assert!(
-                retained
-                    .iter()
-                    .any(|transcript| transcript.contains("subagent retained marker"))
-            );
-            assert!(!provider.has_pending_request());
-            provider.shutdown().await;
-        }
-    })
-    .await;
-}
-
-#[cfg(target_os = "linux")]
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_06e_cancel_pending_background_after_first_result() {
-    let (executable, _exclusive) = exclusive_conformance_executable().await;
-    nix::sys::prctl::set_child_subreaper(true).unwrap();
-    host_scaled_watchdog("pending background cancellation", WATCHDOG, async {
-        let mut provider = LoopbackProvider::start().await;
-        let root = SyntheticClaudeCodeRoot::new();
-        let ready = FixtureSignal::create(root.private().join("pending-child.pid"));
-        let blocker = root.private().join("pending-child.blocker");
-        mkfifo(&blocker, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
-        let observations = RecordingObservationSink::default();
-        let running =
-            launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;
-        provider.next_request().await.release_tool_use(
-            "Bash",
-            json!({
-                "command": format!("printf '%s\\n' \"$$\" > '{}'; IFS= read -r done < '{}'",
-                    ready.path().display(), blocker.display()),
-                "description": "Block a background command until cancellation",
-                "run_in_background": true,
-            }),
-        );
-        let child = process_id(&ready.receive().await);
-        let process_group = getpgid(Some(child)).unwrap();
-        provider
-            .next_request()
-            .await
-            .release_text("not authoritative");
-        observations
-            .wait_for(|event| {
-                matches!(
-                    event,
-                    AgentObservation::Lifecycle {
-                        milestone: AgentLifecycleMilestone::TurnCompleted,
-                    }
-                )
-            })
-            .await;
-        assert!(
-            running
-                .cancellation
-                .request_cancellation(CancellationReason::UserRequest)
-        );
-        running.process_control.interrupt();
-        assert_user_cancelled(running).await;
-        assert!(process_group_is_quiescent(process_group));
-        assert!(!provider.has_pending_request());
-        provider.shutdown().await;
-    })
-    .await;
-}
-
+// REQ-AGENT-86
+// INV-HARNESS-25
 #[tokio::test]
 #[ignore = "requires pinned harness"]
 async fn pinned_real_claude_code_06d_prompt_hook_deny_prevents_provider_request() {
@@ -1128,1217 +1276,95 @@ async fn pinned_real_claude_code_06d_prompt_hook_deny_prevents_provider_request(
             _ = provider.next_request() => panic!("denied prompt reached provider"),
         };
         running.task.await.unwrap();
-        assert!(matches!(outcome, AgentOutcome::Failed(_)), "{outcome:?}");
+        // The blocked prompt closes a turn without calling the model, which decides
+        // nothing, and Claude Code exits 0 by its idle exit.
+        assert_eq!(
+            outcome,
+            failed_agent_outcome(AgentFailureCause::HarnessFailed {
+                detail: AgentHarnessFailureDetail::UnsuccessfulExit,
+            })
+        );
         assert_eq!(fs::read(observed).unwrap(), b"denied");
         assert!(!provider.has_pending_request());
         provider.shutdown().await;
     }).await;
 }
 
+// REQ-AGENT-88
+// INV-HARNESS-25
 #[tokio::test]
 #[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_06c_background_completion_continuation() {
+async fn pinned_real_claude_code_07_the_quiet_bound_interrupts_a_held_claude_code() {
     let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog("background probe", WATCHDOG, async {
+    host_scaled_watchdog("pinned Claude Code quiet bound", WATCHDOG, async {
         let mut provider = LoopbackProvider::start().await;
         let root = SyntheticClaudeCodeRoot::new();
-        let ready = FixtureSignal::create(root.private().join("background-ready"));
-        let blocker = root.private().join("background-blocker");
-        mkfifo(&blocker, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
-        let operations = root.private().join("sandbox-operations");
-        fs::create_dir_all(operations.join("empty")).unwrap();
-        fs::write(operations.join("edit.txt"), b"before\n").unwrap();
-        fs::write(operations.join("remove.txt"), b"remove me\n").unwrap();
-        // The synthetic root's /usr/bin:/bin PATH has no coreutils on NixOS.
-        // Supply only this command's pinned tools without changing fixture isolation.
-        let tools_path = std::env::var("USEFUL_CLAUDE_CODE_CONFORMANCE_TOOLS_PATH")
-            .expect("CLI Devenv must supply the native conformance tools");
         let observations = RecordingObservationSink::default();
-        let mut running = launch_recorded_response_lifecycle(
-            executable, &root, &provider, &observations,
-        ).await;
-        provider.next_request().await.release_tool_use(
-            "Bash",
-            json!({
-                "command": format!(
-                    "export PATH='{tools_path}'; printf 'ready\\n' > '{}' && IFS= read -r done < '{}' && sed -i 's/before/after/' '{}/edit.txt' && rm '{}/remove.txt' && rmdir '{}/empty' && printf 'background finished\\n'",
-                    ready.path().display(), blocker.display(), operations.display(), operations.display(), operations.display()
-                ),
-                "description": "Run a controlled background command",
-                "run_in_background": true,
-            }),
-        );
-        // The tool returns a task identity before its child is released.
-        let next = provider.next_request().await;
-        assert_eq!(ready.receive().await, b"ready\n");
-        next.release_text("first response");
-        observations.wait_for(|event| matches!(event, AgentObservation::Lifecycle {
-            milestone: AgentLifecycleMilestone::TurnCompleted,
-        })).await;
-        assert!(matches!(running.terminal.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
-        let release = tokio::task::spawn_blocking(move || {
-            fs::write(blocker, b"done\n").unwrap();
-        });
-        release.await.unwrap();
-        let mut terminal = running.terminal;
-        let outcome = tokio::select! {
-            request = provider.next_request() => {
-                assert!(request.used_placeholder_key());
-                assert!(request.body()["messages"].is_array());
-                request.release_text("final response");
-                terminal.await.unwrap()
-            }
-            outcome = &mut terminal => outcome.unwrap(),
-        };
-        running.task.await.unwrap();
-        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
-            panic!("background continuation must settle, got {outcome:?}");
-        };
-        assert_eq!(response.as_str(), "final response");
-        assert_eq!(fs::read(operations.join("edit.txt")).unwrap(), b"after\n");
-        assert!(!operations.join("remove.txt").exists());
-        assert!(!operations.join("empty").exists());
-        assert!(!provider.has_pending_request());
-        assert_retained_native_session(&root, &["first response", "final response"]);
-        let transcript = fs::read_to_string(root.retained_transcript()).unwrap();
-        let records = transcript
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        assert!(!records.is_empty());
-        provider.shutdown().await;
-    }).await;
-}
-
-// SC-AGENT-7
-// REQ-AGENT-35
-// REQ-AGENT-64
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_09_backgrounded_subagent_continues_the_invocation() {
-    let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog(
-        "pinned Claude Code backgrounded-subagent",
-        WATCHDOG,
-        async {
-            let mut provider = LoopbackProvider::start().await;
-            let root = SyntheticClaudeCodeRoot::new();
-            let subagent = BackgroundSubagent::new(&root);
-            let observations = RecordingObservationSink::default();
-            let running =
-                launch_recorded_response_lifecycle(executable, &root, &provider, &observations)
-                    .await;
-            let mut terminal = running.terminal;
-
-            subagent
-                .start(&mut provider, &mut terminal)
-                .await
-                .release_text("first response");
-            observations
-                .wait_for(|event| {
-                    matches!(
-                        event,
-                        AgentObservation::Lifecycle {
-                            milestone: AgentLifecycleMilestone::TurnCompleted,
-                        }
-                    )
-                })
-                .await;
-            assert!(matches!(
-                terminal.try_recv(),
-                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-            ));
-
-            subagent
-                .finish(&mut provider, &mut terminal)
-                .await
-                .release_text("final response");
-            let outcome = terminal.await.unwrap();
-            running.task.await.unwrap();
-            let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome
-            else {
-                panic!("the notified turn must settle the invocation, got {outcome:?}");
-            };
-            assert_eq!(response.as_str(), "final response");
-            assert_backgrounded_subagent_activity(&observations);
-            assert!(!provider.has_pending_request());
-            assert_retained_native_session(&root, &["first response", "final response"]);
-            provider.shutdown().await;
-        },
-    )
-    .await;
-}
-
-// SC-AGENT-7
-// REQ-AGENT-35
-// INV-HARNESS-7
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_09c_premature_result_waits_for_the_backgrounded_subagent() {
-    let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog("pinned Claude Code premature-result", WATCHDOG, async {
-        let mut provider = LoopbackProvider::start().await;
-        let root = SyntheticClaudeCodeRoot::new();
-        let subagent = BackgroundSubagent::new(&root);
-        let observations = RecordingObservationSink::default();
-        let running =
-            launch_recorded_result_lifecycle(executable, &root, &provider, &observations).await;
-        let mut terminal = running.terminal;
-
-        // A schema-valid candidate submitted while the subagent runs is still premature.
-        subagent
-            .start(&mut provider, &mut terminal)
-            .await
-            .release_structured_output(json!({"result": 1}));
-        observations
-            .wait_for(|event| {
-                matches!(
-                    event,
-                    AgentObservation::ValueRejected {
-                        kind: AgentValueKind::Result,
-                        ..
-                    }
-                )
+        let (clock, mut control) = StagedClock::new();
+        let running = RunningProductionClaudeCode::launch_on(
+            executable,
+            &root,
+            &provider,
+            AgentValueMode::None,
+            observations.clone(),
+            clock,
+        )
+        .await_started()
+        .await;
+        // Claude Code is held on a provider request nobody answers.
+        let held = provider.next_request().await;
+        control.release(QUIET_BOUND);
+        // SIGINT ends it: the forced stop 30 seconds later is armed and never released.
+        control.registered(QUIET_BOUND_FORCE_DELAY).await;
+        let process_group = running.process_group.clone();
+        let outcome = running.finish().await;
+        assert_eq!(
+            outcome,
+            failed_agent_outcome(AgentFailureCause::HarnessFailed {
+                detail: AgentHarnessFailureDetail::UnsuccessfulExit,
             })
-            .await;
-        let feedback = next_request_or_outcome(&mut provider, &mut terminal).await;
-        assert!(!feedback.opens_with(BACKGROUND_SUBAGENT_PROMPT));
-        assert!(contains_string_fragment(
-            feedback.body(),
-            &premature_candidate_feedback(SUBAGENT_OUTSTANDING)
-        ));
-        feedback.release_text("waiting for the subagent");
-        // The agent ends the feedback turn to wait; any enforcement retry Claude Code makes
-        // within that turn is answered the same way.
-        loop {
-            tokio::select! {
-                request = next_request_or_outcome(&mut provider, &mut terminal) => {
-                    assert!(!request.opens_with(BACKGROUND_SUBAGENT_PROMPT));
-                    request.release_text("waiting for the subagent");
-                }
-                () = wait_for_completed_turns(&observations, 2) => break,
-            }
-        }
-        assert!(matches!(
-            terminal.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ));
-
-        subagent
-            .finish(&mut provider, &mut terminal)
-            .await
-            .release_structured_output(json!({"result": 7}));
-        let outcome = terminal.await.unwrap();
-        running.task.await.unwrap();
-        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
-            panic!("the notified turn's candidate must complete, got {outcome:?}");
-        };
-        assert_eq!(result.value(), &json!(7));
-        let rejections = observations
-            .snapshot()
-            .into_iter()
-            .filter_map(|envelope| match envelope.observation() {
-                AgentObservation::ValueRejected { feedback, .. } => Some(Arc::clone(feedback)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            rejections,
-            [Arc::<str>::from(premature_candidate_feedback(
-                SUBAGENT_OUTSTANDING
-            ))]
         );
-        assert_backgrounded_subagent_activity(&observations);
+        assert!(process_group_is_quiescent(process_group.get()));
+        assert_eq!(adapter_warnings(&observations).len(), 1);
+        drop(held);
         assert!(!provider.has_pending_request());
         provider.shutdown().await;
     })
     .await;
 }
 
-// SC-AGENT-7
-// REQ-AGENT-35
-// REQ-AGENT-64
-// UM-3077: the UM-3024 build's sequence end to end. In Result mode the lead launches a
-// backgrounded builder and submits early (feedback), answers the correction turn and the
-// enforce nag with text and ends it waiting; the first builder's notification begins the
-// turn in which the lead launches a second backgrounded builder and again ends with text
-// through the nag; the second builder's notification begins the turn that submits. On the
-// 0.70.0 release the second launch was recorded as foreground, the exchange's `result`
-// forgot it, and the notified turn's `init` was refused as `initialization_invalid`.
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_09f_a_builder_launched_in_a_notified_turn_after_a_refused_result_is_waited_for()
- {
-    let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog("pinned Claude Code notified-turn launch", WATCHDOG, async {
-        let mut provider = LoopbackProvider::start().await;
-        let root = SyntheticClaudeCodeRoot::new();
-        let first = BackgroundSubagent::named(&root, "first");
-        let second = BackgroundSubagent::named(&root, "second");
-        let observations = RecordingObservationSink::default();
-        let running =
-            launch_recorded_result_lifecycle(executable, &root, &provider, &observations).await;
-        let mut terminal = running.terminal;
-
-        // Exchange 1: the first builder is launched and a candidate is submitted early.
-        first
-            .start(&mut provider, &mut terminal)
-            .await
-            .release_structured_output(json!({"result": 1}));
-        observations
-            .wait_for(|event| {
-                matches!(
-                    event,
-                    AgentObservation::ValueRejected {
-                        kind: AgentValueKind::Result,
-                        ..
-                    }
-                )
-            })
-            .await;
-        // Exchange 2: the correction turn, answered with text through the enforce nag.
-        let feedback = next_request_or_outcome(&mut provider, &mut terminal).await;
-        assert!(contains_string_fragment(
-            feedback.body(),
-            &premature_candidate_feedback(SUBAGENT_OUTSTANDING)
-        ));
-        feedback.release_text("waiting for the first builder");
-        loop {
-            tokio::select! {
-                request = next_request_or_outcome(&mut provider, &mut terminal) => {
-                    assert!(!request.opens_with(BACKGROUND_SUBAGENT_PROMPT));
-                    request.release_text("waiting for the first builder");
-                }
-                () = wait_for_completed_turns(&observations, 2) => break,
-            }
-        }
-
-        // Exchange 3, begun by the first builder's notification: the second builder is
-        // launched and the turn ends with text through the nag.
-        let notified = first.finish(&mut provider, &mut terminal).await;
-        let main_thread = second
-            .launch_from(notified, &mut provider, &mut terminal)
-            .await;
-        main_thread.release_text("waiting for the second builder");
-        loop {
-            tokio::select! {
-                request = next_request_or_outcome(&mut provider, &mut terminal) => {
-                    assert!(!request.opens_with(BACKGROUND_SUBAGENT_PROMPT));
-                    request.release_text("waiting for the second builder");
-                }
-                () = wait_for_completed_turns(&observations, 3) => break,
-            }
-        }
-        assert!(matches!(
-            terminal.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ));
-
-        // Exchange 4, begun by the second builder's notification, submits the result.
-        second
-            .finish(&mut provider, &mut terminal)
-            .await
-            .release_structured_output(json!({"result": 7}));
-        let outcome = terminal.await.unwrap();
-        running.task.await.unwrap();
-        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
-            panic!("the second builder's notified turn must complete the step, got {outcome:?}");
-        };
-        assert_eq!(result.value(), &json!(7));
-        let rejections = observations
-            .snapshot()
-            .into_iter()
-            .filter_map(|envelope| match envelope.observation() {
-                AgentObservation::ValueRejected { feedback, .. } => Some(Arc::clone(feedback)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            rejections,
-            [Arc::<str>::from(premature_candidate_feedback(
-                SUBAGENT_OUTSTANDING
-            ))]
-        );
-        assert_eq!(
-            backgrounded_subagent_statuses(&observations),
-            ["started", "completed", "started", "completed"]
-        );
-        assert!(!provider.has_pending_request());
-        provider.shutdown().await;
-    })
-    .await;
+fn result_value(outcome: AgentOutcome) -> Value {
+    let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
+        panic!("the step must return its result, got {outcome:?}");
+    };
+    result.value().clone()
 }
 
-const RESUMED_SUBAGENT_RESPONSE: &str = "resumed subagent finished";
-
-// REQ-AGENT-64
-// REQ-AGENT-35
-// UM-2879: the lead messages a backgrounded builder that has already finished, inside the
-// turn in which its notification arrived, and Claude Code resumes the builder under the
-// message's tool call. The resume used to be rejected as a duplicate `task_started`
-// (`system_event_invalid`); it is a second run of the same subagent that notifies again.
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_09d_messaging_a_finished_backgrounded_subagent_resumes_it() {
-    let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog("pinned Claude Code resumed-subagent", WATCHDOG, async {
-        let mut provider = LoopbackProvider::start().await;
-        let root = SyntheticClaudeCodeRoot::new();
-        let subagent = BackgroundSubagent::new(&root);
-        let observations = RecordingObservationSink::default();
-        let running =
-            launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;
-        let mut terminal = running.terminal;
-
-        // The main thread keeps its turn open in a foreground command while the subagent
-        // finishes, so the subagent's notification lands inside the active exchange.
-        let main_thread = subagent.start(&mut provider, &mut terminal).await;
-        let agent_id = launched_agent_id(main_thread.body());
-        let lead_ready = FixtureSignal::create(root.private().join("lead-ready"));
-        let lead_blocker = root.private().join("lead-blocker");
-        mkfifo(&lead_blocker, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
-        main_thread.release_tool_use(
-            "Bash",
-            json!({
-                "command": format!(
-                    "printf 'ready\\n' > '{}'; IFS= read -r done < '{}'; printf 'lead waited\\n'",
-                    lead_ready.path().display(), lead_blocker.display()
-                ),
-                "description": "Wait while the subagent finishes",
-            }),
-        );
-        assert_eq!(lead_ready.receive().await, b"ready\n");
-        subagent.release().await;
-        let request = next_request_or_outcome(&mut provider, &mut terminal).await;
-        assert!(request.opens_with(BACKGROUND_SUBAGENT_PROMPT));
-        request.release_text(BACKGROUND_SUBAGENT_RESPONSE);
-        observations
-            .wait_for(|event| {
-                matches!(event, AgentObservation::Diagnostic { message, .. }
-                    if message.contains(BACKGROUND_SUBAGENT_DESCRIPTION) && message.contains("completed"))
-            })
-            .await;
-        tokio::task::spawn_blocking(move || fs::write(lead_blocker, b"done\n").unwrap())
-            .await
-            .unwrap();
-
-        // The message is the second block of its message so that its tool-use id differs
-        // from the Agent call's, as it does in production.
-        let request = next_request_or_outcome(&mut provider, &mut terminal).await;
-        assert!(!request.opens_with(BACKGROUND_SUBAGENT_PROMPT));
-        request.release_blocks(vec![
-            LoopbackBlock::text("messaging the finished subagent"),
-            LoopbackBlock::tool_use(
-                "SendMessage",
-                json!({"to": agent_id, "summary": "Report once more",
-                    "message": "Answer once more with the resumed marker."}),
-            ),
-        ]);
-
-        // The main thread ends its turn to wait before the resumed subagent answers, so the
-        // resumed run's message and notification arrive in the drain and the notification's
-        // turn settles the invocation. Were the resumed run notified inside the turn, the
-        // turn it opened would be an epilogue (REQ-AGENT-76) and the first turn's text the
-        // response.
-        let mut resumed = None;
-        loop {
-            tokio::select! {
-                request = next_request_or_outcome(&mut provider, &mut terminal) => {
-                    if request.opens_with(BACKGROUND_SUBAGENT_PROMPT) {
-                        assert!(
-                            resumed.replace(request).is_none(),
-                            "the resumed subagent asked twice before answering"
-                        );
-                    } else {
-                        request.release_text("waiting for the resumed subagent");
-                    }
-                }
-                () = wait_for_completed_turns(&observations, 1) => break,
-            }
-        }
-        let resumed = match resumed {
-            Some(request) => request,
-            None => next_request_or_outcome(&mut provider, &mut terminal).await,
-        };
-        assert!(resumed.opens_with(BACKGROUND_SUBAGENT_PROMPT));
-        resumed.release_text(RESUMED_SUBAGENT_RESPONSE);
-        let final_turn = next_request_or_outcome(&mut provider, &mut terminal).await;
-        assert!(!final_turn.opens_with(BACKGROUND_SUBAGENT_PROMPT));
-        final_turn.release_text(RESPONSE);
-        let outcome = terminal.await.unwrap();
-        running.task.await.unwrap();
-        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
-            panic!("the resumed subagent's notification must settle the invocation, got {outcome:?}");
-        };
-        assert_eq!(response.as_str(), RESPONSE);
-        assert_eq!(
-            backgrounded_subagent_statuses(&observations),
-            ["started", "completed", "resumed", "completed"]
-        );
-        assert!(observations.snapshot().iter().any(|envelope| matches!(
-            envelope.observation(),
-            AgentObservation::AssistantText { text } if text.as_ref() == RESUMED_SUBAGENT_RESPONSE
-        )));
-        assert!(!observations.snapshot().iter().any(|envelope| matches!(
-            envelope.observation(),
-            AgentObservation::UnrecognizedHarnessEvent { event } if event["subtype"] == "task_started"
-        )));
-        assert!(!provider.has_pending_request());
-        provider.shutdown().await;
-    })
-    .await;
+fn value_rejections(observations: &RecordingObservationSink) -> Vec<Arc<str>> {
+    observations
+        .snapshot()
+        .iter()
+        .filter_map(|envelope| match envelope.observation() {
+            AgentObservation::ValueRejected {
+                kind: AgentValueKind::Result,
+                feedback,
+            } => Some(Arc::clone(feedback)),
+            _ => None,
+        })
+        .collect()
 }
 
-// REQ-AGENT-64
-// REQ-AGENT-35
-// UM-2879: the same message sent from the turn the builder's notification woke. That
-// turn's `init` forgot the subagent as outstanding work, and the resumed run's messages
-// still name the Agent call that launched it, so the adapter must keep the identity it
-// forgot for the resume to be accepted in the drain.
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_09e_messaging_a_finished_subagent_from_its_wakeup_turn_resumes_it()
-{
-    let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog("pinned Claude Code wakeup-resume", WATCHDOG, async {
-        let mut provider = LoopbackProvider::start().await;
-        let root = SyntheticClaudeCodeRoot::new();
-        let subagent = BackgroundSubagent::new(&root);
-        let observations = RecordingObservationSink::default();
-        let running =
-            launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;
-        let mut terminal = running.terminal;
-
-        // The main thread ends its turn to wait; the subagent's notification wakes it.
-        let main_thread = subagent.start(&mut provider, &mut terminal).await;
-        let agent_id = launched_agent_id(main_thread.body());
-        main_thread.release_text("first response");
-        observations
-            .wait_for(|event| {
-                matches!(
-                    event,
-                    AgentObservation::Lifecycle {
-                        milestone: AgentLifecycleMilestone::TurnCompleted,
-                    }
-                )
-            })
-            .await;
-        let wakeup = subagent.finish(&mut provider, &mut terminal).await;
-
-        // From the wakeup turn, the message is the second block of its message so that
-        // its tool-use id differs from the Agent call's, as it does in production.
-        wakeup.release_blocks(vec![
-            LoopbackBlock::text("messaging the finished subagent"),
-            LoopbackBlock::tool_use(
-                "SendMessage",
-                json!({"to": agent_id, "summary": "Report once more",
-                    "message": "Answer once more with the resumed marker."}),
-            ),
-        ]);
-
-        // The main thread ends its turn before the resumed subagent answers, so the
-        // resumed run's message and notification arrive in the drain and the notification's
-        // turn settles the invocation.
-        let mut resumed = None;
-        loop {
-            tokio::select! {
-                request = next_request_or_outcome(&mut provider, &mut terminal) => {
-                    if request.opens_with(BACKGROUND_SUBAGENT_PROMPT) {
-                        assert!(
-                            resumed.replace(request).is_none(),
-                            "the resumed subagent asked twice before answering"
-                        );
-                    } else {
-                        request.release_text("waiting for the resumed subagent");
-                    }
-                }
-                () = wait_for_completed_turns(&observations, 2) => break,
-            }
-        }
-        let resumed = match resumed {
-            Some(request) => request,
-            None => next_request_or_outcome(&mut provider, &mut terminal).await,
-        };
-        assert!(resumed.opens_with(BACKGROUND_SUBAGENT_PROMPT));
-        resumed.release_text(RESUMED_SUBAGENT_RESPONSE);
-        let final_turn = next_request_or_outcome(&mut provider, &mut terminal).await;
-        assert!(!final_turn.opens_with(BACKGROUND_SUBAGENT_PROMPT));
-        final_turn.release_text(RESPONSE);
-        let outcome = terminal.await.unwrap();
-        running.task.await.unwrap();
-        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
-            panic!(
-                "the resumed subagent's notification must settle the invocation, got {outcome:?}"
-            );
-        };
-        assert_eq!(response.as_str(), RESPONSE);
-        assert_eq!(
-            backgrounded_subagent_statuses(&observations),
-            ["started", "completed", "resumed", "completed"]
-        );
-        assert!(observations.snapshot().iter().any(|envelope| matches!(
-            envelope.observation(),
-            AgentObservation::AssistantText { text } if text.as_ref() == RESUMED_SUBAGENT_RESPONSE
-        )));
-        assert!(!provider.has_pending_request());
-        provider.shutdown().await;
-    })
-    .await;
-}
-
-// REQ-AGENT-35
-// REQ-AGENT-64
-// UM-2879: `09e`'s message in Result mode, from a lead that loads `SendMessage` before it
-// calls it, as a model does that finds the tool among the deferred ones. 2.1.310 lists
-// `SendMessage` as deferred, absent from the request's `tools[]`, and runs it unloaded
-// (`09d`, `09e`); here the wakeup turn's first round is a `ToolSearch` that loads it, the
-// next request's `tools[]` carries it, the message resumes the finished subagent, the lead
-// ends the turn with text through the enforcement nag, and the value is submitted on the
-// turn the resumed run's notification wakes.
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_09g_a_lead_that_loads_send_message_before_messaging_a_finished_subagent_resumes_it()
- {
-    let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog("pinned Claude Code loaded-SendMessage", WATCHDOG, async {
-        let mut provider = LoopbackProvider::start().await;
-        let root = SyntheticClaudeCodeRoot::new();
-        let subagent = BackgroundSubagent::new(&root);
-        let observations = RecordingObservationSink::default();
-        let running =
-            launch_recorded_result_lifecycle(executable, &root, &provider, &observations).await;
-        let mut terminal = running.terminal;
-
-        // The main thread ends its turn to wait, through the enforcement nag; the subagent,
-        // blocked in its command, asks nothing meanwhile, and its notification wakes the lead.
-        let main_thread = subagent.start(&mut provider, &mut terminal).await;
-        let agent_id = launched_agent_id(main_thread.body());
-        main_thread.release_text("waiting for the subagent");
-        loop {
-            tokio::select! {
-                request = next_request_or_outcome(&mut provider, &mut terminal) => {
-                    assert!(!request.opens_with(BACKGROUND_SUBAGENT_PROMPT));
-                    request.release_text("waiting for the subagent");
-                }
-                () = wait_for_completed_turns(&observations, 1) => break,
-            }
-        }
-        let wakeup = subagent.finish(&mut provider, &mut terminal).await;
-        assert!(
-            !tool_names(wakeup.body())
-                .iter()
-                .any(|name| name == "SendMessage"),
-            "2.1.321 defers SendMessage: {:?}",
-            tool_names(wakeup.body())
-        );
-        wakeup.release_blocks(vec![
-            LoopbackBlock::text("loading SendMessage"),
-            LoopbackBlock::tool_use(
-                "ToolSearch",
-                json!({"query": "select:SendMessage", "max_results": 1}),
-            ),
-        ]);
-        let loaded = next_request_or_outcome(&mut provider, &mut terminal).await;
-        assert!(!loaded.opens_with(BACKGROUND_SUBAGENT_PROMPT));
-        assert!(
-            tool_names(loaded.body())
-                .iter()
-                .any(|name| name == "SendMessage"),
-            "the ToolSearch round did not load SendMessage: {:?}",
-            tool_names(loaded.body())
-        );
-        // The nag reaches the provider merged into the user message that returns the turn's
-        // tool results (the parser records its event type once), so the conversation's count
-        // tells a new one.
-        let nags_before = enforcement_nags(loaded.body());
-        let mut nags = nags_before;
-        loaded.release_blocks(vec![
-            LoopbackBlock::text("messaging the finished subagent"),
-            LoopbackBlock::tool_use(
-                "SendMessage",
-                json!({"to": agent_id, "summary": "Report once more",
-                    "message": "Answer once more with the resumed marker."}),
-            ),
-        ]);
-
-        // As in `09e`, the lead ends the turn before the resumed subagent answers, here
-        // refusing the nag with text, so the resumed run's notification wakes the turn that
-        // submits the value.
-        let mut resumed = None;
-        loop {
-            tokio::select! {
-                request = next_request_or_outcome(&mut provider, &mut terminal) => {
-                    if request.opens_with(BACKGROUND_SUBAGENT_PROMPT) {
-                        assert!(
-                            resumed.replace(request).is_none(),
-                            "the resumed subagent asked twice before answering"
-                        );
-                    } else {
-                        nags = nags.max(enforcement_nags(request.body()));
-                        request.release_text("waiting for the resumed subagent");
-                    }
-                }
-                () = wait_for_completed_turns(&observations, 2) => break,
-            }
-        }
-        assert!(
-            nags > nags_before,
-            "the messaging turn ended with text but drew no enforcement nag"
-        );
-        let resumed = match resumed {
-            Some(request) => request,
-            None => next_request_or_outcome(&mut provider, &mut terminal).await,
-        };
-        assert!(resumed.opens_with(BACKGROUND_SUBAGENT_PROMPT));
-        resumed.release_text(RESUMED_SUBAGENT_RESPONSE);
-        let final_turn = next_request_or_outcome(&mut provider, &mut terminal).await;
-        assert!(!final_turn.opens_with(BACKGROUND_SUBAGENT_PROMPT));
-        final_turn.release_structured_output(json!({"result": 7}));
-        let outcome = terminal.await.unwrap();
-        running.task.await.unwrap();
-        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
-            panic!(
-                "the resumed subagent's notification must begin the turn that settles, got \
-                 {outcome:?}"
-            );
-        };
-        assert_eq!(result.value(), &json!(7));
-        assert_eq!(
-            backgrounded_subagent_statuses(&observations),
-            ["started", "completed", "resumed", "completed"]
-        );
-        assert!(!provider.has_pending_request());
-        provider.shutdown().await;
-    })
-    .await;
-}
-
-const NESTED_SUBAGENT_PROMPT: &str = "Run the controlled nested subagent.";
-const NESTED_SUBAGENT_DESCRIPTION: &str = "Run a nested subagent";
-const NESTED_SUBAGENT_RESPONSE: &str = "nested subagent finished";
-/// The nested `Agent` call's own id. The loopback names a call by its block's index, so the
-/// nested call, first in the outer subagent's message, would otherwise carry the id of the
-/// main thread's `Agent` call, under which Claude Code would file the nested thread.
-const NESTED_AGENT_CALL_ID: &str = "tool_scherzo_loopback_nested_agent";
-
-/// When and how the backgrounded outer subagent launches its own subagent.
-#[derive(Clone, Copy)]
-enum NestedLaunch {
-    /// In the foreground, inside the main thread's exchange, running past its `result`.
-    ForegroundInTheExchange,
-    /// In the foreground, after the main thread's turn has ended.
-    ForegroundAfterTheTurn,
-    /// In the background, after the main thread's turn has ended, outliving the outer
-    /// subagent.
-    BackgroundedOutlivingItsLauncher,
-}
-
-/// The conversation a case holds with the three threads of a nested launch, which share the
-/// provider: each request is told apart by the prompt its conversation opens with and held
-/// until the case answers its thread, so the threads' interleaving does not matter.
-struct NestedConversation {
-    provider: LoopbackProvider,
-    terminal: tokio::sync::oneshot::Receiver<AgentOutcome>,
-    held: Vec<(NestedThread, ControlledProviderRequest)>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NestedThread {
-    Main,
-    Outer,
-    Nested,
-}
-
-impl NestedConversation {
-    async fn next(&mut self, thread: NestedThread) -> ControlledProviderRequest {
-        if let Some(position) = self.held.iter().position(|(held, _)| *held == thread) {
-            return self.held.remove(position).1;
-        }
-        loop {
-            let request = next_request_or_outcome(&mut self.provider, &mut self.terminal).await;
-            let from = if request.opens_with(NESTED_SUBAGENT_PROMPT) {
-                NestedThread::Nested
-            } else if request.opens_with(BACKGROUND_SUBAGENT_PROMPT) {
-                NestedThread::Outer
-            } else {
-                NestedThread::Main
-            };
-            if from == thread {
-                return request;
-            }
-            assert!(
-                self.held.iter().all(|(held, _)| *held != from),
-                "the {from:?} thread asked twice before it was answered"
-            );
-            self.held.push((from, request));
-        }
-    }
-
-    /// Answers the main thread's held request with text and waits for its turn to end.
-    async fn end_the_first_turn(&mut self, observations: &RecordingObservationSink) {
-        self.next(NestedThread::Main)
-            .await
-            .release_text("first response");
-        wait_for_completed_turns(observations, 1).await;
-    }
-
-    fn assert_running(&mut self) {
-        assert!(matches!(
-            self.terminal.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ));
-    }
-}
-
-/// The outer subagent's `Agent` call launching the nested one.
-fn nested_launch(backgrounded: bool) -> LoopbackBlock {
-    let mut input = json!({
-        "description": NESTED_SUBAGENT_DESCRIPTION,
-        "prompt": NESTED_SUBAGENT_PROMPT,
-        "subagent_type": "general-purpose",
-    });
-    if backgrounded {
-        input["run_in_background"] = json!(true);
-    }
-    LoopbackBlock::tool_use_with_id(NESTED_AGENT_CALL_ID, "Agent", input)
-}
-
-/// Drives a Response-mode step whose backgrounded subagent launches a subagent of its own as
-/// `launch` says, and checks that the step settles on the turn the last notification opens,
-/// with both subagents' starts and settlements reported and nothing refused.
-async fn drive_a_subagents_own_subagent(label: &'static str, launch: NestedLaunch) {
-    use NestedThread::{Main, Nested, Outer};
-    let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog(label, WATCHDOG, async {
-        let provider = LoopbackProvider::start().await;
-        let root = SyntheticClaudeCodeRoot::new();
-        let nested = BackgroundSubagent::named(&root, "nested");
-        let observations = RecordingObservationSink::default();
-        let running =
-            launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;
-        let mut conversation = NestedConversation {
-            provider,
-            terminal: running.terminal,
-            held: Vec::new(),
-        };
-        conversation
-            .next(Main)
-            .await
-            .release_tool_use("Agent", BackgroundSubagent::launch_input());
-        let outer_opening = conversation.next(Outer).await;
-
-        match launch {
-            NestedLaunch::ForegroundInTheExchange => {
-                // AUTO-254's order: the nested subagent starts and blocks inside the main
-                // thread's exchange, and works on after its `result`.
-                outer_opening.release_blocks(vec![nested_launch(false)]);
-                conversation
-                    .next(Nested)
-                    .await
-                    .release_tool_use("Bash", nested.blocking_command());
-                nested.await_ready().await;
-                conversation.end_the_first_turn(&observations).await;
-                conversation.assert_running();
-                nested.release().await;
-                conversation
-                    .next(Nested)
-                    .await
-                    .release_text(NESTED_SUBAGENT_RESPONSE);
-                conversation
-                    .next(Outer)
-                    .await
-                    .release_text(BACKGROUND_SUBAGENT_RESPONSE);
-            }
-            NestedLaunch::ForegroundAfterTheTurn => {
-                conversation.end_the_first_turn(&observations).await;
-                outer_opening.release_blocks(vec![nested_launch(false)]);
-                conversation
-                    .next(Nested)
-                    .await
-                    .release_text(NESTED_SUBAGENT_RESPONSE);
-                conversation
-                    .next(Outer)
-                    .await
-                    .release_text(BACKGROUND_SUBAGENT_RESPONSE);
-            }
-            NestedLaunch::BackgroundedOutlivingItsLauncher => {
-                conversation.end_the_first_turn(&observations).await;
-                outer_opening.release_blocks(vec![nested_launch(true)]);
-                conversation
-                    .next(Nested)
-                    .await
-                    .release_tool_use("Bash", nested.blocking_command());
-                nested.await_ready().await;
-                // The outer subagent finishes with the nested one blocked; its notification
-                // opens a turn with a model call, which ends with the nested one running.
-                conversation
-                    .next(Outer)
-                    .await
-                    .release_text(BACKGROUND_SUBAGENT_RESPONSE);
-                conversation
-                    .next(Main)
-                    .await
-                    .release_text("waiting for the nested subagent");
-                wait_for_completed_turns(&observations, 2).await;
-                conversation.assert_running();
-                nested.release().await;
-                conversation
-                    .next(Nested)
-                    .await
-                    .release_text(NESTED_SUBAGENT_RESPONSE);
-            }
-        }
-
-        conversation.next(Main).await.release_text("final response");
-        let outcome = (&mut conversation.terminal).await.unwrap();
-        running.task.await.unwrap();
-        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
-            panic!("the last notified turn must settle the invocation, got {outcome:?}");
-        };
-        assert_eq!(response.as_str(), "final response");
-        let snapshot = observations.snapshot();
-        assert_eq!(
-            subagent_statuses(
-                snapshot.iter().map(|envelope| envelope.observation()),
-                NESTED_SUBAGENT_DESCRIPTION
-            ),
-            ["started", "completed"]
-        );
-        assert_backgrounded_subagent_activity(&observations);
-        assert!(conversation.held.is_empty());
-        assert!(!conversation.provider.has_pending_request());
-        conversation.provider.shutdown().await;
-    })
-    .await;
-}
-
-// SC-AGENT-9
-// REQ-AGENT-82
-// INV-HARNESS-15 (AUTO-283)
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_09h_a_subagents_own_subagent_started_in_the_exchange_keeps_working_after_it()
- {
-    drive_a_subagents_own_subagent(
-        "pinned Claude Code nested subagent in the exchange",
-        NestedLaunch::ForegroundInTheExchange,
-    )
-    .await;
-}
-
-// SC-AGENT-9
-// REQ-AGENT-82
-// INV-HARNESS-15 (AUTO-283)
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_09i_a_subagents_own_subagent_started_after_the_turn_ended_is_tracked()
- {
-    drive_a_subagents_own_subagent(
-        "pinned Claude Code nested subagent in the drain",
-        NestedLaunch::ForegroundAfterTheTurn,
-    )
-    .await;
-}
-
-// SC-AGENT-9
-// REQ-AGENT-82
-// INV-HARNESS-15 (AUTO-283)
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_09j_a_backgrounded_subagent_a_subagent_started_outlives_it_and_wakes_the_agent()
- {
-    drive_a_subagents_own_subagent(
-        "pinned Claude Code backgrounded nested subagent",
-        NestedLaunch::BackgroundedOutlivingItsLauncher,
-    )
-    .await;
-}
-
-/// Ordered thinking segments deliberately carry multibyte, newline, tab, and trailing
-/// whitespace so the case fails if Claude Code trims or normalizes reconstructed
-/// thinking before restating it in its nominal assistant envelope.
-const THINKING_SEGMENTS: [&str; 3] = [
-    "Step one: \u{e9}\u{4e2d}\u{6587} ",
-    "line\nbreak\ttab  ",
-    "trailing space   ",
-];
-
-fn reasoning_text(observation: &AgentObservation) -> Option<&str> {
-    match observation {
-        AgentObservation::Reasoning { text } => Some(text.as_ref()),
-        _ => None,
-    }
-}
-
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_08_correlates_a_nominal_thinking_envelope_before_text() {
-    // Every exact-binary case deliberately owns a fresh watchdog, loopback provider, and
-    // synthetic root; sharing those resources would let one native case contaminate another.
-    let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog("pinned Claude Code nominal-thinking", WATCHDOG, async {
-        let mut provider = LoopbackProvider::start().await;
-        let root = SyntheticClaudeCodeRoot::new();
-        let observations = RecordingObservationSink::default();
-        let running =
-            launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;
-
-        provider.next_request().await.release_blocks(vec![
-            LoopbackBlock::thinking(&THINKING_SEGMENTS),
-            LoopbackBlock::text(RESPONSE),
-        ]);
-
-        // Claude Code 2.1.302 emits a nominal `assistant` envelope restating the thinking
-        // block. `ActiveContentBlock::correlate_nominal` requires that envelope to be
-        // byte-equal to the reconstructed `thinking_delta` stream, so reaching a response
-        // at all proves the equality invariant holds for native thinking.
-        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
-            running.finish().await
-        else {
-            panic!("a thinking block must not prevent an ordinary response outcome");
-        };
-        assert_eq!(response.as_str(), RESPONSE);
-
-        // Thinking is observational only: it never contributes to the response, and the
-        // response is exactly the text block that followed it.
-        assert_eq!(
-            observations.concatenated_text(reasoning_text),
-            THINKING_SEGMENTS.concat()
-        );
-        assert_eq!(observations.concatenated_text(assistant_text), RESPONSE);
-        // Thinking additionally makes Claude Code interleave `system` events with subtype
-        // `thinking_tokens` between content-block events. They carry no authority, so they
-        // must degrade to ordered unrecognized observations without breaking correlation.
-        assert!(observations.snapshot().iter().any(|observation| matches!(
-            observation.observation(),
-            AgentObservation::UnrecognizedHarnessEvent { event }
-                if event["type"] == "system" && event["subtype"] == "thinking_tokens"
-        )));
-        assert!(!provider.has_pending_request());
-        assert_retained_native_session(&root, &[RESPONSE]);
-        provider.shutdown().await;
-    })
-    .await;
-}
-
-/// Opaque payload of a native `redacted_thinking` block. The native API delivers this
-/// block complete in its `content_block_start`, with no deltas.
-const REDACTED_THINKING_DATA: &str = "EmwKAhgBEgy3va3scherzoredacted";
-
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_09_every_block_kind_correlates_its_own_nominal_envelope() {
-    // Fresh per-case native resources, as in every other exact-binary case.
-    let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog(
-        "pinned Claude Code block-kind correlation",
-        WATCHDOG,
-        async {
-            let mut provider = LoopbackProvider::start().await;
-            let root = SyntheticClaudeCodeRoot::new();
-            let observations = RecordingObservationSink::default();
-            let running =
-                launch_recorded_response_lifecycle(executable, &root, &provider, &observations)
-                    .await;
-
-            // One native message carrying every content-block kind. `redacted_thinking` is an
-            // unrecognized kind, so it correlates through `ActiveContentBlock::Unknown`, whose
-            // rule is stricter than the text and thinking rules: the nominal envelope must equal
-            // the whole `content_block_start` block. A tool_use block additionally proves the
-            // exchange survives block-kind interleaving and continues into a second message.
-            provider.next_request().await.release_blocks(vec![
-                LoopbackBlock::thinking(&["deciding to call a tool "]),
-                LoopbackBlock::redacted_thinking(REDACTED_THINKING_DATA),
-                LoopbackBlock::tool_use(
-                    "Bash",
-                    json!({"command": "echo probe-marker", "description": "controlled probe"}),
-                ),
-            ]);
-            provider.next_request().await.release_text(RESPONSE);
-
-            let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
-                running.finish().await
-            else {
-                panic!("interleaved block kinds must still reach an ordinary response outcome");
-            };
-            assert_eq!(response.as_str(), RESPONSE);
-            // Only the final message's text is the response; nothing from the tool-calling
-            // message contributes to it.
-            assert_eq!(observations.concatenated_text(assistant_text), RESPONSE);
-            assert!(!provider.has_pending_request());
-            assert_retained_native_session(&root, &[RESPONSE]);
-            provider.shutdown().await;
-        },
-    )
-    .await;
-}
-
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_09b_oversized_image_read_returns_a_bounded_tool_error() {
-    let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog("oversized image refusal", WATCHDOG, async {
-        let mut provider = LoopbackProvider::start().await;
-        let root = SyntheticClaudeCodeRoot::new();
-        // Sparse file: the native Read tool must refuse it without reading 129 MB.
-        let image = root.project().join("oversized.png");
-        fs::File::create(&image)
-            .unwrap()
-            .set_len(129 * 1024 * 1024)
-            .unwrap();
-        let observations = RecordingObservationSink::default();
-        let running =
-            launch_recorded_response_lifecycle(executable, &root, &provider, &observations).await;
-        provider
-            .next_request()
-            .await
-            .release_tool_use("Read", json!({"file_path": image.display().to_string()}));
-        let next = provider.next_request().await;
-        let tool_results = observations
-            .snapshot()
-            .iter()
-            .filter_map(|entry| match entry.observation() {
-                AgentObservation::ToolResult {
-                    is_error, content, ..
-                } => Some((*is_error, content.len())),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(tool_results.len(), 1, "{tool_results:?}");
-        assert!(
-            tool_results[0].0,
-            "oversized image must return a tool error"
-        );
-        assert!(
-            tool_results[0].1 < 4096,
-            "tool error must not contain image bytes"
-        );
-        next.release_text(RESPONSE);
-        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
-            running.finish().await
-        else {
-            panic!("image refusal must allow the production adapter to settle");
-        };
-        assert_eq!(response.as_str(), RESPONSE);
-        assert_retained_native_session(&root, &[RESPONSE]);
-        assert!(!provider.has_pending_request());
-        provider.shutdown().await;
-    })
-    .await;
-}
-
-#[tokio::test]
-#[ignore = "requires pinned harness"]
-async fn pinned_real_claude_code_10_tool_exchange_normalizes_inputs_and_omits_is_error() {
-    let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog(
-        "pinned Claude Code tool-exchange normalization",
-        WATCHDOG,
-        async {
-            let mut provider = LoopbackProvider::start().await;
-            let root = SyntheticClaudeCodeRoot::new();
-            let observations = RecordingObservationSink::default();
-            let running =
-                launch_recorded_response_lifecycle(executable, &root, &provider, &observations)
-                    .await;
-
-            // A Write followed by a Bash call in one message reproduces the live workflow
-            // exchange that drifted from the profile: Write's successful result carries no
-            // `is_error`, and the model's Bash `command` begins with `cd <cwd> && `, which
-            // Claude Code strips before restating the block in its nominal envelope. The
-            // command reads the file with shell builtins only: the Bash tool's `PATH` under
-            // the synthetic root is `/usr/bin:/bin`, which carries no coreutils on the NixOS
-            // conformance runners.
-            let probe = root.project().join("probe-marker.txt");
-            const READ_PROBE: &str = "printf '%s\\n' \"$(<probe-marker.txt)\"";
-            let streamed_command = format!("cd {} && {READ_PROBE}", root.project().display());
-            provider.next_request().await.release_blocks(vec![
-                LoopbackBlock::tool_use(
-                    "Write",
-                    json!({"file_path": probe.display().to_string(), "content": "probe-marker\n"}),
-                ),
-                LoopbackBlock::tool_use(
-                    "Bash",
-                    json!({"command": streamed_command, "description": "controlled probe"}),
-                ),
-            ]);
-            provider.next_request().await.release_text(RESPONSE);
-
-            let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) =
-                running.finish().await
-            else {
-                panic!("a tool exchange with normalized inputs must reach an ordinary response");
-            };
-            assert_eq!(response.as_str(), RESPONSE);
-            assert_eq!(fs::read_to_string(&probe).unwrap(), "probe-marker\n");
-
-            // Both results are observed as successes; the Bash result is the written content.
-            let results = observations
-                .snapshot()
-                .iter()
-                .filter_map(|observation| match observation.observation() {
-                    AgentObservation::ToolResult {
-                        call_id,
-                        is_error,
-                        content,
-                    } => Some((Arc::clone(call_id), *is_error, Arc::clone(content))),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            assert_eq!(results.len(), 2, "{results:?}");
-            assert!(
-                results.iter().all(|(_, is_error, _)| !is_error),
-                "{results:?}"
-            );
-            assert!(
-                results
-                    .iter()
-                    .any(|(_, _, content)| content.trim() == "probe-marker")
-            );
-
-            // The retained native transcript proves the drift this case qualifies: the Bash
-            // block Claude Code recorded no longer begins with the `cd <cwd> && ` prefix the
-            // model streamed, and the Write result carries no `is_error` member at all.
-            let transcript = fs::read_to_string(root.retained_transcript())
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str::<Value>(line).unwrap())
-                .collect::<Vec<_>>();
-            let bash_block = transcript
-                .iter()
-                .find_map(|message| find_content_block(message, "tool_use", "Bash"))
-                .expect("retained transcript must carry the Bash tool_use block");
-            assert_eq!(bash_block["input"]["command"], READ_PROBE);
-            let write_result = transcript
-                .iter()
-                .find_map(|message| find_tool_result(message, "File created successfully"))
-                .expect("retained transcript must carry the Write tool_result block");
-            assert!(write_result.get("is_error").is_none(), "{write_result}");
-
-            assert!(!provider.has_pending_request());
-            assert_retained_native_session(&root, &[RESPONSE]);
-            provider.shutdown().await;
-        },
-    )
-    .await;
-}
-
-fn content_blocks(message: &Value) -> impl Iterator<Item = &Value> {
-    message["message"]["content"]
-        .as_array()
-        .into_iter()
-        .flatten()
-}
-
-fn find_content_block<'a>(message: &'a Value, block_type: &str, name: &str) -> Option<&'a Value> {
-    content_blocks(message).find(|block| block["type"] == block_type && block["name"] == name)
-}
-
-fn find_tool_result<'a>(message: &'a Value, content_fragment: &str) -> Option<&'a Value> {
-    content_blocks(message).find(|block| {
-        block["type"] == "tool_result"
-            && contains_string_fragment(&block["content"], content_fragment)
-    })
+fn milestones(
+    observations: &RecordingObservationSink,
+    milestone: AgentLifecycleMilestone,
+) -> usize {
+    observations
+        .snapshot()
+        .iter()
+        .filter(|envelope| {
+            matches!(envelope.observation(), AgentObservation::Lifecycle { milestone: observed } if *observed == milestone)
+        })
+        .count()
 }
 
 fn contains_exact_value(value: &Value, expected: &Value) -> bool {

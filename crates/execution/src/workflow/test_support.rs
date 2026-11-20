@@ -254,8 +254,7 @@ pub(crate) use fixtures::{
 
 // The host-scaled watchdog lives in `useful_test_support::watchdog` (INV-TESTING-18).
 pub(crate) use useful_test_support::watchdog::{
-    MAX_WATCHDOG_SCALE, host_load, host_scaled_watchdog, host_scaled_watchdog_with_diagnosis,
-    watchdog_scale,
+    host_scaled_watchdog, host_scaled_watchdog_with_diagnosis,
 };
 
 /// A validator for one `$defs` definition of a JSON Schema document, so a test checks a

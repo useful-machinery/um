@@ -7,6 +7,7 @@ use std::thread::{self, JoinHandle};
 
 use watchdog::{FIXTURE_WAIT_BASE, host_scaled_duration, host_scaled_recv};
 
+pub mod mcp;
 pub mod watchdog;
 
 pub fn fixture_git_command(program: impl AsRef<OsStr>) -> Command {

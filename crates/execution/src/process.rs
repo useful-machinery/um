@@ -19,16 +19,17 @@ const TEST_WORKER_EXECUTABLE: &str = "USEFUL_TEST_INTERNAL_WORKER_EXECUTABLE";
 /// worker role: that executable dispatches the worker roles and may be its own worker.
 static DISPATCHES_WORKER_ROLES: AtomicBool = AtomicBool::new(false);
 
-/// Records that the running executable dispatches the internal worker roles. Only the two
-/// `internal_worker_requested` predicates call this; a test never does, because the record is
-/// process-wide and would make the whole harness its own worker (INV-TESTING-20).
+/// Records that the running executable dispatches the internal worker roles. Only the three
+/// `internal_worker_requested` predicates, of the child-guard, result-validation and Claude Code
+/// result-tool roles, call this; a test never does, because the record is process-wide and
+/// would make the whole harness its own worker (INV-TESTING-20).
 pub(crate) fn record_internal_worker_dispatch() {
     DISPATCHES_WORKER_ROLES.store(true, Ordering::Relaxed);
 }
 
-/// The executable launched in the child-guard and result-validation worker roles. A shipped
-/// build is its own worker. A test build resolves it by INV-TESTING-20, see
-/// [`test_build_internal_worker_executable`].
+/// The executable launched in the child-guard, result-validation and Claude Code result-tool
+/// worker roles. A shipped build is its own worker. A test build resolves it by INV-TESTING-20,
+/// see [`test_build_internal_worker_executable`].
 pub(crate) fn internal_worker_executable() -> io::Result<PathBuf> {
     if cfg!(any(test, feature = "test-fixtures")) {
         return test_build_internal_worker_executable(

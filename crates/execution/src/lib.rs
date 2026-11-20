@@ -69,6 +69,10 @@ pub use workflow::child_guard::{
     internal_worker_requested as child_guard_worker_requested,
     run_internal_worker as run_child_guard_worker,
 };
+pub use workflow::claude_code::result_tool::{
+    internal_worker_requested as result_tool_worker_requested,
+    run_internal_worker as run_result_tool_worker,
+};
 pub use workflow::continuation::{
     AdmissionViolation as ContinuationAdmissionViolation, PriorState as ContinuationPriorState,
 };

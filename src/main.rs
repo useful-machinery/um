@@ -25,6 +25,9 @@ fn main() -> ExitCode {
     if useful_execution::result_validation_worker_requested() {
         return useful_execution::run_result_validation_worker().into();
     }
+    if useful_execution::result_tool_worker_requested() {
+        return useful_execution::run_result_tool_worker().into();
+    }
     if useful_runner::workflow_git_helper_requested() {
         return if useful_runner::run_workflow_git_helper() {
             ExitCode::Success

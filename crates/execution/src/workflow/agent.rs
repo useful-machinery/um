@@ -15,9 +15,7 @@ use super::admission::{
     CancellationReason, CancellationSource, EnvironmentSnapshot, HarnessLoginOutcome,
 };
 use super::agent_diagnostics::AgentDiagnosticSession;
-use super::agent_stream_excerpt::RejectedStreamExcerpt;
 use super::cancellation::CancellationFlag;
-use super::claude_code::ClaudeCodeStreamJsonV1TrackedWork;
 use super::execution_root::{AdmittedWorkingDirectory, WorkingDirectorySelectionFailure};
 use super::process_group::ProcessGuardRegistry;
 use super::result_validation::ResultValidationFatal;
@@ -1094,15 +1092,6 @@ impl AgentProtocolRejectionDiagnostic {
         }
     }
 
-    pub(crate) fn claude_code_stream_json_v1(
-        diagnostic: super::claude_code::ClaudeCodeStreamJsonV1ProtocolRejection,
-    ) -> Self {
-        Self {
-            schema_version: 1,
-            profile: AgentProtocolRejectionProfile::ClaudeCodeStreamJsonV1(diagnostic),
-        }
-    }
-
     pub(crate) fn codex_app_server_v1(
         diagnostic: super::codex::CodexAppServerV1ProtocolRejection,
     ) -> Self {
@@ -1118,9 +1107,6 @@ impl AgentProtocolRejectionDiagnostic {
             AgentProtocolRejectionProfile::PiJsonV1(rejection) => {
                 useful_support::wire_name(rejection.reason())
             }
-            AgentProtocolRejectionProfile::ClaudeCodeStreamJsonV1(rejection) => {
-                useful_support::wire_name(rejection.reason())
-            }
             AgentProtocolRejectionProfile::CodexAppServerV1(rejection) => {
                 useful_support::wire_name(rejection.reason())
             }
@@ -1132,7 +1118,6 @@ impl AgentProtocolRejectionDiagnostic {
 #[serde(tag = "profile", content = "detail")]
 pub(crate) enum AgentProtocolRejectionProfile {
     PiJsonV1(super::pi::PiJsonV1ProtocolRejection),
-    ClaudeCodeStreamJsonV1(super::claude_code::ClaudeCodeStreamJsonV1ProtocolRejection),
     CodexAppServerV1(super::codex::CodexAppServerV1ProtocolRejection),
 }
 
@@ -1140,11 +1125,6 @@ pub(crate) enum AgentProtocolRejectionProfile {
 pub struct AgentFailure {
     cause: AgentFailureCause,
     protocol_rejection: Option<Box<AgentProtocolRejectionDiagnostic>>,
-    /// Retained beside the protocol rejection on the runner host only; never projected.
-    stream_excerpt: Option<Box<RejectedStreamExcerpt>>,
-    /// The work the Claude Code parser held when it refused; retained beside the protocol
-    /// rejection on the runner host only, never projected.
-    tracked_work: Option<Box<ClaudeCodeStreamJsonV1TrackedWork>>,
 }
 
 impl AgentFailure {
@@ -1152,8 +1132,6 @@ impl AgentFailure {
         Self {
             cause,
             protocol_rejection: None,
-            stream_excerpt: None,
-            tracked_work: None,
         }
     }
 
@@ -1164,14 +1142,7 @@ impl AgentFailure {
         Self {
             cause,
             protocol_rejection: Some(Box::new(protocol_rejection)),
-            stream_excerpt: None,
-            tracked_work: None,
         }
-    }
-
-    pub(crate) fn with_stream_excerpt(mut self, excerpt: RejectedStreamExcerpt) -> Self {
-        self.stream_excerpt = Some(Box::new(excerpt));
-        self
     }
 
     pub(crate) fn cause(&self) -> &AgentFailureCause {
@@ -1180,22 +1151,6 @@ impl AgentFailure {
 
     pub(crate) fn protocol_rejection(&self) -> Option<&AgentProtocolRejectionDiagnostic> {
         self.protocol_rejection.as_deref()
-    }
-
-    pub(crate) fn stream_excerpt(&self) -> Option<&RejectedStreamExcerpt> {
-        self.stream_excerpt.as_deref()
-    }
-
-    pub(crate) fn with_tracked_work(
-        mut self,
-        tracked_work: ClaudeCodeStreamJsonV1TrackedWork,
-    ) -> Self {
-        self.tracked_work = Some(Box::new(tracked_work));
-        self
-    }
-
-    pub(crate) fn tracked_work(&self) -> Option<&ClaudeCodeStreamJsonV1TrackedWork> {
-        self.tracked_work.as_deref()
     }
 }
 

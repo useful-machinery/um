@@ -12,8 +12,8 @@ use super::{
 const CLAUDE_CODE_CHECK_ID: &str = "execution.harness.claude-code-stream-json-v1";
 const PI_CHECK_ID: &str = "execution.harness.pi-json-v1";
 const CLOSED_PROBES: &[u8] = b"--version\n--help\n";
-pub(super) const COMPLETE_HELP: &str = "Usage: claude [options] [command] [prompt]\nOptions:\n  -p, --print Print response\n  --input-format <format> Input format: stream-json\n  --output-format <format> Output format: stream-json\n  --verbose Verbose mode\n  --include-partial-messages Include chunks\n  --forward-subagent-text Forward text\n  --session-id <uuid> Use session\n  --permission-mode <mode> Permission mode\n  --setting-sources <sources> Setting sources\n  --model <model> Model\n  --effort <level> Effort\n  --bare Context via --append-system-prompt[-file]\n  --json-schema <schema> Schema\n";
-const REQUIRED_CAPABILITIES: &str = "print_mode,stream_json_input,stream_json_output,verbose,partial_messages,forward_subagent_text,session_id,permission_mode,setting_sources,model,effort,append_system_prompt_file,json_schema";
+pub(super) const COMPLETE_HELP: &str = "Usage: claude [options] [command] [prompt]\nOptions:\n  -p, --print Print response\n  --input-format <format> Input format: stream-json\n  --output-format <format> Output format: stream-json\n  --verbose Verbose mode\n  --include-partial-messages Include chunks\n  --forward-subagent-text Forward text\n  --session-id <uuid> Use session\n  --permission-mode <mode> Permission mode\n  --setting-sources <sources> Setting sources\n  --model <model> Model\n  --effort <level> Effort\n  --bare Context via --append-system-prompt[-file]\n  --mcp-config <configs...> Load MCP servers from JSON files or strings\n";
+const REQUIRED_CAPABILITIES: &str = "print_mode,stream_json_input,stream_json_output,verbose,partial_messages,forward_subagent_text,session_id,permission_mode,setting_sources,model,effort,append_system_prompt_file,mcp_config";
 
 pub(super) struct ClaudeCodeFixture {
     _directory: tempfile::TempDir,
@@ -245,7 +245,7 @@ fn doctor_rejects_missing_explicit_session_capability() {
     assert_eq!(report_code(&output), "unsupported_claude_code_capability");
 }
 
-// REQ-AGENT-2, REQ-AGENT-4, REQ-AGENT-5, REQ-AGENT-6, REQ-AGENT-50
+// REQ-AGENT-2, REQ-AGENT-4, REQ-AGENT-5, REQ-AGENT-6, REQ-AGENT-7, REQ-AGENT-50
 // INV-HARNESS-11
 #[test]
 fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
@@ -269,7 +269,7 @@ fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
     );
     assert!(fallback.recorded_probes().is_empty());
 
-    let missing_schema_help = COMPLETE_HELP.replace("--json-schema", "--schema");
+    let missing_mcp_config_help = COMPLETE_HELP.replace("--mcp-config", "--mcp");
     for (version, help, expected_code, expected_probes) in [
         (
             "not-a-version",
@@ -291,7 +291,7 @@ fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
         ),
         (
             "2.1.234 (Claude Code)",
-            missing_schema_help.as_str(),
+            missing_mcp_config_help.as_str(),
             "unsupported_claude_code_capability",
             CLOSED_PROBES,
         ),
@@ -308,6 +308,9 @@ fn doctor_reports_each_claude_code_installation_failure_without_fallback() {
                 details["version"],
                 version.trim_end_matches(" (Claude Code)")
             );
+        }
+        if expected_code == "unsupported_claude_code_capability" {
+            assert_eq!(details["capability"], "mcp_config");
         }
         assert_eq!(fixture.recorded_probes(), expected_probes);
     }
@@ -364,11 +367,16 @@ fn doctor_passes_a_newer_claude_code_as_untested_and_reports_qualification() {
         "supported_range"
     );
 
-    let missing_schema_help = COMPLETE_HELP.replace("--json-schema <schema>", "--schema <schema>");
-    let incapable = ClaudeCodeFixture::new("2.2.0 (Claude Code)", &missing_schema_help, true);
+    let missing_mcp_config_help =
+        COMPLETE_HELP.replace("--mcp-config <configs...>", "--mcp <configs...>");
+    let incapable = ClaudeCodeFixture::new("2.2.0 (Claude Code)", &missing_mcp_config_help, true);
     let output = doctor_json(incapable.path_directory(), &[CLAUDE_CODE_CHECK_ID], &[]);
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(report_code(&output), "unsupported_claude_code_capability");
+    assert_eq!(
+        report(&output)["checks"][0]["details"]["capability"],
+        "mcp_config"
+    );
     assert!(
         report(&output)["checks"][0]["details"]
             .get("qualification")

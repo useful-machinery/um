@@ -160,8 +160,8 @@ canonical stable version in `>=2.1.234 <2.2.0`, or any stable version newer than
 `2.1.321`, and the closed non-model capabilities used by the production adapter. The
 repository's exact qualification package remains `2.1.321`; accepting the range does not
 claim exact-binary conformance for every release or host, and a newer release is admitted
-as untested, under the same isolation, launch identity check, and protocol validation,
-without any qualification evidence. The validator does not read ambient `CLAUDE_CONFIG_DIR`, provider credentials, or native
+as untested, under the same isolation, launch identity check, and validation of every
+submitted result, without any qualification evidence. The validator does not read ambient `CLAUDE_CONFIG_DIR`, provider credentials, or native
 settings; query a provider or model catalog; execute the caller project; install or update
 Claude Code; or expose any of those values in doctor output.
 
@@ -184,8 +184,9 @@ identifiers, and the normalized path of a compatible installation. Workflow data
 assignments, imports, and
 remote values cannot supply or alter the search path. Once validation succeeds,
 admission and execution retain the absolute installation identity and exact observed version and never search `PATH` again,
-so a later `PATH` change cannot redirect an admitted invocation. Every native
-initialization frame must report that retained version exactly; a mismatch fails through
+so a later `PATH` change cannot redirect an admitted invocation. The startup report of
+Claude Code, its first initialization frame, and of Codex, its thread start, must report
+that retained version exactly; a mismatch fails through
 the typed harness path before any workflow output can commit.
 
 ## Claude Code execution authority
@@ -207,10 +208,31 @@ process, network, resource, and secret policy. Useful Machinery does not claim t
 settings can contain a hostile same-user process, and the maintained conformance suite
 runs only in fresh synthetic roots against a loopback provider without live credentials.
 
+Once a Claude Code step has started, its first initialization frame having reported the
+retained version, three things alone decide it: the results submitted through the result
+tool, the last `result` Claude Code reports, and how its process exits. Every other line of
+its stream-JSON output is shown as activity and is never workflow, result, failure, or retry
+authority, whatever its type or order. For a step that returns a structured result, Useful
+Machinery adds one MCP server to that invocation alone, `useful_workflow_result`, beside the
+servers the runner's own settings load and in place of a configured server of the same
+name. Claude Code starts it as its child in the invocation's process group. It is the
+`useful` executable itself in an internal relay role that holds no state and opens no
+network listener; it relays each call to a Unix socket, mode 0600, in the invocation's
+owner-private staging, and the MCP configuration file that names it is mode 0400. Both are
+removed when the invocation ends.
+
+Claude Code does not validate a submission: Useful Machinery's validator is the only judge,
+and a value is committed only after the validator accepts it. Any thread of the session can
+call the result tool, a subagent included, and the step's value is the last submission
+accepted, so whatever can direct the agent or a subagent (a loaded project instruction,
+skill, hook, plugin, or MCP server) can decide the value a valid submission carries. That is
+the boundary this section already gives local users and runner operators, and the socket
+is not protected from a process of the same user.
+
 Each invocation drains Claude Code's bounded stderr as a generic process-diagnostic
 stream, independently of stream-JSON stdout. Stderr bytes remain observable and retained;
-the parser never consumes their release-specific prose, and their presence cannot alter
-protocol or result authority.
+nothing reads their release-specific prose, and their presence cannot alter a step's
+outcome or result authority.
 
 Each durable local invocation retains its potentially sensitive native Claude transcript
 inside the owner-private run diagnostics tree and removes its temporary ambient history

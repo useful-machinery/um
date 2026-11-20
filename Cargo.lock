@@ -2926,6 +2926,7 @@ name = "useful-test-support"
 version = "0.0.0-dev"
 dependencies = [
  "rustix",
+ "serde_json",
  "tokio",
 ]
 

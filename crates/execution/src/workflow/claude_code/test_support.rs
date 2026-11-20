@@ -1,15 +1,15 @@
-use std::cell::Cell;
 use std::ffi::OsString;
 use std::fs;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::num::{NonZeroU64, NonZeroUsize};
-use std::os::unix::fs::OpenOptionsExt as _;
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use nix::sys::stat::Mode;
 use nix::unistd::mkfifo;
+use rustix::process::Pid;
 use serde_json::{Value, json};
 use tokio::io::unix::AsyncFd;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -19,22 +19,25 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 
 use super::adapter::ClaudeCodeStreamJsonV1Adapter;
-use super::{ClaudeCodeStreamJsonV1ProtocolLimits, FIXED_INVOCATION_ENVIRONMENT, OutstandingWork};
+use super::{ClaudeCodeStreamJsonV1ProtocolLimits, FIXED_INVOCATION_ENVIRONMENT};
 use crate::claude_code::CLAUDE_CODE_STREAM_JSON_V1_QUALIFICATION_VERSION as QUALIFICATION_VERSION;
 use crate::workflow::admission::{CancellationSource, EnvironmentSnapshot};
 use crate::workflow::agent::{
     AdmittedAgentAdapter, AgentAdapter, AgentCompatibilityProfile, AgentDiagnosticLevel,
     AgentInvocation, AgentInvocationIdentity, AgentInvocationLimits, AgentInvocationStaging,
-    AgentLifecycleMilestone, AgentObservation, AgentOutcome, AgentProcessContext,
-    AgentProcessControl, AgentPrompt, AgentStartReceiver, AgentValueMode, PositiveDuration,
-    WorkflowRunId, agent_start_channel,
+    AgentObservation, AgentOutcome, AgentProcessContext, AgentProcessControl, AgentPrompt,
+    AgentStartReceiver, AgentValueMode, PositiveDuration, WorkflowRunId, agent_start_channel,
 };
 use crate::workflow::agent_diagnostics::AgentDiagnosticSession;
 use crate::workflow::claude_code::{ClaudeCodeConfig, ClaudeCodeEffort};
+use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::diagnostic::StepDiagnosticLog;
 use crate::workflow::execution_root::AdmittedExecutionRoot;
 use crate::workflow::observation::NoopExecutionObserver;
-use crate::workflow::process_group::ProcessGuardRegistry;
+use crate::workflow::process_group::{
+    AuthenticatedProcessGroup, DurableProcessGuardStore, ProcessGuardRegistry,
+    ProcessGuardStoreError,
+};
 use crate::workflow::runtime::{ActionId, TransitionSequence};
 
 const MAXIMUM_HTTP_HEADER_BYTES: usize = 64 * 1024;
@@ -44,7 +47,6 @@ const CONFORMANCE_SHELL_ENVIRONMENT: &str = "USEFUL_CLAUDE_CODE_CONFORMANCE_SHEL
 /// Opaque placeholder for the native `signature_delta` that accompanies a thinking
 /// block. Claude Code forwards this value without interpreting it in one exchange.
 const THINKING_SIGNATURE: &str = "c2NoZXJ6by1sb29wYmFjay10aGlua2luZy1zaWduYXR1cmU=";
-const STRUCTURED_OUTPUT_TOOL_NAME: &str = "StructuredOutput";
 
 #[derive(Clone)]
 pub(crate) struct FixtureSignal {
@@ -89,7 +91,12 @@ impl FixtureSignal {
     }
 }
 
-pub(super) use crate::workflow::test_support::{PendingClock, RecordingObservationSink};
+pub(super) use crate::workflow::test_support::{
+    InlineValidationWorker, PendingClock, RecordingObservationSink,
+};
+
+/// The result tool as the agent sees it (REQ-AGENT-84).
+pub(super) const RESULT_TOOL: &str = "mcp__useful_workflow_result__submit";
 
 pub(super) fn invocation_identity(run: &str, step: &str) -> AgentInvocationIdentity {
     AgentInvocationIdentity::new(
@@ -131,18 +138,10 @@ pub(super) struct SyntheticClaudeCodeRoot {
     private: PathBuf,
     shell: PathBuf,
     system_prompt: PathBuf,
-    environment_overrides: Vec<(OsString, OsString)>,
 }
 
 impl SyntheticClaudeCodeRoot {
     pub(super) fn new() -> Self {
-        Self::with_environment_overrides(&[])
-    }
-
-    /// A root whose child environment also carries `overrides`, for a harness knob a case
-    /// sets, such as Claude Code's foreground-to-background promotion timeout. The names
-    /// must not repeat a variable the root already sets.
-    pub(super) fn with_environment_overrides(overrides: &[(&str, &str)]) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let project = temporary.path().join("project");
         let home = temporary.path().join("home");
@@ -151,6 +150,9 @@ impl SyntheticClaudeCodeRoot {
         for directory in [&project, &home, &config, &private] {
             fs::create_dir(directory).unwrap();
         }
+        // The private directory is the invocation's result endpoint directory, which the
+        // result tool's channel requires to be the owner's alone.
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o700)).unwrap();
         fs::write(
             project.join("README.md"),
             b"synthetic conformance project\n",
@@ -186,10 +188,6 @@ impl SyntheticClaudeCodeRoot {
             private,
             shell,
             system_prompt,
-            environment_overrides: overrides
-                .iter()
-                .map(|(name, value)| (OsString::from(name), OsString::from(value)))
-                .collect(),
         }
     }
 
@@ -411,33 +409,29 @@ done
     }
 
     pub(super) fn environment_snapshot(&self, provider: &LoopbackProvider) -> EnvironmentSnapshot {
-        EnvironmentSnapshot::new(
-            [
-                (OsString::from("HOME"), self.home.as_os_str().to_owned()),
-                (
-                    OsString::from("CLAUDE_CONFIG_DIR"),
-                    self.config.as_os_str().to_owned(),
-                ),
-                (
-                    OsString::from("CLAUDE_CODE_PROJECT_DIR_NAME"),
-                    OsString::from("ambient-project-name"),
-                ),
-                (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
-                (OsString::from("SHELL"), self.shell.as_os_str().to_owned()),
-                (OsString::from("CI"), OsString::from("1")),
-                (OsString::from("NO_COLOR"), OsString::from("1")),
-                (
-                    OsString::from("ANTHROPIC_API_KEY"),
-                    OsString::from(PLACEHOLDER_API_KEY),
-                ),
-                (
-                    OsString::from("ANTHROPIC_BASE_URL"),
-                    OsString::from(provider.base_url()),
-                ),
-            ]
-            .into_iter()
-            .chain(self.environment_overrides.iter().cloned()),
-        )
+        EnvironmentSnapshot::new([
+            (OsString::from("HOME"), self.home.as_os_str().to_owned()),
+            (
+                OsString::from("CLAUDE_CONFIG_DIR"),
+                self.config.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("CLAUDE_CODE_PROJECT_DIR_NAME"),
+                OsString::from("ambient-project-name"),
+            ),
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("SHELL"), self.shell.as_os_str().to_owned()),
+            (OsString::from("CI"), OsString::from("1")),
+            (OsString::from("NO_COLOR"), OsString::from("1")),
+            (
+                OsString::from("ANTHROPIC_API_KEY"),
+                OsString::from(PLACEHOLDER_API_KEY),
+            ),
+            (
+                OsString::from("ANTHROPIC_BASE_URL"),
+                OsString::from(provider.base_url()),
+            ),
+        ])
     }
 
     pub(super) fn configure_command(&self, command: &mut Command, provider: &LoopbackProvider) {
@@ -455,7 +449,6 @@ done
         for (name, value) in FIXED_INVOCATION_ENVIRONMENT {
             command.env(name, value);
         }
-        command.envs(self.environment_overrides.iter().cloned());
     }
 }
 
@@ -492,15 +485,45 @@ impl ControlledProviderRequest {
         self.release_blocks(vec![LoopbackBlock::text(text)]);
     }
 
-    pub(super) fn release_structured_output(self, envelope: Value) {
-        self.release_blocks(vec![LoopbackBlock::tool_use(
-            STRUCTURED_OUTPUT_TOOL_NAME,
-            envelope,
-        )]);
-    }
-
     pub(super) fn release_tool_use(self, name: &str, input: Value) {
         self.release_blocks(vec![LoopbackBlock::tool_use(name, input)]);
+    }
+
+    /// Answers with one call of the result tool submitting `value` (REQ-AGENT-84).
+    pub(super) fn release_submission(self, value: Value) {
+        self.release_tool_use(RESULT_TOOL, submission(value));
+    }
+
+    /// Whether the request offers the agent the result tool.
+    pub(super) fn offers_result_tool(&self) -> bool {
+        self.body["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["name"] == RESULT_TOOL))
+    }
+
+    /// The answer this request carries to the last tool call of the message before it: whether
+    /// it is an error, and its text.
+    pub(super) fn tool_answer(&self) -> (bool, String) {
+        let answer = self.body["messages"]
+            .as_array()
+            .and_then(|messages| messages.last())
+            .and_then(|message| message["content"].as_array())
+            .and_then(|content| {
+                content
+                    .iter()
+                    .rev()
+                    .find(|block| block["type"] == "tool_result")
+            })
+            .unwrap_or_else(|| panic!("the request carries no tool answer: {}", self.body));
+        let text = match &answer["content"] {
+            Value::String(text) => text.clone(),
+            Value::Array(parts) => parts
+                .iter()
+                .filter_map(|part| part["text"].as_str())
+                .collect(),
+            other => panic!("unexpected tool answer content: {other}"),
+        };
+        (answer["is_error"].as_bool().unwrap_or(false), text)
     }
 
     /// Releases one native assistant message built from the supplied ordered content
@@ -539,19 +562,21 @@ impl ControlledProviderRequest {
     }
 }
 
+/// The result tool's input for `value`.
+pub(super) fn submission(value: Value) -> Value {
+    json!({"submission": {"result": value}})
+}
+
 /// One content block of a native assistant message, in the shape the Anthropic
-/// streaming API delivers it. `Thinking` accumulates through deltas, while
-/// `RedactedThinking` arrives complete in its `content_block_start`.
+/// streaming API delivers it. `Thinking` accumulates through deltas.
 #[derive(Debug)]
 pub(super) enum LoopbackBlock {
     Text(String),
     Thinking(Vec<String>),
-    RedactedThinking(String),
-    /// A tool call, its id `tool_scherzo_loopback_<index>` unless `id` names another.
+    /// A tool call, its id `tool_scherzo_loopback_<index>`.
     ToolUse {
         name: String,
         input: Value,
-        id: Option<String>,
     },
 }
 
@@ -569,26 +594,10 @@ impl LoopbackBlock {
         )
     }
 
-    pub(super) fn redacted_thinking(data: &str) -> Self {
-        Self::RedactedThinking(data.to_owned())
-    }
-
     pub(super) fn tool_use(name: &str, input: Value) -> Self {
         Self::ToolUse {
             name: name.to_owned(),
             input,
-            id: None,
-        }
-    }
-
-    /// A tool call with an id of its own, for a call that must not share the default id
-    /// another thread's call carries, as a subagent's `Agent` call that would otherwise name
-    /// the main thread's.
-    pub(super) fn tool_use_with_id(id: &str, name: &str, input: Value) -> Self {
-        Self::ToolUse {
-            name: name.to_owned(),
-            input,
-            id: Some(id.to_owned()),
         }
     }
 }
@@ -873,15 +882,10 @@ fn content_block_events(index: usize, block: &LoopbackBlock) -> Vec<(&'static st
                 deltas,
             )
         }
-        // The native API delivers a redacted thinking block complete, with no deltas.
-        LoopbackBlock::RedactedThinking(data) => (
-            json!({"type": "redacted_thinking", "data": data}),
-            Vec::new(),
-        ),
-        LoopbackBlock::ToolUse { name, input, id } => (
+        LoopbackBlock::ToolUse { name, input } => (
             json!({
                 "type": "tool_use",
-                "id": id.clone().unwrap_or_else(|| format!("tool_scherzo_loopback_{index}")),
+                "id": format!("tool_scherzo_loopback_{index}"),
                 "name": name,
                 "input": {},
             }),
@@ -978,10 +982,8 @@ pub(super) async fn exclusive_conformance_executable()
     let executable = conformance_executable();
     // Native startup is resource-intensive enough that concurrent qualification cases can
     // exhaust their anti-hang watchdogs before reaching controlled provider I/O, so this
-    // mutex admits one exact-binary case at a time. The lifecycle matrix is one such case: it
-    // holds the guard for its whole run and overlaps only its own slow tier under it
-    // (INV-HARNESS-19). Load from outside the suite is left to `host_scaled_watchdog`, which
-    // scales each case's `WATCHDOG` base by the host's load.
+    // mutex admits one exact-binary case at a time. Load from outside the suite is left to
+    // `host_scaled_watchdog`, which scales each case's `WATCHDOG` base by the host's load.
     let exclusive = EXACT_BINARY_CONFORMANCE.lock().await;
     (executable, exclusive)
 }
@@ -1001,12 +1003,47 @@ pub(super) fn conformance_limits() -> AgentInvocationLimits<ClaudeCodeStreamJson
     )
 }
 
+/// Records the process group the adapter registers for its Claude Code, so a case can see
+/// the group gone once the invocation has ended (INV-HARNESS-8).
+#[derive(Clone, Default)]
+pub(super) struct RecordedProcessGroup(Arc<std::sync::Mutex<Option<Pid>>>);
+
+impl RecordedProcessGroup {
+    pub(super) fn get(&self) -> Pid {
+        self.0
+            .lock()
+            .unwrap()
+            .expect("the adapter registered no process group")
+    }
+}
+
+impl DurableProcessGuardStore for RecordedProcessGroup {
+    fn register(
+        &self,
+        _step: &str,
+        _action_id: u64,
+        identity: &AuthenticatedProcessGroup,
+    ) -> Result<String, ProcessGuardStoreError> {
+        *self.0.lock().unwrap() = Some(identity.process_group());
+        Ok(String::from("conformance-guard"))
+    }
+
+    fn mark_released(&self, _guard_id: &str) -> Result<(), ProcessGuardStoreError> {
+        Ok(())
+    }
+
+    fn mark_quiesced(&self, _guard_id: &str) -> Result<(), ProcessGuardStoreError> {
+        Ok(())
+    }
+}
+
 pub(super) struct RunningProductionClaudeCode {
     pub(super) task: tokio::task::JoinHandle<()>,
     started: AgentStartReceiver,
     pub(super) terminal: tokio::sync::oneshot::Receiver<AgentOutcome>,
     pub(super) cancellation: CancellationSource,
     pub(super) process_control: AgentProcessControl,
+    pub(super) process_group: RecordedProcessGroup,
 }
 
 impl RunningProductionClaudeCode {
@@ -1017,11 +1054,34 @@ impl RunningProductionClaudeCode {
         value_mode: AgentValueMode,
         observations: RecordingObservationSink,
     ) -> Self {
+        Self::launch_on(
+            executable,
+            root,
+            provider,
+            value_mode,
+            observations,
+            PendingClock,
+        )
+    }
+
+    /// Launches through the production adapter on `clock`, validating a result in process.
+    pub(super) fn launch_on<Clock>(
+        executable: PathBuf,
+        root: &SyntheticClaudeCodeRoot,
+        provider: &LoopbackProvider,
+        value_mode: AgentValueMode,
+        observations: RecordingObservationSink,
+        clock: Clock,
+    ) -> Self
+    where
+        Clock: CoordinatorClock + Send + Sync + 'static,
+    {
         // Lifecycle cases deliberately build their own invocation instead of borrowing the
         // attachment case's resources, so native cancellation cannot contaminate another root.
         let admitted_root = AdmittedExecutionRoot::admit(root.project()).unwrap();
         let working_directory = admitted_root.select_working_directory(None).unwrap();
         let cancellation = CancellationSource::new();
+        let process_group = RecordedProcessGroup::default();
         let invocation = AgentInvocation::new(
             invocation_identity("claude-code-lifecycle-conformance", "agent"),
             admitted_adapter(executable, MODEL),
@@ -1036,17 +1096,17 @@ impl RunningProductionClaudeCode {
             value_mode.clone(),
             conformance_limits(),
             cancellation.clone(),
-            ProcessGuardRegistry::default(),
+            ProcessGuardRegistry::durable(Arc::new(process_group.clone())),
             observations,
         );
         let process_control = invocation.process_control().clone();
-        let adapter = ClaudeCodeStreamJsonV1Adapter::new_default(
+        let adapter = ClaudeCodeStreamJsonV1Adapter::with_worker(
             StepDiagnosticLog::default(),
             NonZeroU64::new(1024).unwrap(),
-            PendingClock,
+            clock,
             NoopExecutionObserver,
-        )
-        .unwrap();
+            InlineValidationWorker,
+        );
         let (started_callback, started) = agent_start_channel();
         let (terminal_callback, terminal) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
@@ -1058,6 +1118,7 @@ impl RunningProductionClaudeCode {
             terminal,
             cancellation,
             process_control,
+            process_group,
         }
     }
 
@@ -1068,6 +1129,7 @@ impl RunningProductionClaudeCode {
             terminal: self.terminal,
             cancellation: self.cancellation,
             process_control: self.process_control,
+            process_group: self.process_group,
         }
     }
 }
@@ -1077,6 +1139,7 @@ pub(super) struct RunningStartedClaudeCode {
     pub(super) terminal: tokio::sync::oneshot::Receiver<AgentOutcome>,
     pub(super) cancellation: CancellationSource,
     pub(super) process_control: AgentProcessControl,
+    pub(super) process_group: RecordedProcessGroup,
 }
 
 impl RunningStartedClaudeCode {
@@ -1091,13 +1154,6 @@ pub(super) const BACKGROUND_SUBAGENT_PROMPT: &str =
     "Run the controlled background subagent command.";
 pub(super) const BACKGROUND_SUBAGENT_DESCRIPTION: &str = "Run a backgrounded subagent";
 pub(super) const BACKGROUND_SUBAGENT_RESPONSE: &str = "background subagent finished";
-/// The work a backgrounded subagent alone leaves outstanding, which its premature result's
-/// feedback names (REQ-AGENT-35).
-pub(super) const SUBAGENT_OUTSTANDING: OutstandingWork = OutstandingWork {
-    commands: false,
-    monitors: false,
-    subagents: true,
-};
 
 /// A subagent the main thread starts with `run_in_background`, whose own Bash call blocks
 /// on a fifo until the case releases it, so the main thread's turn ends while it runs.
@@ -1138,22 +1194,6 @@ impl BackgroundSubagent {
     ) -> ControlledProviderRequest {
         let request = provider.next_request().await;
         request.release_tool_use("Agent", Self::launch_input());
-        self.await_running(provider, terminal).await
-    }
-
-    /// Launches the subagent from `request`, a main-thread turn already under way, with a
-    /// sentence before the `Agent` call as a lead launching a builder writes one, and returns
-    /// the main thread's next request once the subagent's command is running.
-    pub(super) async fn launch_from(
-        &self,
-        request: ControlledProviderRequest,
-        provider: &mut LoopbackProvider,
-        terminal: &mut tokio::sync::oneshot::Receiver<AgentOutcome>,
-    ) -> ControlledProviderRequest {
-        request.release_blocks(vec![
-            LoopbackBlock::text("launching the next builder"),
-            LoopbackBlock::tool_use("Agent", Self::launch_input()),
-        ]);
         self.await_running(provider, terminal).await
     }
 
@@ -1201,12 +1241,15 @@ impl BackgroundSubagent {
         assert_eq!(self.ready.receive().await, b"ready\n");
     }
 
-    /// Releases the subagent's blocked command.
-    pub(super) async fn release(&self) {
-        let blocker = self.blocker.clone();
-        tokio::task::spawn_blocking(move || fs::write(blocker, b"done\n").unwrap())
-            .await
-            .unwrap();
+    /// Releases the subagent's blocked command. The write does not wait for a reader: a
+    /// command Claude Code has already stopped fails the case rather than hanging it.
+    pub(super) fn release(&self) {
+        let mut blocker = fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&self.blocker)
+            .unwrap_or_else(|error| panic!("no command waits on the blocker: {error}"));
+        blocker.write_all(b"done\n").unwrap();
     }
 
     /// Releases the subagent's command, serves its closing text, and returns the request of
@@ -1216,7 +1259,7 @@ impl BackgroundSubagent {
         provider: &mut LoopbackProvider,
         terminal: &mut tokio::sync::oneshot::Receiver<AgentOutcome>,
     ) -> ControlledProviderRequest {
-        self.release().await;
+        self.release();
         loop {
             let request = next_request_or_outcome(provider, terminal).await;
             if !request.opens_with(BACKGROUND_SUBAGENT_PROMPT) {
@@ -1237,61 +1280,6 @@ pub(super) async fn next_request_or_outcome(
     }
 }
 
-pub(super) fn completed_turns(observations: &RecordingObservationSink) -> usize {
-    observations
-        .snapshot()
-        .iter()
-        .filter(|envelope| {
-            matches!(
-                envelope.observation(),
-                AgentObservation::Lifecycle {
-                    milestone: AgentLifecycleMilestone::TurnCompleted,
-                }
-            )
-        })
-        .count()
-}
-
-pub(super) async fn wait_for_completed_turns(
-    observations: &RecordingObservationSink,
-    turns: usize,
-) {
-    while completed_turns(observations) < turns {
-        wait_for_a_newer_observation(observations).await;
-    }
-}
-
-/// Waits until the backgrounded subagent has reported `status` `count` times.
-pub(super) async fn wait_for_subagent_status(
-    observations: &RecordingObservationSink,
-    status: &str,
-    count: usize,
-) {
-    let reported = || {
-        backgrounded_subagent_statuses(observations)
-            .iter()
-            .filter(|reported| reported.as_str() == status)
-            .count()
-    };
-    while reported() < count {
-        wait_for_a_newer_observation(observations).await;
-    }
-}
-
-/// Waits for an observation past those recorded so far: `wait_for` evaluates the record
-/// from its start on each observation, so an evaluation past the length seen here is of a
-/// newer observation.
-async fn wait_for_a_newer_observation(observations: &RecordingObservationSink) {
-    let seen = observations.snapshot().len();
-    let evaluated = Cell::new(0);
-    observations
-        .wait_for(|_| {
-            evaluated.set(evaluated.get() + 1);
-            evaluated.get() > seen
-        })
-        .await;
-}
-
 /// The subagent's start and settlement are information diagnostics, and its own tool runs
 /// are recognized rather than reported as unrecognized `task_started` events.
 pub(super) fn assert_backgrounded_subagent_activity(observations: &RecordingObservationSink) {
@@ -1307,20 +1295,6 @@ pub(super) fn assert_backgrounded_subagent_activity(observations: &RecordingObse
         envelope.observation(),
         AgentObservation::UnrecognizedHarnessEvent { event } if event["subtype"] == "task_started"
     )));
-}
-
-/// The agent id Claude Code hands back in the Agent tool's result, which `SendMessage`
-/// addresses.
-pub(super) fn launched_agent_id(body: &Value) -> String {
-    let text = body.to_string();
-    let start = text
-        .find("agentId: ")
-        .expect("the Agent result names the agent id")
-        + "agentId: ".len();
-    text[start..]
-        .chars()
-        .take_while(|character| character.is_ascii_alphanumeric())
-        .collect()
 }
 
 /// Information diagnostics naming the subagent `description`, reduced to their status

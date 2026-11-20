@@ -8,6 +8,7 @@ use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -17,40 +18,46 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 
+use super::outcome::{Ending, StepFacts, decide};
+use super::reader::{DecidingResult, ResultText, StreamReader};
+use super::result_channel::{
+    PreparedResultChannel, ResultChannelEvent, ResultChannelHello, ResultSubmissions,
+    SubmissionJudgement,
+};
+use super::result_tool::{ResultChannelAnswer, ResultChannelFailure, ResultChannelRequest};
 use super::{
-    ClaudeCodeStreamJsonV1Parser, ClaudeCodeStreamJsonV1RejectionReason, CompletedResultExchange,
-    FIXED_INVOCATION_ENVIRONMENT, OutstandingWork, initial_user_text_frame, normal_mode_arguments,
+    FIXED_INVOCATION_ENVIRONMENT, initial_user_text_frame, normal_mode_arguments,
     result_mode_arguments, user_content_frame,
 };
 use crate::claude_code::compatibility_profile_for_version;
 use crate::workflow::admission::{CancellationReason, CancellationSource};
 use crate::workflow::agent::{
-    AgentCompatibilityProfile, AgentDiagnosticLevel, AgentFailureCause, AgentInvocation,
-    AgentLifecycleMilestone, AgentObservation, AgentOutcome, AgentProcessDirective,
-    AgentStartCallback, AgentValueKind, OrderedAgentObservationSink, PositiveDuration,
+    AgentCompatibilityProfile, AgentDiagnosticLevel, AgentFailureCause, AgentHarnessSetupStage,
+    AgentInvocation, AgentLifecycleMilestone, AgentObservation, AgentOutcome,
+    AgentProcessDirective, AgentStartCallback, AgentValueKind, OrderedAgentObservationSink,
     StagedAgentAttachment, failed_agent_outcome, finish_agent_diagnostic_capture,
 };
-use crate::workflow::agent_process_driver::{
-    self, StdioProcess, WriteDeadline, close_standard_input,
-};
+use crate::workflow::agent_process_driver::{self, StdioProcess};
+use crate::workflow::agent_result_socket::IncomingResultRequest;
 use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::observation::ExecutionObserver;
 use crate::workflow::private_staging::open_directory_path;
 // Both native adapters use the same containment and validator primitives, but their
 // protocol state machines decide independently when those primitives gain authority.
 use crate::workflow::result_validation::{
-    AuthoritativeResultValidator, ProcessResultValidationWorker, ResultValidationDecision,
-    ResultValidationOutcome, ResultValidationWorker,
+    AuthoritativeResultValidator, ProcessResultValidationWorker, ResultValidationWorker,
 };
 
 const SYSTEM_PROMPT_FILE_PREFIX: &str = "claude-code-system-prompt-";
 pub(super) const MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES: usize = 8 * 1024 * 1024;
-pub(super) const STANDARD_INPUT_WRITE_TIMEOUT: std::time::Duration =
-    std::time::Duration::from_secs(30);
-const AMBIGUOUS_CANDIDATE_FEEDBACK: &str =
-    "Result rejected: submit exactly one standalone structured result candidate.\n";
 pub(super) const NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC: &str =
     "Claude Code native transcript capture missing";
+/// How long Claude Code may write nothing and submit nothing before the adapter interrupts it
+/// (REQ-AGENT-88, INV-HARNESS-24).
+pub(super) const QUIET_BOUND: Duration = Duration::from_secs(2 * 60 * 60);
+/// How long after the quiet bound's interrupt the adapter forces the group. The run's
+/// cancellation grace never reaches the adapter, so this is its own.
+pub(super) const QUIET_BOUND_FORCE_DELAY: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Default)]
 pub(crate) struct ClaudeProfile;
@@ -79,18 +86,11 @@ where
         if let Some(reason) = invocation.cancellation().cancellation_reason() {
             return AgentOutcome::Cancelled { reason };
         }
-        let Some((configuration, _)) = invocation.adapter().native_configuration().claude_code()
-        else {
-            return failed_agent_outcome(AgentFailureCause::start_failure(
-                "harness profile",
-                "mismatch",
-            ));
-        };
-        let model: Arc<str> = Arc::from(configuration.model.as_str());
-        let (invocation, plan) = match self
+        let clock = self.clock.clone();
+        let (invocation, mut plan) = match self
             .prepare_invocation(
                 invocation,
-                prepare_launch,
+                move |invocation| prepare_launch(invocation, clock),
                 AgentFailureCause::start_failure("launch preparation", "unavailable"),
             )
             .await
@@ -98,9 +98,19 @@ where
             Ok(prepared) => prepared,
             Err(outcome) => return outcome,
         };
-        // The shared validator is wired into a native exchange here, while Pi wires it
+        // The channel leaves the plan before launch, so that it is shut down whether or not
+        // the launch succeeds.
+        let channel = plan.result_channel.take();
+        // The shared validator is wired into the result channel here, while Pi wires it
         // into an injected socket bridge; combining those lifecycles would hide authority.
         let validator = self.result_validator(&invocation);
+        if channel.is_some() && validator.is_none() {
+            shutdown_result_channel(channel).await;
+            return failed_agent_outcome(AgentFailureCause::start_failure(
+                "result tool",
+                "result validator unavailable",
+            ));
+        }
 
         let (invocation, plan, process, standard_error, process_directives) = match self
             .launch_stdio(
@@ -111,30 +121,36 @@ where
             .await
         {
             Ok(launched) => launched,
-            Err(outcome) => return outcome,
+            Err(outcome) => {
+                shutdown_result_channel(channel).await;
+                return outcome;
+            }
         };
         // Diagnostic drain is tied to Claude's stream driver lifetime rather than Pi's
         // result bridge and native-session settlement.
         let diagnostic = self.start_diagnostic(&invocation, standard_error);
-        let parser = ClaudeCodeStreamJsonV1Parser::profile(
-            Arc::clone(&plan.expected_cwd),
-            model,
-            Arc::clone(&plan.session_id),
-            Arc::from(invocation.adapter().version()),
-            invocation.value_mode().kind(),
-            invocation.limits().maximum_response_bytes(),
-        );
+        let result_tool = channel
+            .zip(validator.as_ref())
+            .map(|(channel, validator)| ResultTool {
+                hello: channel.hello(),
+                channel,
+                submissions: ResultSubmissions::new(
+                    invocation
+                        .limits()
+                        .maximum_result_rejection_feedback_bytes(),
+                ),
+                validator,
+                listening: true,
+            });
         let outcome = drive_process(
             &invocation,
             started,
             process,
-            parser,
             process_directives,
             ClaudeDriverInput {
                 bytes: &plan.input,
-                validator: validator.as_ref(),
+                result_tool,
                 clock: self.clock.clone(),
-                settlement_grace: invocation.limits().result_settlement_grace(),
             },
         )
         .await;
@@ -155,12 +171,18 @@ where
     }
 }
 
+async fn shutdown_result_channel(channel: Option<PreparedResultChannel>) {
+    if let Some(channel) = channel {
+        let _ = channel.shutdown().await;
+    }
+}
+
 pub(super) struct ClaudeCodeStreamJsonV1LaunchPlan {
     arguments: Vec<OsString>,
-    expected_cwd: Arc<str>,
-    session_id: Arc<str>,
     input: Vec<u8>,
     native_session_bridge: ClaudeCodeNativeSessionBridge,
+    /// The result tool's channel, in Result mode; taken before launch.
+    result_channel: Option<PreparedResultChannel>,
     _system_prompt_file: tempfile::NamedTempFile,
 }
 
@@ -176,18 +198,16 @@ impl ClaudeCodeStreamJsonV1LaunchPlan {
     }
 
     #[cfg(test)]
-    pub(super) fn session_id(&self) -> &str {
-        &self.session_id
-    }
-
-    #[cfg(test)]
     pub(super) fn system_prompt_file(&self) -> &std::path::Path {
         self._system_prompt_file.path()
     }
 }
 
-pub(super) fn prepare_launch(
+/// Prepares one launch. In Result mode it also prepares the result tool's channel, last, so
+/// that nothing after it can fail and leave its socket behind.
+pub(super) fn prepare_launch<Clock: CoordinatorClock>(
     invocation: &AgentInvocation,
+    clock: Clock,
 ) -> Result<ClaudeCodeStreamJsonV1LaunchPlan, AgentFailureCause> {
     agent_process_driver::check_prompt_bounds(invocation)?;
     agent_process_driver::require_native_profile(
@@ -203,31 +223,23 @@ pub(super) fn prepare_launch(
         "claude diagnostic session binding",
     )?;
 
-    // Claude correlates this path in system/init and stages a native prompt file; Pi's
-    // corresponding preparation uses a persisted session and injected input extension.
-    let expected_cwd_path = invocation
+    // Claude stages a native prompt file and a native session bridge under the protocol
+    // directory; Pi's corresponding preparation uses a persisted session and injected
+    // input extension.
+    let expected_cwd = invocation
         .process()
         .protocol_cwd()
         .map_err(|_| AgentFailureCause::start_failure("launch preparation", "unavailable"))?;
-    let session_id = Arc::from(
-        invocation
-            .diagnostic_session()
-            .claude_code_native_session_id()
-            .ok_or(AgentFailureCause::start_failure(
-                "launch preparation",
-                "unavailable",
-            ))?,
-    );
+    let session_id = invocation
+        .diagnostic_session()
+        .claude_code_native_session_id()
+        .ok_or(AgentFailureCause::start_failure(
+            "launch preparation",
+            "unavailable",
+        ))?
+        .to_owned();
     let native_session_bridge =
-        ClaudeCodeNativeSessionBridge::prepare(invocation, &expected_cwd_path, &session_id)?;
-    let expected_cwd =
-        expected_cwd_path
-            .to_str()
-            .map(Arc::from)
-            .ok_or(AgentFailureCause::start_failure(
-                "launch preparation",
-                "unavailable",
-            ))?;
+        ClaudeCodeNativeSessionBridge::prepare(invocation, &expected_cwd, &session_id)?;
     let mut system_prompt_file = tempfile::Builder::new()
         .prefix(SYSTEM_PROMPT_FILE_PREFIX)
         .tempfile_in(invocation.staging().result_endpoint_directory())
@@ -247,28 +259,39 @@ pub(super) fn prepare_launch(
         .native_configuration()
         .claude_code()
         .ok_or_else(|| AgentFailureCause::start_failure("harness profile", "mismatch"))?;
-    let arguments = if invocation.value_mode().kind() == AgentValueKind::Result {
-        result_mode_arguments(
-            &configuration.model,
-            configuration.effort.as_str(),
-            &session_id,
-            system_prompt_file.path(),
+    let input = initial_user_frame(invocation)?;
+    let result_channel = if invocation.value_mode().kind() == AgentValueKind::Result {
+        Some(
+            PreparedResultChannel::prepare(
+                invocation.staging().result_endpoint_directory(),
+                invocation.limits().result_validation_deadline(),
+                clock,
+            )
+            .map_err(|error| AgentFailureCause::start_failure("result tool", error))?,
         )
     } else {
-        normal_mode_arguments(
+        None
+    };
+    let arguments = match &result_channel {
+        Some(channel) => result_mode_arguments(
             &configuration.model,
             configuration.effort.as_str(),
             &session_id,
             system_prompt_file.path(),
-        )
+            channel.configuration_path(),
+        ),
+        None => normal_mode_arguments(
+            &configuration.model,
+            configuration.effort.as_str(),
+            &session_id,
+            system_prompt_file.path(),
+        ),
     };
-    let input = initial_user_frame(invocation)?;
     Ok(ClaudeCodeStreamJsonV1LaunchPlan {
         arguments,
-        expected_cwd,
-        session_id,
         input,
         native_session_bridge,
+        result_channel,
         _system_prompt_file: system_prompt_file,
     })
 }
@@ -751,23 +774,49 @@ impl agent_process_driver::StdioLaunchPlan for ClaudeCodeStreamJsonV1LaunchPlan 
     }
 }
 
-type SettlementDeadlineWait = Pin<Box<dyn Future<Output = ()> + Send>>;
+type QuietBoundWait = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// The adapter's end of the result tool in Result mode (INV-HARNESS-23).
+struct ResultTool<'a, Clock, Worker> {
+    channel: PreparedResultChannel,
+    hello: ResultChannelHello,
+    submissions: ResultSubmissions,
+    validator: &'a AuthoritativeResultValidator<Clock, Worker>,
+    /// Whether the channel's server may still deliver an event.
+    listening: bool,
+}
 
 enum ClaudeExtra {
     Initial(InitialInputProgress),
-    SettlementExpired,
+    Channel(ResultChannelEvent),
+    QuietBound,
+}
+
+/// Whether start was acknowledged: what the reader yields before it is held, and dropped if
+/// the start check fails.
+enum Start {
+    Pending(Vec<AgentObservation>),
+    Acknowledged,
+    Refused,
 }
 
 struct ClaudeProtocol<'a, Clock, Worker> {
     invocation: &'a AgentInvocation,
     started: &'a AgentStartCallback,
-    parser: ClaudeCodeStreamJsonV1Parser,
-    validator: Option<&'a AuthoritativeResultValidator<Clock, Worker>>,
+    reader: StreamReader,
+    result_tool: Option<ResultTool<'a, Clock, Worker>>,
+    /// Held open from the prompt frame until Claude Code exits or the invocation is
+    /// cancelled; nothing more is written to it (INV-HARNESS-24).
     standard_input: Option<UnixStream>,
     initial_input: Pin<Box<dyn Future<Output = InitialInputProgress> + Send + 'a>>,
     initial_input_pending: bool,
-    settlement_deadline: Option<SettlementDeadlineWait>,
-    settlement_grace: PositiveDuration,
+    start: Start,
+    /// The quiet bound, or after its interrupt the force that follows it.
+    quiet_bound: Option<QuietBoundWait>,
+    /// The deciding `result` held when the quiet bound interrupted Claude Code. What the
+    /// interrupt makes it report afterwards, the `result` of the turn it aborts among it, is
+    /// activity and decides nothing (REQ-AGENT-88).
+    held_at_bound: Option<Option<DecidingResult>>,
     failure: Option<AgentFailureCause>,
 }
 
@@ -778,15 +827,23 @@ where
 {
     type Extra = ClaudeExtra;
 
+    async fn on_start(&mut self, state: &mut agent_process_driver::State<Clock>) {
+        self.quiet_bound = Some(quiet_bound_wait(&mut state.clock, QUIET_BOUND));
+    }
+
     fn extra_enabled(&self, _state: &agent_process_driver::State<Clock>) -> bool {
-        self.initial_input_pending || self.settlement_deadline.is_some()
+        self.initial_input_pending
+            || self.quiet_bound.is_some()
+            || self.result_tool.as_ref().is_some_and(|tool| tool.listening)
     }
 
     async fn extra(&mut self) -> ClaudeExtra {
+        let listening = self.result_tool.as_ref().is_some_and(|tool| tool.listening);
         tokio::select! {
             biased;
             progress = &mut self.initial_input, if self.initial_input_pending => ClaudeExtra::Initial(progress),
-            () = wait_for_optional_deadline(&mut self.settlement_deadline), if self.settlement_deadline.is_some() => ClaudeExtra::SettlementExpired,
+            event = receive_channel_event(&mut self.result_tool), if listening => ClaudeExtra::Channel(event),
+            () = wait_for_quiet_bound(&mut self.quiet_bound), if self.quiet_bound.is_some() => ClaudeExtra::QuietBound,
         }
     }
 
@@ -800,29 +857,17 @@ where
                 self.initial_input_pending = false;
                 match progress {
                     InitialInputProgress::Ready(input) => self.standard_input = Some(input),
-                    InitialInputProgress::Cancelled(reason) => {
-                        state.cancelled.get_or_insert(reason);
-                        state.parser_enabled = false;
-                    }
-                    InitialInputProgress::Failed(reason) => {
-                        if state.cancelled.is_none() && self.failure.is_none() {
-                            self.failure = Some(self.parser.fail_initial_input(reason));
-                        }
-                        state.parser_enabled = false;
-                        state.force_group();
-                    }
+                    InitialInputProgress::Cancelled(reason) => self.cancel(reason, state),
+                    InitialInputProgress::Failed => self.fail(
+                        AgentFailureCause::HarnessSetupFailed {
+                            stage: AgentHarnessSetupStage::Initialization,
+                        },
+                        state,
+                    ),
                 }
             }
-            ClaudeExtra::SettlementExpired => {
-                self.settlement_deadline = None;
-                if let Some(reason) = state.cancellation.cancellation_reason() {
-                    state.cancelled = Some(reason);
-                } else {
-                    self.failure = Some(AgentFailureCause::ResultSettlementFailed);
-                }
-                state.parser_enabled = false;
-                state.force_group();
-            }
+            ClaudeExtra::Channel(event) => self.on_channel_event(event, state).await,
+            ClaudeExtra::QuietBound => self.on_quiet_bound(state).await,
         }
     }
 
@@ -832,31 +877,66 @@ where
         state: &mut agent_process_driver::State<Clock>,
     ) {
         state.parser_enabled = false;
-        self.settlement_deadline = None;
+        self.quiet_bound = None;
         self.standard_input.take();
     }
 
     async fn on_stdout(&mut self, bytes: &[u8], state: &mut agent_process_driver::State<Clock>) {
-        self.read_stdout(bytes, state).await;
-        // A `result` awaiting a decision ended the parser's read of the chunk; the frames after
-        // it are read once `read_stdout` has made that decision, so an `init` behind that
-        // `result` opens an epilogue or the correction turn and never meets a pending decision
-        // (REQ-AGENT-76, REQ-AGENT-69).
-        while state.parser_enabled && self.parser.has_deferred_stdout() {
-            self.read_stdout(&[], state).await;
+        self.restart_quiet_bound(&mut state.clock);
+        let mut observations = Vec::new();
+        self.reader
+            .push(bytes, |observation| observations.push(observation));
+        if let Some(reason) = state.cancellation.cancellation_reason() {
+            self.cancel(reason, state);
+            return;
+        }
+        if matches!(self.start, Start::Pending(_))
+            && let Some(initialization) = self.reader.initialization()
+        {
+            // Claude Code writes `system/init` only after the relay has answered `initialize`,
+            // which follows the adapter's answer to its hello, so a missing hello here means
+            // the result tool never connected (REQ-AGENT-44, REQ-AGENT-89).
+            let acknowledged = initialization.claude_code_version.as_deref()
+                == Some(self.invocation.adapter().version())
+                && self
+                    .result_tool
+                    .as_ref()
+                    .is_none_or(|tool| tool.hello.recorded());
+            if !acknowledged {
+                self.start = Start::Refused;
+                self.fail(
+                    AgentFailureCause::start_failure("launch preparation", "unavailable"),
+                    state,
+                );
+                return;
+            }
+            if let Start::Pending(mut held) =
+                std::mem::replace(&mut self.start, Start::Acknowledged)
+            {
+                held.append(&mut observations);
+                observations = held;
+            }
+        }
+        self.deliver(observations, state).await;
+        if state.parser_enabled
+            && self.reader.deciding_result()
+                == Some(&DecidingResult::Successful(ResultText::OverLimit))
+        {
+            self.fail(AgentFailureCause::CapturedValueTooLarge, state);
         }
     }
 
-    fn classify_read_failure(&mut self) {
-        self.failure = Some(self.parser.protocol_failure());
-    }
+    /// A read error ends the stream like its end does; the rule decides what was read.
+    fn classify_read_failure(&mut self) {}
+
     fn cancellation_precedes_read_failure(&self) -> bool {
         true
     }
 
     async fn on_wait_error(&mut self, state: &mut agent_process_driver::State<Clock>) {
         if state.cancelled.is_none() {
-            self.failure.get_or_insert(self.parser.protocol_failure());
+            self.failure
+                .get_or_insert(AgentFailureCause::HarnessProtocolFailed);
         }
         state.force_group();
     }
@@ -871,95 +951,51 @@ where
             && !state.group_quiescent
     }
 
-    fn on_group_quiescent(&mut self, _state: &mut agent_process_driver::State<Clock>) {
-        self.settlement_deadline = None;
-    }
-
+    /// Once Claude Code has exited and its output has closed, what is left in its group is a
+    /// leftover, the relay or a stray child: it is forced and decides nothing
+    /// (INV-HARNESS-24).
     fn on_group_live(&mut self, state: &mut agent_process_driver::State<Clock>) {
-        if self.settlement_deadline.is_none() && !state.termination_requested {
-            if state.cancelled.is_none() {
-                self.failure
-                    .get_or_insert(AgentFailureCause::HarnessProtocolFailed);
-            }
-            state.parser_enabled = false;
+        if !state.termination_requested {
             state.force_group();
         }
     }
 
     async fn finish(
-        self,
+        mut self,
         mut state: agent_process_driver::State<Clock>,
         supervisor_quiesced: bool,
     ) -> AgentOutcome {
         if state.cancelled.is_none() {
             state.cancelled = state.cancellation.cancellation_reason();
         }
-        if let Some(reason) = state.cancelled {
-            return AgentOutcome::Cancelled { reason };
-        }
-        if let Some(cause) = self.failure {
-            return AgentOutcome::Failed(self.parser.agent_failure(cause));
+        let mut observations = Vec::new();
+        self.reader
+            .finish(|observation| observations.push(observation));
+        let accepted = self
+            .result_tool
+            .as_ref()
+            .and_then(|tool| tool.submissions.accepted().cloned());
+        if let Some(tool) = self.result_tool.take()
+            && let Err(error) = tool.channel.shutdown().await
+        {
+            observations.push(warning(format!(
+                "the result tool's socket could not be removed: {error}"
+            )));
         }
         if state.wait_failed || !supervisor_quiesced {
-            return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
+            self.failure
+                .get_or_insert(AgentFailureCause::HarnessProtocolFailed);
         }
-        // Background work still outstanding once the value has settled is abandoned by
-        // Claude Code's exit: each piece is reported before quiescence, and the step
-        // completes with the settled value (REQ-AGENT-76).
-        let mut observations = self.parser.abandoned_work_warnings();
-        observations.push(AgentObservation::Lifecycle {
-            milestone: AgentLifecycleMilestone::HarnessQuiescent,
-        });
-        match emit_observations(
-            self.invocation.observations(),
-            self.started,
-            observations,
-            &state.cancellation,
-        )
-        .await
-        {
-            ObservationProgress::Completed => {}
-            ObservationProgress::Cancelled(reason) => return AgentOutcome::Cancelled { reason },
-            ObservationProgress::Failed => {
-                return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
-            }
-        }
-        let Some(status) = state.completion else {
-            return failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed);
-        };
-        self.parser.finish(status.success())
-    }
-}
-
-impl<Clock, Worker> ClaudeProtocol<'_, Clock, Worker>
-where
-    Clock: CoordinatorClock,
-    Worker: ResultValidationWorker,
-{
-    /// Reads one stdout chunk, or with no bytes the rest a pending decision deferred, and
-    /// acts on what it completed.
-    async fn read_stdout(&mut self, bytes: &[u8], state: &mut agent_process_driver::State<Clock>) {
-        let (parsed, observations) = agent_process_driver::collect_stdout_observations(|emit| {
-            self.parser.push_stdout(bytes, emit)
-        });
-        // The parser reports HarnessCompleted only in Response and None modes, for a result
-        // that leaves no background work outstanding: the invocation has settled, so its
-        // input ends. Result mode settles on acceptance instead.
-        let settled = observations.iter().any(|observation| {
-            matches!(
-                observation,
+        let started = matches!(self.start, Start::Acknowledged);
+        if started && state.cancelled.is_none() && self.failure.is_none() {
+            observations.extend([
                 AgentObservation::Lifecycle {
                     milestone: AgentLifecycleMilestone::HarnessCompleted,
-                }
-            )
-        });
-        if let Some(reason) = state.cancellation.cancellation_reason() {
-            state.cancelled = Some(reason);
-            state.parser_enabled = false;
-            self.settlement_deadline = None;
-            self.standard_input.take();
-        }
-        if state.parser_enabled {
+                },
+                AgentObservation::Lifecycle {
+                    milestone: AgentLifecycleMilestone::HarnessQuiescent,
+                },
+            ]);
             match emit_observations(
                 self.invocation.observations(),
                 self.started,
@@ -969,123 +1005,251 @@ where
             .await
             {
                 ObservationProgress::Completed => {}
-                ObservationProgress::Cancelled(reason) => {
-                    state.cancelled = Some(reason);
-                    state.parser_enabled = false;
-                    self.settlement_deadline = None;
-                    self.standard_input.take();
-                }
+                ObservationProgress::Cancelled(reason) => state.cancelled = Some(reason),
                 ObservationProgress::Failed => {
                     self.failure = Some(AgentFailureCause::HarnessProtocolFailed);
-                    state.parser_enabled = false;
-                    state.force_group();
                 }
             }
         }
-        if state.parser_enabled
-            && let Err(cause) = parsed
-        {
-            self.failure = Some(cause);
-            state.parser_enabled = false;
-            state.force_group();
-        }
-        // After acceptance the grace measures idle time only: an epilogue turn or the
-        // background work it awaits suspends it, and it restarts in full once both have
-        // settled (INV-HARNESS-7, REQ-AGENT-76).
-        if state.parser_enabled && self.parser.result_accepted() {
-            if !self.parser.settling() {
-                self.settlement_deadline = None;
-            } else if self.settlement_deadline.is_none() {
-                self.arm_settlement_deadline(&mut state.clock);
-            }
-        }
-        if state.parser_enabled
-            && settled
-            && close_standard_input(&mut self.standard_input)
+        let (ending, deciding_result) = match self.held_at_bound {
+            Some(held) => (Ending::StoppedAtBound, held),
+            None => (
+                Ending::Exited {
+                    success: state.completion.is_some_and(|status| status.success()),
+                },
+                self.reader.deciding_result().cloned(),
+            ),
+        };
+        decide(StepFacts {
+            cancellation: state.cancelled,
+            own_failure: self.failure,
+            started,
+            value_kind: self.invocation.value_mode().kind(),
+            deciding_result,
+            accepted,
+            ending,
+        })
+    }
+}
+
+impl<Clock, Worker> ClaudeProtocol<'_, Clock, Worker>
+where
+    Clock: CoordinatorClock,
+    Worker: ResultValidationWorker,
+{
+    /// Delivers observations once start is acknowledged; until then they are held, and once
+    /// start is refused they are dropped.
+    async fn deliver(
+        &mut self,
+        mut observations: Vec<AgentObservation>,
+        state: &mut agent_process_driver::State<Clock>,
+    ) {
+        match &mut self.start {
+            Start::Pending(held) => held.append(&mut observations),
+            Start::Refused => {}
+            Start::Acknowledged => {
+                match emit_observations(
+                    self.invocation.observations(),
+                    self.started,
+                    observations,
+                    &state.cancellation,
+                )
                 .await
-                .is_err()
-        {
-            self.failure = Some(AgentFailureCause::HarnessProtocolFailed);
-            state.parser_enabled = false;
-            state.force_group();
-        }
-        if state.parser_enabled
-            && let Some(exchange) = self.parser.take_completed_result_exchange()
-        {
-            match handle_result_exchange(
-                exchange,
-                self.invocation,
-                self.validator,
-                &mut self.parser,
-                &mut self.standard_input,
-                &mut state.clock,
-            )
-            .await
-            {
-                ResultExchangeProgress::Continue => {}
-                ResultExchangeProgress::Accepted => {
-                    self.arm_settlement_deadline(&mut state.clock);
-                    match emit_observations(
-                        self.invocation.observations(),
-                        self.started,
-                        vec![AgentObservation::Lifecycle {
-                            milestone: AgentLifecycleMilestone::HarnessCompleted,
-                        }],
-                        &state.cancellation,
-                    )
-                    .await
-                    {
-                        ObservationProgress::Completed => {}
-                        ObservationProgress::Cancelled(reason) => {
-                            state.cancelled = Some(reason);
-                            state.parser_enabled = false;
-                            self.settlement_deadline = None;
-                            self.standard_input.take();
-                        }
-                        ObservationProgress::Failed => {
-                            self.failure = Some(AgentFailureCause::HarnessProtocolFailed);
-                            state.parser_enabled = false;
-                            state.force_group();
-                        }
+                {
+                    ObservationProgress::Completed => {}
+                    ObservationProgress::Cancelled(reason) => self.cancel(reason, state),
+                    ObservationProgress::Failed => {
+                        self.fail(AgentFailureCause::HarnessProtocolFailed, state);
                     }
-                }
-                ResultExchangeProgress::Failed(cause) => {
-                    self.failure = Some(cause);
-                    state.parser_enabled = false;
-                    state.force_group();
-                }
-                ResultExchangeProgress::Cancelled(reason) => {
-                    state.cancelled = Some(reason);
-                    state.parser_enabled = false;
-                    self.settlement_deadline = None;
-                    self.standard_input.take();
                 }
             }
         }
     }
 
-    /// Starts the full settlement grace from now (INV-HARNESS-7).
-    fn arm_settlement_deadline(&mut self, clock: &mut Clock) {
-        let deadline = clock.now().add(self.settlement_grace.get());
-        let deadline_clock = clock.clone();
-        self.settlement_deadline = Some(Box::pin(async move {
-            deadline_clock.wait_until(deadline).await;
-        }));
+    fn cancel(
+        &mut self,
+        reason: CancellationReason,
+        state: &mut agent_process_driver::State<Clock>,
+    ) {
+        state.cancelled.get_or_insert(reason);
+        state.parser_enabled = false;
+        self.quiet_bound = None;
+        self.standard_input.take();
+    }
+
+    /// Records the adapter's own failure, unless cancelled, and forces the group.
+    fn fail(&mut self, cause: AgentFailureCause, state: &mut agent_process_driver::State<Clock>) {
+        if state.cancelled.is_none() {
+            self.failure.get_or_insert(cause);
+        }
+        state.parser_enabled = false;
+        state.force_group();
+    }
+
+    /// Restarts the quiet bound in full, unless it has already interrupted Claude Code or the
+    /// invocation was cancelled (INV-HARNESS-24).
+    fn restart_quiet_bound(&mut self, clock: &mut Clock) {
+        if self.quiet_bound.is_some() && self.held_at_bound.is_none() {
+            self.quiet_bound = Some(quiet_bound_wait(clock, QUIET_BOUND));
+        }
+    }
+
+    /// At the quiet bound Claude Code is interrupted, and 30 seconds later its group is
+    /// forced and its output no longer read, so the step ends even when a process outside
+    /// the group holds the pipe (REQ-AGENT-88).
+    async fn on_quiet_bound(&mut self, state: &mut agent_process_driver::State<Clock>) {
+        if self.held_at_bound.is_some() {
+            self.quiet_bound = None;
+            state.force_group();
+            state.output_closed = true;
+            return;
+        }
+        self.held_at_bound = Some(self.reader.deciding_result().cloned());
+        self.quiet_bound = Some(quiet_bound_wait(&mut state.clock, QUIET_BOUND_FORCE_DELAY));
+        self.deliver(
+            vec![warning(String::from(
+                "Claude Code wrote nothing and submitted nothing for 2 hours; stopping it",
+            ))],
+            state,
+        )
+        .await;
+        agent_process_driver::signal_interrupt(state.process_group);
+    }
+
+    /// A hello is answered; a submission is judged and answered (REQ-AGENT-84,
+    /// REQ-AGENT-85). Both restart the quiet bound.
+    async fn on_channel_event(
+        &mut self,
+        event: ResultChannelEvent,
+        state: &mut agent_process_driver::State<Clock>,
+    ) {
+        let incoming = match event {
+            ResultChannelEvent::Request(incoming) => incoming,
+            ResultChannelEvent::ProtocolFailure => {
+                self.deliver(
+                    vec![warning(String::from(
+                        "a result tool request could not be read",
+                    ))],
+                    state,
+                )
+                .await;
+                return;
+            }
+            ResultChannelEvent::Closed => {
+                if let Some(tool) = self.result_tool.as_mut() {
+                    tool.listening = false;
+                }
+                return;
+            }
+        };
+        self.restart_quiet_bound(&mut state.clock);
+        let Some(tool) = self.result_tool.as_mut() else {
+            return;
+        };
+        if !state.parser_enabled {
+            answer(
+                incoming,
+                ResultChannelAnswer::Failed {
+                    cause: ResultChannelFailure::Channel,
+                },
+                &state.cancellation,
+            )
+            .await;
+            return;
+        }
+        let judgement = tool
+            .submissions
+            .judge(
+                incoming.request(),
+                tool.validator,
+                self.invocation.cancellation(),
+            )
+            .await;
+        // Acceptance is the validator's decision: an answer that cannot be delivered undoes
+        // nothing held.
+        match judgement {
+            SubmissionJudgement::Answer {
+                answer: reply,
+                observation,
+            } => {
+                let accepted = reply == ResultChannelAnswer::Accepted;
+                answer(incoming, reply, &state.cancellation).await;
+                let observation = observation.or_else(|| {
+                    accepted.then(|| AgentObservation::Diagnostic {
+                        level: AgentDiagnosticLevel::Information,
+                        message: Arc::from("result accepted"),
+                    })
+                });
+                if let Some(observation) = observation {
+                    self.deliver(vec![observation], state).await;
+                }
+            }
+            SubmissionJudgement::Fatal {
+                answer: reply,
+                cause,
+            } => {
+                answer(incoming, reply, &state.cancellation).await;
+                self.fail(cause, state);
+            }
+            SubmissionJudgement::Cancelled(reason) => self.cancel(reason, state),
+        }
+    }
+}
+
+fn warning(message: String) -> AgentObservation {
+    AgentObservation::Diagnostic {
+        level: AgentDiagnosticLevel::Warning,
+        message: Arc::from(message),
+    }
+}
+
+fn quiet_bound_wait<Clock: CoordinatorClock>(clock: &mut Clock, after: Duration) -> QuietBoundWait {
+    let deadline = clock.now().add(after);
+    let deadline_clock = clock.clone();
+    Box::pin(async move {
+        deadline_clock.wait_until(deadline).await;
+    })
+}
+
+async fn wait_for_quiet_bound(wait: &mut Option<QuietBoundWait>) {
+    match wait {
+        Some(wait) => wait.await,
+        None => pending().await,
+    }
+}
+
+async fn receive_channel_event<Clock, Worker>(
+    result_tool: &mut Option<ResultTool<'_, Clock, Worker>>,
+) -> ResultChannelEvent {
+    match result_tool {
+        Some(tool) => tool.channel.receive().await,
+        None => pending().await,
+    }
+}
+
+/// Answers one request; the relay may already be gone, which changes nothing.
+async fn answer(
+    incoming: IncomingResultRequest<ResultChannelRequest, ResultChannelAnswer>,
+    reply: ResultChannelAnswer,
+    cancellation: &CancellationSource,
+) {
+    tokio::select! {
+        biased;
+        _ = cancellation.wait_for_cancellation() => {}
+        _ = incoming.respond(reply) => {}
     }
 }
 
 struct ClaudeDriverInput<'a, Clock, Worker> {
     bytes: &'a [u8],
-    validator: Option<&'a AuthoritativeResultValidator<Clock, Worker>>,
+    result_tool: Option<ResultTool<'a, Clock, Worker>>,
     clock: Clock,
-    settlement_grace: PositiveDuration,
 }
 
 async fn drive_process<Clock, Worker>(
     invocation: &AgentInvocation,
     started: &AgentStartCallback,
     process: LaunchedClaudeCodeProcess,
-    parser: ClaudeCodeStreamJsonV1Parser,
     process_directives: mpsc::UnboundedReceiver<AgentProcessDirective>,
     driver_input: ClaudeDriverInput<'_, Clock, Worker>,
 ) -> AgentOutcome
@@ -1095,9 +1259,8 @@ where
 {
     let ClaudeDriverInput {
         bytes,
-        validator,
+        result_tool,
         clock,
-        settlement_grace,
     } = driver_input;
     let (standard_input, output) = process.split();
     let cancellation = invocation.cancellation().clone();
@@ -1108,13 +1271,17 @@ where
     let protocol = ClaudeProtocol {
         invocation,
         started,
-        parser,
-        validator,
+        reader: StreamReader::new(
+            invocation.value_mode().kind(),
+            invocation.limits().maximum_response_bytes(),
+        ),
+        result_tool,
+        standard_input: None,
         initial_input,
         initial_input_pending: true,
-        standard_input: None,
-        settlement_deadline: None,
-        settlement_grace,
+        start: Start::Pending(Vec::new()),
+        quiet_bound: None,
+        held_at_bound: None,
         failure: None,
     };
     agent_process_driver::drive_signalled(
@@ -1131,38 +1298,7 @@ where
 enum InitialInputProgress {
     Ready(UnixStream),
     Cancelled(CancellationReason),
-    Failed(ClaudeCodeStreamJsonV1RejectionReason),
-}
-
-enum WriteProgress {
-    Completed,
-    Cancelled(CancellationReason),
     Failed,
-    TimedOut,
-}
-
-async fn write_with_cancellation<Clock: CoordinatorClock>(
-    input: &mut UnixStream,
-    bytes: &[u8],
-    cancellation: &CancellationSource,
-    mut clock: Clock,
-) -> WriteProgress {
-    let cancelled = cancellation.wait_for_cancellation();
-    tokio::pin!(cancelled);
-    tokio::select! {
-        biased;
-        reason = &mut cancelled => WriteProgress::Cancelled(reason),
-        result = agent_process_driver::write_until(&mut clock, STANDARD_INPUT_WRITE_TIMEOUT, input.write_all(bytes)) => {
-            if let Some(reason) = cancellation.cancellation_reason() {
-                return WriteProgress::Cancelled(reason);
-            }
-            match result {
-                Ok(()) => WriteProgress::Completed,
-                Err(WriteDeadline::Failed(_)) => WriteProgress::Failed,
-                Err(WriteDeadline::TimedOut) => WriteProgress::TimedOut,
-            }
-        }
-    }
 }
 
 async fn initialize_standard_input(
@@ -1173,11 +1309,9 @@ async fn initialize_standard_input(
     if let Some(reason) = cancellation.cancellation_reason() {
         return InitialInputProgress::Cancelled(reason);
     }
-    // Standard input stays open after the prompt: Claude Code defers a turn's result while
-    // a backgrounded subagent is pending once its input has ended, so the adapter closes it
-    // only when the invocation settles.
-    // A full socket can mean the harness is still starting. Applying the feedback
-    // write deadline here would impose a startup timeout only on large prompts.
+    // A full socket can mean the harness is still starting, so the prompt's delivery has no
+    // deadline of its own. Standard input stays open after it until Claude Code exits:
+    // Claude Code ends the session by its own idle exit (INV-HARNESS-24).
     let result = tokio::select! {
         biased;
         reason = cancellation.wait_for_cancellation() => return InitialInputProgress::Cancelled(reason),
@@ -1188,9 +1322,7 @@ async fn initialize_standard_input(
     }
     match result {
         Ok(()) => InitialInputProgress::Ready(standard_input),
-        Err(_) => InitialInputProgress::Failed(
-            ClaudeCodeStreamJsonV1RejectionReason::StandardInputWriteFailed,
-        ),
+        Err(_) => InitialInputProgress::Failed,
     }
 }
 
@@ -1248,166 +1380,5 @@ async fn emit_observation(
                 ObservationProgress::Failed
             }
         }
-    }
-}
-
-enum ResultExchangeProgress {
-    Continue,
-    Accepted,
-    Failed(AgentFailureCause),
-    Cancelled(crate::workflow::admission::CancellationReason),
-}
-
-async fn handle_result_exchange<Clock, Worker>(
-    exchange: CompletedResultExchange,
-    invocation: &AgentInvocation,
-    validator: Option<&AuthoritativeResultValidator<Clock, Worker>>,
-    parser: &mut ClaudeCodeStreamJsonV1Parser,
-    standard_input: &mut Option<UnixStream>,
-    clock: &mut Clock,
-) -> ResultExchangeProgress
-where
-    Clock: CoordinatorClock,
-    Worker: ResultValidationWorker,
-{
-    match exchange {
-        CompletedResultExchange::Candidate(candidate) => {
-            let Some(validator) = validator else {
-                return ResultExchangeProgress::Failed(AgentFailureCause::HarnessProtocolFailed);
-            };
-            match validator
-                .validate(candidate, invocation.cancellation())
-                .await
-            {
-                ResultValidationOutcome::Cancelled { reason } => {
-                    ResultExchangeProgress::Cancelled(reason)
-                }
-                ResultValidationOutcome::Decided(ResultValidationDecision::Valid(result)) => {
-                    if parser.accept_result(result).is_err()
-                        || close_standard_input(standard_input).await.is_err()
-                    {
-                        ResultExchangeProgress::Failed(AgentFailureCause::HarnessProtocolFailed)
-                    } else {
-                        ResultExchangeProgress::Accepted
-                    }
-                }
-                ResultValidationOutcome::Decided(ResultValidationDecision::Rejected {
-                    feedback,
-                }) => {
-                    reject_and_continue(invocation, parser, standard_input, feedback, clock).await
-                }
-                ResultValidationOutcome::Decided(ResultValidationDecision::Fatal(fatal)) => {
-                    ResultExchangeProgress::Failed(AgentFailureCause::from(fatal))
-                }
-            }
-        }
-        CompletedResultExchange::AmbiguousCandidate
-        | CompletedResultExchange::PrematureCandidate(_) => {
-            let feedback = match exchange {
-                CompletedResultExchange::PrematureCandidate(outstanding) => {
-                    premature_candidate_feedback(outstanding)
-                }
-                _ => AMBIGUOUS_CANDIDATE_FEEDBACK.to_owned(),
-            };
-            let feedback = bounded_feedback(
-                &feedback,
-                invocation
-                    .limits()
-                    .maximum_result_rejection_feedback_bytes()
-                    .get(),
-            );
-            reject_and_continue(invocation, parser, standard_input, feedback, clock).await
-        }
-        CompletedResultExchange::MissingCandidate | CompletedResultExchange::NativeFailure => {
-            if close_standard_input(standard_input).await.is_err() {
-                ResultExchangeProgress::Failed(AgentFailureCause::HarnessProtocolFailed)
-            } else {
-                ResultExchangeProgress::Continue
-            }
-        }
-    }
-}
-
-async fn reject_and_continue<Clock: CoordinatorClock>(
-    invocation: &AgentInvocation,
-    parser: &mut ClaudeCodeStreamJsonV1Parser,
-    standard_input: &mut Option<UnixStream>,
-    feedback: Arc<str>,
-    clock: &mut Clock,
-) -> ResultExchangeProgress {
-    match emit_observation(
-        invocation.observations(),
-        AgentObservation::ValueRejected {
-            kind: AgentValueKind::Result,
-            feedback: Arc::clone(&feedback),
-        },
-        invocation.cancellation(),
-    )
-    .await
-    {
-        ObservationProgress::Completed => {}
-        ObservationProgress::Cancelled(reason) => {
-            standard_input.take();
-            return ResultExchangeProgress::Cancelled(reason);
-        }
-        ObservationProgress::Failed => {
-            return ResultExchangeProgress::Failed(AgentFailureCause::HarnessProtocolFailed);
-        }
-    }
-    if parser.reject_result_candidate().is_err() || parser.begin_exchange().is_err() {
-        return ResultExchangeProgress::Failed(AgentFailureCause::HarnessProtocolFailed);
-    }
-    let frame = match initial_user_text_frame(&feedback) {
-        Ok(frame) => frame,
-        Err(_) => {
-            return ResultExchangeProgress::Failed(AgentFailureCause::HarnessProtocolFailed);
-        }
-    };
-    let Some(input) = standard_input.as_mut() else {
-        return ResultExchangeProgress::Failed(AgentFailureCause::HarnessProtocolFailed);
-    };
-    match write_with_cancellation(input, &frame, invocation.cancellation(), clock.clone()).await {
-        WriteProgress::Completed => ResultExchangeProgress::Continue,
-        WriteProgress::Cancelled(reason) => {
-            standard_input.take();
-            ResultExchangeProgress::Cancelled(reason)
-        }
-        WriteProgress::Failed | WriteProgress::TimedOut => {
-            ResultExchangeProgress::Failed(AgentFailureCause::HarnessProtocolFailed)
-        }
-    }
-}
-
-/// The premature candidate's rejection: the kinds of work still running and the two routes
-/// to a result it can settle (REQ-AGENT-35, REQ-AGENT-77). Model-visible workflow content: no
-/// counts or native identifiers.
-pub(super) fn premature_candidate_feedback(outstanding: OutstandingWork) -> String {
-    let kinds = [
-        (outstanding.commands, "a background command"),
-        (outstanding.monitors, "a monitor"),
-        (outstanding.subagents, "a backgrounded subagent"),
-    ]
-    .into_iter()
-    .filter_map(|(running, kind)| running.then_some(kind))
-    .collect::<Vec<_>>()
-    .join(" and ");
-    format!(
-        "Result rejected: background work you started is still running: {kinds}. Either end \
-         your turn without submitting a result and resubmit it after the notification that \
-         the work has finished arrives, or stop the work with TaskStop and resubmit the \
-         result in the round after the stop's result: no notification follows a stopped \
-         command or monitor.\n"
-    )
-}
-
-fn bounded_feedback(feedback: &str, maximum_bytes: u64) -> Arc<str> {
-    let maximum_bytes = usize::try_from(maximum_bytes).unwrap_or(usize::MAX);
-    Arc::from(&feedback[..feedback.floor_char_boundary(maximum_bytes)])
-}
-
-async fn wait_for_optional_deadline(wait: &mut Option<SettlementDeadlineWait>) {
-    match wait {
-        Some(wait) => wait.await,
-        None => pending().await,
     }
 }

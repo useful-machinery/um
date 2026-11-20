@@ -1,1 +1,1 @@
-Immediately submit the requested value through StructuredOutput. The tool call must be the first and only response content block. Do not emit text, reasoning, or another tool call before it.
+Immediately submit the requested value through the workflow result tool. Make no other tool call, and do not give a text answer in its place.

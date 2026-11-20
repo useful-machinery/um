@@ -1,31 +1,32 @@
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::{self, Write as _};
-use std::num::NonZeroU64;
-use std::ops::Add as _;
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use jsonschema::{Draft, PatternOptions, Retrieve, Uri};
 use ring::digest::{SHA256, digest};
-use rustix::net::{RecvFlags, recv};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+// The socket tests in `result_bridge/tests.rs` bind and dial through these names.
+#[cfg(test)]
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{mpsc, oneshot, watch};
-use tokio::task::JoinHandle;
 
 use super::PiJsonV1ProtocolLimits;
 use crate::workflow::agent::{AgentInvocationIdentity, PositiveDuration, RetainedJsonSchema};
+use crate::workflow::agent_result_socket::{
+    self, ResultSocketResponse, bind_result_socket, remove_materialized_file, remove_result_socket,
+};
+pub(super) use crate::workflow::agent_result_socket::{
+    validate_result_endpoint_directory, write_private_file,
+};
 use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::result_validation::{decode_uri_fragment, join_pointer};
 use crate::workflow::schema_common::lowercase_hex;
+#[cfg(test)]
 use crate::workflow::socket_alias::{
-    SOCKET_ALIAS_NAME, SOCKET_ALIAS_ROOT, create_socket_alias_retry, ignore_not_found,
-    random_socket_alias_directory, remove_socket_alias,
+    SOCKET_ALIAS_NAME, create_socket_alias_retry, remove_socket_alias,
 };
+use crate::workflow::socket_alias::{SOCKET_ALIAS_ROOT, random_socket_alias_directory};
 
 fn invalid_bridge(error: impl std::fmt::Display) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, error.to_string())
@@ -43,6 +44,15 @@ const EXTENSION_TEMPLATE: &str = include_str!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/src/workflow/pi-json-v1-extension/src/pi-json-v1-extension.ts"
 ));
+
+type ResultSocketServer =
+    agent_result_socket::ResultSocketServer<ValidatePiResultV1Request, ValidatePiResultV1Response>;
+pub(super) type ResultSocketEvent =
+    agent_result_socket::ResultSocketEvent<ValidatePiResultV1Request, ValidatePiResultV1Response>;
+pub(super) type IncomingResultRequest = agent_result_socket::IncomingResultRequest<
+    ValidatePiResultV1Request,
+    ValidatePiResultV1Response,
+>;
 
 #[derive(Debug)]
 pub(super) struct PreparedResultBridge {
@@ -64,55 +74,34 @@ impl PreparedResultBridge {
     ) -> Result<Self, io::Error> {
         validate_result_endpoint_directory(staging_directory)?;
         let tool_name = Arc::<str>::from(result_tool_name(identity)?);
-        let socket_path = staging_directory.join(SOCKET_FILE_NAME);
         let extension_path = staging_directory.join(EXTENSION_FILE_NAME);
         let transport = derive_transport_schema(schema)?;
-        let socket_alias_directory = create_random_socket_alias(&tool_name, staging_directory)?;
-        let socket_alias = socket_alias_directory.join(SOCKET_ALIAS_NAME);
-        let socket_address = socket_alias.join(SOCKET_FILE_NAME);
-        let source = match materialize_extension(&ExtensionConfig {
-            tool_name: &tool_name,
-            socket_path: socket_address
-                .to_str()
-                .ok_or_else(|| invalid_bridge("socket path is not UTF-8"))?,
-            parameters: &transport.native_parameters,
-        }) {
-            Ok(source) => source,
-            Err(error) => {
-                let _ = remove_socket_alias(&socket_alias_directory, &socket_alias);
-                return Err(error);
-            }
-        };
-        let listener = match UnixListener::bind(&socket_address) {
-            Ok(listener) => listener,
-            Err(error) => {
-                let _ = remove_socket_alias(&socket_alias_directory, &socket_alias);
-                return Err(io::Error::new(
-                    error.kind(),
-                    format!("socket bind: {error}"),
-                ));
-            }
-        };
-        if let Err(error) = make_socket_private(&socket_path) {
-            drop(listener);
-            let _ = fs::remove_file(&socket_path);
-            let _ = remove_socket_alias(&socket_alias_directory, &socket_alias);
-            return Err(io::Error::new(
-                error.kind(),
-                format!("socket permissions: {error}"),
-            ));
-        }
-        if let Err(error) = write_private_file(&extension_path, source.as_bytes()) {
-            drop(listener);
-            let _ = fs::remove_file(&socket_path);
-            let _ = remove_socket_alias(&socket_alias_directory, &socket_alias);
-            return Err(io::Error::new(
-                error.kind(),
-                format!("extension write: {error}"),
-            ));
+        let socket = bind_result_socket(staging_directory, SOCKET_FILE_NAME, || {
+            socket_alias_directory(&tool_name)
+        })?;
+        let written = socket
+            .address
+            .to_str()
+            .ok_or_else(|| invalid_bridge("socket path is not UTF-8"))
+            .and_then(|socket_path| {
+                materialize_extension(&ExtensionConfig {
+                    tool_name: &tool_name,
+                    socket_path,
+                    parameters: &transport.native_parameters,
+                })
+            })
+            .and_then(|source| {
+                write_private_file(&extension_path, source.as_bytes()).map_err(|error| {
+                    io::Error::new(error.kind(), format!("extension write: {error}"))
+                })
+            });
+        if let Err(error) = written {
+            drop(socket.listener);
+            let _ = remove_result_socket(&socket.socket_path, &socket.alias_directory);
+            return Err(error);
         }
         let server = ResultSocketServer::start(
-            listener,
+            socket.listener,
             limits.maximum_frame_bytes(),
             receive_deadline,
             clock,
@@ -120,8 +109,8 @@ impl PreparedResultBridge {
         Ok(Self {
             tool_name,
             extension_path,
-            socket_path,
-            socket_alias_directory,
+            socket_path: socket.socket_path,
+            socket_alias_directory: socket.alias_directory,
             server,
         })
     }
@@ -147,49 +136,9 @@ impl PreparedResultBridge {
             ..
         } = self;
         let server_result = server.shutdown().await;
-        let socket_result = remove_materialized_file(&socket_path);
         let extension_result = remove_materialized_file(&extension_path);
-        let alias_result = remove_socket_alias(
-            &socket_alias_directory,
-            &socket_alias_directory.join(SOCKET_ALIAS_NAME),
-        );
-        server_result
-            .and(socket_result)
-            .and(extension_result)
-            .and(alias_result)
-    }
-}
-
-#[derive(Debug)]
-pub(super) enum ResultSocketEvent {
-    Request(IncomingResultRequest),
-    ProtocolFailure,
-    Closed,
-}
-
-#[derive(Debug)]
-pub(super) struct IncomingResultRequest {
-    request: ValidatePiResultV1Request,
-    response: oneshot::Sender<ResponseCommand>,
-}
-
-impl IncomingResultRequest {
-    pub(super) fn request(&self) -> &ValidatePiResultV1Request {
-        &self.request
-    }
-
-    pub(super) async fn respond(
-        self,
-        response: ValidatePiResultV1Response,
-    ) -> Result<(), io::Error> {
-        let (delivered, delivery) = oneshot::channel();
-        self.response
-            .send(ResponseCommand {
-                response,
-                delivered,
-            })
-            .map_err(|_| invalid_bridge("response channel closed"))?;
-        delivery.await.map_err(invalid_bridge)?
+        let socket_result = remove_result_socket(&socket_path, &socket_alias_directory);
+        server_result.and(extension_result).and(socket_result)
     }
 }
 
@@ -252,292 +201,9 @@ impl ValidatePiResultV1Response {
     }
 }
 
-#[derive(Debug)]
-struct ResponseCommand {
-    response: ValidatePiResultV1Response,
-    delivered: oneshot::Sender<Result<(), io::Error>>,
-}
-
-#[derive(Debug)]
-struct ResultSocketServer {
-    events: mpsc::Receiver<ResultSocketEvent>,
-    stop: watch::Sender<bool>,
-    task: JoinHandle<()>,
-}
-
-impl ResultSocketServer {
-    fn start<Clock: CoordinatorClock>(
-        listener: UnixListener,
-        maximum_frame_bytes: NonZeroU64,
-        receive_deadline: PositiveDuration,
-        clock: Clock,
-    ) -> Self {
-        let (events_sender, events) = mpsc::channel(1);
-        let (stop, stop_receiver) = watch::channel(false);
-        let task = tokio::spawn(serve_socket(
-            listener,
-            events_sender,
-            stop_receiver,
-            maximum_frame_bytes,
-            receive_deadline,
-            clock,
-        ));
-        Self { events, stop, task }
-    }
-
-    async fn receive(&mut self) -> ResultSocketEvent {
-        self.events
-            .recv()
-            .await
-            .unwrap_or(ResultSocketEvent::Closed)
-    }
-
-    async fn shutdown(self) -> Result<(), io::Error> {
-        let Self { events, stop, task } = self;
-        drop(events);
-        stop.send_replace(true);
-        task.await.map_err(invalid_bridge)
-    }
-}
-
-async fn serve_socket<Clock: CoordinatorClock>(
-    listener: UnixListener,
-    events: mpsc::Sender<ResultSocketEvent>,
-    mut stop: watch::Receiver<bool>,
-    maximum_frame_bytes: NonZeroU64,
-    receive_deadline: PositiveDuration,
-    mut clock: Clock,
-) {
-    loop {
-        let accepted = tokio::select! {
-            biased;
-            _ = wait_for_stop(&mut stop) => return,
-            accepted = listener.accept() => accepted,
-        };
-        let Ok((stream, _address)) = accepted else {
-            let _ = events.send(ResultSocketEvent::ProtocolFailure).await;
-            return;
-        };
-        let deadline = clock.now().add(receive_deadline.get());
-        if !serve_connection(
-            stream,
-            &events,
-            &mut stop,
-            maximum_frame_bytes,
-            &clock,
-            deadline,
-        )
-        .await
-        {
-            return;
-        }
-    }
-}
-
-async fn serve_connection<Clock: CoordinatorClock>(
-    mut stream: UnixStream,
-    events: &mpsc::Sender<ResultSocketEvent>,
-    stop: &mut watch::Receiver<bool>,
-    maximum_frame_bytes: NonZeroU64,
-    clock: &Clock,
-    deadline: Clock::Instant,
-) -> bool {
-    let request = match read_request_frame(&mut stream, stop, maximum_frame_bytes, clock, deadline)
-        .await
-    {
-        FrameRead::Request(request) => request,
-        FrameRead::ProtocolFailure => {
-            let response = ValidatePiResultV1Response::fatal(CHANNEL_FAILURE_CAUSE);
-            let _ = write_response_frame(&mut stream, stop, &response, maximum_frame_bytes).await;
-            let _ = events.send(ResultSocketEvent::ProtocolFailure).await;
-            return true;
-        }
-        FrameRead::Stopped => return false,
-    };
-
-    let (response_sender, response) = oneshot::channel();
-    if events
-        .send(ResultSocketEvent::Request(IncomingResultRequest {
-            request,
-            response: response_sender,
-        }))
-        .await
-        .is_err()
-    {
-        return false;
-    }
-    let command = match wait_for_response_command(&mut stream, stop, response).await {
-        Ok(command) => command,
-        Err(ResponseWaitFailure::TrailingRequest) => {
-            discard_buffered_request(&stream);
-            let response = ValidatePiResultV1Response::fatal(CHANNEL_FAILURE_CAUSE);
-            let _ = write_response_frame(&mut stream, stop, &response, maximum_frame_bytes).await;
-            let _ = events.send(ResultSocketEvent::ProtocolFailure).await;
-            return true;
-        }
-        Err(ResponseWaitFailure::SenderDropped) => {
-            let _ = events.send(ResultSocketEvent::ProtocolFailure).await;
-            return true;
-        }
-        Err(ResponseWaitFailure::Stopped) => return false,
-    };
-    let delivered =
-        write_response_frame(&mut stream, stop, &command.response, maximum_frame_bytes).await;
-    let _ = command.delivered.send(delivered);
-    true
-}
-
-enum ResponseWaitFailure {
-    TrailingRequest,
-    SenderDropped,
-    Stopped,
-}
-
-async fn wait_for_response_command(
-    stream: &mut UnixStream,
-    stop: &mut watch::Receiver<bool>,
-    response: oneshot::Receiver<ResponseCommand>,
-) -> Result<ResponseCommand, ResponseWaitFailure> {
-    let mut response = response;
-    let mut trailing = [0_u8; 1];
-    tokio::select! {
-        biased;
-        _ = wait_for_stop(stop) => Err(ResponseWaitFailure::Stopped),
-        read = stream.read(&mut trailing) => match read {
-            Ok(0) => tokio::select! {
-                biased;
-                _ = wait_for_stop(stop) => Err(ResponseWaitFailure::Stopped),
-                command = &mut response => command.map_err(|_| ResponseWaitFailure::SenderDropped),
-            },
-            Ok(_) | Err(_) => Err(ResponseWaitFailure::TrailingRequest),
-        },
-        command = &mut response => match command {
-            Ok(_) if has_trailing_request(stream) => Err(ResponseWaitFailure::TrailingRequest),
-            Ok(command) => Ok(command),
-            Err(_) => Err(ResponseWaitFailure::SenderDropped),
-        },
-    }
-}
-
-// Query the socket directly because Tokio's cached readiness can lag a peer write
-// that completed before the validator's response became ready.
-fn has_trailing_request(stream: &UnixStream) -> bool {
-    let mut trailing = [0_u8; 1];
-    match recv(stream, &mut trailing, RecvFlags::DONTWAIT | RecvFlags::PEEK) {
-        Ok((_, 0)) => false,
-        Err(rustix::io::Errno::AGAIN) => false,
-        Ok(_) | Err(_) => true,
-    }
-}
-
-fn discard_buffered_request(stream: &UnixStream) {
-    let mut trailing = [0_u8; 1024];
-    loop {
-        match recv(stream, &mut trailing, RecvFlags::DONTWAIT) {
-            Ok((_, 0)) | Err(rustix::io::Errno::AGAIN) => return,
-            Ok(_) => {}
-            Err(_) => return,
-        }
-    }
-}
-
-enum FrameRead {
-    Request(ValidatePiResultV1Request),
-    ProtocolFailure,
-    Stopped,
-}
-
-async fn read_request_frame<Clock: CoordinatorClock>(
-    stream: &mut UnixStream,
-    stop: &mut watch::Receiver<bool>,
-    maximum_frame_bytes: NonZeroU64,
-    clock: &Clock,
-    deadline: Clock::Instant,
-) -> FrameRead {
-    let mut length = [0_u8; 4];
-    let deadline_wait = clock.wait_until(deadline.clone());
-    tokio::pin!(deadline_wait);
-    let read_length = tokio::select! {
-        biased;
-        _ = wait_for_stop(stop) => return FrameRead::Stopped,
-        () = &mut deadline_wait => return FrameRead::ProtocolFailure,
-        result = stream.read_exact(&mut length) => result,
-    };
-    if read_length.is_err() {
-        return FrameRead::ProtocolFailure;
-    }
-    let payload_length = u64::from(u32::from_be_bytes(length));
-    if payload_length > maximum_frame_bytes.get() {
-        return FrameRead::ProtocolFailure;
-    }
-    let Ok(payload_length) = usize::try_from(payload_length) else {
-        return FrameRead::ProtocolFailure;
-    };
-    let mut payload = Vec::new();
-    if payload.try_reserve_exact(payload_length).is_err() {
-        return FrameRead::ProtocolFailure;
-    }
-    payload.resize(payload_length, 0);
-    let deadline_wait = clock.wait_until(deadline.clone());
-    tokio::pin!(deadline_wait);
-    let read_payload = tokio::select! {
-        biased;
-        _ = wait_for_stop(stop) => return FrameRead::Stopped,
-        () = &mut deadline_wait => return FrameRead::ProtocolFailure,
-        result = stream.read_exact(&mut payload) => result,
-    };
-    if read_payload.is_err() {
-        return FrameRead::ProtocolFailure;
-    }
-
-    // Pi 0.84's Bun node:net compatibility closes both socket halves on end(),
-    // so a request-side EOF would also discard the response. Reject any already
-    // buffered trailing frame bytes, then let the length prefix delimit the one
-    // request while the server owns closing the connection after its response.
-    let mut trailing = [0_u8; 1];
-    match stream.try_read(&mut trailing) {
-        Ok(0) => {}
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-        Ok(_) | Err(_) => return FrameRead::ProtocolFailure,
-    }
-    useful_support::strict_json_from_slice(&payload)
-        .and_then(serde_json::from_value)
-        .map(FrameRead::Request)
-        .unwrap_or(FrameRead::ProtocolFailure)
-}
-
-async fn write_response_frame(
-    stream: &mut UnixStream,
-    stop: &mut watch::Receiver<bool>,
-    response: &ValidatePiResultV1Response,
-    maximum_frame_bytes: NonZeroU64,
-) -> Result<(), io::Error> {
-    let payload = serde_json::to_vec(response).map_err(invalid_bridge)?;
-    let payload_length = u64::try_from(payload.len()).map_err(invalid_bridge)?;
-    if payload_length > maximum_frame_bytes.get() {
-        return Err(invalid_bridge("bridge response exceeds frame limit"));
-    }
-    let payload_length = u32::try_from(payload_length).map_err(invalid_bridge)?;
-    let mut frame = Vec::with_capacity(4_usize.saturating_add(payload.len()));
-    frame.extend_from_slice(&payload_length.to_be_bytes());
-    frame.extend_from_slice(&payload);
-    let written = tokio::select! {
-        biased;
-        _ = wait_for_stop(stop) => return Err(io::Error::new(io::ErrorKind::Interrupted, "bridge stopped")),
-        result = stream.write_all(&frame) => result,
-    };
-    written?;
-    stream.shutdown().await
-}
-
-async fn wait_for_stop(stop: &mut watch::Receiver<bool>) {
-    if *stop.borrow_and_update() {
-        return;
-    }
-    while stop.changed().await.is_ok() {
-        if *stop.borrow_and_update() {
-            return;
-        }
+impl ResultSocketResponse for ValidatePiResultV1Response {
+    fn channel_failure() -> Self {
+        Self::fatal(CHANNEL_FAILURE_CAUSE)
     }
 }
 
@@ -1212,48 +878,11 @@ fn map_schema_keywords() -> &'static [&'static str] {
     ]
 }
 
-pub(super) fn validate_result_endpoint_directory(directory: &Path) -> Result<(), io::Error> {
-    let metadata = fs::symlink_metadata(directory)?;
-    if !metadata.file_type().is_dir() || metadata.permissions().mode() & 0o077 != 0 {
-        return Err(invalid_bridge("result endpoint is not a private directory"));
-    }
-    if metadata.permissions().mode() & 0o200 == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "result endpoint is not writable",
-        ));
-    }
-    Ok(())
-}
-
 fn socket_alias_directory(tool_name: &str) -> io::Result<PathBuf> {
     let identity = tool_name
         .strip_prefix(TOOL_NAME_PREFIX)
         .ok_or_else(|| invalid_bridge("invalid result tool name"))?;
     random_socket_alias_directory(Path::new(SOCKET_ALIAS_ROOT), &format!(".szp-{identity}-"))
-}
-
-fn create_random_socket_alias(tool_name: &str, target: &Path) -> io::Result<PathBuf> {
-    create_socket_alias_retry(target, || socket_alias_directory(tool_name))
-}
-
-fn make_socket_private(path: &Path) -> io::Result<()> {
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-}
-
-pub(super) fn write_private_file(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)?;
-    file.write_all(bytes)?;
-    file.flush()?;
-    file.set_permissions(fs::Permissions::from_mode(0o400))
-}
-
-fn remove_materialized_file(path: &Path) -> Result<(), io::Error> {
-    ignore_not_found(fs::remove_file(path))
 }
 
 #[cfg(test)]

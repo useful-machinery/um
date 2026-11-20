@@ -1,13 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
-use std::future::Future;
+use std::future::{Future, pending};
 use std::io::{BufRead as _, Write as _};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use nix::sys::stat::Mode;
@@ -15,30 +15,39 @@ use nix::unistd::mkfifo;
 use rustix::process::{Pid, getpgid};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
+use useful_test_support::mcp::McpServerProcess;
 
 use super::adapter::{
     ClaudeCodeStreamJsonV1Adapter, MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES,
-    NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC, native_project_slug, prepare_launch,
+    NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC, QUIET_BOUND, QUIET_BOUND_FORCE_DELAY,
+    native_project_slug, prepare_launch,
 };
+use super::result_tool::TOOL_NAME;
 use super::test_support::{
-    FixtureSignal, PendingClock, RecordingObservationSink, admitted_adapter, completed_turns,
-    invocation_identity,
+    FixtureSignal, PendingClock, RecordingObservationSink, admitted_adapter, invocation_identity,
 };
 use super::*;
 use crate::workflow::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
 use crate::workflow::agent::{
-    AgentAdapter, AgentCompatibilityProfile, AgentInvocation, AgentInvocationLimits,
-    AgentInvocationStaging, AgentProcessContext, AgentPrompt, AgentStartReceiver, AgentValueMode,
-    PositiveDuration, RetainedJsonSchema, StagedAgentAttachment, agent_start_channel,
+    AgentAdapter, AgentCompatibilityProfile, AgentDiagnosticLevel, AgentFailureCause,
+    AgentHarnessFailureDetail, AgentInvocation, AgentInvocationLimits, AgentInvocationStaging,
+    AgentLifecycleMilestone, AgentObservation, AgentOutcome, AgentProcessContext, AgentPrompt,
+    AgentStartReceiver, AgentValueKind, AgentValueMode, CompletedAgentInvocation, PositiveDuration,
+    RetainedJsonSchema, StagedAgentAttachment, agent_start_channel, failed_agent_outcome,
 };
-use crate::workflow::agent_diagnostics::{AgentDiagnosticSession, AgentDiagnosticSessionStore};
+use crate::workflow::agent_diagnostics::AgentDiagnosticSessionStore;
+use crate::workflow::agent_process_driver::PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL;
 use crate::workflow::coordinator::CoordinatorClock;
 use crate::workflow::diagnostic::StepDiagnosticLog;
 use crate::workflow::execution_root::AdmittedExecutionRoot;
 use crate::workflow::observation::NoopExecutionObserver;
 use crate::workflow::private_staging::open_directory_path;
 use crate::workflow::process_group::{ProcessGuardRegistry, process_group_is_quiescent};
-use crate::workflow::result_validation::ResultValidationWorker;
+use crate::workflow::result_validation::{ResultValidationWorker, ValidationWorkerRequest};
+pub(super) use crate::workflow::test_support::InlineValidationWorker;
+use crate::workflow::test_support::claude_validation::{
+    FailingValidationWorker, PendingValidation, PendingValidationWorker,
+};
 use crate::workflow::test_support::{
     host_scaled_watchdog, process_fixture_interrupt_receiver, spawn_process_fixture,
     write_process_fixture_id, write_process_fixture_signal,
@@ -79,6 +88,7 @@ printf '%s\n' "$PWD" > "$CLAUDE_FIXTURE_CWD"
   printf 'marketplace=%s\n' "$CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL"
   printf 'memory=%s\n' "$CLAUDE_CODE_DISABLE_AUTO_MEMORY"
   printf 'git=%s\n' "$CLAUDE_CODE_DISABLE_GIT_INSTRUCTIONS"
+  printf 'exit_after_stop=%s\n' "$CLAUDE_CODE_EXIT_AFTER_STOP_DELAY"
 } > "$CLAUDE_FIXTURE_ENVIRONMENT"
 printf 'fixture diagnostic\n' >&2
 output=$(
@@ -91,10 +101,29 @@ printf '{"type":"assistant","message":{"id":"msg-driver","type":"message","role"
 printf '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
 printf '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
 printf '{"type":"stream_event","event":{"type":"message_stop"},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
-printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"convenience duplicate","session_id":"%s"}\n' "$session"
+printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","num_turns":1,"result":"driver response","session_id":"%s"}\n' "$session"
 )
 printf '%s\n' "$output"
-cat >> "$CLAUDE_FIXTURE_INPUT"
+"#;
+
+/// A Claude Code that records its arguments, exports the `--mcp-config` file they name, and
+/// hands over to the scripted process fixture, which writes its frames on fd 3.
+const SCRIPTED_FAKE_CLAUDE: &str = r#"#!/bin/sh
+for argument in "$@"; do
+  printf '%s\0' "$argument"
+done > "$CLAUDE_FIXTURE_ARGUMENTS"
+previous=
+for argument in "$@"; do
+  if [ "$previous" = --mcp-config ]; then
+    CLAUDE_FIXTURE_MCP_CONFIG=$argument
+    export CLAUDE_FIXTURE_MCP_CONFIG
+  fi
+  previous=$argument
+done
+exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
+  --exact workflow::claude_code::adapter_tests::scripted_process_fixture \
+  --ignored --test-threads=1 \
+  3>&1 >/dev/null 2>&1
 "#;
 
 const CANCELLATION_FAKE_CLAUDE: &str = r#"#!/bin/sh
@@ -132,13 +161,6 @@ exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
   3>&1 >/dev/null 2>&1
 "#;
 
-const BACKGROUND_SUBAGENT_FAKE_CLAUDE: &str = r#"#!/bin/sh
-exec "$CLAUDE_FIXTURE_PROCESS_HELPER" \
-  --exact workflow::claude_code::adapter_tests::background_subagent_response_process_fixture \
-  --ignored --test-threads=1 \
-  3>&1 >/dev/null 2>&1
-"#;
-
 type TestInvocation = AgentInvocation;
 
 struct ProcessFixture {
@@ -155,6 +177,9 @@ struct ProcessFixture {
     config: PathBuf,
     native_session: PathBuf,
     session_id: Arc<str>,
+    process: PathBuf,
+    report: PathBuf,
+    result_endpoint: PathBuf,
     ready: FixtureSignal,
     descendant_ready: FixtureSignal,
     interrupted: FixtureSignal,
@@ -178,6 +203,55 @@ impl ProcessFixture {
         maximum_response_bytes: u64,
         attachment_fixtures: &[AttachmentFixture<'_>],
     ) -> Self {
+        Self::build(
+            value_mode,
+            maximum_response_bytes,
+            attachment_fixtures,
+            FAKE_CLAUDE,
+            None,
+        )
+    }
+
+    /// A fake Claude Code that is the scripted process fixture, performing `actions` in order
+    /// (see `scripted_process_fixture`).
+    fn scripted(value_mode: AgentValueMode, actions: &[Value]) -> Self {
+        let fixture = Self::build(
+            value_mode,
+            1024,
+            &[],
+            SCRIPTED_FAKE_CLAUDE,
+            Some(Value::Array(actions.to_vec())),
+        );
+        mkfifo(
+            &fixture.ready.path().with_file_name("release"),
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        )
+        .unwrap();
+        fixture
+    }
+
+    /// Lets the scripted fixture past its next `release` action.
+    async fn release(&self) {
+        let release = self.ready.path().with_file_name("release");
+        tokio::task::spawn_blocking(move || {
+            std::fs::write(
+                release,
+                b"release
+",
+            )
+        })
+        .await
+        .unwrap()
+        .unwrap();
+    }
+
+    fn build(
+        value_mode: AgentValueMode,
+        maximum_response_bytes: u64,
+        attachment_fixtures: &[AttachmentFixture<'_>],
+        script: &str,
+        actions: Option<Value>,
+    ) -> Self {
         let temporary = tempfile::tempdir().unwrap();
         let execution_root = temporary.path().join("execution");
         let cwd = execution_root.join("worktree");
@@ -198,8 +272,10 @@ impl ProcessFixture {
         ] {
             std::fs::create_dir_all(directory).unwrap();
         }
+        // The result tool's socket and configuration live in the private endpoint directory.
+        std::fs::set_permissions(&result_endpoint, std::fs::Permissions::from_mode(0o700)).unwrap();
         let executable = temporary.path().join("claude");
-        std::fs::write(&executable, FAKE_CLAUDE).unwrap();
+        std::fs::write(&executable, script).unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         let arguments = controls.join("arguments");
@@ -207,6 +283,8 @@ impl ProcessFixture {
         let prompt = controls.join("prompt");
         let captured_cwd = controls.join("cwd");
         let environment = controls.join("environment");
+        let process = controls.join("process");
+        let report = controls.join("report.json");
         let ready = FixtureSignal::create(controls.join("ready"));
         let descendant_ready = FixtureSignal::create(controls.join("descendant-ready"));
         let interrupted = FixtureSignal::create(controls.join("interrupted"));
@@ -264,7 +342,21 @@ impl ProcessFixture {
                 OsString::from("CLAUDE_FIXTURE_INTERRUPTED"),
                 interrupted.path().as_os_str().to_owned(),
             ),
+            (
+                OsString::from("CLAUDE_FIXTURE_PROCESS"),
+                process.as_os_str().to_owned(),
+            ),
+            (
+                OsString::from("CLAUDE_FIXTURE_REPORT"),
+                report.as_os_str().to_owned(),
+            ),
         ]);
+        if let Some(actions) = actions {
+            runner_environment.insert(
+                OsString::from("CLAUDE_FIXTURE_ACTIONS"),
+                OsString::from(actions.to_string()),
+            );
+        }
         let attachments = attachment_fixtures
             .iter()
             .enumerate()
@@ -327,8 +419,6 @@ impl ProcessFixture {
             OsString::from(session_id.as_ref()),
         );
         let diagnostic_directory = diagnostic_session.directory().to_owned();
-        // The normal-driver and result-driver fixtures intentionally construct distinct
-        // production invocations so their stdin closure and correction scripts cannot mix.
         let invocation = AgentInvocation::new(
             identity,
             admitted_adapter(executable, MODEL),
@@ -336,7 +426,7 @@ impl ProcessFixture {
                 working_directory,
                 EnvironmentSnapshot::new(runner_environment),
             ),
-            AgentInvocationStaging::new(result_endpoint),
+            AgentInvocationStaging::new(result_endpoint.clone()),
             diagnostic_session,
             AgentPrompt::new(
                 Arc::from("exact system prompt\n"),
@@ -363,6 +453,9 @@ impl ProcessFixture {
             config,
             native_session,
             session_id,
+            process,
+            report,
+            result_endpoint,
             ready,
             descendant_ready,
             interrupted,
@@ -427,19 +520,12 @@ fn start_process_fixture(
     AgentStartReceiver,
     tokio::sync::oneshot::Receiver<AgentOutcome>,
 ) {
-    let adapter = ClaudeCodeStreamJsonV1Adapter::with_worker(
+    start_adapter(
+        invocation,
         diagnostics,
-        NonZeroU64::new(1024).unwrap(),
         PendingClock,
-        NoopExecutionObserver,
         InlineValidationWorker,
-    );
-    let (started, start) = agent_start_channel();
-    let (terminal, outcome) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
-        let _ = terminal.send(adapter.invoke(invocation, started).await);
-    });
-    (task, start, outcome)
+    )
 }
 
 fn assert_user_cancelled(outcome: AgentOutcome) {
@@ -449,13 +535,6 @@ fn assert_user_cancelled(outcome: AgentOutcome) {
             reason: CancellationReason::UserRequest,
         }
     );
-}
-
-fn assert_agent_failure(outcome: &AgentOutcome, cause: AgentFailureCause) {
-    let AgentOutcome::Failed(failure) = outcome else {
-        panic!("expected agent failure, got {outcome:?}");
-    };
-    assert_eq!(failure.cause(), &cause);
 }
 
 fn production_transcript_script(
@@ -491,609 +570,322 @@ printf '{{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":
     )
 }
 
-async fn invoke_fixture_adapter<Adapter>(
-    invocation: TestInvocation,
-    adapter: Adapter,
-) -> AgentOutcome
-where
-    Adapter: AgentAdapter,
-{
-    let (started, start) = agent_start_channel();
-    let (terminal, outcome) = tokio::sync::oneshot::channel();
-    let _ = terminal.send(adapter.invoke(invocation, started).await);
-    let outcome = outcome.await.unwrap();
-    assert_eq!(
-        start.receive().await,
-        Ok(()),
-        "terminal outcome: {outcome:?}"
-    );
-    outcome
-}
-
-const RESULT_FAKE_CLAUDE: &str = r#"#!/bin/sh
-set -eu
-printf '%s\n' "$$" > "$CLAUDE_RESULT_PROCESS"
-printf 'ready\n' > "$CLAUDE_RESULT_PROCESS_READY"
-IFS= read -r initial
-printf '%s\n' "$initial" > "$CLAUDE_RESULT_INPUT"
-cat "$CLAUDE_RESULT_FIRST"
-if [ "${CLAUDE_RESULT_READ_FEEDBACK:-0}" = 1 ]; then
-  IFS= read -r feedback
-  printf '%s\n' "$feedback" >> "$CLAUDE_RESULT_INPUT"
-fi
-if [ -s "$CLAUDE_RESULT_SECOND" ]; then
-  cat "$CLAUDE_RESULT_SECOND"
-fi
-if [ -s "$CLAUDE_RESULT_SHARED_READ" ]; then
-  cat "$CLAUDE_RESULT_SHARED_READ"
-fi
-if [ "${CLAUDE_RESULT_MODE:-settle}" = exit-after-feedback ]; then
-  exit 0
-fi
-cat >/dev/null
-case "${CLAUDE_RESULT_MODE:-settle}" in
-  settle | background-subagent) ;;
-  delayed-exit)
-    printf 'ready\n' > "$CLAUDE_RESULT_SETTLEMENT_READY"
-    IFS= read -r released < "$CLAUDE_RESULT_SETTLEMENT_RELEASE"
-    ;;
-  post-work | epilogue-in-the-results-read) cat "$CLAUDE_RESULT_POST_WORK" ;;
-  epilogue)
-    sed '$d' "$CLAUDE_RESULT_POST_WORK"
-    printf 'ready\n' > "$CLAUDE_RESULT_SETTLEMENT_READY"
-    IFS= read -r released < "$CLAUDE_RESULT_SETTLEMENT_RELEASE"
-    tail -n 1 "$CLAUDE_RESULT_POST_WORK"
-    ;;
-  hang)
-    trap '' INT TERM
-    IFS= read -r unexpected < "$CLAUDE_RESULT_SETTLEMENT_RELEASE"
-    exit 75
-    ;;
-  *) exit 74 ;;
-esac
-"#;
-
-#[derive(Clone)]
-struct ResultExchangeFixture {
-    candidate: Option<Value>,
-    structured_tool_count: usize,
-    sibling_tool_use: bool,
-}
-
-impl ResultExchangeFixture {
-    fn standalone(candidate: Value) -> Self {
-        Self {
-            candidate: Some(candidate),
-            structured_tool_count: 1,
-            sibling_tool_use: false,
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-enum ResultFixtureMode {
-    Settle,
-    DelayedExit,
-    ExitAfterFeedback,
-    PostWork,
-    Hang,
-    /// The first exchange launches a backgrounded subagent before its candidate; after
-    /// the feedback frame the agent ends a turn without a candidate, the subagent's
-    /// notification arrives, and the notified turn submits the second candidate.
-    BackgroundSubagent,
-    /// The first exchange launches a backgrounded subagent that settles before the
-    /// candidate; after acceptance the turn its notification announced (an epilogue)
-    /// opens, holds until the case releases it, and ends with its `result`.
-    Epilogue,
-    /// As `Epilogue`, but the candidate's `result` and the epilogue's `init` are written
-    /// together so one read carries both; the epilogue's remaining frames follow once the
-    /// input has closed.
-    EpilogueInTheResultsRead,
-}
-
-impl ResultFixtureMode {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Settle => "settle",
-            Self::DelayedExit => "delayed-exit",
-            Self::ExitAfterFeedback => "exit-after-feedback",
-            Self::PostWork => "post-work",
-            Self::Hang => "hang",
-            Self::BackgroundSubagent => "background-subagent",
-            Self::Epilogue => "epilogue",
-            Self::EpilogueInTheResultsRead => "epilogue-in-the-results-read",
-        }
-    }
-}
-
-struct ResultProcessFixture {
-    _temporary: tempfile::TempDir,
-    invocation: Option<TestInvocation>,
-    observations: RecordingObservationSink,
-    captured_input: PathBuf,
-    process: PathBuf,
-    process_ready: FixtureSignal,
-    settlement_ready: FixtureSignal,
-    settlement_release: PathBuf,
-}
-
-impl ResultProcessFixture {
-    fn new(
-        schema: RetainedJsonSchema,
-        first: ResultExchangeFixture,
-        second: Option<ResultExchangeFixture>,
-        mode: ResultFixtureMode,
-    ) -> Self {
-        let temporary = tempfile::tempdir().unwrap();
-        let execution_root = temporary.path().join("execution");
-        let cwd = execution_root.join("worktree");
-        let staging = temporary.path().join("staging");
-        let result_endpoint = staging.join("result-endpoint");
-        let controls = temporary.path().join("controls");
-        let home = temporary.path().join("home");
-        let config = temporary.path().join("claude-config");
-        for directory in [&cwd, &staging, &result_endpoint, &controls, &home, &config] {
-            std::fs::create_dir_all(directory).unwrap();
-        }
-        let executable = temporary.path().join("claude");
-        std::fs::write(&executable, RESULT_FAKE_CLAUDE).unwrap();
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
-
-        let admitted_root = AdmittedExecutionRoot::admit(&execution_root).unwrap();
-        let working_directory = admitted_root
-            .select_working_directory(Some("worktree"))
-            .unwrap();
-        let expected_cwd = working_directory.protocol_path().unwrap();
-        let first_path = controls.join("first.jsonl");
-        let second_path = controls.join("second.jsonl");
-        let post_work_path = controls.join("post-work.jsonl");
-        let mut first_values = result_exchange_values(&expected_cwd, 1, &first);
-        let mut second_values = second.as_ref().map_or_else(Vec::new, |exchange| {
-            result_exchange_values(&expected_cwd, 2, exchange)
-        });
-        if matches!(mode, ResultFixtureMode::BackgroundSubagent) {
-            first_values.splice(1..1, backgrounded_subagent_launch(RESULT_FIXTURE_SESSION));
-            let waiting = ResultExchangeFixture {
-                candidate: None,
-                structured_tool_count: 0,
-                sibling_tool_use: false,
-            };
-            let mut paused = result_exchange_values(&expected_cwd, 2, &waiting);
-            paused.push(backgrounded_subagent_notification(RESULT_FIXTURE_SESSION));
-            second_values.splice(0..0, paused);
-        }
-        let mut post_work = Vec::new();
-        if matches!(mode, ResultFixtureMode::Epilogue) {
-            let mut launch = backgrounded_subagent_launch(RESULT_FIXTURE_SESSION);
-            launch.push(backgrounded_subagent_notification(RESULT_FIXTURE_SESSION));
-            first_values.splice(1..1, launch);
-            let waiting = ResultExchangeFixture {
-                candidate: None,
-                structured_tool_count: 0,
-                sibling_tool_use: false,
-            };
-            post_work = result_exchange_values(&expected_cwd, 2, &waiting);
-            post_work.splice(
-                1..1,
-                fixture_stream_message(
-                    RESULT_FIXTURE_SESSION,
-                    "msg-epilogue",
-                    json!({"type": "text", "text": "noted"}),
-                    "end_turn",
-                ),
-            );
-        }
-        let mut shared_read = Vec::new();
-        if matches!(mode, ResultFixtureMode::EpilogueInTheResultsRead) {
-            let mut launch = backgrounded_subagent_launch(RESULT_FIXTURE_SESSION);
-            launch.push(backgrounded_subagent_notification(RESULT_FIXTURE_SESSION));
-            first_values.splice(1..1, launch);
-            let candidate_result = first_values.pop().unwrap();
-            let waiting = ResultExchangeFixture {
-                candidate: None,
-                structured_tool_count: 0,
-                sibling_tool_use: false,
-            };
-            post_work = result_exchange_values(&expected_cwd, 2, &waiting);
-            let epilogue_init = post_work.remove(0);
-            shared_read = vec![candidate_result, epilogue_init];
-            post_work.splice(
-                0..0,
-                fixture_stream_message(
-                    RESULT_FIXTURE_SESSION,
-                    "msg-epilogue",
-                    json!({"type": "text", "text": "noted"}),
-                    "end_turn",
-                ),
-            );
-        }
-        let shared_read_path = controls.join("shared-read.jsonl");
-        std::fs::write(&first_path, framed_result_values(&first_values)).unwrap();
-        std::fs::write(&shared_read_path, framed_result_values(&shared_read)).unwrap();
-        std::fs::write(&second_path, framed_result_values(&second_values)).unwrap();
-        if post_work.is_empty() {
-            post_work.push(json!({
-                "type": "stream_event",
-                "event": {
-                    "type": "message_start",
-                    "message": {
-                        "id": "msg-post-acceptance",
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [],
-                        "model": MODEL,
-                        "usage": {"input_tokens": 1, "output_tokens": 0},
-                    },
-                },
-                "session_id": RESULT_FIXTURE_SESSION,
-                "parent_tool_use_id": null,
-            }));
-        }
-        std::fs::write(&post_work_path, framed_result_values(&post_work)).unwrap();
-        let captured_input = controls.join("input.jsonl");
-        let process = controls.join("process.pid");
-        let process_ready = FixtureSignal::create(controls.join("process.ready"));
-        let settlement_ready = FixtureSignal::create(controls.join("settlement.ready"));
-        let settlement_release = controls.join("settlement.release");
-        mkfifo(&settlement_release, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
-        let runner_environment = EnvironmentSnapshot::new([
-            (
-                OsString::from("PATH"),
-                std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin")),
-            ),
-            (OsString::from("HOME"), home.into_os_string()),
-            (OsString::from("CLAUDE_CONFIG_DIR"), config.into_os_string()),
-            (
-                OsString::from("CLAUDE_RESULT_INPUT"),
-                captured_input.as_os_str().to_owned(),
-            ),
-            (
-                OsString::from("CLAUDE_RESULT_PROCESS"),
-                process.as_os_str().to_owned(),
-            ),
-            (
-                OsString::from("CLAUDE_RESULT_PROCESS_READY"),
-                process_ready.path().as_os_str().to_owned(),
-            ),
-            (
-                OsString::from("CLAUDE_RESULT_SETTLEMENT_READY"),
-                settlement_ready.path().as_os_str().to_owned(),
-            ),
-            (
-                OsString::from("CLAUDE_RESULT_SETTLEMENT_RELEASE"),
-                settlement_release.as_os_str().to_owned(),
-            ),
-            (
-                OsString::from("CLAUDE_RESULT_FIRST"),
-                first_path.into_os_string(),
-            ),
-            (
-                OsString::from("CLAUDE_RESULT_SECOND"),
-                second_path.into_os_string(),
-            ),
-            (
-                OsString::from("CLAUDE_RESULT_POST_WORK"),
-                post_work_path.into_os_string(),
-            ),
-            (
-                OsString::from("CLAUDE_RESULT_SHARED_READ"),
-                shared_read_path.into_os_string(),
-            ),
-            (
-                OsString::from("CLAUDE_RESULT_READ_FEEDBACK"),
-                OsString::from(
-                    if second.is_some() || matches!(mode, ResultFixtureMode::ExitAfterFeedback) {
-                        "1"
-                    } else {
-                        "0"
-                    },
-                ),
-            ),
-            (
-                OsString::from("CLAUDE_RESULT_MODE"),
-                OsString::from(mode.as_str()),
-            ),
-        ]);
-        let observations = RecordingObservationSink::default();
-        let invocation = AgentInvocation::new(
-            invocation_identity("run-claude-result", "result-step"),
-            admitted_adapter(executable, MODEL),
-            AgentProcessContext::new(working_directory, runner_environment),
-            AgentInvocationStaging::new(result_endpoint),
-            AgentDiagnosticSession::claude_code_fixture(
-                temporary.path().join("diagnostics/session"),
-            ),
-            AgentPrompt::new(Arc::from("system"), Arc::from("produce one result")),
-            Arc::from([]),
-            AgentValueMode::Result {
-                output: Arc::from("result"),
-                schema,
-            },
-            invocation_limits(1024),
-            CancellationSource::new(),
-            ProcessGuardRegistry::default(),
-            observations.clone(),
-        );
-        Self {
-            _temporary: temporary,
-            invocation: Some(invocation),
-            observations,
-            captured_input,
-            process,
-            process_ready,
-            settlement_ready,
-            settlement_release,
-        }
-    }
-}
-
-const RESULT_FIXTURE_SESSION: &str = "00000000-0000-4000-8000-000000000001";
-
-fn result_exchange_values(
-    expected_cwd: &std::path::Path,
-    exchange: u64,
-    fixture: &ResultExchangeFixture,
-) -> Vec<Value> {
-    let stream_event = |event| {
-        json!({
-            "type": "stream_event",
-            "event": event,
-            "session_id": RESULT_FIXTURE_SESSION,
-            "parent_tool_use_id": null,
-        })
-    };
-    let mut values = vec![json!({
-        "type": "system",
-        "subtype": "init",
-        "cwd": expected_cwd,
-        "session_id": RESULT_FIXTURE_SESSION,
-        "model": MODEL,
-        "permissionMode": "bypassPermissions",
-        "claude_code_version": QUALIFICATION_VERSION,
-    })];
-    if let Some(candidate) = &fixture.candidate {
-        values.push(stream_event(json!({
-            "type": "message_start",
-            "message": {
-                "id": format!("msg-result-{exchange}"),
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": MODEL,
-                "usage": {"input_tokens": 1, "output_tokens": 0},
-            },
-        })));
-        for index in 0..fixture.structured_tool_count {
-            let call_id = format!("tool-result-{exchange}-{index}");
-            values.extend([
-                stream_event(json!({
-                    "type": "content_block_start",
-                    "index": index,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": call_id,
-                        "name": "StructuredOutput",
-                        "input": candidate,
-                    },
-                })),
-                json!({
-                    "type": "assistant",
-                    "message": {
-                        "id": format!("msg-result-{exchange}"),
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [{
-                            "type": "tool_use",
-                            "id": call_id,
-                            "name": "StructuredOutput",
-                            "input": candidate,
-                        }],
-                        "model": MODEL,
-                    },
-                    "parent_tool_use_id": null,
-                    "session_id": RESULT_FIXTURE_SESSION,
-                }),
-                stream_event(json!({
-                    "type": "content_block_stop",
-                    "index": index,
-                })),
-            ]);
-            values.push(json!({
-                "type": "user",
-                "message": {
-                    "role": "user",
-                    "content": [{
-                        "type": "tool_result",
-                        "tool_use_id": call_id,
-                        "content": "structurally correlated acknowledgement",
-                    }],
-                },
-                "parent_tool_use_id": null,
-                "session_id": RESULT_FIXTURE_SESSION,
-                "tool_use_result": "structurally correlated acknowledgement",
-            }));
-        }
-        let next_index = fixture.structured_tool_count;
-        // Thinking and text siblings are observational and leave a candidate standalone;
-        // another tool call beside it is other native work and makes it ambiguous.
-        if fixture.sibling_tool_use {
-            values.extend([
-                stream_event(json!({
-                    "type": "content_block_start",
-                    "index": next_index,
-                    "content_block": {
-                        "type": "tool_use",
-                        "id": format!("tool-sibling-{exchange}"),
-                        "name": "Bash",
-                        "input": {"command": "true"},
-                    },
-                })),
-                stream_event(json!({
-                    "type": "content_block_stop",
-                    "index": next_index,
-                })),
-            ]);
-        }
-        values.extend([
-            stream_event(json!({
-                "type": "message_delta",
-                "delta": {"stop_reason": "tool_use"},
-                "usage": {"output_tokens": 1},
-            })),
-            stream_event(json!({"type": "message_stop"})),
-        ]);
-    }
-    let mut result = json!({
-        "type": "result",
-        "subtype": "success",
-        "is_error": false,
-        "terminal_reason": "completed",
-        "result": "structured result convenience text",
-        "session_id": RESULT_FIXTURE_SESSION,
-    });
-    if let Some(candidate) = &fixture.candidate {
-        result["structured_output"] = candidate.clone();
-    }
-    values.push(result);
-    values
-}
-
-fn framed_result_values(values: &[Value]) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    for value in values {
-        serde_json::to_writer(&mut bytes, value).unwrap();
-        bytes.push(b'\n');
-    }
-    bytes
-}
-
-/// A main-thread assistant message streamed as Claude Code emits it.
-fn fixture_stream_message(session: &str, id: &str, block: Value, stop_reason: &str) -> Vec<Value> {
-    let stream_event = |event| {
-        json!({
-            "type": "stream_event",
-            "event": event,
-            "session_id": session,
-            "parent_tool_use_id": null,
-        })
-    };
-    let delta = match block["type"].as_str() {
-        Some("text") => json!({"type": "text_delta", "text": block["text"]}),
-        _ => json!({"type": "input_json_delta", "partial_json": "{}"}),
-    };
-    let mut start = block;
-    if start["type"] == "text" {
-        start["text"] = json!("");
-    }
-    vec![
-        stream_event(json!({
-            "type": "message_start",
-            "message": {
-                "id": id,
-                "type": "message",
-                "role": "assistant",
-                "content": [],
-                "model": MODEL,
-                "usage": {"input_tokens": 1, "output_tokens": 0},
-            },
-        })),
-        stream_event(json!({"type": "content_block_start", "index": 0, "content_block": start})),
-        stream_event(json!({"type": "content_block_delta", "index": 0, "delta": delta})),
-        stream_event(json!({"type": "content_block_stop", "index": 0})),
-        stream_event(json!({
-            "type": "message_delta",
-            "delta": {"stop_reason": stop_reason},
-            "usage": {"output_tokens": 1},
-        })),
-        stream_event(json!({"type": "message_stop"})),
-    ]
-}
-
-/// The main-thread fragment that launches a backgrounded subagent: the Agent call, the
-/// backgrounded `task_started`, and the call's immediate tool result.
-fn backgrounded_subagent_launch(session: &str) -> Vec<Value> {
-    let mut values = fixture_stream_message(
-        session,
-        "msg-agent-call",
-        json!({"type": "tool_use", "id": "agent-call", "name": "Agent", "input": {}}),
-        "tool_use",
-    );
-    values.extend([
-        json!({"type": "system", "subtype": "task_started", "task_id": "t1",
-            "tool_use_id": "agent-call", "task_type": "local_agent",
-            "description": "Review the diff", "subagent_type": "Explore",
-            "is_backgrounded": true, "session_id": session}),
-        json!({"type": "user", "session_id": session, "parent_tool_use_id": null,
-            "message": {"role": "user", "content": [{"type": "tool_result",
-                "tool_use_id": "agent-call", "content": "Async agent launched",
-                "is_error": false}]}}),
-    ]);
-    values
-}
-
-fn backgrounded_subagent_notification(session: &str) -> Value {
-    json!({"type": "system", "subtype": "task_notification", "task_id": "t1",
-        "tool_use_id": "agent-call", "status": "completed", "summary": "No issues",
-        "session_id": session})
-}
-
 fn retained_schema(schema: Value) -> RetainedJsonSchema {
     let bytes = Arc::<[u8]>::from(serde_json::to_vec(&schema).unwrap());
     RetainedJsonSchema::compile(bytes, Arc::new(schema)).unwrap()
 }
 
-fn type_schema(root_type: &str) -> RetainedJsonSchema {
+pub(super) fn type_schema(root_type: &str) -> RetainedJsonSchema {
     retained_schema(json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": root_type,
     }))
 }
 
-use crate::workflow::test_support::ControlledClock;
-pub(super) use crate::workflow::test_support::InlineValidationWorker;
-use crate::workflow::test_support::claude_validation::{
-    FailingValidationWorker, PendingValidationWorker,
-};
-
-fn controlled_clock() -> (
-    ControlledClock,
-    mpsc::UnboundedReceiver<Duration>,
-    watch::Sender<bool>,
-) {
-    let (registrations, registered) = mpsc::unbounded_channel();
-    let (release, released) = watch::channel(false);
-    (
-        ControlledClock {
-            registrations,
-            release: released,
-        },
-        registered,
-        release,
-    )
+pub(super) fn positive_integer_schema() -> RetainedJsonSchema {
+    retained_schema(json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "integer",
+        "minimum": 1,
+    }))
 }
 
-async fn run_result_fixture<Clock, Worker>(
-    mut fixture: ResultProcessFixture,
+pub(super) fn result_mode(schema: RetainedJsonSchema) -> AgentValueMode {
+    AgentValueMode::Result {
+        output: Arc::from("result"),
+        schema,
+    }
+}
+
+/// The deadlines a [`StagedClock`] lets expire.
+#[derive(Clone, Default)]
+struct ReleasedDeadlines {
+    durations: BTreeSet<Duration>,
+    /// Every deadline but the quiet bound's two.
+    all_but_the_bound: bool,
+}
+
+impl ReleasedDeadlines {
+    fn admit(&self, deadline: Duration) -> bool {
+        self.durations.contains(&deadline)
+            || (self.all_but_the_bound
+                && deadline != QUIET_BOUND
+                && deadline != QUIET_BOUND_FORCE_DELAY)
+    }
+}
+
+/// A clock at zero whose deadlines expire only as the case releases their durations, and
+/// which shows each quiet-bound wait still pending, so a case can tell a bound armed afresh
+/// from the one it replaced.
+#[derive(Clone)]
+pub(super) struct StagedClock {
+    registrations: mpsc::UnboundedSender<Duration>,
+    released: watch::Receiver<ReleasedDeadlines>,
+    pending_bounds: Arc<watch::Sender<BTreeSet<u64>>>,
+    armed_bounds: Arc<AtomicU64>,
+}
+
+pub(super) struct StagedClockControl {
+    registrations: mpsc::UnboundedReceiver<Duration>,
+    released: watch::Sender<ReleasedDeadlines>,
+    pending_bounds: watch::Receiver<BTreeSet<u64>>,
+}
+
+impl StagedClock {
+    pub(super) fn new() -> (Self, StagedClockControl) {
+        let (registrations, registered) = mpsc::unbounded_channel();
+        let (released, release) = watch::channel(ReleasedDeadlines::default());
+        let (pending_bounds, pending) = watch::channel(BTreeSet::new());
+        (
+            Self {
+                registrations,
+                released: release,
+                pending_bounds: Arc::new(pending_bounds),
+                armed_bounds: Arc::new(AtomicU64::new(0)),
+            },
+            StagedClockControl {
+                registrations: registered,
+                released,
+                pending_bounds: pending,
+            },
+        )
+    }
+}
+
+impl StagedClockControl {
+    pub(super) fn release(&self, deadline: Duration) {
+        self.released.send_modify(|released| {
+            released.durations.insert(deadline);
+        });
+    }
+
+    fn release_all_but_the_bound(&self) {
+        self.released
+            .send_modify(|released| released.all_but_the_bound = true);
+    }
+
+    /// Waits for the next registration of `deadline`.
+    pub(super) async fn registered(&mut self, deadline: Duration) {
+        while let Some(registered) = self.registrations.recv().await {
+            if registered == deadline {
+                return;
+            }
+        }
+        panic!("the clock was dropped before {deadline:?} was registered");
+    }
+
+    /// Waits until exactly one quiet-bound wait is pending and it was armed after `after`.
+    async fn fresh_bound(&mut self, after: Option<u64>) -> u64 {
+        let pending = self
+            .pending_bounds
+            .wait_for(|pending| pending.len() == 1 && pending.first().copied() > after)
+            .await
+            .unwrap();
+        *pending.first().unwrap()
+    }
+}
+
+/// One quiet-bound wait while it is pending.
+struct PendingBound {
+    pending_bounds: Arc<watch::Sender<BTreeSet<u64>>>,
+    armed: u64,
+}
+
+impl Drop for PendingBound {
+    fn drop(&mut self) {
+        self.pending_bounds.send_modify(|pending| {
+            pending.remove(&self.armed);
+        });
+    }
+}
+
+impl CoordinatorClock for StagedClock {
+    type Instant = Duration;
+
+    fn now(&mut self) -> Self::Instant {
+        Duration::ZERO
+    }
+
+    async fn wait_until(&self, deadline: Self::Instant) {
+        if deadline == PROCESS_GROUP_QUIESCENCE_PROBE_INTERVAL {
+            // An OS process-group probe has no readiness channel: a spawned empty task is the
+            // scheduling point between probes.
+            let _ = tokio::spawn(async {}).await;
+            return;
+        }
+        let _ = self.registrations.send(deadline);
+        let _pending = (deadline == QUIET_BOUND).then(|| {
+            let armed = self.armed_bounds.fetch_add(1, Ordering::SeqCst) + 1;
+            self.pending_bounds.send_modify(|pending| {
+                pending.insert(armed);
+            });
+            PendingBound {
+                pending_bounds: Arc::clone(&self.pending_bounds),
+                armed,
+            }
+        });
+        let mut released = self.released.clone();
+        let closed = released
+            .wait_for(|released| released.admit(deadline))
+            .await
+            .is_err();
+        if closed {
+            pending::<()>().await;
+        }
+    }
+}
+
+/// A validation that never decides and reports that it started.
+#[derive(Clone)]
+struct ReportedPendingValidationWorker {
+    pending: PendingValidationWorker,
+    started: mpsc::UnboundedSender<()>,
+}
+
+impl ResultValidationWorker for ReportedPendingValidationWorker {
+    type Running = PendingValidation;
+
+    fn start(&self, request: ValidationWorkerRequest) -> Result<Self::Running, ()> {
+        let _ = self.started.send(());
+        self.pending.start(request)
+    }
+}
+
+fn start_adapter<Clock, Worker>(
+    invocation: TestInvocation,
+    diagnostics: StepDiagnosticLog,
     clock: Clock,
     worker: Worker,
-) -> (ResultProcessFixture, AgentOutcome)
+) -> (
+    tokio::task::JoinHandle<()>,
+    AgentStartReceiver,
+    tokio::sync::oneshot::Receiver<AgentOutcome>,
+)
 where
     Clock: CoordinatorClock,
     Worker: ResultValidationWorker,
 {
-    let invocation = fixture.invocation.take().unwrap();
     let adapter = ClaudeCodeStreamJsonV1Adapter::with_worker(
-        StepDiagnosticLog::default(),
+        diagnostics,
         NonZeroU64::new(1024).unwrap(),
         clock,
         NoopExecutionObserver,
         worker,
     );
-    let outcome = invoke_fixture_adapter(invocation, adapter).await;
-    (fixture, outcome)
+    let (started, start) = agent_start_channel();
+    let (terminal, outcome) = tokio::sync::oneshot::channel();
+    let task = tokio::spawn(async move {
+        let _ = terminal.send(adapter.invoke(invocation, started).await);
+    });
+    (task, start, outcome)
 }
 
-fn fixture_process(path: &std::path::Path) -> Pid {
+/// Runs a scripted fixture to its outcome, and whether start was reported.
+async fn run_scripted<Clock, Worker>(
+    mut fixture: ProcessFixture,
+    clock: Clock,
+    worker: Worker,
+) -> (ProcessFixture, AgentOutcome, bool)
+where
+    Clock: CoordinatorClock,
+    Worker: ResultValidationWorker,
+{
+    let invocation = fixture.invocation.take().unwrap();
+    let (task, start, outcome) =
+        start_adapter(invocation, fixture.diagnostics.clone(), clock, worker);
+    task.await.unwrap();
+    (
+        fixture,
+        outcome.await.unwrap(),
+        start.receive().await.is_ok(),
+    )
+}
+
+fn relay() -> Value {
+    json!({"relay": true})
+}
+
+fn init() -> Value {
+    json!({"init": QUALIFICATION_VERSION})
+}
+
+fn submit(value: Value) -> Value {
+    json!({"submit": {"submission": {"result": value}}})
+}
+
+fn frame(value: Value) -> Value {
+    json!({"frame": value})
+}
+
+fn successful_result(text: &str) -> Value {
+    frame(
+        json!({"type": "result", "subtype": "success", "is_error": false,
+        "terminal_reason": "completed", "num_turns": 2, "result": text}),
+    )
+}
+
+/// What the scripted fixture reported, in action order: each submission's answer and each
+/// `stdin` probe.
+fn fixture_report(fixture: &ProcessFixture) -> Vec<Value> {
+    serde_json::from_slice(&std::fs::read(&fixture.report).unwrap()).unwrap()
+}
+
+fn recorded_arguments(fixture: &ProcessFixture) -> Vec<OsString> {
+    std::fs::read(&fixture.arguments)
+        .unwrap()
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .map(|argument| OsStr::from_bytes(argument).to_owned())
+        .collect()
+}
+
+fn value_rejections(observations: &RecordingObservationSink) -> Vec<Arc<str>> {
+    observations
+        .snapshot()
+        .into_iter()
+        .filter_map(|observation| match observation.observation() {
+            AgentObservation::ValueRejected {
+                kind: AgentValueKind::Result,
+                feedback,
+            } => Some(Arc::clone(feedback)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The warnings the adapter showed, but the transcript-capture one a fake that writes no
+/// native transcript always earns.
+/// Waits until the adapter has read a `result` frame.
+pub(super) async fn wait_for_turn_completed(observations: &RecordingObservationSink) {
+    observations
+        .wait_for(|observation| {
+            matches!(
+                observation,
+                AgentObservation::Lifecycle {
+                    milestone: AgentLifecycleMilestone::TurnCompleted,
+                }
+            )
+        })
+        .await;
+}
+
+pub(super) fn adapter_warnings(observations: &RecordingObservationSink) -> Vec<Arc<str>> {
+    observations
+        .snapshot()
+        .into_iter()
+        .filter_map(|observation| match observation.observation() {
+            AgentObservation::Diagnostic {
+                level: AgentDiagnosticLevel::Warning,
+                message,
+            } if !message.starts_with(NATIVE_TRANSCRIPT_CAPTURE_MISSING_DIAGNOSTIC) => {
+                Some(Arc::clone(message))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn fixture_process(path: &Path) -> Pid {
     let process = std::fs::read_to_string(path)
         .unwrap()
         .trim()
@@ -1224,7 +1016,12 @@ fn delayed_input_process_fixture() {
 }
 
 fn write_fixture_frames(protocol: &mut std::fs::File, values: &[Value]) {
-    protocol.write_all(&framed_result_values(values)).unwrap();
+    let mut bytes = Vec::new();
+    for value in values {
+        serde_json::to_writer(&mut bytes, value).unwrap();
+        bytes.push(b'\n');
+    }
+    protocol.write_all(&bytes).unwrap();
     protocol.flush().unwrap();
 }
 
@@ -1241,37 +1038,21 @@ fn await_fixture_release() {
     );
 }
 
-#[test]
-#[ignore = "launched as the backgrounded-subagent Claude Code response fixture"]
-fn background_subagent_response_process_fixture() {
-    let session = std::env::var("CLAUDE_FIXTURE_SESSION").unwrap();
-    write_fixture_init();
-    let mut protocol = open_fixture_protocol();
-    let mut first_turn = backgrounded_subagent_launch(&session);
-    first_turn.extend(fixture_stream_message(
-        &session,
-        "msg-waiting",
-        json!({"type": "text", "text": "waiting"}),
-        "end_turn",
-    ));
-    first_turn.push(
-        json!({"type": "result", "subtype": "success", "is_error": false,
-        "terminal_reason": "completed", "result": "waiting", "session_id": session}),
-    );
-    write_fixture_frames(&mut protocol, &first_turn);
-    await_fixture_release();
-    write_fixture_frames(
-        &mut protocol,
-        &[json!({"type": "assistant", "session_id": session,
-            "parent_tool_use_id": "agent-call", "agent_id": "agent-1",
-            "subagent_type": "Explore", "task_description": "Review the diff",
-            "uuid": "00000000-0000-4000-8000-0000000000a1",
-            "timestamp": "2026-10-23T00:00:00Z",
-            "message": {"id": "msg-sub-1", "type": "message", "role": "assistant",
-                "model": MODEL, "content": [{"type": "text", "text": "No issues"}]}})],
-    );
-    await_fixture_release();
-    // The adapter has processed both chunks; a closed input is readable at once.
+/// Reads the prompt frame from stdin without buffering past it, so that what follows it is
+/// still there for the `stdin` action to see.
+fn read_prompt_frame() {
+    let mut byte = [0_u8; 1];
+    loop {
+        let read = rustix::io::read(std::io::stdin(), &mut byte).unwrap();
+        assert_eq!(read, 1, "stdin ended inside the prompt frame");
+        if byte[0] == b'\n' {
+            return;
+        }
+    }
+}
+
+/// `open` while stdin has neither ended nor carries a byte.
+fn standard_input_state() -> &'static str {
     let standard_input = std::io::stdin();
     let mut probe = [rustix::event::PollFd::new(
         &standard_input,
@@ -1285,32 +1066,84 @@ fn background_subagent_response_process_fixture() {
         }),
     )
     .unwrap();
-    write_process_fixture_signal(
-        "CLAUDE_FIXTURE_READY",
-        if ready == 0 {
-            &b"open\n"[..]
-        } else {
-            &b"closed\n"[..]
-        },
-    );
-    let mut final_turn = vec![backgrounded_subagent_notification(&session)];
-    write_fixture_frames(&mut protocol, &final_turn);
-    write_fixture_initialization(&mut protocol, &session, None);
-    final_turn = fixture_stream_message(
-        &session,
-        "msg-final",
-        json!({"type": "text", "text": "final"}),
-        "end_turn",
-    );
-    final_turn.push(
-        json!({"type": "result", "subtype": "success", "is_error": false,
-        "terminal_reason": "completed", "result": "final", "session_id": session}),
-    );
-    write_fixture_frames(&mut protocol, &final_turn);
-    // The step settles only when the adapter closes the input after the final result.
-    let mut remaining = Vec::new();
-    std::io::Read::read_to_end(&mut standard_input.lock(), &mut remaining).unwrap();
-    assert!(remaining.is_empty());
+    if ready == 0 { "open" } else { "readable" }
+}
+
+/// The scripted fake Claude Code. It writes its process id, reads the prompt frame, and then
+/// performs `CLAUDE_FIXTURE_ACTIONS` in order: `{"relay": _}` starts the relay the
+/// `--mcp-config` file names and initializes it, as Claude Code does before `init`;
+/// `{"init": version}` writes `system/init` naming `version`; `{"submit": arguments}` calls
+/// the result tool and reports its answer; `{"frame": value}` writes a frame; `{"exit": code}`
+/// exits; `"ready"` signals ready; `"release"` waits for the case's release; `"stdin"`
+/// reports whether stdin is still `open`; `"catch_interrupt"` keeps SIGINT from ending it;
+/// `"interrupted"` waits for SIGINT and signals it; `"park"` never returns. It then writes
+/// its report and exits 0.
+#[test]
+#[ignore = "launched as the scripted Claude Code process fixture"]
+fn scripted_process_fixture() {
+    write_process_fixture_id("CLAUDE_FIXTURE_PROCESS");
+    read_prompt_frame();
+    let actions: Vec<Value> =
+        serde_json::from_str(&std::env::var("CLAUDE_FIXTURE_ACTIONS").unwrap()).unwrap();
+    let mut protocol = open_fixture_protocol();
+    let mut relay = None;
+    let mut interrupt = None;
+    let mut report = Vec::new();
+    for action in actions {
+        match action.as_str() {
+            Some("ready") => write_process_fixture_signal("CLAUDE_FIXTURE_READY", b"ready\n"),
+            Some("release") => await_fixture_release(),
+            Some("stdin") => report.push(json!(standard_input_state())),
+            Some("catch_interrupt") => interrupt = Some(process_fixture_interrupt_receiver()),
+            Some("interrupted") => {
+                let interrupted: &std::sync::mpsc::Receiver<()> = interrupt.as_ref().unwrap();
+                interrupted.recv().unwrap();
+                write_process_fixture_signal("CLAUDE_FIXTURE_INTERRUPTED", b"interrupted\n");
+            }
+            Some("park") => loop {
+                std::thread::park();
+            },
+            _ => {
+                let (name, value) = action.as_object().unwrap().iter().next().unwrap();
+                match name.as_str() {
+                    "relay" => {
+                        let configuration =
+                            PathBuf::from(std::env::var_os("CLAUDE_FIXTURE_MCP_CONFIG").unwrap());
+                        let mut server = McpServerProcess::start(&configuration).unwrap();
+                        server.initialize().unwrap();
+                        relay = Some(server);
+                    }
+                    "init" => write_fixture_frames(
+                        &mut protocol,
+                        &[json!({
+                            "type": "system",
+                            "subtype": "init",
+                            "cwd": std::env::current_dir().unwrap(),
+                            "session_id": std::env::var("CLAUDE_FIXTURE_SESSION").unwrap(),
+                            "model": MODEL,
+                            "permissionMode": "bypassPermissions",
+                            "claude_code_version": value,
+                        })],
+                    ),
+                    "submit" => {
+                        let server: &mut McpServerProcess = relay.as_mut().unwrap();
+                        report.push(match server.call_tool(TOOL_NAME, value.clone()) {
+                            Ok(answer) => json!({"isError": answer.is_error, "text": answer.text}),
+                            Err(error) => json!({"error": error.to_string()}),
+                        });
+                    }
+                    "frame" => write_fixture_frames(&mut protocol, std::slice::from_ref(value)),
+                    "exit" => std::process::exit(i32::try_from(value.as_i64().unwrap()).unwrap()),
+                    _ => panic!("unknown fixture action {action}"),
+                }
+            }
+        }
+    }
+    std::fs::write(
+        std::env::var_os("CLAUDE_FIXTURE_REPORT").unwrap(),
+        serde_json::to_vec(&report).unwrap(),
+    )
+    .unwrap();
 }
 
 // A plain function, not an `async fn`: the body reaches `host_scaled_watchdog`'s heap pin
@@ -1326,7 +1159,7 @@ fn with_watchdog<Output>(future: impl Future<Output = Output>) -> impl Future<Ou
 #[test]
 fn launch_plan_stages_exact_prompt_and_lf_delimited_input() {
     let fixture = ProcessFixture::new(AgentValueMode::None, 1024);
-    let plan = prepare_launch(fixture.invocation.as_ref().unwrap()).unwrap();
+    let plan = prepare_launch(fixture.invocation.as_ref().unwrap(), PendingClock).unwrap();
     assert_eq!(
         std::fs::read(plan.system_prompt_file()).unwrap(),
         b"exact system prompt\n"
@@ -1351,7 +1184,7 @@ fn launch_plan_stages_exact_prompt_and_lf_delimited_input() {
         .windows(2)
         .find(|arguments| arguments[0] == OsStr::new("--session-id"))
         .unwrap();
-    assert_eq!(session_argument[1], OsStr::new(plan.session_id()));
+    assert_eq!(session_argument[1], OsStr::new(fixture.session_id.as_ref()));
 }
 
 // REQ-AGENT-17
@@ -1368,7 +1201,7 @@ fn an_existing_native_session_entry_is_never_selected_or_replaced() {
     std::fs::write(&existing, b"existing conversation sentinel").unwrap();
 
     assert!(matches!(
-        prepare_launch(fixture.invocation.as_ref().unwrap()),
+        prepare_launch(fixture.invocation.as_ref().unwrap(), PendingClock),
         Err(AgentFailureCause::HarnessStartFailed { .. })
     ));
     assert_eq!(
@@ -1388,7 +1221,7 @@ fn the_bridge_removes_only_the_ambient_directories_it_created() {
     let ambient_project =
         projects.join(native_project_slug(fixture.expected_cwd.to_str().unwrap()));
 
-    let plan = prepare_launch(fixture.invocation.as_ref().unwrap()).unwrap();
+    let plan = prepare_launch(fixture.invocation.as_ref().unwrap(), PendingClock).unwrap();
     assert!(ambient_project.is_dir());
     drop(plan);
 
@@ -1468,7 +1301,7 @@ fn attachment_transport_is_ordered_lossless_and_uses_only_sealed_identities() {
         .iter()
         .map(|attachment| attachment.path().to_str().unwrap().to_owned())
         .collect::<Vec<_>>();
-    let plan = prepare_launch(invocation).unwrap();
+    let plan = prepare_launch(invocation, PendingClock).unwrap();
     let frame = serde_json::from_slice::<Value>(&plan.input()[..plan.input().len() - 1]).unwrap();
     let content = frame["message"]["content"].as_array().unwrap();
 
@@ -1570,7 +1403,7 @@ fn unreadable_native_attachment_preserves_the_attachment_read_failure() {
     std::fs::set_permissions(&attachment_path, std::fs::Permissions::from_mode(0o000)).unwrap();
 
     let Err(AgentFailureCause::HarnessStartFailed { stage, error }) =
-        prepare_launch(fixture.invocation.as_ref().unwrap())
+        prepare_launch(fixture.invocation.as_ref().unwrap(), PendingClock)
     else {
         panic!("unreadable attachment did not produce a typed launch failure");
     };
@@ -1593,7 +1426,7 @@ fn native_attachment_above_the_inline_cap_uses_a_bounded_path_reference() {
     );
     let invocation = fixture.invocation.as_ref().unwrap();
     let sealed_path = invocation.attachments()[0].path().to_str().unwrap();
-    let plan = prepare_launch(invocation).unwrap();
+    let plan = prepare_launch(invocation, PendingClock).unwrap();
     assert!(plan.input().len() <= MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES);
 
     let frame = serde_json::from_slice::<Value>(&plan.input()[..plan.input().len() - 1]).unwrap();
@@ -1645,10 +1478,10 @@ async fn slow_startup_does_not_expire_initial_input_delivery() {
         let release_input = fixture.ready.path().with_file_name("release");
         mkfifo(&release_input, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
         let invocation = fixture.invocation.take().unwrap();
-        let (clock, _registered, expire) = controlled_clock();
-        // Every ordinary deadline is already expired. A large initial frame must
-        // still wait for the gated reader, rather than fail before system/init.
-        expire.send_replace(true);
+        let (clock, control) = StagedClock::new();
+        // Every deadline but the quiet bound has already expired. A large initial frame
+        // must still wait for the gated reader, rather than fail before system/init.
+        control.release_all_but_the_bound();
         let adapter = ClaudeCodeStreamJsonV1Adapter::with_worker(
             fixture.diagnostics.clone(),
             NonZeroU64::new(1024).unwrap(),
@@ -1703,9 +1536,342 @@ async fn cancellation_during_initial_input_quiesces_the_process_group() {
     .await;
 }
 
-// REQ-AGENT-32
+// REQ-AGENT-29, REQ-AGENT-35, REQ-AGENT-84, REQ-AGENT-85
+// INV-HARNESS-7, INV-HARNESS-23, INV-HARNESS-24
 #[tokio::test]
-async fn permissive_native_envelope_preserves_every_authoritatively_valid_json_root() {
+async fn a_rejected_result_is_corrected_through_the_tool_and_the_last_accepted_one_is_the_value() {
+    with_watchdog(async {
+        let fixture = ProcessFixture::scripted(
+            result_mode(positive_integer_schema()),
+            &[
+                relay(),
+                init(),
+                submit(json!(0)),
+                submit(json!(3)),
+                submit(json!(5)),
+                json!("stdin"),
+                successful_result("submitted"),
+            ],
+        );
+        let (fixture, outcome, started) =
+            run_scripted(fixture, PendingClock, InlineValidationWorker).await;
+        assert!(started, "terminal outcome: {outcome:?}");
+        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
+            panic!("the last accepted submission must be the value: {outcome:?}");
+        };
+        assert_eq!(result.value(), &json!(5));
+
+        let report = fixture_report(&fixture);
+        assert_eq!(report.len(), 4, "{report:?}");
+        // The rejection is the tool's error answer and the one observation of it.
+        let rejections = value_rejections(&fixture.observations);
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(report[0]["isError"], true);
+        assert_eq!(report[0]["text"], rejections[0].as_ref());
+        assert!(!rejections[0].is_empty());
+        assert_eq!(report[1]["isError"], false);
+        assert_eq!(report[2]["isError"], false);
+        // Standard input held nothing after the prompt frame and had not ended.
+        assert_eq!(report[3], "open");
+
+        let arguments = recorded_arguments(&fixture);
+        let [.., flag, configuration] = arguments.as_slice() else {
+            panic!("too few arguments: {arguments:?}");
+        };
+        assert_eq!(flag, "--mcp-config");
+        let configuration = Path::new(configuration);
+        assert!(configuration.starts_with(&fixture.result_endpoint));
+        // The configuration goes with the invocation.
+        assert!(!configuration.exists());
+    })
+    .await;
+}
+
+// REQ-AGENT-87, REQ-AGENT-42
+#[tokio::test]
+async fn a_stream_the_reader_cannot_name_fails_nothing_and_leaves_no_rejection_record() {
+    let fixture = ProcessFixture::new(AgentValueMode::None, 1024);
+    let session = fixture.session_id.to_string();
+    let script = production_transcript_script(
+        &[
+            json!({"type": "mystery_frame", "payload": 1}),
+            json!(["not", "an", "object"]),
+            json!({"type": "system", "subtype": "init", "cwd": "/elsewhere",
+                "session_id": "another-session", "model": "another-model",
+                "permissionMode": "default", "claude_code_version": "0.0.1"}),
+            json!({"type": "system", "subtype": "never_seen_before"}),
+            json!({"type": "result", "subtype": "success", "is_error": false,
+                "terminal_reason": "completed", "num_turns": 1, "result": "done",
+                "session_id": session}),
+        ],
+        true,
+        0,
+        &session,
+    );
+    std::fs::write(
+        fixture.invocation.as_ref().unwrap().adapter().executable(),
+        script,
+    )
+    .unwrap();
+
+    let (fixture, outcome) = run_fixture(fixture).await;
+    assert_eq!(
+        outcome,
+        AgentOutcome::Completed(CompletedAgentInvocation::NoValue)
+    );
+    let observations = fixture.observations.snapshot();
+    assert_eq!(
+        observations
+            .iter()
+            .filter(|observation| matches!(
+                observation.observation(),
+                AgentObservation::UnrecognizedHarnessEvent { .. }
+            ))
+            .count(),
+        3
+    );
+    assert!(!adapter_warnings(&fixture.observations).is_empty());
+    assert!(fixture.diagnostic_directory.is_dir());
+    assert!(
+        !fixture
+            .diagnostic_directory
+            .join("protocol-rejection.json")
+            .exists()
+    );
+}
+
+/// Runs a scripted fixture that never ends by itself and is expected to fail at start, and
+/// checks that its group is gone.
+async fn assert_fails_at_start(fixture: ProcessFixture) {
+    let (fixture, outcome, started) =
+        run_scripted(fixture, PendingClock, InlineValidationWorker).await;
+    assert!(!started, "terminal outcome: {outcome:?}");
+    assert_eq!(
+        outcome,
+        failed_agent_outcome(AgentFailureCause::start_failure(
+            "launch preparation",
+            "unavailable"
+        ))
+    );
+    assert!(process_group_is_quiescent(fixture_process(
+        &fixture.process
+    )));
+}
+
+// REQ-AGENT-89
+#[tokio::test]
+async fn an_init_without_the_result_tool_fails_at_start() {
+    with_watchdog(assert_fails_at_start(ProcessFixture::scripted(
+        result_mode(positive_integer_schema()),
+        &[init(), json!("park")],
+    )))
+    .await;
+}
+
+// REQ-AGENT-44
+// INV-HARNESS-4
+#[tokio::test]
+async fn an_init_naming_another_version_fails_at_start() {
+    with_watchdog(assert_fails_at_start(ProcessFixture::scripted(
+        result_mode(positive_integer_schema()),
+        &[relay(), json!({"init": "2.1.320"}), json!("park")],
+    )))
+    .await;
+}
+
+// REQ-AGENT-88
+// INV-HARNESS-24
+#[tokio::test]
+async fn a_silent_claude_code_is_stopped_at_the_quiet_bound() {
+    with_watchdog(async {
+        // Silent after a frame and a submission, without a successful `result`: interrupted
+        // at the bound, and how it then exits is not read.
+        let mut fixture = ProcessFixture::scripted(
+            result_mode(positive_integer_schema()),
+            &[
+                relay(),
+                init(),
+                json!("ready"),
+                json!("release"),
+                frame(json!({"type": "system", "subtype": "status", "status": "requesting"})),
+                json!("ready"),
+                json!("release"),
+                submit(json!(7)),
+                json!("catch_interrupt"),
+                json!("ready"),
+                json!("interrupted"),
+                json!({"exit": 0}),
+            ],
+        );
+        let (clock, mut control) = StagedClock::new();
+        let (task, start, outcome) = start_adapter(
+            fixture.invocation.take().unwrap(),
+            fixture.diagnostics.clone(),
+            clock,
+            InlineValidationWorker,
+        );
+        control.registered(QUIET_BOUND).await;
+        start.receive().await.unwrap();
+        assert_eq!(fixture.ready.receive().await, b"ready\n");
+        let mut bound = control.fresh_bound(None).await;
+        // A stdout byte arms the bound afresh,
+        fixture.release().await;
+        assert_eq!(fixture.ready.receive().await, b"ready\n");
+        bound = control.fresh_bound(Some(bound)).await;
+        // and so does a request on the result channel.
+        fixture.release().await;
+        assert_eq!(fixture.ready.receive().await, b"ready\n");
+        control.fresh_bound(Some(bound)).await;
+
+        control.release(QUIET_BOUND);
+        assert_eq!(fixture.interrupted.receive().await, b"interrupted\n");
+        task.await.unwrap();
+        assert_eq!(
+            outcome.await.unwrap(),
+            failed_agent_outcome(AgentFailureCause::HarnessFailed {
+                detail: AgentHarnessFailureDetail::UnsuccessfulExit,
+            })
+        );
+        assert_eq!(adapter_warnings(&fixture.observations).len(), 1);
+
+        // A value accepted and a turn reported successful before the bound stand.
+        let mut fixture = ProcessFixture::scripted(
+            result_mode(positive_integer_schema()),
+            &[
+                relay(),
+                init(),
+                submit(json!(7)),
+                successful_result("submitted"),
+                json!("catch_interrupt"),
+                json!("ready"),
+                json!("interrupted"),
+                json!({"exit": 130}),
+            ],
+        );
+        let (clock, control) = StagedClock::new();
+        let (task, _start, outcome) = start_adapter(
+            fixture.invocation.take().unwrap(),
+            fixture.diagnostics.clone(),
+            clock,
+            InlineValidationWorker,
+        );
+        assert_eq!(fixture.ready.receive().await, b"ready\n");
+        // The bound is taken ahead of a stdout read, so the `result` must have been read.
+        wait_for_turn_completed(&fixture.observations).await;
+        control.release(QUIET_BOUND);
+        task.await.unwrap();
+        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) =
+            outcome.await.unwrap()
+        else {
+            panic!("the accepted value must stand at the bound");
+        };
+        assert_eq!(result.value(), &json!(7));
+
+        // A Claude Code that ignores the interrupt is forced 30 seconds later.
+        let mut fixture = ProcessFixture::scripted(
+            AgentValueMode::None,
+            &[
+                init(),
+                json!("catch_interrupt"),
+                json!("ready"),
+                json!("interrupted"),
+                json!("park"),
+            ],
+        );
+        let (clock, mut control) = StagedClock::new();
+        let (task, start, outcome) = start_adapter(
+            fixture.invocation.take().unwrap(),
+            fixture.diagnostics.clone(),
+            clock,
+            InlineValidationWorker,
+        );
+        assert_eq!(fixture.ready.receive().await, b"ready\n");
+        // The bound is taken ahead of a stdout read, so the `init` must have been read.
+        start.receive().await.unwrap();
+        let process = fixture_process(&fixture.process);
+        control.release(QUIET_BOUND);
+        assert_eq!(fixture.interrupted.receive().await, b"interrupted\n");
+        control.registered(QUIET_BOUND_FORCE_DELAY).await;
+        assert!(!task.is_finished());
+        control.release(QUIET_BOUND_FORCE_DELAY);
+        task.await.unwrap();
+        assert_eq!(
+            outcome.await.unwrap(),
+            failed_agent_outcome(AgentFailureCause::HarnessFailed {
+                detail: AgentHarnessFailureDetail::UnsuccessfulExit,
+            })
+        );
+        assert!(process_group_is_quiescent(process));
+    })
+    .await;
+}
+
+// REQ-AGENT-88
+#[tokio::test]
+async fn the_result_an_interrupt_at_the_quiet_bound_draws_decides_nothing() {
+    with_watchdog(async {
+        // 2.1.321 interrupted in a turn reports that turn aborted, as the pinned native case
+        // `07` observed; the step is decided by what it held at the bound.
+        let aborted = frame(json!({
+            "type": "result", "subtype": "error_during_execution", "is_error": true,
+            "terminal_reason": "aborted_streaming", "num_turns": 2,
+        }));
+        // Without a successful `result` before the bound the step fails, and with one the
+        // accepted value stands.
+        for (before_the_bound, value) in [
+            (None, None),
+            (Some(successful_result("submitted")), Some(json!(7))),
+        ] {
+            let mut script = vec![relay(), init(), submit(json!(7))];
+            let turn_ends_before_the_bound = before_the_bound.is_some();
+            script.extend(before_the_bound);
+            script.extend([
+                json!("catch_interrupt"),
+                json!("ready"),
+                json!("interrupted"),
+                aborted.clone(),
+                json!({"exit": 0}),
+            ]);
+            let mut fixture =
+                ProcessFixture::scripted(result_mode(positive_integer_schema()), &script);
+            let (clock, control) = StagedClock::new();
+            let (task, _start, outcome) = start_adapter(
+                fixture.invocation.take().unwrap(),
+                fixture.diagnostics.clone(),
+                clock,
+                InlineValidationWorker,
+            );
+            assert_eq!(fixture.ready.receive().await, b"ready\n");
+            // The bound is taken ahead of a stdout read, so the `result` must have been read.
+            if turn_ends_before_the_bound {
+                wait_for_turn_completed(&fixture.observations).await;
+            }
+            control.release(QUIET_BOUND);
+            task.await.unwrap();
+            let outcome = outcome.await.unwrap();
+            match value {
+                None => assert_eq!(
+                    outcome,
+                    failed_agent_outcome(AgentFailureCause::HarnessFailed {
+                        detail: AgentHarnessFailureDetail::UnsuccessfulExit,
+                    })
+                ),
+                Some(value) => {
+                    let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome
+                    else {
+                        panic!("the accepted value must stand at the bound, got {outcome:?}");
+                    };
+                    assert_eq!(result.value(), &value);
+                }
+            }
+        }
+    })
+    .await;
+}
+
+// REQ-AGENT-32, REQ-AGENT-84
+#[tokio::test]
+async fn every_authoritatively_valid_json_root_is_returned_as_submitted() {
     let cases = [
         ("object", json!({"value": 1})),
         ("array", json!([1, 2])),
@@ -1715,463 +1881,114 @@ async fn permissive_native_envelope_preserves_every_authoritatively_valid_json_r
         ("null", Value::Null),
     ];
     for (root_type, candidate) in cases {
-        let fixture = ResultProcessFixture::new(
-            type_schema(root_type),
-            ResultExchangeFixture::standalone(json!({"result": candidate})),
-            None,
-            ResultFixtureMode::Settle,
+        let fixture = ProcessFixture::scripted(
+            result_mode(type_schema(root_type)),
+            &[
+                relay(),
+                init(),
+                submit(candidate.clone()),
+                successful_result("submitted"),
+            ],
         );
-        let plan = prepare_launch(fixture.invocation.as_ref().unwrap()).unwrap();
-        assert_eq!(
-            plan.arguments()[plan.arguments().len() - 2..],
-            [
-                OsStr::new("--json-schema"),
-                OsStr::new(RESULT_ENVELOPE_SCHEMA)
-            ]
-        );
-        drop(plan);
-        let (_, outcome) = run_result_fixture(fixture, PendingClock, InlineValidationWorker).await;
+        let (_, outcome, _) =
+            with_watchdog(run_scripted(fixture, PendingClock, InlineValidationWorker)).await;
         let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
-            panic!("{root_type} root must complete through authoritative validation");
+            panic!("{root_type} root must complete through authoritative validation: {outcome:?}");
         };
         assert_eq!(result.value(), &candidate);
     }
 }
 
-// REQ-AGENT-29
-#[tokio::test]
-async fn rejected_candidate_is_corrected_in_the_same_process_and_conversation() {
-    let schema = retained_schema(json!({
-        "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "type": "integer",
-        "minimum": 1,
-    }));
-    let fixture = ResultProcessFixture::new(
-        schema,
-        ResultExchangeFixture::standalone(json!({"result": -1})),
-        Some(ResultExchangeFixture::standalone(json!({"result": 7}))),
-        ResultFixtureMode::Settle,
-    );
-    let (fixture, outcome) =
-        run_result_fixture(fixture, PendingClock, InlineValidationWorker).await;
-    let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
-        panic!("corrected candidate must complete");
-    };
-    assert_eq!(result.value(), &json!(7));
-
-    let input = std::fs::read_to_string(&fixture.captured_input).unwrap();
-    let frames = input
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .collect::<Vec<_>>();
-    assert_eq!(frames.len(), 2);
-    let feedback = frames[1]["message"]["content"][0]["text"].as_str().unwrap();
-    assert!(feedback.starts_with("Result rejected by the workflow schema:"));
-    assert!(feedback.len() <= 512);
-    let rejections = fixture
-        .observations
-        .snapshot()
-        .into_iter()
-        .filter(|observation| {
-            matches!(
-                observation.observation(),
-                AgentObservation::ValueRejected {
-                    kind: AgentValueKind::Result,
-                    ..
-                }
-            )
-        })
-        .count();
-    assert_eq!(rejections, 1);
-}
-
 // REQ-AGENT-30
 #[tokio::test]
-async fn oversized_candidate_receives_bounded_feedback_before_a_valid_correction() {
-    let fixture = ResultProcessFixture::new(
-        type_schema("string"),
-        ResultExchangeFixture::standalone(json!({"result": "x".repeat(1100)})),
-        Some(ResultExchangeFixture::standalone(json!({"result": "ok"}))),
-        ResultFixtureMode::Settle,
-    );
-    let (fixture, outcome) =
-        run_result_fixture(fixture, PendingClock, InlineValidationWorker).await;
-    let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
-        panic!("bounded correction must complete");
-    };
-    assert_eq!(result.value(), &json!("ok"));
-    let input = std::fs::read_to_string(&fixture.captured_input).unwrap();
-    let feedback = serde_json::from_str::<Value>(input.lines().nth(1).unwrap()).unwrap();
-    let feedback = feedback["message"]["content"][0]["text"].as_str().unwrap();
-    assert!(feedback.contains("1024-byte limit"));
-    assert!(feedback.len() <= 512);
+async fn an_oversized_submission_receives_bounded_feedback_before_a_valid_one() {
+    with_watchdog(async {
+        let fixture = ProcessFixture::scripted(
+            result_mode(type_schema("string")),
+            &[
+                relay(),
+                init(),
+                submit(json!("x".repeat(1100))),
+                submit(json!("ok")),
+                successful_result("submitted"),
+            ],
+        );
+        let (fixture, outcome, _) =
+            run_scripted(fixture, PendingClock, InlineValidationWorker).await;
+        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
+            panic!("the valid submission must complete: {outcome:?}");
+        };
+        assert_eq!(result.value(), &json!("ok"));
+        let report = fixture_report(&fixture);
+        assert_eq!(report[0]["isError"], true);
+        let feedback = report[0]["text"].as_str().unwrap();
+        assert!(!feedback.is_empty() && feedback.len() <= 512);
+        assert_eq!(report[1]["isError"], false);
+    })
+    .await;
 }
 
 // REQ-AGENT-31
 #[tokio::test]
-async fn ambiguous_duplicate_and_missing_candidates_never_become_results() {
-    let ambiguous = [
-        ResultExchangeFixture {
-            candidate: Some(json!({"result": 1})),
-            structured_tool_count: 1,
-            sibling_tool_use: true,
-        },
-        ResultExchangeFixture {
-            candidate: Some(json!({"result": 1})),
-            structured_tool_count: 2,
-            sibling_tool_use: false,
-        },
-    ];
-    for first in ambiguous {
-        let fixture = ResultProcessFixture::new(
-            type_schema("number"),
-            first,
-            None,
-            ResultFixtureMode::ExitAfterFeedback,
-        );
-        let (fixture, outcome) =
-            run_result_fixture(fixture, PendingClock, InlineValidationWorker).await;
-        assert!(matches!(
-            outcome,
-            AgentOutcome::Failed(failure)
-                if matches!(failure.cause(), AgentFailureCause::HarnessProtocolFailed)
-        ));
-        let input = std::fs::read_to_string(&fixture.captured_input).unwrap();
-        assert_eq!(input.lines().count(), 2);
-        assert!(input.contains("standalone structured result candidate"));
-    }
-
-    let missing = ResultProcessFixture::new(
-        type_schema("number"),
-        ResultExchangeFixture {
-            candidate: None,
-            structured_tool_count: 0,
-            sibling_tool_use: false,
-        },
-        None,
-        ResultFixtureMode::Settle,
-    );
-    let (_, outcome) = run_result_fixture(missing, PendingClock, InlineValidationWorker).await;
-    assert_eq!(
-        outcome,
-        failed_agent_outcome(AgentFailureCause::MissingResult)
-    );
+async fn a_step_without_an_accepted_submission_fails_with_missing_result() {
+    with_watchdog(async {
+        for actions in [
+            vec![relay(), init(), successful_result("no submission")],
+            vec![
+                relay(),
+                init(),
+                submit(json!(0)),
+                successful_result("rejected"),
+            ],
+        ] {
+            let fixture =
+                ProcessFixture::scripted(result_mode(positive_integer_schema()), &actions);
+            let (_, outcome, _) = run_scripted(fixture, PendingClock, InlineValidationWorker).await;
+            assert_eq!(
+                outcome,
+                failed_agent_outcome(AgentFailureCause::MissingResult)
+            );
+        }
+    })
+    .await;
 }
 
 // REQ-AGENT-34
 #[tokio::test]
-async fn validation_timeout_stops_its_worker_and_discards_the_candidate() {
-    let stopped = Arc::new(AtomicBool::new(false));
-    let quiesced = Arc::new(AtomicBool::new(false));
-    let worker = PendingValidationWorker {
-        stopped: Arc::clone(&stopped),
-        quiesced: Arc::clone(&quiesced),
-    };
-    let (clock, mut registered, release) = controlled_clock();
-    let fixture = ResultProcessFixture::new(
-        type_schema("number"),
-        ResultExchangeFixture::standalone(json!({"result": 1})),
-        None,
-        ResultFixtureMode::Settle,
-    );
-    let task = tokio::spawn(run_result_fixture(fixture, clock, worker));
-    assert_eq!(registered.recv().await, Some(Duration::from_secs(1)));
-    release.send_replace(true);
-    let (_, outcome) = task.await.unwrap();
-    assert_eq!(
-        outcome,
-        failed_agent_outcome(AgentFailureCause::ResultValidationLimitExceeded {
-            deadline: PositiveDuration::new(Duration::from_secs(1)).unwrap(),
-        })
-    );
-    assert!(stopped.load(Ordering::SeqCst));
-    assert!(quiesced.load(Ordering::SeqCst));
-}
-
-#[tokio::test]
-async fn accepted_result_closes_input_and_remains_provisional_until_process_exit() {
+async fn validation_timeout_stops_its_worker_and_discards_the_submission() {
     with_watchdog(async {
-        let fixture = ResultProcessFixture::new(
-            type_schema("number"),
-            ResultExchangeFixture::standalone(json!({"result": 1})),
-            None,
-            ResultFixtureMode::DelayedExit,
-        );
-        let ready = fixture.settlement_ready.clone();
-        let release = fixture.settlement_release.clone();
-        let captured_input = fixture.captured_input.clone();
-        let task = tokio::spawn(run_result_fixture(
-            fixture,
-            PendingClock,
-            InlineValidationWorker,
-        ));
-
-        assert_eq!(ready.receive().await, b"ready\n");
-        assert_eq!(
-            std::fs::read_to_string(captured_input)
-                .unwrap()
-                .lines()
-                .count(),
-            1
-        );
-        assert!(
-            !task.is_finished(),
-            "an accepted candidate must remain provisional before native exit"
-        );
-        std::fs::write(release, b"release\n").unwrap();
-
-        let (_, outcome) = task.await.unwrap();
-        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
-            panic!("clean settlement must publish the accepted result");
-        };
-        assert_eq!(result.value(), &json!(1));
-    })
-    .await;
-}
-
-// REQ-AGENT-33
-// INV-HARNESS-7
-#[tokio::test]
-async fn post_acceptance_work_and_failed_settlement_discard_the_provisional_result() {
-    with_watchdog(async {
-        let post_work = ResultProcessFixture::new(
-            type_schema("number"),
-            ResultExchangeFixture::standalone(json!({"result": 1})),
-            None,
-            ResultFixtureMode::PostWork,
-        );
-        let (_, post_work_outcome) =
-            run_result_fixture(post_work, PendingClock, InlineValidationWorker).await;
-        assert_agent_failure(&post_work_outcome, AgentFailureCause::HarnessProtocolFailed);
-        let AgentOutcome::Failed(post_work_failure) = post_work_outcome else {
-            panic!("fixture outcome was not failed");
-        };
-        let rejection =
-            serde_json::to_value(post_work_failure.protocol_rejection().unwrap()).unwrap();
-        assert_eq!(
-            rejection["detail"]["reason"],
-            "terminal_drain_event_invalid"
-        );
-
-        let (clock, mut registered, release) = controlled_clock();
-        let nonsettling = ResultProcessFixture::new(
-            type_schema("number"),
-            ResultExchangeFixture::standalone(json!({"result": 1})),
-            None,
-            ResultFixtureMode::Hang,
-        );
-        let task = tokio::spawn(run_result_fixture(
-            nonsettling,
-            clock,
-            InlineValidationWorker,
-        ));
-        assert_eq!(registered.recv().await, Some(Duration::from_secs(1)));
-        assert_eq!(registered.recv().await, Some(Duration::from_secs(1)));
-        release.send_replace(true);
-        let (_, settlement_outcome) = task.await.unwrap();
-        assert_eq!(
-            settlement_outcome,
-            failed_agent_outcome(AgentFailureCause::ResultSettlementFailed)
-        );
-    })
-    .await;
-}
-
-// REQ-AGENT-76
-// INV-HARNESS-7
-#[tokio::test]
-async fn an_announced_epilogue_suspends_the_settlement_grace_and_the_accepted_result_stands() {
-    with_watchdog(async {
-        let (clock, mut registered, _release) = controlled_clock();
-        let fixture = ResultProcessFixture::new(
-            type_schema("number"),
-            ResultExchangeFixture::standalone(json!({"result": 1})),
-            None,
-            ResultFixtureMode::Epilogue,
-        );
-        let ready = fixture.settlement_ready.clone();
-        let release = fixture.settlement_release.clone();
-        let observations = fixture.observations.clone();
-        let task = tokio::spawn(run_result_fixture(fixture, clock, InlineValidationWorker));
-        // The validation deadline, then the grace armed at acceptance.
-        assert_eq!(registered.recv().await, Some(Duration::from_secs(1)));
-        assert_eq!(registered.recv().await, Some(Duration::from_secs(1)));
-
-        assert_eq!(ready.receive().await, b"ready\n");
-        observations
-            .wait_for(|observation| {
-                matches!(
-                    observation,
-                    AgentObservation::AssistantText { text } if text.as_ref() == "noted"
-                )
-            })
-            .await;
-        assert!(
-            registered.try_recv().is_err(),
-            "no settlement wait may run while the epilogue is open"
-        );
-        std::fs::write(release, b"release\n").unwrap();
-
-        let (_, outcome) = task.await.unwrap();
-        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
-            panic!("the accepted result must stand after the epilogue, got {outcome:?}");
-        };
-        assert_eq!(result.value(), &json!(1));
-        assert_eq!(
-            registered.try_recv().ok(),
-            Some(Duration::from_secs(1)),
-            "the grace restarts in full once the epilogue has settled"
-        );
-    })
-    .await;
-}
-
-/// 2.1.310 writes a queued notification's turn close behind a `result` (AUTO-63's
-/// experiment saw a `result` and the next turn's `init` in one 8 KiB read). The fake Claude
-/// writes the candidate's `result` and the epilogue's `init` in one write, so one read
-/// carries both: the adapter decides on the candidate before the parser reads the `init`,
-/// which then opens the epilogue.
-// REQ-AGENT-76
-// INV-HARNESS-7
-#[tokio::test]
-async fn an_epilogue_init_in_the_same_read_as_the_accepted_result_is_read_after_acceptance() {
-    with_watchdog(async {
-        let fixture = ResultProcessFixture::new(
-            type_schema("number"),
-            ResultExchangeFixture::standalone(json!({"result": 1})),
-            None,
-            ResultFixtureMode::EpilogueInTheResultsRead,
-        );
-        let observations = fixture.observations.clone();
-        let task = tokio::spawn(run_result_fixture(
-            fixture,
-            PendingClock,
-            InlineValidationWorker,
-        ));
-        let (_, outcome) = task.await.unwrap();
-        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
-            panic!("the accepted result must stand after the epilogue, got {outcome:?}");
-        };
-        assert_eq!(result.value(), &json!(1));
-        let observed = observations.snapshot();
-        assert!(
-            observed.iter().any(|envelope| matches!(
-                envelope.observation(),
-                AgentObservation::AssistantText { text } if text.as_ref() == "noted"
-            )),
-            "the epilogue's text must appear as activity: {observed:?}"
-        );
-        assert_eq!(completed_turns(&observations), 2);
-    })
-    .await;
-}
-
-// REQ-AGENT-35
-// INV-HARNESS-7
-#[tokio::test]
-async fn premature_structured_result_is_returned_as_feedback_until_background_work_settles() {
-    with_watchdog(async {
-        let fixture = ResultProcessFixture::new(
-            type_schema("number"),
-            ResultExchangeFixture::standalone(json!({"result": 1})),
-            Some(ResultExchangeFixture::standalone(json!({"result": 7}))),
-            ResultFixtureMode::BackgroundSubagent,
-        );
-        let (fixture, outcome) =
-            run_result_fixture(fixture, PendingClock, InlineValidationWorker).await;
-        let AgentOutcome::Completed(CompletedAgentInvocation::Result(result)) = outcome else {
-            panic!("the notified turn's candidate must complete, got {outcome:?}");
-        };
-        assert_eq!(result.value(), &json!(7));
-
-        let rejections = fixture
-            .observations
-            .snapshot()
-            .into_iter()
-            .filter_map(|observation| match observation.observation() {
-                AgentObservation::ValueRejected {
-                    kind: AgentValueKind::Result,
-                    feedback,
-                } => Some(Arc::clone(feedback)),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        let [feedback] = rejections.as_slice() else {
-            panic!("exactly one premature rejection, got {rejections:?}");
-        };
-        // The feedback names the kind of work that blocks the result and the stop route.
-        assert!(feedback.starts_with("Result rejected:"), "{feedback}");
-        assert!(feedback.contains("subagent"), "{feedback}");
-        assert!(feedback.contains("TaskStop"), "{feedback}");
-        let input = std::fs::read_to_string(&fixture.captured_input).unwrap();
-        let frames = input
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap())
-            .collect::<Vec<_>>();
-        assert_eq!(frames.len(), 2);
-        assert_eq!(
-            frames[1]["message"]["content"][0]["text"],
-            Value::from(&**feedback)
-        );
-    })
-    .await;
-}
-
-// REQ-AGENT-35
-#[tokio::test]
-async fn response_mode_closes_standard_input_only_when_the_invocation_settles() {
-    with_watchdog(async {
-        let mut fixture = ProcessFixture::new(
-            AgentValueMode::Response {
-                output: Arc::from("response"),
+        let stopped = Arc::new(AtomicBool::new(false));
+        let quiesced = Arc::new(AtomicBool::new(false));
+        let (validation_started, mut validating) = mpsc::unbounded_channel();
+        let worker = ReportedPendingValidationWorker {
+            pending: PendingValidationWorker {
+                stopped: Arc::clone(&stopped),
+                quiesced: Arc::clone(&quiesced),
             },
-            1024,
-        );
-        let invocation = fixture.invocation.take().unwrap();
-        std::fs::write(
-            invocation.adapter().executable(),
-            BACKGROUND_SUBAGENT_FAKE_CLAUDE,
-        )
-        .unwrap();
-        // Keep a reader open while the child drains stdout between phases. Opening
-        // a write-only FIFO here could block the runtime that must drain that output.
-        let release = FixtureSignal::create(fixture.ready.path().with_file_name("release"));
-        let observations = fixture.observations.clone();
-        let (task, start, outcome) = start_process_fixture(invocation, fixture.diagnostics.clone());
-
-        observations
-            .wait_for(|observation| {
-                matches!(
-                    observation,
-                    AgentObservation::Lifecycle {
-                        milestone: AgentLifecycleMilestone::TurnCompleted,
-                    }
-                )
-            })
-            .await;
-        std::fs::write(release.path(), b"release\n").unwrap();
-        observations
-            .wait_for(|observation| {
-                matches!(
-                    observation,
-                    AgentObservation::AssistantText { text } if text.as_ref() == "No issues"
-                )
-            })
-            .await;
-        std::fs::write(release.path(), b"release\n").unwrap();
-        assert_eq!(
-            fixture.ready.receive().await,
-            b"open\n",
-            "the first result left a subagent outstanding, so the input must stay open"
-        );
-
-        task.await.unwrap();
-        let outcome = outcome.await.unwrap();
-        assert!(start.receive().await.is_ok());
-        let AgentOutcome::Completed(CompletedAgentInvocation::Response(response)) = outcome else {
-            panic!("the wakeup turn must complete the response, got {outcome:?}");
+            started: validation_started,
         };
-        assert_eq!(response.as_str(), "final");
+        let fixture = ProcessFixture::scripted(
+            result_mode(type_schema("number")),
+            &[
+                relay(),
+                init(),
+                submit(json!(1)),
+                successful_result("submitted"),
+            ],
+        );
+        let (clock, control) = StagedClock::new();
+        let task = tokio::spawn(run_scripted(fixture, clock, worker));
+        validating.recv().await.unwrap();
+        control.release(Duration::from_secs(1));
+        let (_, outcome, _) = task.await.unwrap();
+        assert_eq!(
+            outcome,
+            failed_agent_outcome(AgentFailureCause::ResultValidationLimitExceeded {
+                deadline: PositiveDuration::new(Duration::from_secs(1)).unwrap(),
+            })
+        );
+        assert!(stopped.load(Ordering::SeqCst));
+        assert!(quiesced.load(Ordering::SeqCst));
     })
     .await;
 }
@@ -2181,27 +1998,26 @@ async fn cancellation_during_validation_stops_the_worker_and_quiesces_the_proces
     with_watchdog(async {
         let stopped = Arc::new(AtomicBool::new(false));
         let quiesced = Arc::new(AtomicBool::new(false));
-        let worker = PendingValidationWorker {
-            stopped: Arc::clone(&stopped),
-            quiesced: Arc::clone(&quiesced),
+        let (validation_started, mut validating) = mpsc::unbounded_channel();
+        let worker = ReportedPendingValidationWorker {
+            pending: PendingValidationWorker {
+                stopped: Arc::clone(&stopped),
+                quiesced: Arc::clone(&quiesced),
+            },
+            started: validation_started,
         };
-        let (clock, mut registered, _release) = controlled_clock();
-        let fixture = ResultProcessFixture::new(
-            type_schema("number"),
-            ResultExchangeFixture::standalone(json!({"result": 1})),
-            None,
-            ResultFixtureMode::Settle,
+        let fixture = ProcessFixture::scripted(
+            result_mode(type_schema("number")),
+            &[relay(), init(), submit(json!(1))],
         );
         let cancellation = fixture.invocation.as_ref().unwrap().cancellation().clone();
         let process_path = fixture.process.clone();
-        let process_ready = fixture.process_ready.clone();
-        let task = tokio::spawn(run_result_fixture(fixture, clock, worker));
-        assert_eq!(registered.recv().await, Some(Duration::from_secs(1)));
-        assert_eq!(process_ready.receive().await, b"ready\n");
+        let task = tokio::spawn(run_scripted(fixture, PendingClock, worker));
+        validating.recv().await.unwrap();
         let process = fixture_process(&process_path);
 
         assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
-        let (_, outcome) = task.await.unwrap();
+        let (_, outcome, _) = task.await.unwrap();
         assert_user_cancelled(outcome);
         assert!(stopped.load(Ordering::SeqCst));
         assert!(quiesced.load(Ordering::SeqCst));
@@ -2211,36 +2027,41 @@ async fn cancellation_during_validation_stops_the_worker_and_quiesces_the_proces
 }
 
 #[tokio::test]
-async fn cancellation_after_a_provisional_result_forces_containment_quiescent() {
+async fn cancellation_after_an_accepted_result_forces_containment_quiescent() {
     with_watchdog(async {
-        let (clock, mut registered, _release) = controlled_clock();
-        let fixture = ResultProcessFixture::new(
-            type_schema("number"),
-            ResultExchangeFixture::standalone(json!({"result": 1})),
-            None,
-            ResultFixtureMode::Hang,
+        let mut fixture = ProcessFixture::scripted(
+            result_mode(type_schema("number")),
+            &[
+                relay(),
+                init(),
+                submit(json!(1)),
+                successful_result("submitted"),
+                json!("catch_interrupt"),
+                json!("ready"),
+                json!("park"),
+            ],
         );
-        let invocation = fixture.invocation.as_ref().unwrap();
+        let invocation = fixture.invocation.take().unwrap();
         let cancellation = invocation.cancellation().clone();
         let process_control = invocation.process_control().clone();
-        let process_path = fixture.process.clone();
-        let process_ready = fixture.process_ready.clone();
-        let task = tokio::spawn(run_result_fixture(fixture, clock, InlineValidationWorker));
-        assert_eq!(registered.recv().await, Some(Duration::from_secs(1)));
-        assert_eq!(registered.recv().await, Some(Duration::from_secs(1)));
-        assert_eq!(process_ready.receive().await, b"ready\n");
-        let process = fixture_process(&process_path);
+        let (task, _start, outcome) = start_adapter(
+            invocation,
+            fixture.diagnostics.clone(),
+            PendingClock,
+            InlineValidationWorker,
+        );
+        assert_eq!(fixture.ready.receive().await, b"ready\n");
+        let process = fixture_process(&fixture.process);
         assert!(
             !task.is_finished(),
-            "the accepted result must remain provisional during settlement"
+            "an accepted result must not end the step while Claude Code runs"
         );
 
         assert!(cancellation.request_cancellation(CancellationReason::UserRequest));
         process_control.interrupt();
         process_control.force();
-
-        let (_, outcome) = task.await.unwrap();
-        assert_user_cancelled(outcome);
+        task.await.unwrap();
+        assert_user_cancelled(outcome.await.unwrap());
         assert!(process_group_is_quiescent(process));
     })
     .await;
@@ -2317,7 +2138,7 @@ async fn normal_driver_preserves_runner_configuration_and_returns_only_final_res
     assert_eq!(
         std::fs::read_to_string(&fixture.environment).unwrap(),
         format!(
-            "runner=runner exact\nconfig={}\nproject_dir_name=unset\nupdates=1\ntraffic=1\nmarketplace=1\nmemory=1\ngit=1\n",
+            "runner=runner exact\nconfig={}\nproject_dir_name=unset\nupdates=1\ntraffic=1\nmarketplace=1\nmemory=1\ngit=1\nexit_after_stop=5000\n",
             fixture
                 ._temporary
                 .path()
@@ -2440,80 +2261,36 @@ async fn a_scripted_harness_that_writes_nowhere_emits_the_named_capture_diagnost
 // INV-HARNESS-5
 #[tokio::test]
 async fn production_failure_matrix_uses_only_existing_typed_outcomes() {
-    enum Transcript {
-        Malformed,
-        Success,
-        NativeFailure,
-    }
-
+    let successful = json!({"type": "result", "subtype": "success", "is_error": false,
+        "terminal_reason": "completed", "num_turns": 1, "result": "terminal text"});
+    let native_failure = json!({"type": "result", "subtype": "error_during_execution",
+        "is_error": true, "terminal_reason": "error_during_execution", "num_turns": 1});
+    let unsuccessful_exit = failed_agent_outcome(AgentFailureCause::HarnessFailed {
+        detail: AgentHarnessFailureDetail::UnsuccessfulExit,
+    });
     let cases = [
+        // A malformed stream fails nothing.
         (
-            AgentValueMode::None,
-            Transcript::Malformed,
+            vec![successful.clone()],
+            true,
             0,
-            AgentFailureCause::HarnessProtocolFailed,
+            AgentOutcome::Completed(CompletedAgentInvocation::NoValue),
         ),
         (
-            AgentValueMode::Response {
-                output: Arc::from("response"),
-            },
-            Transcript::Success,
-            0,
-            AgentFailureCause::MissingResponse,
-        ),
-        (
-            AgentValueMode::None,
-            Transcript::NativeFailure,
+            vec![native_failure],
+            false,
             17,
-            AgentFailureCause::HarnessFailed {
+            failed_agent_outcome(AgentFailureCause::HarnessFailed {
                 detail: AgentHarnessFailureDetail::ModelError,
-            },
+            }),
         ),
-        (
-            AgentValueMode::None,
-            Transcript::Success,
-            17,
-            AgentFailureCause::HarnessFailed {
-                detail: AgentHarnessFailureDetail::UnsuccessfulExit,
-            },
-        ),
+        (vec![successful], false, 17, unsuccessful_exit.clone()),
+        (Vec::new(), false, 0, unsuccessful_exit),
     ];
-    for (value_mode, transcript, exit_status, cause) in cases {
-        let fixture = ProcessFixture::new(value_mode, 1024);
-        let session = fixture
-            .invocation
-            .as_ref()
-            .unwrap()
-            .diagnostic_session()
-            .claude_code_native_session_id()
-            .unwrap()
-            .to_owned();
-        let (events, malformed_tail) = match transcript {
-            Transcript::Malformed => (Vec::new(), true),
-            Transcript::Success => (
-                vec![json!({
-                    "type": "result",
-                    "subtype": "success",
-                    "is_error": false,
-                    "terminal_reason": "completed",
-                    "result": "terminal convenience text",
-                    "session_id": session,
-                })],
-                false,
-            ),
-            Transcript::NativeFailure => (
-                vec![json!({
-                    "type": "result",
-                    "subtype": "error_during_execution",
-                    "is_error": true,
-                    "terminal_reason": "error_during_execution",
-                    "session_id": session,
-                })],
-                false,
-            ),
-        };
-        let script =
-            production_transcript_script(&events, malformed_tail, exit_status, session.as_str());
+    for (events, malformed_tail, exit_status, expected) in cases {
+        let fixture = ProcessFixture::new(AgentValueMode::None, 1024);
+        let session = fixture.session_id.to_string();
+        let script = production_transcript_script(&events, malformed_tail, exit_status, &session);
         std::fs::write(
             fixture.invocation.as_ref().unwrap().adapter().executable(),
             script,
@@ -2521,7 +2298,7 @@ async fn production_failure_matrix_uses_only_existing_typed_outcomes() {
         .unwrap();
         let (_, outcome, started) = run_fixture_allowing_start_failure(fixture).await;
         assert!(started, "fixture exit {exit_status}: {outcome:?}");
-        assert_agent_failure(&outcome, cause);
+        assert_eq!(outcome, expected, "fixture exit {exit_status}");
     }
 
     let startup = ProcessFixture::new(AgentValueMode::None, 1024);
@@ -2536,132 +2313,25 @@ async fn production_failure_matrix_uses_only_existing_typed_outcomes() {
         ))
     );
 
-    let validation = ResultProcessFixture::new(
-        type_schema("number"),
-        ResultExchangeFixture::standalone(json!({"result": 1})),
-        None,
-        ResultFixtureMode::Settle,
+    let validation = ProcessFixture::scripted(
+        result_mode(type_schema("number")),
+        &[
+            relay(),
+            init(),
+            submit(json!(1)),
+            successful_result("submitted"),
+        ],
     );
-    let (_, validation_outcome) =
-        run_result_fixture(validation, PendingClock, FailingValidationWorker).await;
+    let (_, validation_outcome, _) = with_watchdog(run_scripted(
+        validation,
+        PendingClock,
+        FailingValidationWorker,
+    ))
+    .await;
     assert_eq!(
         validation_outcome,
         failed_agent_outcome(AgentFailureCause::HarnessProtocolFailed)
     );
-}
-
-// REQ-AGENT-42, REQ-AGENT-71
-#[tokio::test]
-async fn parser_rejection_is_surfaced_and_retained_beside_claude_invocation_metadata() {
-    let fixture = ProcessFixture::new(AgentValueMode::None, 1024);
-    let session = fixture
-        .invocation
-        .as_ref()
-        .unwrap()
-        .diagnostic_session()
-        .claude_code_native_session_id()
-        .unwrap()
-        .to_owned();
-    let rejected = json!({
-        "type": "stream_event",
-        "event": {
-            "type": "content_block_delta",
-            "index": 7,
-            "delta": {
-                "type": "text_delta",
-                "text": "SENTINEL_ASSISTANT_TEXT",
-                "tool_input": "SENTINEL_TOOL_INPUT",
-            },
-        },
-        "session_id": session,
-        "parent_tool_use_id": "SENTINEL_PARENT_ID",
-        "provider_payload": "SENTINEL_PROVIDER_PAYLOAD",
-        "request_id": "SENTINEL_REQUEST_ID",
-        "structured_output": "SENTINEL_STRUCTURED_OUTPUT",
-        "tool_result": "SENTINEL_TOOL_RESULT",
-    });
-    std::fs::write(
-        fixture.invocation.as_ref().unwrap().adapter().executable(),
-        production_transcript_script(std::slice::from_ref(&rejected), false, 0, session.as_str()),
-    )
-    .unwrap();
-
-    let (fixture, outcome, started) = run_fixture_allowing_start_failure(fixture).await;
-    assert!(started);
-    assert_agent_failure(&outcome, AgentFailureCause::HarnessProtocolFailed);
-    let AgentOutcome::Failed(failure) = &outcome else {
-        panic!("fixture outcome was not failed");
-    };
-    let surfaced = serde_json::to_value(failure.protocol_rejection().unwrap()).unwrap();
-    assert_eq!(surfaced["profile"], "ClaudeCodeStreamJsonV1");
-    assert_eq!(
-        surfaced["detail"]["reason"],
-        "active_stream_parent_mismatch"
-    );
-    assert_eq!(surfaced["detail"]["outerEvent"], "stream_event");
-    assert_eq!(surfaced["detail"]["streamEvent"], "content_block_delta");
-    assert_eq!(surfaced["detail"]["contentIndex"], 7);
-    assert_eq!(surfaced["detail"]["contentBlock"], "text");
-
-    let retained_bytes =
-        std::fs::read(fixture.diagnostic_directory.join("protocol-rejection.json")).unwrap();
-    let mut retained: Value = serde_json::from_slice(&retained_bytes).unwrap();
-    assert!(retained_bytes.len() < 64 * 1024);
-    // Only the file keeps the stream excerpt and the tracked work beside the surfaced
-    // diagnostic (REQ-AGENT-71, REQ-AGENT-74).
-    let members = retained.as_object_mut().unwrap();
-    let rejected_line = members.remove("rejectedLine").unwrap();
-    let preceding_lines = members.remove("precedingLines").unwrap();
-    let tracked_work = members.remove("trackedWork").unwrap();
-    assert_eq!(
-        tracked_work,
-        serde_json::to_value(failure.tracked_work().unwrap()).unwrap()
-    );
-    assert_eq!(retained, surfaced);
-    assert_eq!(
-        rejected_line["text"],
-        serde_json::to_string(&rejected).unwrap()
-    );
-    let preceding_lines = preceding_lines.as_array().unwrap();
-    let preceding: Value =
-        serde_json::from_str(preceding_lines.last().unwrap()["text"].as_str().unwrap()).unwrap();
-    assert_eq!(preceding["subtype"], "init");
-    assert_eq!(preceding["session_id"], session.as_str());
-    let metadata: Value = serde_json::from_slice(
-        &std::fs::read(fixture.diagnostic_directory.join("metadata.json")).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        metadata["localRunId"],
-        "00000000-0000-4000-8000-000000000001"
-    );
-    assert_eq!(metadata["attemptNumber"], 1);
-    assert_eq!(metadata["stepId"], "agent-step");
-    assert!(metadata["invocationId"].is_u64());
-    assert_eq!(metadata["profile"], "ClaudeCodeStreamJsonV1");
-    assert_eq!(metadata["claudeCodeVersion"], QUALIFICATION_VERSION);
-    assert_eq!(
-        metadata["nativeSession"],
-        json!({
-            "relativeDirectory": "session",
-            "formatVersion": 1
-        })
-    );
-    assert!(metadata.get("nativeSessionPersistence").is_none());
-
-    let serialized = surfaced.to_string();
-    for sentinel in [
-        "SENTINEL_ASSISTANT_TEXT",
-        "SENTINEL_TOOL_INPUT",
-        "SENTINEL_PARENT_ID",
-        "SENTINEL_PROVIDER_PAYLOAD",
-        "SENTINEL_REQUEST_ID",
-        "SENTINEL_STRUCTURED_OUTPUT",
-        "SENTINEL_TOOL_RESULT",
-        session.as_str(),
-    ] {
-        assert!(!serialized.contains(sentinel));
-    }
 }
 
 #[tokio::test]

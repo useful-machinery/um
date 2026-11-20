@@ -122,8 +122,8 @@ capability set. Local and runner admission
 inspect resolved workflows and require only each selected installation. Admission and
 later execution use those values without another `PATH` lookup or native probe, so later
 `PATH` changes cannot switch an active operation's executable. Claude execution also
-requires every native initialization frame to equal the retained observed version rather
-than a compile-time qualification release. Command-only work requires no harness, and
+requires Claude Code's first initialization frame to equal the retained observed version
+rather than a compile-time qualification release. Command-only work requires no harness, and
 each single-harness workflow requires no unrelated installation. Runner Serve retains
 independent optional Pi, Claude Code, and Codex snapshots for its process lifetime and
 exposes none through the runner protocol.

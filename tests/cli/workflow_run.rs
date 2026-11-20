@@ -16,6 +16,7 @@ use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 use rustix::process::{Pid, Signal, kill_process, test_kill_process};
 use rustix::termios::Winsize;
 use tempfile::TempDir;
+use useful_test_support::mcp::McpServerProcess;
 
 use super::claude_code_installation::{
     COMPLETE_HELP as CLAUDE_CODE_COMPLETE_HELP, ClaudeCodeFixture,
@@ -242,7 +243,7 @@ impl RunBundle {
         } else {
             source.replacen(
                 "schemaVersion: 1\n",
-                "schemaVersion: 1\nenvironmentPassthrough: [RETRY_PHASE, PHASE, RECOVERY_STATE, CLAUDE_CONFIG_DIR, ANTHROPIC_API_KEY, CODEX_HOME, CODEX_FIXTURE_HELPER, CODEX_LOCAL_SCENARIO, CODEX_LOCAL_READY, PI_CODING_AGENT_DIR, XDG_CONFIG_HOME, XDG_CACHE_HOME, XDG_DATA_HOME, XDG_STATE_HOME, PI_OFFLINE, PI_SKIP_VERSION_CHECK, PI_TELEMETRY, WORKFLOW_RUN_FIXTURE_SOCKET, WORKFLOW_RUN_FIXTURE_MODE, WORKFLOW_READY_FIFO, WORKFLOW_RELEASE_FIFO, WORKFLOW_HOLD_FIFO, CLAUDE_FIXTURE_PID, WORKFLOW_MARKER, RESULT_TARGET, ROOT_PATH, MOVED_ROOT, EXECUTION_MARKER, RUN_STATE, REMOVER_READY, REMOVER_RELEASE, SURVIVOR_PID, SURVIVOR_READY, SURVIVOR_RELEASE, LATE_SIDE_EFFECT, LEADER_FILE, GUARDIAN_FILE, DESCENDANT_FILE]\n",
+                "schemaVersion: 1\nenvironmentPassthrough: [RETRY_PHASE, PHASE, RECOVERY_STATE, CLAUDE_CONFIG_DIR, ANTHROPIC_API_KEY, CODEX_HOME, CODEX_FIXTURE_HELPER, CLAUDE_FIXTURE_HELPER, CODEX_LOCAL_SCENARIO, CODEX_LOCAL_READY, PI_CODING_AGENT_DIR, XDG_CONFIG_HOME, XDG_CACHE_HOME, XDG_DATA_HOME, XDG_STATE_HOME, PI_OFFLINE, PI_SKIP_VERSION_CHECK, PI_TELEMETRY, WORKFLOW_RUN_FIXTURE_SOCKET, WORKFLOW_RUN_FIXTURE_MODE, WORKFLOW_READY_FIFO, WORKFLOW_RELEASE_FIFO, WORKFLOW_HOLD_FIFO, CLAUDE_FIXTURE_PID, WORKFLOW_MARKER, RESULT_TARGET, ROOT_PATH, MOVED_ROOT, EXECUTION_MARKER, RUN_STATE, REMOVER_READY, REMOVER_RELEASE, SURVIVOR_PID, SURVIVOR_READY, SURVIVOR_RELEASE, LATE_SIDE_EFFECT, LEADER_FILE, GUARDIAN_FILE, DESCENDANT_FILE]\n",
                 1,
             )
         };
@@ -721,7 +722,7 @@ printf '{"type":"assistant","message":{"id":"msg-local","type":"message","role":
 printf '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
 printf '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
 printf '{"type":"stream_event","event":{"type":"message_stop"},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
-printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"convenience duplicate","session_id":"%s"}\n' "$session""#
+printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"claude response","session_id":"%s"}\n' "$session""#
 }
 
 fn response_claude_code_execution_for_version(version: &str) -> String {
@@ -731,36 +732,25 @@ fn response_claude_code_execution_for_version(version: &str) -> String {
     )
 }
 
+/// A Claude Code that hands its launch to `claude_code_result_correction_fixture`, naming the
+/// `--mcp-config` file, the session and the model it was given.
 fn corrected_claude_code_result_execution() -> &'static str {
     r#"set -eu
 model=
 session=
+configuration=
 previous=
 for argument in "$@"; do
   if [ "$previous" = --model ]; then model=$argument; fi
   if [ "$previous" = --session-id ]; then session=$argument; fi
+  if [ "$previous" = --mcp-config ]; then configuration=$argument; fi
   previous=$argument
 done
-emit_exchange() {
-  exchange=$1
-  value=$2
-  call=tool-result-$exchange
-  message=msg-result-$exchange
-  printf '{"type":"system","subtype":"init","cwd":"%s","session_id":"%s","model":"%s","permissionMode":"bypassPermissions","claude_code_version":"2.1.300"}\n' "$PWD" "$session" "$model"
-  printf '{"type":"stream_event","event":{"type":"message_start","message":{"id":"%s","type":"message","role":"assistant","content":[],"model":"%s","usage":{"input_tokens":1,"output_tokens":0}}},"session_id":"%s","parent_tool_use_id":null}\n' "$message" "$model" "$session"
-  printf '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"%s","name":"StructuredOutput","input":{"result":%s}}},"session_id":"%s","parent_tool_use_id":null}\n' "$call" "$value" "$session"
-  printf '{"type":"assistant","message":{"id":"%s","type":"message","role":"assistant","content":[{"type":"tool_use","id":"%s","name":"StructuredOutput","input":{"result":%s}}],"model":"%s"},"parent_tool_use_id":null,"session_id":"%s"}\n' "$message" "$call" "$value" "$model" "$session"
-  printf '{"type":"stream_event","event":{"type":"content_block_stop","index":0},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
-  printf '{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"%s","content":"Structured output provided successfully"}]},"parent_tool_use_id":null,"session_id":"%s","tool_use_result":"Structured output provided successfully"}\n' "$call" "$session"
-  printf '{"type":"stream_event","event":{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":1}},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
-  printf '{"type":"stream_event","event":{"type":"message_stop"},"session_id":"%s","parent_tool_use_id":null}\n' "$session"
-  printf '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","result":"structured convenience","session_id":"%s","structured_output":{"result":%s}}\n' "$session" "$value"
-}
-IFS= read -r _
-emit_exchange 1 -1
-IFS= read -r _
-emit_exchange 2 7
-"#
+CLAUDE_FIXTURE_MODEL=$model
+CLAUDE_FIXTURE_SESSION=$session
+CLAUDE_FIXTURE_MCP_CONFIG=$configuration
+export CLAUDE_FIXTURE_MODEL CLAUDE_FIXTURE_SESSION CLAUDE_FIXTURE_MCP_CONFIG
+exec "$CLAUDE_FIXTURE_HELPER" --exact workflow_run::claude_code_result_correction_fixture --ignored --test-threads=1 3>&1 >/dev/null"#
 }
 
 fn result_claude_code_agent_source() -> &'static str {
@@ -3275,6 +3265,7 @@ fn mixed_pi_claude_and_codex_run_preserves_independent_dispatch_and_atomic_expor
     }
 }
 
+// REQ-AGENT-29
 #[test]
 fn local_claude_result_correction_publishes_only_the_authoritatively_valid_value() {
     let claude = ClaudeCodeFixture::with_execution(
@@ -3298,6 +3289,7 @@ fn local_claude_result_correction_publishes_only_the_authoritatively_valid_value
     let output = isolated_command(&args)
         .env("PATH", path)
         .env("CLAUDE_CONFIG_DIR", bundle.claude_config())
+        .env("CLAUDE_FIXTURE_HELPER", std::env::current_exe().unwrap())
         .output()
         .unwrap();
 
@@ -6271,6 +6263,57 @@ fn send_codex_turn_completed(
             "params": {"threadId": CODEX_THREAD_ID, "turn": turn}
         }),
     );
+}
+
+/// The Claude Code `local_claude_result_correction_publishes_only_the_authoritatively_valid_value`
+/// runs. It reads the prompt, starts and initializes the result relay its `--mcp-config` file
+/// names before `init`, as Claude Code does, submits `-1`, which the schema rejects, and then
+/// `7` in the same turn, and ends the turn with a successful `result`.
+#[test]
+#[ignore = "launched as the local Claude Code result correction fixture"]
+fn claude_code_result_correction_fixture() {
+    let session = std::env::var("CLAUDE_FIXTURE_SESSION").unwrap();
+    let model = std::env::var("CLAUDE_FIXTURE_MODEL").unwrap();
+    let configuration = PathBuf::from(std::env::var_os("CLAUDE_FIXTURE_MCP_CONFIG").unwrap());
+    let mut prompt = String::new();
+    assert!(std::io::stdin().lock().read_line(&mut prompt).unwrap() > 0);
+    let mut relay = McpServerProcess::start(&configuration).unwrap();
+    relay.initialize().unwrap();
+    let mut output = OpenOptions::new().write(true).open("/dev/fd/3").unwrap();
+    writeln!(
+        output,
+        "{}",
+        serde_json::json!({
+            "type": "system",
+            "subtype": "init",
+            "cwd": std::env::current_dir().unwrap(),
+            "session_id": session,
+            "model": model,
+            "permissionMode": "bypassPermissions",
+            "claude_code_version": "2.1.300",
+        })
+    )
+    .unwrap();
+
+    let rejected = relay
+        .call_tool("submit", serde_json::json!({"submission": {"result": -1}}))
+        .unwrap();
+    assert!(rejected.is_error, "{rejected:?}");
+    let accepted = relay
+        .call_tool("submit", serde_json::json!({"submission": {"result": 7}}))
+        .unwrap();
+    assert!(!accepted.is_error, "{accepted:?}");
+
+    for frame in [
+        serde_json::json!({"type": "assistant", "message": {"id": "msg-result", "type": "message",
+            "role": "assistant", "content": [{"type": "text", "text": "submitted"}],
+            "model": model}, "parent_tool_use_id": null, "session_id": session}),
+        serde_json::json!({"type": "result", "subtype": "success", "is_error": false,
+            "terminal_reason": "completed", "num_turns": 3, "result": "submitted",
+            "session_id": session}),
+    ] {
+        writeln!(output, "{frame}").unwrap();
+    }
 }
 
 #[test]

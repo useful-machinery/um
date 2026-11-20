@@ -34,7 +34,7 @@ const REQUIRED_CAPABILITIES: [ClaudeCodeCapability; 13] = [
     ClaudeCodeCapability::Model,
     ClaudeCodeCapability::Effort,
     ClaudeCodeCapability::AppendSystemPromptFile,
-    ClaudeCodeCapability::JsonSchema,
+    ClaudeCodeCapability::McpConfig,
 ];
 
 pub(crate) type ClaudeCodeVersion = StableVersion;
@@ -53,7 +53,7 @@ pub enum ClaudeCodeCapability {
     Model,
     Effort,
     AppendSystemPromptFile,
-    JsonSchema,
+    McpConfig,
 }
 
 impl ClaudeCodeCapability {
@@ -71,7 +71,7 @@ impl ClaudeCodeCapability {
             Self::Model => "model",
             Self::Effort => "effort",
             Self::AppendSystemPromptFile => "append_system_prompt_file",
-            Self::JsonSchema => "json_schema",
+            Self::McpConfig => "mcp_config",
         }
     }
 
@@ -89,7 +89,7 @@ impl ClaudeCodeCapability {
             Self::Model => has_option(help, "--model <model>"),
             Self::Effort => has_option(help, "--effort <level>"),
             Self::AppendSystemPromptFile => help.contains("--append-system-prompt[-file]"),
-            Self::JsonSchema => has_option(help, "--json-schema <schema>"),
+            Self::McpConfig => has_option(help, "--mcp-config <configs...>"),
         }
     }
 }
