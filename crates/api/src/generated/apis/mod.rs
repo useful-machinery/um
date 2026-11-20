@@ -130,7 +130,6 @@ pub mod publications_api;
 pub mod run_inputs_api;
 pub mod runners_api;
 pub mod runs_api;
-pub mod schedules_api;
 pub mod source_connections_api;
 pub mod webhooks_api;
 pub mod workflow_definitions_api;

@@ -1080,15 +1080,9 @@ async fn the_evaluation_of_a_held_wait_in_flight_holds_off_an_install() {
     fs::write(fixture.log.join("proceed"), b"").unwrap();
     start(&mut fixture).await;
     wait_for_waiting(&mut fixture).await;
-    crate::service::test_support::with_watchdog(async {
-        while resumes(&fixture.log) == 0 {
-            crate::service::Sleeper::sleep(
-                &crate::service::TokioSleeper,
-                Duration::from_millis(10),
-            )
-            .await;
-        }
-    })
+    crate::service::test_support::with_watchdog(poll_resumes_while(&fixture.log, |resumed| {
+        resumed == 0
+    }))
     .await
     .expect("the held wait was not evaluated");
 
@@ -1918,6 +1912,15 @@ fn terminal_count(reports: &[ExecutionReport]) -> usize {
 
 fn resumes(log: &Path) -> usize {
     fs::read_to_string(log.join("resume.log")).map_or(0, |resumed| resumed.lines().count())
+}
+
+/// Polls `resumes(log)` every 10 ms while `pending` holds for it. Unbounded on its own:
+/// a caller wraps it in `with_watchdog`, so an expiry names the test's line.
+async fn poll_resumes_while(log: &Path, pending: impl Fn(usize) -> bool) {
+    while pending(resumes(log)) {
+        crate::service::Sleeper::sleep(&crate::service::TokioSleeper, Duration::from_millis(10))
+            .await;
+    }
 }
 
 fn chosen_outcome(reports: &[ExecutionReport]) -> Option<String> {
@@ -2995,6 +2998,13 @@ async fn withdrawal_a_held_wait_evaluation_left_pending_is_finished_without_a_re
     fs::write(fixture.log.join("gate"), b"").unwrap();
     start(&mut fixture).await;
     wait_for_waiting(&mut fixture).await;
+    // The run is reported waiting while `create` may still be running, so the withdrawal is
+    // sent only once the gated evaluation of the held wait is in flight.
+    crate::service::test_support::with_watchdog(poll_resumes_while(&fixture.log, |resumed| {
+        resumed == 0
+    }))
+    .await
+    .expect("the held wait was not evaluated");
     send_control(&mut fixture, CONTROL_ID, json!({"kind": "withdraw"}));
     wait_for_reports(&mut fixture.manager, |reports| {
         !control_applications(reports).is_empty()
@@ -3591,8 +3601,11 @@ async fn refused_application_reports_its_code_and_the_run_keeps_waiting() {
     .await;
     // The wait is still held and evaluated at its interval.
     let resumed = resumes(&fixture.log);
-    crate::service::Sleeper::sleep(&crate::service::TokioSleeper, Duration::from_millis(100)).await;
-    assert!(resumes(&fixture.log) > resumed);
+    crate::service::test_support::with_watchdog(poll_resumes_while(&fixture.log, |now| {
+        now <= resumed
+    }))
+    .await
+    .expect("the held wait was not evaluated again");
 
     fixture
         .manager
