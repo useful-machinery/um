@@ -11,6 +11,7 @@ use reqwest::StatusCode;
 use zeroize::Zeroize as _;
 
 use super::agent_logins::{valid_authorization_record, valid_ended_authorization};
+use super::connection_authorizations::ConnectionAuthorizationRefusal;
 use super::generated::{apis, models};
 use super::http_client::zeroize_generated_bearer_access_token;
 use super::resource::{
@@ -135,6 +136,9 @@ pub enum MemberGrantFailure {
     IntegrationTokenRunnerNotFound,
     IntegrationTokenAlreadyAuthorized,
     IntegrationTokenAuthorizationNotFound,
+    // The refusals only the connection authorization routes answer (REQ-INTEGRATION-27 to
+    // REQ-INTEGRATION-29), one value for the seven so a caller that reads none of them names one.
+    ConnectionAuthorizationRefused(ConnectionAuthorizationRefusal),
     RateLimited { retry_after: Option<u64> },
     Unreachable { category: UnreachableCategory },
     InvalidResponse { credential_rejected: bool },
@@ -267,8 +271,8 @@ fn problems() -> impl Iterator<Item = &'static ProblemRow<MemberGrantFailure>> {
     SHARED_PROBLEMS.iter().chain(&GRANT_PROBLEMS)
 }
 
-/// The problem only the operations that name an organization, its lookup, an import and the
-/// organization's integration tokens, answer.
+/// The problem only the operations that name an organization, its lookup, an import, the
+/// organization's integration tokens and its connection authorizations, answer.
 pub(crate) static ORGANIZATION_PROBLEMS: [ProblemRow<MemberGrantFailure>; 1] = [(
     StatusCode::NOT_FOUND,
     problem::NOT_FOUND,

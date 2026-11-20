@@ -1,23 +1,28 @@
 //! How `useful integration` prints a token service's token: the record's view, which every leaf
 //! that shows a token prints, the report of a token connected, replaced or revoked, the list of
 //! one organization's tokens and connections and the report of one token, and a refusal with its
-//! remedy (REQ-INTEGRATION-16 to REQ-INTEGRATION-20), and the view of an organization's
-//! connection the list prints (REQ-INTEGRATION-22). Only the record's named fields are printed,
-//! so nothing an answer adds beyond the model, a token least of all, reaches output.
+//! remedy (REQ-INTEGRATION-16 to REQ-INTEGRATION-20), the view of an organization's connection
+//! the list prints with its authorizations (REQ-INTEGRATION-22, REQ-INTEGRATION-34), and a
+//! runner's authorization for an organization's connection in one project with its scope, the
+//! report of one made or ended and the refusals of making or ending one (REQ-INTEGRATION-32,
+//! REQ-INTEGRATION-33). Only the record's named fields are printed, so nothing an answer adds
+//! beyond the model, a token least of all, reaches output.
 
 use std::io::{self, Write};
 
 use anyhow::Context;
 use serde::Serialize;
 
+use super::authorizations::RouteFailure;
 use super::connections::Listing;
 use crate::cli::ApiFailureReport;
-use crate::cli::connection::organization::OrganizationConnection;
+use crate::cli::connection::organization::{OrganizationConnection, Provider};
 use crate::cli::grant;
 use crate::exit_code::{ExitCode, OutcomeClass};
 use useful_api::{
-    IntegrationToken, IntegrationTokenAuthorization, IntegrationTokenSide, MemberGrantFailure,
-    ServedTokenService,
+    ConnectionAuthorization, ConnectionAuthorizationRefusal, ConnectionAuthorizationScope,
+    ConnectionAuthorizationState, GitHubRepositorySelection, IntegrationToken,
+    IntegrationTokenAuthorization, IntegrationTokenSide, MemberGrantFailure, ServedTokenService,
 };
 use useful_execution::visible_text;
 
@@ -178,9 +183,10 @@ impl<'a> TokenView<'a> {
 }
 
 /// An organization's connection as `useful integration list` prints it (REQ-INTEGRATION-22):
-/// its ID, service and side, its organization, the account and instance the record names, and
-/// its state in the word `useful connection` prints. Never a credential: the connection reads
-/// carry none, and only these named fields are printed.
+/// its ID, service and side, its organization, the account and instance the record names, its
+/// state in the word `useful connection` prints, and, where the organization's were read, the
+/// runners' authorizations in force for it (REQ-INTEGRATION-34). Never a credential: the
+/// connection reads carry none, and only these named fields are printed.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(super) struct ConnectionView<'a> {
@@ -193,15 +199,18 @@ pub(super) struct ConnectionView<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     instance_url: Option<&'a str>,
     state: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    authorizations: Option<Vec<ConnectionAuthorizationView<'a>>>,
 }
 
 impl<'a> ConnectionView<'a> {
     /// The view of `connection`, an organization's, of the organization `organization_id` and
-    /// `slug` name.
+    /// `slug` name, with `authorizations` where the organization's were read and answered.
     pub(super) fn new(
         connection: &'a OrganizationConnection,
         organization_id: Option<&'a str>,
         slug: Option<&'a str>,
+        authorizations: Option<&'a [ConnectionAuthorization]>,
     ) -> Self {
         Self {
             id: &connection.id,
@@ -211,11 +220,18 @@ impl<'a> ConnectionView<'a> {
             account: connection.account.as_deref(),
             instance_url: connection.instance_url.as_deref(),
             state: &connection.state,
+            authorizations: authorizations.map(|authorizations| {
+                authorizations
+                    .iter()
+                    .map(ConnectionAuthorizationView::new)
+                    .collect()
+            }),
         }
     }
 
-    /// Writes the view's lines of a human report. What Cloud names, an account and an instance,
-    /// is another party's text and is printed visibly.
+    /// Writes the view's lines of a human report, each authorization's after the state; nothing
+    /// of one where there is none. What Cloud names, an account and an instance, is another
+    /// party's text and is printed visibly.
     pub(super) fn write_human(&self, output: &mut impl Write) -> io::Result<()> {
         writeln!(output, "connection: {}", self.id)?;
         writeln!(output, "service: {}", self.service)?;
@@ -226,7 +242,461 @@ impl<'a> ConnectionView<'a> {
         if let Some(instance_url) = self.instance_url {
             writeln!(output, "instance: {}", visible_text(instance_url))?;
         }
-        writeln!(output, "state: {}", visible_text(self.state))
+        writeln!(output, "state: {}", visible_text(self.state))?;
+        for authorization in self.authorizations.iter().flatten() {
+            authorization.write_human(output)?;
+        }
+        Ok(())
+    }
+}
+
+/// A runner's authorization for an organization's connection in one project, as a leaf prints
+/// it (REQ-INTEGRATION-32, REQ-INTEGRATION-33): its ID and provider, its project, runner and
+/// connection, who made it and when, and its scope. Never a credential: an authorization holds
+/// none, and only these named fields are printed.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ConnectionAuthorizationView<'a> {
+    #[serde(flatten)]
+    named: NamedAuthorizationView<'a>,
+    authorized_by: &'a str,
+    created_at: &'a str,
+    scope: ScopeView<'a>,
+}
+
+/// What names a runner's authorization for an organization's connection: its ID and provider,
+/// its project, runner and connection, which the report of one ended prints alone.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NamedAuthorizationView<'a> {
+    id: &'a str,
+    provider: &'a str,
+    project_id: &'a str,
+    project_name: &'a str,
+    runner_id: &'a str,
+    runner_name: &'a str,
+    connection_id: &'a str,
+    connection_account: &'a str,
+}
+
+/// What the provider grants the authorization's connection (REQ-INTEGRATION-32): its state,
+/// and for a `current` GitHub scope the installation's repository selection and permissions.
+#[derive(Serialize)]
+struct ScopeView<'a> {
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    github: Option<GitHubScopeView<'a>>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GitHubScopeView<'a> {
+    repository_selection: &'static str,
+    permissions: Vec<PermissionView<'a>>,
+}
+
+/// A permission the installation grants, its name and access as GitHub reports them.
+#[derive(Serialize)]
+struct PermissionView<'a> {
+    name: &'a str,
+    access: &'a str,
+}
+
+impl<'a> ScopeView<'a> {
+    fn new(scope: &'a ConnectionAuthorizationScope) -> Self {
+        let current = scope.state == ConnectionAuthorizationState::Current;
+        Self {
+            state: match scope.state {
+                ConnectionAuthorizationState::Current => "current",
+                ConnectionAuthorizationState::Unavailable => "unavailable",
+            },
+            github: scope
+                .github
+                .as_deref()
+                .filter(|_| current)
+                .map(|github| GitHubScopeView {
+                    repository_selection: match github.repository_selection {
+                        GitHubRepositorySelection::GitHubInstallationScopeRepositorySelectionAll => {
+                            "all"
+                        }
+                        GitHubRepositorySelection::GitHubInstallationScopeRepositorySelectionSelected => {
+                            "selected"
+                        }
+                    },
+                    permissions: github
+                        .permissions
+                        .iter()
+                        .map(|permission| PermissionView {
+                            name: &permission.name,
+                            access: &permission.access,
+                        })
+                        .collect(),
+                }),
+        }
+    }
+
+    /// Writes the scope's lines of a human report: the repository selection and one line for
+    /// each permission, which are GitHub's text and printed visibly; that the provider could not
+    /// be read; or, for a `current` scope this release knows no member of, `current` alone.
+    fn write_human(&self, output: &mut impl Write) -> io::Result<()> {
+        match (&self.github, self.state) {
+            (Some(github), _) => {
+                writeln!(
+                    output,
+                    "scope: {} repositories",
+                    github.repository_selection
+                )?;
+                for permission in &github.permissions {
+                    writeln!(
+                        output,
+                        "permission: {} · {}",
+                        visible_text(permission.name),
+                        visible_text(permission.access)
+                    )?;
+                }
+                Ok(())
+            }
+            (None, "unavailable") => {
+                writeln!(output, "scope: unavailable, the provider could not be read")
+            }
+            (None, state) => writeln!(output, "scope: {state}"),
+        }
+    }
+}
+
+impl<'a> ConnectionAuthorizationView<'a> {
+    pub(super) fn new(authorization: &'a ConnectionAuthorization) -> Self {
+        Self {
+            named: NamedAuthorizationView::new(authorization),
+            authorized_by: &authorization.authorized_by,
+            created_at: &authorization.created_at,
+            scope: ScopeView::new(&authorization.scope),
+        }
+    }
+
+    /// Writes the view's lines of a human report: what names the authorization, then who made
+    /// it and when, and its scope.
+    pub(super) fn write_human(&self, output: &mut impl Write) -> io::Result<()> {
+        self.named.write_human(output)?;
+        writeln!(output, "authorized by: {}", self.authorized_by)?;
+        writeln!(output, "authorized at: {}", self.created_at)?;
+        self.scope.write_human(output)
+    }
+}
+
+impl<'a> NamedAuthorizationView<'a> {
+    fn new(authorization: &'a ConnectionAuthorization) -> Self {
+        Self {
+            id: &authorization.id,
+            provider: &authorization.provider,
+            project_id: &authorization.project_id,
+            project_name: &authorization.project_name,
+            runner_id: &authorization.runner_id,
+            runner_name: &authorization.runner_name,
+            connection_id: &authorization.connection_id,
+            connection_account: &authorization.connection_account,
+        }
+    }
+
+    /// Writes the view's lines of a human report. What Cloud names, a project, a runner and an
+    /// account, is another party's text and is printed visibly, each with its ID.
+    fn write_human(&self, output: &mut impl Write) -> io::Result<()> {
+        writeln!(output, "authorization: {}", self.id)?;
+        writeln!(output, "provider: {}", self.provider)?;
+        writeln!(
+            output,
+            "project: {} ({})",
+            visible_text(self.project_name),
+            self.project_id
+        )?;
+        writeln!(
+            output,
+            "runner: {} ({})",
+            visible_text(self.runner_name),
+            self.runner_id
+        )?;
+        writeln!(
+            output,
+            "connection: {} ({})",
+            visible_text(self.connection_account),
+            self.connection_id
+        )
+    }
+}
+
+/// The document of an authorization made or ended, whose view is `V`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionAuthorizationResult<'a, V> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    authorization: V,
+}
+
+/// Reports the authorization `useful integration authorize` given `--project-id` made
+/// (REQ-INTEGRATION-33).
+pub(super) fn write_connection_authorized(
+    deployment: &str,
+    authorization: &ConnectionAuthorization,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    let view = ConnectionAuthorizationView::new(authorization);
+    write_connection_outcome(
+        deployment,
+        ("authorized", "✓ Runner authorized."),
+        &view,
+        |output| view.write_human(output),
+        json,
+    )
+}
+
+/// Reports the authorization `useful integration deauthorize` given `--project-id` ended
+/// (REQ-INTEGRATION-33): what names it, without who made it, when or its scope.
+pub(super) fn write_connection_deauthorized(
+    deployment: &str,
+    authorization: &ConnectionAuthorization,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    let view = NamedAuthorizationView::new(authorization);
+    write_connection_outcome(
+        deployment,
+        ("deauthorized", "✓ Runner authorization ended."),
+        &view,
+        |output| view.write_human(output),
+        json,
+    )
+}
+
+/// Reports an authorization made or ended under `outcome`, the document's outcome and the
+/// report's first line: under `--json` one document carrying `view`, else the report, whose
+/// lines of the authorization `write_human` writes, then the deployment.
+fn write_connection_outcome(
+    deployment: &str,
+    (outcome, done): (&'static str, &str),
+    view: &impl Serialize,
+    write_human: impl FnOnce(&mut io::StdoutLock<'static>) -> io::Result<()>,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    if json {
+        write_json(&ConnectionAuthorizationResult {
+            schema_version: 1,
+            deployment,
+            outcome,
+            authorization: view,
+        })?;
+        return Ok(ExitCode::Success);
+    }
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{done}")?;
+    write_human(&mut stdout)?;
+    writeln!(stdout, "deployment: {deployment}")?;
+    stdout.flush()?;
+    Ok(ExitCode::Success)
+}
+
+/// A connection a leaf names among those it can act on: its ID and account.
+#[derive(Serialize)]
+struct NamedConnectionView<'a> {
+    id: &'a str,
+    account: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionRequiredResult<'a> {
+    schema_version: u8,
+    deployment: &'a str,
+    outcome: &'static str,
+    connections: Vec<NamedConnectionView<'a>>,
+}
+
+/// Refuses a leaf given no `--connection-id` where the organization holds several `active`
+/// connections at `provider` (REQ-INTEGRATION-33): exit 2, naming each by its ID and account,
+/// then the command line `example` that names one; under `--json`, one document with outcome
+/// `connection_required`.
+pub(super) fn write_connection_required(
+    deployment: &str,
+    provider: Provider,
+    connections: &[OrganizationConnection],
+    example: &str,
+    json: bool,
+) -> anyhow::Result<ExitCode> {
+    if json {
+        write_json(&ConnectionRequiredResult {
+            schema_version: 1,
+            deployment,
+            outcome: "connection_required",
+            connections: connections
+                .iter()
+                .map(|connection| NamedConnectionView {
+                    id: &connection.id,
+                    account: connection.account.as_deref(),
+                })
+                .collect(),
+        })?;
+    } else {
+        let mut stderr = io::stderr().lock();
+        writeln!(
+            stderr,
+            "error: name the {} connection to authorize, one of:",
+            provider.name()
+        )?;
+        for connection in connections {
+            match connection.account.as_deref() {
+                Some(account) => {
+                    writeln!(stderr, "  {} · {}", connection.id, visible_text(account))?;
+                }
+                None => writeln!(stderr, "  {}", connection.id)?,
+            }
+        }
+        writeln!(stderr, "\nName one by its ID, for example:\n  {example}")?;
+    }
+    Ok(ExitCode::UsageError)
+}
+
+/// The command that connects the organization `org` at `provider`: `connect --org` for GitHub
+/// and Linear, and the first step of a GitLab connection, which `connect --org` refuses.
+fn connecting(org: &str, provider: Provider) -> String {
+    match provider {
+        Provider::GitHub | Provider::Linear => {
+            format!("useful integration connect {} --org {org}", provider.name())
+        }
+        Provider::GitLab => format!("useful connection gitlab create {org} INSTANCE_URL"),
+    }
+}
+
+/// The refusal of a leaf that finds no connection of the organization `org` at `provider` to
+/// authorize a runner for, having sent nothing more (REQ-INTEGRATION-33): none `active`, with
+/// the command that connects one, or none by the ID `--connection-id` named, with the list of
+/// the organization's connections.
+pub(super) fn no_connection(
+    org: &str,
+    provider: Provider,
+    connection_id: Option<&str>,
+) -> ApiFailureReport {
+    let name = provider.name();
+    let (summary, remedy) = match connection_id {
+        None => (
+            format!("error: the organization {org} holds no active {name} connection"),
+            format!(
+                "Connect the organization at {name}:\n  {}",
+                connecting(org, provider)
+            ),
+        ),
+        Some(id) => (
+            format!("error: the organization {org} holds no {name} connection {id}"),
+            format!("List the organization's connections:\n  useful integration list --org {org}"),
+        ),
+    };
+    ApiFailureReport::new(
+        "connection_not_found",
+        summary,
+        remedy,
+        OutcomeClass::GeneralFailure,
+    )
+}
+
+/// A failure of a leaf acting on a connection authorization of the organization `org` at
+/// `provider` (REQ-INTEGRATION-33): an owner's refusal, each refusal only those routes answer
+/// worded with the organization and the provider, and a deployment that does not serve them;
+/// any other as a grant's.
+pub(super) fn connection_authorization_report(
+    deployment: &str,
+    failure: &RouteFailure,
+    org: &str,
+    provider: Provider,
+) -> ApiFailureReport {
+    use ConnectionAuthorizationRefusal as R;
+    let name = provider.name();
+    let list = format!("useful integration list --org {org}");
+    let refused = |outcome, summary: String, remedy: String| {
+        ApiFailureReport::new(outcome, summary, remedy, OutcomeClass::GeneralFailure)
+    };
+    let refusal = match failure {
+        RouteFailure::NotServed => {
+            return refused(
+                "connection_authorizations_not_served",
+                "error: this deployment does not serve connection authorizations".to_owned(),
+                "Ask the deployment's operator when it will; until then no command authorizes a \
+                 runner for an organization's connection there."
+                    .to_owned(),
+            );
+        }
+        RouteFailure::Failed(MemberGrantFailure::Forbidden) => {
+            return ApiFailureReport::new(
+                "forbidden",
+                format!(
+                    "! Only an owner of the organization {org} can authorize a runner for its \
+                     connections or end that authorization."
+                ),
+                format!(
+                    "Ask an owner of {org}. List the organization's members:\n  useful \
+                     organization member list {org}"
+                ),
+                OutcomeClass::Forbidden,
+            );
+        }
+        RouteFailure::Failed(MemberGrantFailure::ConnectionAuthorizationRefused(refusal)) => {
+            *refusal
+        }
+        RouteFailure::Failed(failure) => return grant::output::report(deployment, failure),
+    };
+    let connect = format!(
+        "Connect the organization at {name}:\n  {}\nor list its connections:\n  {list}",
+        connecting(org, provider)
+    );
+    match refusal {
+        R::ProjectNotFound => refused(
+            "project_not_found",
+            format!("error: project not found in the organization {org}"),
+            format!(
+                "List the organization's projects and use a project ID:\n  useful project list \
+                 {org}"
+            ),
+        ),
+        R::RunnerNotFound => refused(
+            "runner_not_found",
+            format!("error: runner not found in the organization {org}"),
+            format!(
+                "List the organization's runners and use a runner ID:\n  useful runner list {org}"
+            ),
+        ),
+        R::ConnectionNotFound => refused(
+            "connection_not_found",
+            format!("error: {name} connection not found in the organization {org}"),
+            connect,
+        ),
+        R::ConnectionInactive => refused(
+            "connection_inactive",
+            format!("error: that {name} connection of the organization {org} is not active"),
+            connect,
+        ),
+        R::ProviderIneligible => refused(
+            "provider_ineligible",
+            format!(
+                "error: this deployment cannot authorize a runner for an organization's {name} \
+                 connection"
+            ),
+            format!("List the organization's integrations:\n  {list}"),
+        ),
+        R::AlreadyAuthorized => refused(
+            "already_authorized",
+            format!(
+                "error: the runner is already authorized for a {name} connection of the \
+                 organization {org} in that project"
+            ),
+            format!(
+                "List the organization's integrations:\n  {list}\nor end the runner's \
+                 authorization in that project:\n  useful integration deauthorize {name} RUNNER \
+                 --org {org} --project-id PROJECT --yes"
+            ),
+        ),
+        R::AuthorizationNotFound => refused(
+            "authorization_not_found",
+            format!("error: connection authorization not found in the organization {org}"),
+            format!("List the organization's integrations:\n  {list}"),
+        ),
     }
 }
 

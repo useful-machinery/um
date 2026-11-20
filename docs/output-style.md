@@ -247,7 +247,9 @@ separate entity family.
   hidden aliases check `--yes` themselves, refusing its absence as clap does but
   with the statement of what the command will do; since the refusal comes before
   the name is looked up, it states that for an OAuth grant, a native grant, your
-  token and an organization's token alike, and the leaf states only the lines of
+  token and an organization's token alike, or, for `integration authorize` and
+  `deauthorize` given `--project-id`, for an organization's connection
+  authorization alone, and the leaf states only the lines of
   what it acts on before it acts; `integration authorize` and `deauthorize` and
   their `grant` aliases given no `RUNNER` on a terminal ask a `[y/N]` question
   after the runner is chosen instead of refusing a missing `--yes`. This set

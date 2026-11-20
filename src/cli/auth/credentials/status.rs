@@ -94,8 +94,8 @@ fn grant_failure(failure: MemberGrantFailure) -> GrantFailure {
         } => GrantFailure::InvalidResponse {
             credential_rejected,
         },
-        // The served read names no organization, material, runner, authorization or integration
-        // token, so these answers are not ones it defines.
+        // The served read names no organization, material, runner, authorization, integration
+        // token or connection authorization, so these answers are not ones it defines.
         MemberGrantFailure::OrganizationNotFound
         | MemberGrantFailure::MaterialInvalid
         | MemberGrantFailure::LimitReached
@@ -108,11 +108,10 @@ fn grant_failure(failure: MemberGrantFailure) -> GrantFailure {
         | MemberGrantFailure::IntegrationTokenNotFound
         | MemberGrantFailure::IntegrationTokenRunnerNotFound
         | MemberGrantFailure::IntegrationTokenAlreadyAuthorized
-        | MemberGrantFailure::IntegrationTokenAuthorizationNotFound => {
-            GrantFailure::InvalidResponse {
-                credential_rejected: false,
-            }
-        }
+        | MemberGrantFailure::IntegrationTokenAuthorizationNotFound
+        | MemberGrantFailure::ConnectionAuthorizationRefused(_) => GrantFailure::InvalidResponse {
+            credential_rejected: false,
+        },
     }
 }
 

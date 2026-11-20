@@ -1062,8 +1062,9 @@ fn connect_with_org_refuses_a_members_sign_in_option_and_gitlab_before_any_reque
         assert!(refused(&[provider, "--org", "acme"]).contains("--organization"));
     }
 
-    // An organization's connection is authorized for no runner, and revoke names the command
-    // that removes it.
+    // Without --project-id an organization's connection is refused: authorize and deauthorize
+    // name the form that authorizes a runner for it in one project or ends that
+    // (REQ-INTEGRATION-33), and revoke names the command that removes it.
     for (provider, removes) in [
         ("github", "useful connection github installation remove"),
         ("gitlab.com", "useful connection gitlab remove"),
@@ -1077,13 +1078,15 @@ fn connect_with_org_refuses_a_members_sign_in_option_and_gitlab_before_any_reque
             let output = for_acme(&server, &credential, args);
             assert_eq!(output.status.code(), Some(2), "{args:?}");
             assert!(output.stdout.is_empty(), "{args:?}");
-            if args[0] == "revoke" {
-                assert!(
-                    stderr(&output).contains(removes),
-                    "{args:?} {}",
-                    stderr(&output)
-                );
-            }
+            let named = match args[0] {
+                "revoke" => removes,
+                _ => "--project-id",
+            };
+            assert!(
+                stderr(&output).contains(named),
+                "{args:?} {}",
+                stderr(&output)
+            );
         }
     }
     assert!(server.finish().is_empty());
@@ -1237,10 +1240,43 @@ fn gitlab_connections() -> Vec<u8> {
     holding_connection(super::gitlab::active_connection())
 }
 
-/// The answers to an owner's three connection reads of acme, in the order they are sent.
-fn connections_of_acme() -> Vec<Vec<u8>> {
-    vec![installations(), linear_connections(), gitlab_connections()]
+const LIST_AUTHORIZATIONS: &str = "GET /api/v1/organizations/org_01k0z6r1w8f4jy2m7q9v3x5abc/connection-authorizations?limit=200 HTTP/1.1";
+const LIST_ACME_AUTHORIZATIONS: &str =
+    "GET /api/v1/organizations/acme/connection-authorizations?limit=200 HTTP/1.1";
+
+/// One page of acme's connection authorizations in force holding `items`.
+fn authorizations_page(items: &[serde_json::Value]) -> Vec<u8> {
+    json_http_response("200 OK", serde_json::json!({"items": items}))
 }
+
+/// Acme's connection authorizations in force: the runner's for its GitHub App installation in
+/// the project.
+fn authorizations_of_acme() -> Vec<u8> {
+    authorizations_page(&[connection_authorization(
+        RUNNER_ID,
+        "github",
+        INSTALLATION_ID,
+    )])
+}
+
+/// The answers to an owner's three connection reads of acme and then its authorizations read,
+/// in the order they are sent.
+fn connections_of_acme() -> Vec<Vec<u8>> {
+    vec![
+        installations(),
+        linear_connections(),
+        gitlab_connections(),
+        authorizations_of_acme(),
+    ]
+}
+
+/// What `useful integration list` sends for [`connections_of_acme`].
+const CONNECTIONS_OF_ACME: [&str; 4] = [
+    LIST_INSTALLATIONS,
+    LIST_LINEAR,
+    LIST_GITLAB,
+    LIST_AUTHORIZATIONS,
+];
 
 /// The services of the connections a `useful integration list` document carries, in order.
 fn services(document: &serde_json::Value) -> Vec<&str> {
@@ -1268,11 +1304,7 @@ fn list_prints_the_members_tokens_then_each_organizations_after_the_grants() {
     let requests = asked(&server.finish());
 
     // The organization's connection reads follow its tokens (REQ-INTEGRATION-22).
-    let expected = [
-        &EVERY_SIDE[..],
-        &[LIST_INSTALLATIONS, LIST_LINEAR, LIST_GITLAB],
-    ]
-    .concat();
+    let expected = [&EVERY_SIDE[..], &CONNECTIONS_OF_ACME[..]].concat();
     assert_eq!(lines(&requests), [&expected[..], &expected[..]].concat());
     assert_eq!(
         listed.status.code(),
@@ -1396,13 +1428,15 @@ fn list_reads_no_token_unless_the_deployment_serves_a_token_service() {
 #[test]
 fn list_with_org_shows_that_side_alone_and_list_of_a_service_shows_its_token() {
     // --org: the organization's tokens and connections, read by the reference as given with no
-    // membership read, and no grant; the installations read Cloud refuses is passed over.
+    // membership read, and no grant; the installations read Cloud refuses is passed over, and
+    // the authorization of the installation not shown is dropped (REQ-INTEGRATION-34).
     let (server, _directory, credential) = prepared(vec![
         tokens(&[acme_buildkite()]),
         directory(),
         problem("403 Forbidden", 403, "forbidden"),
         linear_connections(),
         gitlab_connections(),
+        authorizations_of_acme(),
     ]);
     let alone = run_under(
         "integration",
@@ -1417,7 +1451,8 @@ fn list_with_org_shows_that_side_alone_and_list_of_a_service_shows_its_token() {
             READ_ACME_DIRECTORY,
             LIST_ACME_INSTALLATIONS,
             LIST_ACME_LINEAR,
-            LIST_ACME_GITLAB
+            LIST_ACME_GITLAB,
+            LIST_ACME_AUTHORIZATIONS
         ]
     );
     assert_eq!(alone.status.code(), Some(0), "{}", stderr(&alone));
@@ -1429,6 +1464,11 @@ fn list_with_org_shows_that_side_alone_and_list_of_a_service_shows_its_token() {
         assert_eq!(
             connection["organization"],
             serde_json::json!({"id": ORGANIZATION_ID, "slug": "acme"}),
+            "{connection}"
+        );
+        assert_eq!(
+            connection["authorizations"],
+            serde_json::json!([]),
             "{connection}"
         );
     }
@@ -1564,15 +1604,18 @@ fn list_prints_each_organizations_connections_after_the_tokens() {
     let human = run_under("integration", &server, &credential, &["list"]);
     let requests = asked(&server.finish());
 
-    let expected = [
-        &EVERY_SIDE[..],
-        &[LIST_INSTALLATIONS, LIST_LINEAR, LIST_GITLAB],
-    ]
-    .concat();
+    let expected = [&EVERY_SIDE[..], &CONNECTIONS_OF_ACME[..]].concat();
     assert_eq!(lines(&requests), [&expected[..], &expected[..]].concat());
-    assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
-    assert!(listed.stderr.is_empty());
-    let document = json_output(&listed);
+    assert_lists_the_connections_of_acme(&listed, &human);
+}
+
+/// `listed`, `useful integration list --json`, and `human`, the report, over [`every_side`],
+/// succeeded with nothing on standard error and show acme's three connections after the tokens,
+/// each with its named fields, the report one section for each before what is not connected.
+fn assert_lists_the_connections_of_acme(listed: &Output, human: &Output) {
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr(listed));
+    assert!(listed.stderr.is_empty(), "{}", stderr(listed));
+    let document = json_output(listed);
     assert_eq!(
         document["tokens"].as_array().unwrap().len(),
         2,
@@ -1614,8 +1657,8 @@ fn list_prints_each_organizations_connections_after_the_tokens() {
 
     // The report prints one section for each, after the tokens and before what is not
     // connected.
-    assert_eq!(human.status.code(), Some(0), "{}", stderr(&human));
-    let text = String::from_utf8(human.stdout).unwrap();
+    assert_eq!(human.status.code(), Some(0), "{}", stderr(human));
+    let text = String::from_utf8(human.stdout.clone()).unwrap();
     let token = line_at(&text, &format!("token: {BUILDKITE_TOKEN_ID}"));
     let sections: Vec<_> = [INSTALLATION_ID, LINEAR_CONNECTION_ID, GITLAB_CONNECTION_ID]
         .iter()
@@ -1646,10 +1689,12 @@ fn list_prints_each_organizations_connections_after_the_tokens() {
 }
 
 // REQ-INTEGRATION-22
+// REQ-INTEGRATION-34
 #[test]
 fn list_reads_the_installations_for_an_owner_alone_and_passes_over_a_read_cloud_refuses_or_cannot_serve()
  {
-    // A member who is not an owner is not sent the installations read.
+    // A member who is not an owner is not sent the installations read, nor the authorizations
+    // read Cloud refuses them, and no connection carries `authorizations`.
     let (server, _directory, credential) = prepared(every_side_with(
         "member",
         vec![linear_connections(), gitlab_connections()],
@@ -1660,7 +1705,11 @@ fn list_reads_the_installations_for_an_owner_alone_and_passes_over_a_read_cloud_
         [&EVERY_SIDE[..], &[LIST_LINEAR, LIST_GITLAB]].concat()
     );
     assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
-    assert_eq!(services(&json_output(&listed)), ["linear", "gitlab.com"]);
+    let document = json_output(&listed);
+    assert_eq!(services(&document), ["linear", "gitlab.com"]);
+    for connection in document["connections"].as_array().unwrap() {
+        assert!(connection.get("authorizations").is_none(), "{connection}");
+    }
 
     // A read Cloud refuses, or answers that it cannot serve, is passed over and the other reads
     // of the organization are listed.
@@ -1687,11 +1736,7 @@ fn list_reads_the_installations_for_an_owner_alone_and_passes_over_a_read_cloud_
         let listed = run_under("integration", &server, &credential, &["list", "--json"]);
         assert_eq!(
             lines(&asked(&server.finish())),
-            [
-                &EVERY_SIDE[..],
-                &[LIST_INSTALLATIONS, LIST_LINEAR, LIST_GITLAB]
-            ]
-            .concat()
+            [&EVERY_SIDE[..], &CONNECTIONS_OF_ACME[..]].concat()
         );
         assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
         assert!(listed.stderr.is_empty(), "{}", stderr(&listed));
@@ -1727,6 +1772,278 @@ fn list_reads_the_installations_for_an_owner_alone_and_passes_over_a_read_cloud_
             json_output(&token_failed)["outcome"]
         );
     }
+}
+
+/// The lines of the report's section of the connection `id`, after its `connection:` line and
+/// up to the next section's rule.
+fn connection_section<'a>(text: &'a str, id: &str) -> Vec<&'a str> {
+    let heading = format!("connection: {id}");
+    text.lines()
+        .skip_while(|line| *line != heading)
+        .skip(1)
+        .take_while(|line| !line.starts_with("── "))
+        .collect()
+}
+
+/// The lines of `text` that begin an authorization's lines.
+fn authorization_lines(text: &str) -> usize {
+    text.lines()
+        .filter(|line| line.starts_with("authorization: "))
+        .count()
+}
+
+/// `useful integration list --json` and its report over acme's connections whose authorizations
+/// read answered [`authorizations_of_acme`]: the installation's `authorizations` holds the one
+/// authorization with its named fields and scope, the others' are empty, and the report prints it
+/// inside the installation's section alone.
+fn assert_the_installation_carries_its_authorization(listed: &Output, human: &Output) {
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr(listed));
+    let document = json_output(listed);
+    let connections = document["connections"].as_array().unwrap();
+    let authorizations: Vec<_> = connections
+        .iter()
+        .map(|connection| {
+            (
+                connection["id"].as_str().unwrap(),
+                &connection["authorizations"],
+            )
+        })
+        .collect();
+    let empty = serde_json::json!([]);
+    assert_eq!(
+        authorizations,
+        [
+            (
+                INSTALLATION_ID,
+                &serde_json::json!([{
+                    "id": CONNECTION_AUTHORIZATION_ID,
+                    "provider": "github",
+                    "projectId": PROJECT_ID,
+                    "projectName": "Website",
+                    "runnerId": RUNNER_ID,
+                    "runnerName": "bravo",
+                    "connectionId": INSTALLATION_ID,
+                    "connectionAccount": "acme",
+                    "authorizedBy": PRINCIPAL_ID,
+                    "createdAt": "2026-11-19T09:00:00Z",
+                    "scope": {
+                        "state": "current",
+                        "github": {
+                            "repositorySelection": "selected",
+                            "permissions": [
+                                {"name": "contents", "access": "write"},
+                                {"name": "metadata", "access": "read"}
+                            ]
+                        }
+                    }
+                }])
+            ),
+            (LINEAR_CONNECTION_ID, &empty),
+            (GITLAB_CONNECTION_ID, &empty),
+        ],
+        "{document}"
+    );
+
+    assert_eq!(human.status.code(), Some(0), "{}", stderr(human));
+    let text = String::from_utf8(human.stdout.clone()).unwrap();
+    let section = connection_section(&text, INSTALLATION_ID);
+    for field in [
+        CONNECTION_AUTHORIZATION_ID,
+        PROJECT_ID,
+        "Website",
+        RUNNER_ID,
+        "bravo",
+        PRINCIPAL_ID,
+        "2026-11-19T09:00:00Z",
+        "selected",
+        "contents",
+        "metadata",
+    ] {
+        assert_eq!(
+            section.iter().filter(|line| line.contains(field)).count(),
+            1,
+            "{field} not on one line of the installation's section in\n{text}"
+        );
+    }
+    let state = section
+        .iter()
+        .position(|line| *line == "state: active")
+        .unwrap_or_else(|| panic!("no state in\n{text}"));
+    let authorization = section
+        .iter()
+        .position(|line| line.starts_with("authorization: "))
+        .unwrap_or_else(|| panic!("no authorization in\n{text}"));
+    assert!(state < authorization, "{text}");
+    assert_eq!(authorization_lines(&text), 1, "{text}");
+}
+
+// REQ-INTEGRATION-34
+// REQ-INTEGRATION-32
+#[test]
+fn list_prints_each_connections_authorizations_inside_its_section() {
+    let (server, _directory, credential) = prepared([every_side(), every_side()].concat());
+    let listed = run_under("integration", &server, &credential, &["list", "--json"]);
+    let human = run_under("integration", &server, &credential, &["list"]);
+    let requests = asked(&server.finish());
+    // The organization's authorizations are read after its connections.
+    let expected = [&EVERY_SIDE[..], &CONNECTIONS_OF_ACME[..]].concat();
+    assert_eq!(lines(&requests), [&expected[..], &expected[..]].concat());
+    assert_the_installation_carries_its_authorization(&listed, &human);
+
+    // With --org the organization's authorizations are read by the reference as given.
+    let for_org = || {
+        [
+            vec![tokens(&[acme_buildkite()]), directory()],
+            connections_of_acme(),
+        ]
+        .concat()
+    };
+    let (server, _directory, credential) = prepared([for_org(), for_org()].concat());
+    let args = ["list", "--org", "acme"];
+    let listed = run_under(
+        "integration",
+        &server,
+        &credential,
+        &[&args[..], &["--json"]].concat(),
+    );
+    let human = run_under("integration", &server, &credential, &args);
+    let expected = [
+        LIST_ACME_TOKENS,
+        READ_ACME_DIRECTORY,
+        LIST_ACME_INSTALLATIONS,
+        LIST_ACME_LINEAR,
+        LIST_ACME_GITLAB,
+        LIST_ACME_AUTHORIZATIONS,
+    ];
+    assert_eq!(
+        lines(&asked(&server.finish())),
+        [&expected[..], &expected[..]].concat()
+    );
+    assert_the_installation_carries_its_authorization(&listed, &human);
+
+    // A scope the provider could not be read for is printed as that.
+    let mut unavailable = connection_authorization(RUNNER_ID, "github", INSTALLATION_ID);
+    unavailable["scope"] = serde_json::json!({"state": "unavailable"});
+    let mut connections = connections_of_acme();
+    connections[3] = authorizations_page(&[unavailable]);
+    let answers = every_side_with("owner", connections);
+    let (server, _directory, credential) = prepared([answers.clone(), answers].concat());
+    let listed = run_under("integration", &server, &credential, &["list", "--json"]);
+    let human = run_under("integration", &server, &credential, &["list"]);
+    server.finish();
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
+    assert_eq!(
+        json_output(&listed)["connections"][0]["authorizations"][0]["scope"],
+        serde_json::json!({"state": "unavailable"})
+    );
+    assert_eq!(human.status.code(), Some(0), "{}", stderr(&human));
+    let text = String::from_utf8(human.stdout).unwrap();
+    let section = connection_section(&text, INSTALLATION_ID);
+    let scope: Vec<_> = section
+        .iter()
+        .filter(|line| line.starts_with("scope: ") || line.starts_with("permission: "))
+        .collect();
+    assert_eq!(scope.len(), 1, "{text}");
+    assert!(scope[0].contains("unavailable"), "{text}");
+}
+
+// REQ-INTEGRATION-34
+#[test]
+fn list_passes_over_an_authorization_read_cloud_refuses_or_cannot_serve_and_fails_on_another() {
+    // Refused as a member who is not an owner is, unserved, or one Cloud cannot serve: the list
+    // is what it was without the read, and no organization read follows.
+    for answer in [
+        problem("403 Forbidden", 403, "forbidden"),
+        problem("404 Not Found", 404, "not-found"),
+        problem("500 Internal Server Error", 500, "internal"),
+    ] {
+        let mut connections = connections_of_acme();
+        connections[3] = answer;
+        let answers = every_side_with("owner", connections);
+        let (server, _directory, credential) = prepared([answers.clone(), answers].concat());
+        let listed = run_under("integration", &server, &credential, &["list", "--json"]);
+        let human = run_under("integration", &server, &credential, &["list"]);
+        let expected = [&EVERY_SIDE[..], &CONNECTIONS_OF_ACME[..]].concat();
+        assert_eq!(
+            lines(&asked(&server.finish())),
+            [&expected[..], &expected[..]].concat()
+        );
+        assert_lists_the_connections_of_acme(&listed, &human);
+        assert!(human.stderr.is_empty(), "{}", stderr(&human));
+        let document = json_output(&listed);
+        for connection in document["connections"].as_array().unwrap() {
+            assert!(connection.get("authorizations").is_none(), "{connection}");
+        }
+        assert_eq!(
+            authorization_lines(&String::from_utf8(human.stdout).unwrap()),
+            0
+        );
+    }
+
+    // A dropped answer, or an answer outside the contract, fails the command as a failed token
+    // read does.
+    let outside: fn() -> Vec<u8> = || authorizations_page(&[serde_json::json!({"id": "cna_x"})]);
+    for failed in [Vec::new as fn() -> Vec<u8>, outside] {
+        let mut answers = every_side()[..3].to_vec();
+        answers.push(failed());
+        let (server, _directory, credential) = prepared(answers);
+        let token_failed = run_under("integration", &server, &credential, &["list", "--json"]);
+        server.finish();
+
+        let mut connections = connections_of_acme();
+        connections[3] = failed();
+        let (server, _directory, credential) = prepared(every_side_with("owner", connections));
+        let listed = run_under("integration", &server, &credential, &["list", "--json"]);
+        assert_eq!(
+            lines(&asked(&server.finish())),
+            [&EVERY_SIDE[..], &CONNECTIONS_OF_ACME[..]].concat()
+        );
+        assert_ne!(listed.status.code(), Some(0));
+        assert_eq!(listed.status.code(), token_failed.status.code());
+        assert_eq!(
+            json_output(&listed)["outcome"],
+            json_output(&token_failed)["outcome"]
+        );
+    }
+}
+
+// REQ-INTEGRATION-34
+#[test]
+fn list_reads_no_authorization_of_an_organization_it_shows_no_connection_of() {
+    // Its connection reads answer no connection, as an owner's and with --org.
+    let none = || {
+        let empty = || json_http_response("200 OK", serde_json::json!({"items": []}));
+        vec![installations_in(&[]), empty(), empty()]
+    };
+    let (server, _directory, credential) = prepared(every_side_with("owner", none()));
+    let listed = run_under("integration", &server, &credential, &["list", "--json"]);
+    assert_eq!(
+        lines(&asked(&server.finish())),
+        [&EVERY_SIDE[..], &CONNECTIONS_OF_ACME[..3]].concat()
+    );
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
+    assert_eq!(json_output(&listed)["connections"], serde_json::json!([]));
+
+    let (server, _directory, credential) =
+        prepared([vec![tokens(&[acme_buildkite()]), directory()], none()].concat());
+    let listed = run_under(
+        "integration",
+        &server,
+        &credential,
+        &["list", "--org", "acme", "--json"],
+    );
+    assert_eq!(
+        lines(&asked(&server.finish())),
+        [
+            LIST_ACME_TOKENS,
+            READ_ACME_DIRECTORY,
+            LIST_ACME_INSTALLATIONS,
+            LIST_ACME_LINEAR,
+            LIST_ACME_GITLAB
+        ]
+    );
+    assert_eq!(listed.status.code(), Some(0), "{}", stderr(&listed));
+    assert_eq!(json_output(&listed)["connections"], serde_json::json!([]));
 }
 
 // `useful integration authorize`, `deauthorize` and `revoke` acting on a token service's token,
@@ -2372,4 +2689,930 @@ fn with_org_a_refusal_ends_the_leaf_and_a_grants_provider_is_refused() {
     assert_eq!(oauth.status.code(), Some(2), "{}", stderr(&oauth));
     assert_eq!(missing.status.code(), Some(1), "{}", stderr(&missing));
     assert_eq!(json_output(&missing)["outcome"], "token_not_found");
+}
+
+// `useful integration authorize --org ORGANIZATION --project-id PROJECT`: a runner authorized
+// for the organization's connection in one project.
+
+const PROJECT_ID: &str = "prj_01k0z6r1w8f4jy2m7q9v3x5abc";
+const CONNECTION_AUTHORIZATION_ID: &str = "cna_01k0z6r1w8f4jy2m7q9v3x5abc";
+/// A second installation of acme's, on the account `globex`.
+const OTHER_INSTALLATION_ID: &str = "ghi_01k0z6r1w8f4jy2m7q9v3x5abd";
+const AUTHORIZE_ACME_CONNECTION: &str =
+    "POST /api/v1/organizations/acme/connection-authorizations HTTP/1.1";
+const LIST_ACME_PROJECT_AUTHORIZATIONS: &str = "GET /api/v1/organizations/acme/connection-authorizations?limit=200&projectId=prj_01k0z6r1w8f4jy2m7q9v3x5abc&provider=github HTTP/1.1";
+const LIST_RUNNERS_OF_ACME: &str =
+    "GET /api/v1/organizations/acme/runner-registrations?limit=200 HTTP/1.1";
+const READ_ACME: &str = "GET /api/v1/organizations/acme HTTP/1.1";
+
+/// Runs `useful integration LEAF args --project-id PROJECT --org acme`.
+fn in_project(leaf: &str, server: &ScriptedServer, credential: &Path, args: &[&str]) -> Output {
+    for_acme(
+        server,
+        credential,
+        &[&[leaf], args, &["--project-id", PROJECT_ID]].concat(),
+    )
+}
+
+/// Runs `useful integration authorize args --project-id PROJECT --org acme`.
+fn authorize_in_project(server: &ScriptedServer, credential: &Path, args: &[&str]) -> Output {
+    in_project("authorize", server, credential, args)
+}
+
+/// Runs `useful integration deauthorize args --project-id PROJECT --org acme`.
+fn deauthorize_in_project(server: &ScriptedServer, credential: &Path, args: &[&str]) -> Output {
+    in_project("deauthorize", server, credential, args)
+}
+
+/// One page of acme's GitHub App installations in `states`, the first on the account `acme` and
+/// the second, where there is one, on `globex`.
+fn installations_in(states: &[&str]) -> Vec<u8> {
+    let items: Vec<_> = states
+        .iter()
+        .zip([(INSTALLATION_ID, "acme"), (OTHER_INSTALLATION_ID, "globex")])
+        .map(|(state, (id, account))| {
+            let mut item = super::github::installation_body(state);
+            item["id"] = id.into();
+            item["providerAccountLogin"] = account.into();
+            item["token"] = SENTINEL.into();
+            item
+        })
+        .collect();
+    json_http_response("200 OK", serde_json::json!({"items": items}))
+}
+
+/// The authorization Cloud answers of `runner_id` for acme's `provider` connection
+/// `connection_id` in the project, with the installation's scope, carrying in members no model
+/// names what no output may carry.
+fn connection_authorization(
+    runner_id: &str,
+    provider: &str,
+    connection_id: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "id": CONNECTION_AUTHORIZATION_ID,
+        "organizationId": ORGANIZATION_ID,
+        "provider": provider,
+        "projectId": PROJECT_ID,
+        "projectName": "Website",
+        "runnerId": runner_id,
+        "runnerName": "bravo",
+        "connectionId": connection_id,
+        "connectionAccount": "acme",
+        "authorizedBy": PRINCIPAL_ID,
+        "createdAt": "2026-11-19T09:00:00Z",
+        "scope": {
+            "state": "current",
+            "github": {
+                "repositorySelection": "selected",
+                "permissions": [
+                    {"name": "contents", "access": "write"},
+                    {"name": "metadata", "access": "read"}
+                ],
+                "token": SENTINEL
+            }
+        },
+        "token": SENTINEL
+    })
+}
+
+/// The 201 that makes [`connection_authorization`], which echoes the request's key.
+fn connection_authorized(runner_id: &str, connection_id: &str) -> Vec<u8> {
+    http_response_with_headers(
+        "201 Created",
+        Some("application/json"),
+        &[("Idempotency-Key", ECHO_IDEMPOTENCY_KEY)],
+        &serde_json::to_vec(&connection_authorization(
+            runner_id,
+            "github",
+            connection_id,
+        ))
+        .unwrap(),
+    )
+}
+
+// REQ-INTEGRATION-33
+// REQ-INTEGRATION-27
+// REQ-INTEGRATION-32
+// REQ-INTEGRATION-24
+#[test]
+fn authorize_with_a_project_authorizes_the_runner_for_the_organizations_active_connection() {
+    let (server, _directory, credential) = prepared(vec![
+        installations_in(&["active"]),
+        connection_authorized(NEW_RUNNER_ID, INSTALLATION_ID),
+        installations_in(&["active"]),
+        connection_authorized(NEW_RUNNER_ID, INSTALLATION_ID),
+    ]);
+    let json = authorize_in_project(
+        &server,
+        &credential,
+        &["github", NEW_RUNNER_ID, "--yes", "--json"],
+    );
+    let human = authorize_in_project(&server, &credential, &["github", NEW_RUNNER_ID, "--yes"]);
+    // Without --yes each is refused before anything is sent.
+    let refusal = refused_without_yes(
+        &server,
+        &credential,
+        &[
+            "authorize",
+            "github",
+            NEW_RUNNER_ID,
+            "--org",
+            "acme",
+            "--project-id",
+            PROJECT_ID,
+        ],
+    );
+    let token_refusal = refused_without_yes(
+        &server,
+        &credential,
+        &["authorize", "mergify", NEW_RUNNER_ID, "--org", "acme"],
+    );
+    let requests = server.finish();
+
+    assert_eq!(
+        lines(&asked(&requests)),
+        [
+            LIST_ACME_INSTALLATIONS,
+            AUTHORIZE_ACME_CONNECTION,
+            LIST_ACME_INSTALLATIONS,
+            AUTHORIZE_ACME_CONNECTION,
+        ]
+    );
+    for request in [&requests[1], &requests[3]] {
+        assert!(!header_value(request, "idempotency-key").is_empty());
+        assert_eq!(
+            request_body(request),
+            serde_json::json!({
+                "projectId": PROJECT_ID,
+                "runnerId": NEW_RUNNER_ID,
+                "provider": "github",
+                "connectionId": INSTALLATION_ID
+            })
+        );
+    }
+
+    assert_eq!(json.status.code(), Some(0), "{}", stderr(&json));
+    let document = json_output(&json);
+    assert_eq!(document["outcome"], "authorized", "{document}");
+    assert_eq!(document["schemaVersion"], 1, "{document}");
+    assert_eq!(
+        document["authorization"],
+        serde_json::json!({
+            "id": CONNECTION_AUTHORIZATION_ID,
+            "provider": "github",
+            "projectId": PROJECT_ID,
+            "projectName": "Website",
+            "runnerId": NEW_RUNNER_ID,
+            "runnerName": "bravo",
+            "connectionId": INSTALLATION_ID,
+            "connectionAccount": "acme",
+            "authorizedBy": PRINCIPAL_ID,
+            "createdAt": "2026-11-19T09:00:00Z",
+            "scope": {
+                "state": "current",
+                "github": {
+                    "repositorySelection": "selected",
+                    "permissions": [
+                        {"name": "contents", "access": "write"},
+                        {"name": "metadata", "access": "read"}
+                    ]
+                }
+            }
+        })
+    );
+
+    // The report prints the same named fields, one line each.
+    assert_eq!(human.status.code(), Some(0), "{}", stderr(&human));
+    let report = String::from_utf8(human.stdout.clone()).unwrap();
+    for field in [
+        CONNECTION_AUTHORIZATION_ID,
+        PROJECT_ID,
+        "Website",
+        NEW_RUNNER_ID,
+        INSTALLATION_ID,
+        PRINCIPAL_ID,
+        "2026-11-19T09:00:00Z",
+        "selected",
+        "contents",
+        "metadata",
+    ] {
+        assert_eq!(
+            report.lines().filter(|line| line.contains(field)).count(),
+            1,
+            "{field} not on one line of\n{report}"
+        );
+    }
+    assert!(
+        report.lines().last().unwrap().starts_with("deployment: "),
+        "{report}"
+    );
+
+    // What the authorization permits is stated before acting, under a heading naming the
+    // connection, as the refusal states it, and none of it is a token's statement.
+    let stated = statement(&json, INSTALLATION_ID);
+    assert_eq!(stated, statement(&human, INSTALLATION_ID));
+    assert_stated_by_the_refusal(&stated, &refusal);
+    assert!(
+        stated.iter().all(|line| !token_refusal
+            .lines()
+            .any(|refused| refused.ends_with(line.as_str()))),
+        "{stated:?}\n{token_refusal}"
+    );
+}
+
+// REQ-INTEGRATION-33
+#[test]
+fn authorize_with_a_project_takes_the_one_active_connection_or_the_one_named() {
+    let (server, _directory, credential) = prepared(vec![
+        installations_in(&["active", "active"]),
+        installations_in(&["active", "active"]),
+        installations_in(&["active", "active"]),
+        connection_authorized(NEW_RUNNER_ID, OTHER_INSTALLATION_ID),
+        installations_in(&["disconnected"]),
+        installations_in(&["disconnected"]),
+        installations_in(&["active"]),
+    ]);
+    let several = authorize_in_project(
+        &server,
+        &credential,
+        &["github", NEW_RUNNER_ID, "--yes", "--json"],
+    );
+    let several_human =
+        authorize_in_project(&server, &credential, &["github", NEW_RUNNER_ID, "--yes"]);
+    let named = authorize_in_project(
+        &server,
+        &credential,
+        &[
+            "github",
+            NEW_RUNNER_ID,
+            "--connection-id",
+            OTHER_INSTALLATION_ID,
+            "--yes",
+            "--json",
+        ],
+    );
+    let none_active = authorize_in_project(
+        &server,
+        &credential,
+        &["github", NEW_RUNNER_ID, "--yes", "--json"],
+    );
+    let none_active_human =
+        authorize_in_project(&server, &credential, &["github", NEW_RUNNER_ID, "--yes"]);
+    let not_listed = authorize_in_project(
+        &server,
+        &credential,
+        &[
+            "github",
+            NEW_RUNNER_ID,
+            "--connection-id",
+            OTHER_INSTALLATION_ID,
+            "--yes",
+            "--json",
+        ],
+    );
+    let requests = server.finish();
+
+    assert_eq!(
+        lines(&asked(&requests)),
+        [
+            LIST_ACME_INSTALLATIONS,
+            LIST_ACME_INSTALLATIONS,
+            LIST_ACME_INSTALLATIONS,
+            AUTHORIZE_ACME_CONNECTION,
+            LIST_ACME_INSTALLATIONS,
+            LIST_ACME_INSTALLATIONS,
+            LIST_ACME_INSTALLATIONS,
+        ]
+    );
+
+    // Two active connections and none named: each is named, and nothing more is sent.
+    assert_eq!(several.status.code(), Some(2), "{}", stderr(&several));
+    let document = json_output(&several);
+    assert_eq!(document["outcome"], "connection_required", "{document}");
+    assert_eq!(
+        document["connections"],
+        serde_json::json!([
+            {"id": INSTALLATION_ID, "account": "acme"},
+            {"id": OTHER_INSTALLATION_ID, "account": "globex"}
+        ])
+    );
+    assert_eq!(several_human.status.code(), Some(2));
+    assert!(several_human.stdout.is_empty());
+    let text = stderr(&several_human);
+    for named in [
+        INSTALLATION_ID,
+        OTHER_INSTALLATION_ID,
+        "globex",
+        "--connection-id",
+    ] {
+        assert!(text.contains(named), "{named} not in\n{text}");
+    }
+
+    // The one --connection-id names is sent.
+    assert_eq!(named.status.code(), Some(0), "{}", stderr(&named));
+    assert_eq!(
+        request_body(&requests[3])["connectionId"],
+        OTHER_INSTALLATION_ID
+    );
+    assert_eq!(
+        json_output(&named)["authorization"]["connectionId"],
+        OTHER_INSTALLATION_ID
+    );
+
+    // No active connection, and one --connection-id names that the read does not list.
+    for output in [&none_active, &not_listed] {
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(output));
+        assert_eq!(json_output(output)["outcome"], "connection_not_found");
+    }
+    assert_eq!(none_active_human.status.code(), Some(1));
+    assert!(none_active_human.stdout.is_empty());
+    assert!(
+        stderr(&none_active_human).contains("useful integration connect github --org acme"),
+        "{}",
+        stderr(&none_active_human)
+    );
+}
+
+/// One page of acme's connection authorizations in force for the project: `runner_id`'s.
+fn project_authorizations(runner_id: &str) -> Vec<u8> {
+    json_http_response(
+        "200 OK",
+        serde_json::json!({"items": [connection_authorization(
+            runner_id,
+            "github",
+            INSTALLATION_ID
+        )]}),
+    )
+}
+
+// REQ-INTEGRATION-33
+// REQ-GRANT-81
+// REQ-GRANT-82
+// INV-CLI-16
+#[test]
+fn authorize_with_a_project_offers_the_runners_without_an_authorization_in_that_project() {
+    // Charlie holds the project's authorization, so bravo and alpha are offered.
+    let offer = || {
+        vec![
+            installations_in(&["active"]),
+            project_authorizations(RUNNER_ID),
+            registrations(&[
+                registration(ALPHA, "offline", "enabled"),
+                registration(BRAVO, "online", "enabled"),
+                registration(CHARLIE, "online", "enabled"),
+            ]),
+        ]
+    };
+    let mut answers = offer();
+    answers.extend(offer());
+    answers.push(connection_authorized(NEW_RUNNER_ID, INSTALLATION_ID));
+    let (server, _directory, credential) = prepared(answers);
+    let refused = authorize_in_project(&server, &credential, &["github", "--json"]);
+    // Bravo, online and enabled, is offered first; the list is shown once alpha is.
+    let (shown, chosen) = on_terminal(
+        family_on_terminal(
+            "integration",
+            &server,
+            &credential,
+            &[
+                "authorize",
+                "github",
+                "--org",
+                "acme",
+                "--project-id",
+                PROJECT_ID,
+            ],
+        ),
+        &[(ENDED_RUNNER_ID, "\r"), ("[y/N]", "y\n")],
+    );
+    let requests = server.finish();
+
+    let reads = [
+        LIST_ACME_INSTALLATIONS,
+        LIST_ACME_PROJECT_AUTHORIZATIONS,
+        LIST_RUNNERS_OF_ACME,
+    ];
+    assert_eq!(
+        lines(&asked(&requests)),
+        [&reads[..], &reads, &[AUTHORIZE_ACME_CONNECTION]].concat()
+    );
+
+    assert_eq!(refused.status.code(), Some(2), "{}", stderr(&refused));
+    let document = json_output(&refused);
+    assert_eq!(document["outcome"], "runner_required", "{document}");
+    assert_eq!(document["connectionId"], INSTALLATION_ID, "{document}");
+    let runners: Vec<_> = document["runners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|runner| runner["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(runners, [NEW_RUNNER_ID, ENDED_RUNNER_ID], "{document}");
+
+    // The runner chosen is stated by name and ID, and the command asks before it sends.
+    assert_eq!(chosen.status.code(), Some(0), "{shown}");
+    assert!(!shown.contains("charlie"), "{shown}");
+    let stated = shown
+        .find(&format!("bravo ({NEW_RUNNER_ID})"))
+        .unwrap_or_else(|| panic!("the runner is not stated in\n{shown}"));
+    assert!(stated < shown.find("[y/N]").unwrap(), "{shown}");
+    assert_eq!(request_body(&requests[6])["runnerId"], NEW_RUNNER_ID);
+}
+
+// REQ-INTEGRATION-33
+// REQ-INTEGRATION-27
+#[test]
+fn authorize_with_a_project_reports_each_of_clouds_refusals_with_its_own_outcome() {
+    let refusals = [
+        (
+            "github",
+            problem("403 Forbidden", 403, "forbidden"),
+            "forbidden",
+        ),
+        (
+            "github",
+            problem(
+                "404 Not Found",
+                404,
+                "connection-authorization-project-not-found",
+            ),
+            "project_not_found",
+        ),
+        (
+            "github",
+            problem(
+                "404 Not Found",
+                404,
+                "connection-authorization-runner-not-found",
+            ),
+            "runner_not_found",
+        ),
+        (
+            "github",
+            problem(
+                "404 Not Found",
+                404,
+                "connection-authorization-connection-not-found",
+            ),
+            "connection_not_found",
+        ),
+        (
+            "github",
+            problem(
+                "409 Conflict",
+                409,
+                "connection-authorization-connection-inactive",
+            ),
+            "connection_inactive",
+        ),
+        (
+            "linear",
+            problem(
+                "409 Conflict",
+                409,
+                "connection-authorization-provider-ineligible",
+            ),
+            "provider_ineligible",
+        ),
+        (
+            "github",
+            problem(
+                "409 Conflict",
+                409,
+                "connection-authorization-already-authorized",
+            ),
+            "already_authorized",
+        ),
+    ];
+    for (provider, refusal, outcome) in refusals {
+        let read = || match provider {
+            "linear" => linear_connections(),
+            _ => installations_in(&["active"]),
+        };
+        let (server, _directory, credential) =
+            prepared(vec![read(), refusal.clone(), read(), refusal]);
+        let json = authorize_in_project(
+            &server,
+            &credential,
+            &[provider, NEW_RUNNER_ID, "--yes", "--json"],
+        );
+        let human = authorize_in_project(&server, &credential, &[provider, NEW_RUNNER_ID, "--yes"]);
+        let read = match provider {
+            "linear" => LIST_ACME_LINEAR,
+            _ => LIST_ACME_INSTALLATIONS,
+        };
+        let requests = server.finish();
+        assert_eq!(
+            lines(&asked(&requests)),
+            [
+                read,
+                AUTHORIZE_ACME_CONNECTION,
+                read,
+                AUTHORIZE_ACME_CONNECTION
+            ],
+            "{outcome}"
+        );
+        if provider == "linear" {
+            assert_eq!(
+                request_body(&requests[1])["connectionId"],
+                LINEAR_CONNECTION_ID
+            );
+        }
+        assert_eq!(json.status.code(), Some(1), "{outcome}: {}", stderr(&json));
+        assert_eq!(json_output(&json)["outcome"], outcome);
+        assert_eq!(human.status.code(), Some(1), "{outcome}");
+        assert!(human.stdout.is_empty(), "{outcome}");
+        assert!(!stderr(&human).is_empty(), "{outcome}");
+    }
+
+    // The generic not-found of a deployment that routes no connection authorization is told
+    // from an organization the member cannot read by one read of the organization.
+    for (organization_read, outcome) in [
+        (organization(), "connection_authorizations_not_served"),
+        (
+            problem("404 Not Found", 404, "not-found"),
+            "organization_not_found",
+        ),
+    ] {
+        let (server, _directory, credential) = prepared(vec![
+            installations_in(&["active"]),
+            problem("404 Not Found", 404, "not-found"),
+            organization_read,
+        ]);
+        let output = authorize_in_project(
+            &server,
+            &credential,
+            &["github", NEW_RUNNER_ID, "--yes", "--json"],
+        );
+        assert_eq!(
+            lines(&asked(&server.finish())),
+            [
+                LIST_ACME_INSTALLATIONS,
+                AUTHORIZE_ACME_CONNECTION,
+                READ_ACME
+            ]
+        );
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
+        assert_eq!(json_output(&output)["outcome"], outcome);
+    }
+}
+
+// REQ-INTEGRATION-33
+// REQ-INTEGRATION-15
+#[test]
+fn project_and_connection_options_are_refused_before_any_request_where_they_do_not_apply() {
+    let (server, _directory, credential) = prepared(vec![]);
+    let project = ["--project-id", PROJECT_ID];
+    let refusals = [
+        // Without --org.
+        run_under(
+            "integration",
+            &server,
+            &credential,
+            &[
+                &["authorize", "github", NEW_RUNNER_ID, "--yes"][..],
+                &project,
+            ]
+            .concat(),
+        ),
+        // --connection-id without --project-id.
+        for_acme(
+            &server,
+            &credential,
+            &[
+                "authorize",
+                "github",
+                NEW_RUNNER_ID,
+                "--connection-id",
+                INSTALLATION_ID,
+                "--yes",
+            ],
+        ),
+        // With --all.
+        authorize_in_project(&server, &credential, &["--all", NEW_RUNNER_ID, "--yes"]),
+        // A token service's name, a coding agent's and a grant's ID.
+        authorize_in_project(&server, &credential, &["mergify", NEW_RUNNER_ID, "--yes"]),
+        authorize_in_project(&server, &credential, &["codex", NEW_RUNNER_ID, "--yes"]),
+        authorize_in_project(
+            &server,
+            &credential,
+            &[OAUTH_GRANT_ID, NEW_RUNNER_ID, "--yes"],
+        ),
+        // The leaves that take neither option, and the earlier spelling.
+        for_acme(
+            &server,
+            &credential,
+            &[&["connect", "github"][..], &project].concat(),
+        ),
+        for_acme(&server, &credential, &[&["list"][..], &project].concat()),
+        for_acme(
+            &server,
+            &credential,
+            &[&["revoke", "github", "--yes"][..], &project].concat(),
+        ),
+        run_under(
+            "grant",
+            &server,
+            &credential,
+            &[
+                &["authorize", "github", NEW_RUNNER_ID, "--yes"][..],
+                &project,
+            ]
+            .concat(),
+        ),
+        // deauthorize: a token service's name, without --org, --connection-id without
+        // --project-id, and the earlier spelling.
+        deauthorize_in_project(&server, &credential, &["mergify", RUNNER_ID, "--yes"]),
+        run_under(
+            "integration",
+            &server,
+            &credential,
+            &[&["deauthorize", "github", RUNNER_ID, "--yes"][..], &project].concat(),
+        ),
+        for_acme(
+            &server,
+            &credential,
+            &[
+                "deauthorize",
+                "github",
+                RUNNER_ID,
+                "--connection-id",
+                INSTALLATION_ID,
+                "--yes",
+            ],
+        ),
+        run_under(
+            "grant",
+            &server,
+            &credential,
+            &[&["deauthorize", "github", RUNNER_ID, "--yes"][..], &project].concat(),
+        ),
+    ];
+    assert!(server.finish().is_empty());
+    for output in &refusals {
+        assert_eq!(output.status.code(), Some(2), "{}", stderr(output));
+        assert!(output.stdout.is_empty(), "{}", stderr(output));
+    }
+    // A token service's name is told the command line without --project-id.
+    for (refusal, leaf) in [(&refusals[3], "authorize"), (&refusals[10], "deauthorize")] {
+        let token = stderr(refusal);
+        assert!(token.contains("--project-id"), "{token}");
+        assert!(
+            token.contains(&format!(
+                "useful integration {leaf} mergify RUNNER --org ORGANIZATION --yes"
+            )),
+            "{token}"
+        );
+    }
+}
+
+// `useful integration deauthorize --org ORGANIZATION --project-id PROJECT`: a runner's
+// authorization for the organization's connection in one project ended.
+
+const LIST_ACME_RUNNER_AUTHORIZATIONS: &str = "GET /api/v1/organizations/acme/connection-authorizations?limit=200&projectId=prj_01k0z6r1w8f4jy2m7q9v3x5abc&runnerId=rnr_01k0z6r1w8f4jy2m7q9v3x5abc&provider=github HTTP/1.1";
+const LIST_ACME_RUNNER_CONNECTION_AUTHORIZATIONS: &str = "GET /api/v1/organizations/acme/connection-authorizations?limit=200&projectId=prj_01k0z6r1w8f4jy2m7q9v3x5abc&runnerId=rnr_01k0z6r1w8f4jy2m7q9v3x5abc&provider=github&connectionId=ghi_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
+const END_ACME_CONNECTION_AUTHORIZATION: &str = "DELETE /api/v1/organizations/acme/connection-authorizations/cna_01k0z6r1w8f4jy2m7q9v3x5abc HTTP/1.1";
+
+/// One page of acme's connection authorizations in force for the project that holds none.
+fn no_project_authorizations() -> Vec<u8> {
+    json_http_response("200 OK", serde_json::json!({"items": []}))
+}
+
+// REQ-INTEGRATION-33
+// REQ-INTEGRATION-29
+#[test]
+fn deauthorize_with_a_project_ends_the_runners_authorization_found_in_the_organizations_list() {
+    let (server, _directory, credential) = prepared(vec![
+        project_authorizations(RUNNER_ID),
+        deleted(),
+        project_authorizations(RUNNER_ID),
+        deleted(),
+        // Repeated, the list holds none.
+        no_project_authorizations(),
+        // Ended meanwhile: the route answers the authorization not found.
+        project_authorizations(RUNNER_ID),
+        problem("404 Not Found", 404, "connection-authorization-not-found"),
+        // --connection-id keeps that connection's alone.
+        project_authorizations(RUNNER_ID),
+        deleted(),
+    ]);
+    let json = deauthorize_in_project(
+        &server,
+        &credential,
+        &["github", RUNNER_ID, "--yes", "--json"],
+    );
+    let human = deauthorize_in_project(&server, &credential, &["github", RUNNER_ID, "--yes"]);
+    let repeated = deauthorize_in_project(
+        &server,
+        &credential,
+        &["github", RUNNER_ID, "--yes", "--json"],
+    );
+    let ended = deauthorize_in_project(
+        &server,
+        &credential,
+        &["github", RUNNER_ID, "--yes", "--json"],
+    );
+    let named = deauthorize_in_project(
+        &server,
+        &credential,
+        &[
+            "github",
+            RUNNER_ID,
+            "--connection-id",
+            INSTALLATION_ID,
+            "--yes",
+            "--json",
+        ],
+    );
+    // Without --yes each is refused before anything is sent.
+    let refusal = refused_without_yes(
+        &server,
+        &credential,
+        &[
+            "deauthorize",
+            "github",
+            RUNNER_ID,
+            "--org",
+            "acme",
+            "--project-id",
+            PROJECT_ID,
+        ],
+    );
+    let token_refusal = refused_without_yes(
+        &server,
+        &credential,
+        &["deauthorize", "mergify", RUNNER_ID, "--org", "acme"],
+    );
+    let requests = server.finish();
+
+    assert_eq!(
+        lines(&asked(&requests)),
+        [
+            LIST_ACME_RUNNER_AUTHORIZATIONS,
+            END_ACME_CONNECTION_AUTHORIZATION,
+            LIST_ACME_RUNNER_AUTHORIZATIONS,
+            END_ACME_CONNECTION_AUTHORIZATION,
+            LIST_ACME_RUNNER_AUTHORIZATIONS,
+            LIST_ACME_RUNNER_AUTHORIZATIONS,
+            END_ACME_CONNECTION_AUTHORIZATION,
+            LIST_ACME_RUNNER_CONNECTION_AUTHORIZATIONS,
+            END_ACME_CONNECTION_AUTHORIZATION,
+        ]
+    );
+    for request in [&requests[1], &requests[3], &requests[6], &requests[8]] {
+        assert!(!header_value(request, "idempotency-key").is_empty());
+    }
+
+    assert_eq!(json.status.code(), Some(0), "{}", stderr(&json));
+    let document = json_output(&json);
+    assert_eq!(document["outcome"], "deauthorized", "{document}");
+    assert_eq!(document["schemaVersion"], 1, "{document}");
+    assert_eq!(
+        document["authorization"],
+        serde_json::json!({
+            "id": CONNECTION_AUTHORIZATION_ID,
+            "provider": "github",
+            "projectId": PROJECT_ID,
+            "projectName": "Website",
+            "runnerId": RUNNER_ID,
+            "runnerName": "bravo",
+            "connectionId": INSTALLATION_ID,
+            "connectionAccount": "acme"
+        })
+    );
+    assert_eq!(named.status.code(), Some(0), "{}", stderr(&named));
+    assert_eq!(json_output(&named)["outcome"], "deauthorized");
+
+    // The report names the authorization, its project, runner and connection, and no scope.
+    assert_eq!(human.status.code(), Some(0), "{}", stderr(&human));
+    let report = String::from_utf8(human.stdout.clone()).unwrap();
+    for field in [
+        CONNECTION_AUTHORIZATION_ID,
+        PROJECT_ID,
+        "Website",
+        RUNNER_ID,
+        INSTALLATION_ID,
+    ] {
+        assert_eq!(
+            report.lines().filter(|line| line.contains(field)).count(),
+            1,
+            "{field} not on one line of\n{report}"
+        );
+    }
+    for absent in ["selected", "contents", PRINCIPAL_ID] {
+        assert!(!report.contains(absent), "{absent} in\n{report}");
+    }
+    assert!(
+        report.lines().last().unwrap().starts_with("deployment: "),
+        "{report}"
+    );
+
+    // None in force, from the list or from the route, ends nothing more.
+    for output in [&repeated, &ended] {
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(output));
+        assert_eq!(json_output(output)["outcome"], "authorization_not_found");
+    }
+
+    // That the permission ends is stated before acting, under a heading naming the connection,
+    // as the refusal states it, and none of it is a token's statement.
+    let stated = statement(&json, INSTALLATION_ID);
+    assert_eq!(stated, statement(&human, INSTALLATION_ID));
+    let heading = stderr(&human).lines().next().unwrap().to_owned();
+    for named in [RUNNER_ID, PROJECT_ID] {
+        assert!(heading.contains(named), "{named} not in {heading}");
+    }
+    assert_stated_by_the_refusal(&stated, &refusal);
+    assert!(
+        stated.iter().all(|line| !token_refusal
+            .lines()
+            .any(|refused| refused.ends_with(line.as_str()))),
+        "{stated:?}\n{token_refusal}"
+    );
+}
+
+// REQ-INTEGRATION-33
+// REQ-GRANT-81
+#[test]
+fn deauthorize_with_a_project_offers_the_runners_that_hold_an_authorization_in_that_project() {
+    // Charlie, registered, and alpha, which has no registration, hold the project's
+    // authorizations; bravo holds none and is not offered.
+    let mut unregistered = connection_authorization(ENDED_RUNNER_ID, "github", INSTALLATION_ID);
+    unregistered["id"] = "cna_01k0z6r1w8f4jy2m7q9v3x5abd".into();
+    let held = json_http_response(
+        "200 OK",
+        serde_json::json!({"items": [
+            connection_authorization(RUNNER_ID, "github", INSTALLATION_ID),
+            unregistered
+        ]}),
+    );
+    let (server, _directory, credential) = prepared(vec![
+        held,
+        registrations(&[
+            registration(BRAVO, "online", "enabled"),
+            registration(CHARLIE, "online", "enabled"),
+        ]),
+        no_project_authorizations(),
+    ]);
+    let refused = deauthorize_in_project(&server, &credential, &["github", "--json"]);
+    let none = deauthorize_in_project(&server, &credential, &["github", "--json"]);
+    assert_eq!(
+        lines(&asked(&server.finish())),
+        [
+            LIST_ACME_PROJECT_AUTHORIZATIONS,
+            LIST_ACME_RUNNERS,
+            LIST_ACME_PROJECT_AUTHORIZATIONS,
+        ]
+    );
+
+    assert_eq!(refused.status.code(), Some(2), "{}", stderr(&refused));
+    let document = json_output(&refused);
+    assert_eq!(document["outcome"], "runner_required", "{document}");
+    assert_eq!(document["connectionId"], INSTALLATION_ID, "{document}");
+    let runners: Vec<_> = document["runners"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|runner| runner["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(runners, [RUNNER_ID, ENDED_RUNNER_ID], "{document}");
+
+    // None in force is no authorization found, and no runner is read.
+    assert_eq!(none.status.code(), Some(1), "{}", stderr(&none));
+    assert_eq!(json_output(&none)["outcome"], "authorization_not_found");
+}
+
+// REQ-INTEGRATION-33
+#[test]
+fn deauthorize_with_a_project_reports_a_refused_list_and_a_deployment_that_does_not_serve_it() {
+    let (server, _directory, credential) = prepared(vec![
+        problem("403 Forbidden", 403, "forbidden"),
+        problem("404 Not Found", 404, "not-found"),
+        organization(),
+    ]);
+    let forbidden = deauthorize_in_project(
+        &server,
+        &credential,
+        &["github", RUNNER_ID, "--yes", "--json"],
+    );
+    let unserved = deauthorize_in_project(
+        &server,
+        &credential,
+        &["github", RUNNER_ID, "--yes", "--json"],
+    );
+    assert_eq!(
+        lines(&asked(&server.finish())),
+        [
+            LIST_ACME_RUNNER_AUTHORIZATIONS,
+            LIST_ACME_RUNNER_AUTHORIZATIONS,
+            READ_ACME,
+        ]
+    );
+    for (output, outcome) in [
+        (&forbidden, "forbidden"),
+        (&unserved, "connection_authorizations_not_served"),
+    ] {
+        assert_eq!(output.status.code(), Some(1), "{}", stderr(output));
+        assert_eq!(json_output(output)["outcome"], outcome);
+    }
 }

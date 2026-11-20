@@ -2,16 +2,21 @@ use anyhow::Context as _;
 use clap::{ArgMatches, Args};
 
 use crate::cli::CommandResult;
-use crate::cli::integration::Reach;
-use useful_api::{MemberGrant, MemberGrantApi, MemberGrantFailure, MemberGrantKind};
+use crate::cli::integration::{ConnectionAuthorizations, Reach, RouteFailure};
+use crate::exit_code::ExitCode;
+use useful_api::{
+    ConnectionAuthorizationRefusal, MemberGrant, MemberGrantApi, MemberGrantFailure,
+    MemberGrantKind,
+};
 use useful_human_auth::Deployment;
 
-use super::authorization::{ended_authorization_views, write_deauthorized};
-use super::confirmation::{Confirmation, NATIVE_DEAUTHORIZE, Stated, Statement};
-use super::runner_choice::Chosen;
+use super::authorization::{Holder, ended_authorization_views, write_deauthorized};
+use super::confirmation::{self, Confirmation, NATIVE_DEAUTHORIZE, Stated, Statement};
+use super::runner_choice::{Acting, Chosen};
 use super::{
     GrantArg, INTEGRATION_HELP, LeafRun, Options, RUNNER_HELP, RunnerArgs, Subject, replayed,
     runner_choice, runner_outcome, state_then_act, state_then_act_on_each, subject_and_runner,
+    with_api,
 };
 
 pub(super) const ABOUT: &str = "End a runner's authorization for one of your grants";
@@ -20,6 +25,15 @@ pub(super) const ABOUT: &str = "End a runner's authorization for one of your gra
 const TOKEN_DEAUTHORIZE: &[&str] = &[
     "the runner is issued the token no more; a running assignment loses it at its next refresh, \
      within five minutes",
+];
+
+/// What ending a runner's authorization for an organization's connection in one project does
+/// (REQ-INTEGRATION-29, REQ-INTEGRATION-33): the permission ends, and no run is touched, since
+/// Cloud delivers an organization's connection to no run today (REQ-INTEGRATION-24).
+const CONNECTION_DEAUTHORIZE: &[&str] = &[
+    "the runner's permission to use the connection for the project's app runs ends",
+    "no run is asked to stop and none loses anything: Cloud delivers an organization's \
+     connection to no run today",
 ];
 
 /// `useful integration deauthorize INTEGRATION [RUNNER]`; given no `RUNNER` it offers the runners
@@ -62,18 +76,39 @@ impl Stated for Command {
         // The ID clap gives the field `runner_id`.
         !matches.try_contains_id("runner_id").unwrap_or(true)
     }
+
+    /// With `--project-id` the command ends a runner's authorization for an organization's
+    /// connection, so its refusal states that end's lines alone (REQ-INTEGRATION-33). Under
+    /// `useful grant`, which has no `project_id` to read, there is no project.
+    fn refusal_lines(matches: &ArgMatches) -> Vec<String> {
+        if matches.try_contains_id("project_id").unwrap_or(false) {
+            CONNECTION_DEAUTHORIZE
+                .iter()
+                .map(|&line| line.to_owned())
+                .collect()
+        } else {
+            Self::STATEMENT.every_line()
+        }
+    }
 }
 
 impl Command {
     /// Ends a runner's authorization of what `INTEGRATION` names under `reach`: a grant, or,
     /// under `useful integration`, a token, the member's or with `--org` the organization's
-    /// (REQ-INTEGRATION-20).
+    /// (REQ-INTEGRATION-20). With `--project-id` it ends the runner's authorization for the
+    /// organization's connection at the provider `INTEGRATION` names in that project instead,
+    /// and looks no grant or token up (REQ-INTEGRATION-33).
     pub(super) fn run(self, deployment: &Deployment, reach: &Reach) -> CommandResult {
         let context = LeafRun {
             deployment,
             options: &self.options,
             reach,
         };
+        if let Some(authorizations) =
+            reach.connection_authorizations(self.grant.as_str(), Self::COMMAND)
+        {
+            return Ok(self.end_connection_authorization(context, &authorizations)?);
+        }
         let options = &self.options;
         let runner = RunnerArgs {
             id: self.runner_id.as_deref(),
@@ -135,6 +170,106 @@ impl Command {
             |api, subject| deauthorize(api, reach, subject, runner_id, &key),
             |api_url, subject, ended, json| write(api_url, subject, runner_id, ended, json),
         )?)
+    }
+
+    /// Ends the runner's authorization for the organization's connection `authorizations`
+    /// names, in its project (REQ-INTEGRATION-29, REQ-INTEGRATION-33): finds it among the
+    /// organization's authorizations in force for the project and the provider, of the runner
+    /// `RUNNER` names or, given none, of one chosen among the runners they name (REQ-GRANT-81,
+    /// REQ-GRANT-82), and of the connection `--connection-id` names; none is reported, with
+    /// nothing more sent. Then it states that the permission ends, asks where the runner was
+    /// chosen without `--yes`, and ends it under one key made before it is sent, once more under
+    /// it when the answer was lost. No connection of the organization is read: the authorization
+    /// names its own.
+    fn end_connection_authorization(
+        &self,
+        context: LeafRun<'_>,
+        authorizations: &ConnectionAuthorizations<'_>,
+    ) -> anyhow::Result<ExitCode> {
+        let LeafRun {
+            deployment,
+            options,
+            ..
+        } = context;
+        let api_url = deployment.fingerprint().api_url();
+        let json = options.json;
+        let runner_id = self.runner_id.as_deref();
+        let report = |failure: &RouteFailure| authorizations.report(api_url, failure);
+        let not_found = || {
+            report(&RouteFailure::Failed(
+                MemberGrantFailure::ConnectionAuthorizationRefused(
+                    ConnectionAuthorizationRefusal::AuthorizationNotFound,
+                ),
+            ))
+            .write(api_url, json)
+        };
+        let read = with_api(deployment, options, |api| {
+            authorizations.to_end(api, runner_id)
+        })?;
+        let in_force = match RouteFailure::answered(read) {
+            Ok(in_force) if in_force.is_empty() => return not_found(),
+            Ok(in_force) => in_force,
+            Err(failure) => return report(&failure).write(api_url, json),
+        };
+        let runner = match runner_id {
+            Some(runner_id) => Acting::named(runner_id),
+            None => {
+                let offer =
+                    runner_choice::to_deauthorize_connection(deployment, options, &in_force)?;
+                // The connection every authorization offered names, which the command line
+                // names only where `--connection-id` did.
+                let connection = in_force
+                    .first()
+                    .map(|first| first.connection_id.as_str())
+                    .filter(|first| {
+                        in_force
+                            .iter()
+                            .all(|authorization| authorization.connection_id == *first)
+                    });
+                let named = connection.filter(|_| authorizations.names_connection());
+                match runner_choice::choose(
+                    deployment,
+                    json,
+                    self.confirmation.yes,
+                    offer,
+                    connection.map(Holder::Connection),
+                    &format!(
+                        "whose authorization for the {} connection to end",
+                        authorizations.provider()
+                    ),
+                    |runner_id| authorizations.command_line(runner_id, named),
+                )? {
+                    Ok(runner) => runner,
+                    Err(exit) => return Ok(exit),
+                }
+            }
+        };
+        // Cloud holds at most one in force for the project, the runner and the provider.
+        let Some(authorization) = in_force
+            .into_iter()
+            .find(|authorization| authorization.runner_id == runner.id)
+        else {
+            return not_found();
+        };
+        confirmation::state(
+            format_args!(
+                "{}",
+                authorizations.ending_heading(&runner.named, &authorization)
+            ),
+            CONNECTION_DEAUTHORIZE,
+        )?;
+        if let Err(exit) = confirmation::go_on(runner.asks)? {
+            return Ok(exit);
+        }
+        let key = useful_support::generate_idempotency_key()
+            .context("generate connection deauthorization request key")?;
+        let ended = with_api(deployment, options, |api| {
+            authorizations.end(api, &authorization.id, &key)
+        })?;
+        match RouteFailure::answered(ended) {
+            Ok(()) => authorizations.write_deauthorized(api_url, &authorization, json),
+            Err(failure) => report(&failure).write(api_url, json),
+        }
     }
 }
 

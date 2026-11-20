@@ -995,9 +995,10 @@ useful integration connect mergify --org acme --replace
 # exit 2 before any request, as are --no-wait and --timeout with github. gitlab.com is refused
 # with --org: its connection is the several steps of
 # useful connection gitlab create ORGANIZATION INSTANCE_URL. An organization's connection acts
-# for Cloud and is authorized for no runner, so authorize, deauthorize and revoke refuse --org
-# with github, gitlab.com and linear, and revoke names the useful connection command that
-# removes one.
+# for Cloud and is authorized for a runner only by a connection authorization, so authorize and
+# deauthorize refuse --org with github, gitlab.com and linear unless --project-id is given,
+# naming that form, and revoke refuses it and names the useful connection command that removes
+# the connection.
 useful integration connect github --org acme
 useful integration connect linear --org acme --no-wait --json
 
@@ -1051,9 +1052,14 @@ useful integration list
 # each as side org with its service (github, linear or gitlab.com), ID, account and state as
 # useful connection prints it. A read you may not make, such as the GitHub installations for a
 # member who is not an owner, or one the deployment has not configured, is left out and fails
-# nothing. --org keeps that organization's tokens and connections alone, with no grant. A
-# connection is named to no other useful integration command; useful connection shows and
-# removes it.
+# nothing. Under each connection of an organization you own, or the one --org names, it lists
+# the runners authorized for that connection: each authorization's ID, its project and runner
+# by name and ID, who authorized it by ID and when, and the repository selection and each
+# permission the provider grants the connection, or that the provider could not be read. Where
+# Cloud refuses that read or cannot serve it, the connections are listed without it. --org
+# keeps that organization's tokens and connections alone, with no grant. A connection is named
+# to no other useful integration command but authorize and deauthorize with --project-id;
+# useful connection shows and removes it.
 useful integration list --org acme --json
 
 # Show one grant in detail: for a native grant what each runner was last delivered and
@@ -1097,11 +1103,50 @@ useful integration authorize claude_code
 # that grant, and exits 1.
 useful integration authorize --all rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 
+# As an owner, authorize a runner for the organization's connection at github, gitlab.com or
+# linear in one project with --org ORGANIZATION and --project-id PROJECT. The permission covers
+# every app run of that project on that runner, whoever or whatever caused the run, and reaches
+# whatever the provider grants the connection, which no authorization narrows; Cloud delivers
+# an organization's connection to no run today, so the authorization records a permission and
+# delivers nothing. The command states this and does nothing without --yes. It reads the
+# organization's connections at the provider and takes the active one; where several are
+# active, --connection-id CONNECTION names one, and without it the command names each by ID and
+# account and exits 2 (connection_required). With none active it exits 1 (connection_not_found)
+# naming the command that connects the organization, and with a --connection-id the read does
+# not list it exits 1 the same way naming useful integration list --org ORGANIZATION. Given no
+# RUNNER it offers the organization's runners that hold no authorization for that project and
+# provider, one to choose. It prints the authorization; --json prints one
+# document with outcome authorized whose authorization carries id, provider, projectId,
+# projectName, runnerId, runnerName, connectionId, connectionAccount, authorizedBy, createdAt and
+# scope: its state, current or unavailable, and for a current GitHub scope github with the
+# installation's repositorySelection and each permission's name and access. Cloud decides which
+# providers it authorizes: a refusal exits 1 as forbidden, project_not_found, runner_not_found,
+# connection_not_found, connection_inactive, provider_ineligible or already_authorized, and a
+# deployment that does not serve these authorizations as connection_authorizations_not_served.
+# --project-id needs --org and is refused with --all and with any other name, exit 2.
+useful integration authorize github rnr_01k0z6r1w8f4jy2m7q9v3x5abc --org acme --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+useful integration authorize github --org acme --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc --connection-id ghi_01k0z6r1w8f4jy2m7q9v3x5abc --json
+
 # End that runner's authorization. For a native grant Cloud also asks the run that runner is
 # serving, whichever member started it, to stop, and the command prints whether the runner has
 # confirmed removing its copy and the run asked to stop; for an OAuth grant no run is stopped
 # and no further token is issued there.
 useful integration deauthorize codex rnr_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+
+# As an owner, end a runner's authorization for the organization's connection at github,
+# gitlab.com or linear in one project with --org ORGANIZATION and --project-id PROJECT. The
+# command finds the authorization in force for that project, runner and provider in the
+# organization's list, reading no connection; --connection-id CONNECTION keeps only an
+# authorization of that connection. It states that the runner's permission ends and that no run
+# is asked to stop or loses anything, and does nothing without --yes. Given no RUNNER it offers
+# the runners that hold an authorization for that project and provider, one to choose. It
+# prints the authorization's ID, project, runner and connection; --json prints one document
+# with outcome deauthorized whose authorization carries id, provider, projectId, projectName,
+# runnerId, runnerName, connectionId and connectionAccount. Where none is in force, a repeated
+# command included, it sends nothing more and exits 1 (authorization_not_found); forbidden and
+# connection_authorizations_not_served are reported as authorize reports them.
+useful integration deauthorize github rnr_01k0z6r1w8f4jy2m7q9v3x5abc --org acme --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc --yes
+useful integration deauthorize github --org acme --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc --json
 
 # Revoke a grant everywhere. An OAuth grant is erased and revoked at the provider where the
 # provider offers it. A native grant is erased and the command prints each runner it was
@@ -1126,8 +1171,13 @@ present whatever it holds: your tokens and then each organization's, each with i
 `connectedAt`, `createdAt` and `authorizations`, none of which holds the token itself.
 It and `list --org ORGANIZATION --json` also carry `connections`, present whatever it holds:
 each organization connection with its `id`, `service`, `side` (`org`), `organization`,
-`account` where the read names one, `instanceUrl` for a GitLab connection, and `state`, and
-never a credential. `useful grant list` carries no `tokens` and no `connections`.
+`account` where the read names one, `instanceUrl` for a GitLab connection, `state` and,
+where the organization's authorizations were read, `authorizations`, present whatever it
+holds: each with the `id`, `provider`, `projectId`, `projectName`, `runnerId`, `runnerName`,
+`connectionId`, `connectionAccount`, `authorizedBy`, `createdAt` and `scope` that
+`useful integration authorize` given `--project-id` prints under `--json`, and never a
+credential.
+`useful grant list` carries no `tokens` and no `connections`.
 
 `connect --json` prints newline-delimited events: `consent_required` with `sessionId`,
 `provider`, `authorizationUrl` and `expiresAt`, then `consent_result` with its `outcome`

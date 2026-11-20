@@ -483,6 +483,7 @@ const fn audit_subject_kind(kind: OrganizationAuditSubjectKind) -> &'static str 
         OrganizationAuditSubjectKind::RunnerCredential => "runner_credential",
         OrganizationAuditSubjectKind::RunnerJoinKey => "runner_join_key",
         OrganizationAuditSubjectKind::IntegrationToken => "integration_token",
+        OrganizationAuditSubjectKind::ConnectionAuthorization => "connection_authorization",
         OrganizationAuditSubjectKind::GithubInstallation => "github_installation",
         OrganizationAuditSubjectKind::GitlabConnection => "gitlab_connection",
         OrganizationAuditSubjectKind::GitlabCandidate => "gitlab_candidate",

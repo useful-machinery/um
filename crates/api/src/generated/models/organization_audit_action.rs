@@ -159,6 +159,10 @@ pub enum OrganizationAuditAction {
     IntegrationTokenRunnerDeauthorized,
     #[serde(rename = "integration_token.issued")]
     IntegrationTokenIssued,
+    #[serde(rename = "connection_authorization.authorized")]
+    ConnectionAuthorizationAuthorized,
+    #[serde(rename = "connection_authorization.revoked")]
+    ConnectionAuthorizationRevoked,
     #[serde(rename = "github_installation.connected")]
     GithubInstallationConnected,
     #[serde(rename = "github_installation.reactivated")]
@@ -390,6 +394,10 @@ impl std::fmt::Display for OrganizationAuditAction {
                 write!(f, "integration_token.runner_deauthorized")
             }
             Self::IntegrationTokenIssued => write!(f, "integration_token.issued"),
+            Self::ConnectionAuthorizationAuthorized => {
+                write!(f, "connection_authorization.authorized")
+            }
+            Self::ConnectionAuthorizationRevoked => write!(f, "connection_authorization.revoked"),
             Self::GithubInstallationConnected => write!(f, "github_installation.connected"),
             Self::GithubInstallationReactivated => write!(f, "github_installation.reactivated"),
             Self::GithubInstallationDisconnected => write!(f, "github_installation.disconnected"),

@@ -92,6 +92,8 @@ pub enum Kind {
     Schedule,
     #[serde(rename = "workflow_definition")]
     WorkflowDefinition,
+    #[serde(rename = "connection_authorization")]
+    ConnectionAuthorization,
 }
 
 impl Default for Kind {

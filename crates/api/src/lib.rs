@@ -7,6 +7,7 @@ mod artifacts;
     reason = "artifact unit tests use Rust test assertions and fixture extraction"
 )]
 mod artifacts_tests;
+mod connection_authorizations;
 mod current_principal;
 mod delegations;
 mod github;
@@ -82,6 +83,12 @@ pub use artifacts::{
     ArtifactSource,
 };
 pub use artifacts::{ArtifactCapabilities, DownloadedMember};
+pub use connection_authorizations::{
+    ConnectionAuthorization, ConnectionAuthorizationFilter, ConnectionAuthorizationList,
+    ConnectionAuthorizationRefusal, ConnectionAuthorizationRequest, ConnectionAuthorizationScope,
+    ConnectionAuthorizationState, GitHubInstallationPermission, GitHubInstallationScope,
+    GitHubRepositorySelection,
+};
 pub use current_principal::{
     AuthenticatedPrincipal, CurrentPrincipalError, CurrentPrincipalOutcome, UnreachableCategory,
     classify_reqwest_error, get_current_principal,

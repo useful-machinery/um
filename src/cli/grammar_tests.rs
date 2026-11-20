@@ -639,6 +639,47 @@ fn org_is_an_option_of_every_integration_leaf_and_of_no_grant_leaf() {
     assert!(grant.iter().all(|(_, org)| !*org), "{grant:?}");
 }
 
+// REQ-INTEGRATION-15
+// REQ-INTEGRATION-33
+// `--project-id` and `--connection-id` act on an organization's connection authorization, which
+// only `useful integration authorize` and `deauthorize` reach among these leaves: no leaf of
+// `useful grant` takes either.
+#[test]
+fn project_and_connection_are_options_of_integration_authorize_and_deauthorize_and_of_no_grant_leaf()
+ {
+    let mut root = Cli::command();
+    root.build();
+    let taking = |family: &str| {
+        root.find_subcommand(family)
+            .unwrap_or_else(|| panic!("no {family}"))
+            .get_subcommands()
+            .filter(|leaf| {
+                leaf.get_arguments()
+                    .any(|arg| arg.get_id() == "project_id" || arg.get_id() == "connection_id")
+            })
+            .map(|leaf| {
+                let ids = leaf
+                    .get_arguments()
+                    .map(|arg| arg.get_id().as_str())
+                    .filter(|id| ["project_id", "connection_id"].contains(id))
+                    .collect::<Vec<_>>();
+                (leaf.get_name().to_owned(), ids)
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        taking("integration"),
+        [
+            ("authorize".to_owned(), vec!["project_id", "connection_id"]),
+            (
+                "deauthorize".to_owned(),
+                vec!["project_id", "connection_id"]
+            )
+        ]
+    );
+    assert_eq!(taking("grant"), []);
+}
+
 // REQ-CONNECTION-88
 #[test]
 fn github_connections_live_only_under_the_connection_family() {

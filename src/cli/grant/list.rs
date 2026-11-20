@@ -77,9 +77,10 @@ impl Command {
     /// Where `reach` puts token services in reach, under `useful integration`, the list then
     /// reads the member's tokens and each of their organizations', once the served read named a
     /// token service, and the memberships and each organization's connections whatever is
-    /// served; a name that names no grant is looked up among the member's tokens; and `--org`
-    /// keeps that organization's tokens and connections alone, with no grant
-    /// (REQ-INTEGRATION-19, REQ-INTEGRATION-22).
+    /// served, each connection with its authorizations where its organization's are read; a
+    /// name that names no grant is looked up among the member's tokens; and `--org` keeps that
+    /// organization's tokens and connections alone, with no grant (REQ-INTEGRATION-19,
+    /// REQ-INTEGRATION-22, REQ-INTEGRATION-34).
     pub(super) fn run(self, deployment: &Deployment, reach: &Reach) -> anyhow::Result<ExitCode> {
         let json = self.options.json;
         let read = super::with_api(deployment, &self.options, |api| {

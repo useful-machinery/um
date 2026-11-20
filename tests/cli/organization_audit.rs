@@ -141,7 +141,7 @@ fn organization_audit_list_preserves_one_privacy_safe_page_as_stable_json() {
     let requests = server.finish();
     assert_eq!(requests.len(), 1, "the CLI must return exactly one page");
     assert!(requests[0].starts_with(
-        "GET /api/v1/organizations/acme-research/audit-records?limit=100&cursor=opaque+%2F%2B%3D%3F%26&vocabulary=4 HTTP/1.1\r\n"
+        "GET /api/v1/organizations/acme-research/audit-records?limit=100&cursor=opaque+%2F%2B%3D%3F%26&vocabulary=5 HTTP/1.1\r\n"
     ));
     assert_eq!(
         header_value(&requests[0], "authorization"),
@@ -391,7 +391,7 @@ fn organization_audit_list_reads_gitlab_connection_and_candidate_records() {
     assert_eq!(document["items"], page["items"]);
     let requests = server.finish();
     assert!(requests[0].starts_with(
-        "GET /api/v1/organizations/acme-research/audit-records?vocabulary=4 HTTP/1.1\r\n"
+        "GET /api/v1/organizations/acme-research/audit-records?vocabulary=5 HTTP/1.1\r\n"
     ));
 
     let (server, _directory, _path, credential_path) =
@@ -411,6 +411,80 @@ fn organization_audit_list_reads_gitlab_connection_and_candidate_records() {
     for expected in [
         "target: gitlab_connection glc_01k0z6r1w8f4jy2m7q9v3x5abc",
         "target: gitlab_candidate glca_01k0z6r1w8f4jy2m7q9v3x5abc",
+    ] {
+        assert!(
+            stdout.lines().any(|line| line == expected),
+            "missing {expected}"
+        );
+    }
+    server.finish();
+}
+
+// REQ-AUDIT-48
+#[test]
+fn organization_audit_list_reads_a_connection_authorization_record() {
+    let page = serde_json::json!({
+        "items": [gitlab_audit_item(
+            "aud_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "2026-11-18T12:00:00Z",
+            serde_json::json!({
+                "kind": "principal",
+                "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc"
+            }),
+            "connection_authorization.revoked",
+            serde_json::json!({
+                "kind": "connection_authorization",
+                "id": "cna_01k0z6r1w8f4jy2m7q9v3x5abc"
+            }),
+            serde_json::json!([
+                { "field": "provider", "after": "github" },
+                { "field": "project_id", "after": "prj_01k0z6r1w8f4jy2m7q9v3x5abc" },
+                { "field": "runner_id", "after": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc" },
+                { "field": "connection_id", "after": "gac_01k0z6r1w8f4jy2m7q9v3x5abc" },
+                { "field": "state", "before": "active", "after": "revoked" }
+            ]),
+        )],
+        "warnings": []
+    });
+
+    let (server, _directory, _path, credential_path) = organization::prepared_organization(
+        vec![json_http_response("200 OK", page.clone())],
+        TOKEN,
+    );
+    let output = run_with_env(
+        &[
+            "organization",
+            "audit",
+            "list",
+            "acme-research",
+            "--json",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert!(output.status.success(), "{output:?}");
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(document["items"], page["items"]);
+    server.finish();
+
+    let (server, _directory, _path, credential_path) =
+        organization::prepared_organization(vec![json_http_response("200 OK", page)], TOKEN);
+    let output = run_with_env(
+        &[
+            "organization",
+            "audit",
+            "list",
+            "acme-research",
+            "--allow-insecure-http",
+        ],
+        &deployment_environment(&server.api_url, &credential_path),
+    );
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    for expected in [
+        "action: connection_authorization.revoked",
+        "target: connection_authorization cna_01k0z6r1w8f4jy2m7q9v3x5abc",
+        "changes: 5",
     ] {
         assert!(
             stdout.lines().any(|line| line == expected),

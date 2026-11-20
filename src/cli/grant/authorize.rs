@@ -3,7 +3,7 @@ use clap::error::{ContextKind, ContextValue, ErrorKind};
 use clap::{ArgMatches, Args, FromArgMatches};
 
 use crate::cli::CommandResult;
-use crate::cli::integration::Reach;
+use crate::cli::integration::{ConnectionAuthorizations, Reach, RouteFailure};
 use crate::exit_code::ExitCode;
 use useful_api::{
     IntegrationTokenAuthorization, IntegrationTokenSide, MemberGrantApi, MemberGrantAuthorization,
@@ -11,13 +11,13 @@ use useful_api::{
 };
 use useful_human_auth::Deployment;
 
-use super::authorization::{AuthorizationView, write_authorized};
+use super::authorization::{AuthorizationView, Holder, write_authorized};
 use super::confirmation::{self, Confirmation, Kind, NATIVE_AUTHORIZE, Stated, Statement};
 use super::runner_choice::{self, Acting, Chosen};
 use super::{
     GrantArg, INTEGRATION_HELP, LeafRun, Options, RUNNER_HELP, RunnerArgs, Subject,
     each_under_its_key, every_grant, output, replayed, report_under, runner_outcome,
-    state_then_act, state_then_act_on_each, subject_and_runner, unrevoked,
+    state_then_act, state_then_act_on_each, subject_and_runner, unrevoked, with_api,
 };
 
 pub(super) const ABOUT: &str = "Authorize a runner to use one of your grants, or all of them";
@@ -27,6 +27,18 @@ pub(super) const ABOUT: &str = "Authorize a runner to use one of your grants, or
 /// grant serves one runner, and another sign-in cannot make a second grant for another runner,
 /// since a held grant is refused or replaced in place (REQ-GRANT-73).
 pub(in crate::cli) const MOVE_CODEX_GRANT: &str = "A Codex grant serves one runner at a time. To move it to this runner, end its authorization for the other, which `useful integration list INTEGRATION` names, then authorize this one:\n  useful integration deauthorize INTEGRATION RUNNER --yes";
+
+/// What authorizing a runner for an organization's connection in one project permits
+/// (REQ-INTEGRATION-33): it is a permission, which the authorization records and Cloud acts on
+/// for no run today (REQ-INTEGRATION-24).
+const CONNECTION_AUTHORIZE: &[&str] = &[
+    "the permission covers every app run of the project on the runner, whoever or whatever \
+     caused the run",
+    "the permission reaches whatever the provider grants the connection; no authorization \
+     narrows that",
+    "Cloud delivers an organization's connection to no run today: the authorization records a \
+     permission and delivers nothing",
+];
 
 /// The leaf's arguments as clap reads them. `--all` takes the place of `INTEGRATION`, so after it
 /// the first positional is the runner: clap fills positionals in order, whatever they hold, so the
@@ -205,6 +217,20 @@ impl Stated for Command {
     fn chooses_runner(matches: &ArgMatches) -> bool {
         target(matches).is_ok_and(|(_, runner_id)| runner_id.is_none())
     }
+
+    /// With `--project-id` the command authorizes a runner for an organization's connection, so
+    /// its refusal states that authorization's lines alone (REQ-INTEGRATION-33). Under
+    /// `useful grant`, which has no `project_id` to read, there is no project.
+    fn refusal_lines(matches: &ArgMatches) -> Vec<String> {
+        if matches.try_contains_id("project_id").unwrap_or(false) {
+            CONNECTION_AUTHORIZE
+                .iter()
+                .map(|&line| line.to_owned())
+                .collect()
+        } else {
+            Self::STATEMENT.every_line()
+        }
+    }
 }
 
 /// An authorization `authorize` made: of a grant, or of a token (REQ-INTEGRATION-20).
@@ -278,7 +304,10 @@ const fn refuses_one_subject(failure: &MemberGrantFailure) -> bool {
 impl Command {
     /// Authorizes the runner for what `INTEGRATION` names under `reach`, a grant or, under
     /// `useful integration`, a token, the member's or with `--org` the organization's; or with
-    /// `--all` for every one that can serve it (REQ-GRANT-66, REQ-INTEGRATION-20).
+    /// `--all` for every one that can serve it (REQ-GRANT-66, REQ-INTEGRATION-20). With
+    /// `--project-id` it authorizes the runner for the organization's connection at the
+    /// provider `INTEGRATION` names in that project instead, and looks no grant or token up
+    /// (REQ-INTEGRATION-33).
     pub(super) fn run(self, deployment: &Deployment, reach: &Reach) -> CommandResult {
         let options = &self.arguments.options;
         let context = LeafRun {
@@ -309,7 +338,14 @@ impl Command {
                     Err(exit) => Ok(exit),
                 };
             }
-            (Target::Grant(grant), _) => grant,
+            (Target::Grant(grant), _) => {
+                if let Some(authorizations) =
+                    reach.connection_authorizations(grant.as_str(), Self::COMMAND)
+                {
+                    return Ok(self.authorize_connection(context, &authorizations)?);
+                }
+                grant
+            }
         };
         let runner = RunnerArgs {
             id: self.runner_id.as_deref(),
@@ -363,6 +399,100 @@ impl Command {
             |api, subject| authorize(api, reach, subject, &runner.id, &key),
             |api_url, subject, made, json| write(api_url, subject, &made, json),
         )?)
+    }
+
+    /// Authorizes the runner for the organization's connection `authorizations` names, in its
+    /// project (REQ-INTEGRATION-33): reads the organization's connections at the provider and
+    /// takes the one it acts on, then the runner `RUNNER` names or, given none, one chosen among
+    /// the organization's runners that hold no authorization in force for the project and the
+    /// provider (REQ-GRANT-81, REQ-GRANT-82); states what the authorization permits, asks where
+    /// the runner was chosen without `--yes`, and sends the authorization under one key made
+    /// before the session is opened, once more under it when the answer was lost.
+    fn authorize_connection(
+        &self,
+        context: LeafRun<'_>,
+        authorizations: &ConnectionAuthorizations<'_>,
+    ) -> anyhow::Result<ExitCode> {
+        let LeafRun {
+            deployment,
+            options,
+            ..
+        } = context;
+        let api_url = deployment.fingerprint().api_url();
+        let json = options.json;
+        let runner_id = self.runner_id.as_deref();
+        let connection = match authorizations.connection(
+            deployment,
+            options.http.allow_insecure_http,
+            runner_id,
+            json,
+        )? {
+            Ok(connection) => connection,
+            Err(exit) => return Ok(exit),
+        };
+        let runner = match runner_id {
+            Some(runner_id) => Acting::named(runner_id),
+            None => {
+                let read = with_api(deployment, options, |api| {
+                    authorizations.in_force(api, None)
+                })?;
+                let in_force: Vec<_> = match RouteFailure::answered(read) {
+                    Ok(in_force) => in_force
+                        .into_iter()
+                        .map(|authorization| authorization.runner_id)
+                        .collect(),
+                    Err(failure) => {
+                        return authorizations
+                            .report(api_url, &failure)
+                            .write(api_url, json);
+                    }
+                };
+                let offer = runner_choice::to_authorize_connection(
+                    deployment,
+                    options,
+                    authorizations.organization(),
+                    &in_force,
+                )?;
+                // The command line names the connection only where `--connection-id` did.
+                let named = authorizations
+                    .names_connection()
+                    .then_some(connection.id.as_str());
+                match runner_choice::choose(
+                    deployment,
+                    json,
+                    self.arguments.confirmation.yes,
+                    offer,
+                    Some(Holder::Connection(&connection.id)),
+                    &format!(
+                        "to authorize for the {} connection {}",
+                        authorizations.provider(),
+                        connection.id
+                    ),
+                    |runner_id| authorizations.command_line(runner_id, named),
+                )? {
+                    Ok(runner) => runner,
+                    Err(exit) => return Ok(exit),
+                }
+            }
+        };
+        confirmation::state(
+            format_args!("{}", authorizations.heading(&runner.named, &connection)),
+            CONNECTION_AUTHORIZE,
+        )?;
+        if let Err(exit) = confirmation::go_on(runner.asks)? {
+            return Ok(exit);
+        }
+        let key = useful_support::generate_idempotency_key()
+            .context("generate connection authorization request key")?;
+        let made = with_api(deployment, options, |api| {
+            authorizations.authorize(api, &connection.id, &runner.id, &key)
+        })?;
+        match RouteFailure::answered(made) {
+            Ok(authorization) => authorizations.write_authorized(api_url, &authorization, json),
+            Err(failure) => authorizations
+                .report(api_url, &failure)
+                .write(api_url, json),
+        }
     }
 
     /// Authorizes the runner for every unrevoked grant of the member and, under

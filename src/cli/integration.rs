@@ -8,8 +8,12 @@
 //! `connect --org` connects the organization at GitHub or Linear through the `useful connection`
 //! family's own leaves, reached the same way (REQ-INTEGRATION-21), as `list` reads the
 //! organizations' connections through that family's reads (REQ-INTEGRATION-22).
-//! `useful grant` is its earlier, hidden name (REQ-INTEGRATION-15).
+//! `authorize` given `--org` and `--project-id` authorizes a runner for one of the
+//! organization's connections in that project, and `deauthorize` given them ends that, each
+//! acting on it through `integration/` as well (REQ-INTEGRATION-33). `useful grant` is its
+//! earlier, hidden name (REQ-INTEGRATION-15).
 
+mod authorizations;
 mod connect;
 mod connections;
 mod output;
@@ -20,13 +24,14 @@ use std::path::Path;
 use clap::{Args, Subcommand};
 
 use super::grant::{self, Flow, Leaf, authorize, create, deauthorize, list, revoke};
-use super::{ApiFailureReport, CommandFailure, OrganizationArg, connection};
+use super::{ApiFailureReport, CommandFailure, OrganizationArg, ProjectArg, connection};
 use crate::exit_code::ExitCode;
 use useful_api::{
     IntegrationToken, IntegrationTokenOwner, MemberGrantApi, MemberGrantFailure, ServedTokenService,
 };
 use useful_human_auth::Deployment;
 
+pub(super) use authorizations::{ConnectionAuthorizations, RouteFailure};
 pub(super) use connections::{Connections, Listing};
 pub(super) use tokens::{ListedToken, Tokens};
 
@@ -47,11 +52,11 @@ pub(super) struct Command {
 #[derive(Debug, Subcommand)]
 enum IntegrationCommand {
     #[command(about = "Authorize a runner to use one of your integrations, or all of them")]
-    Authorize(Org<authorize::Command>),
+    Authorize(OrgProject<authorize::Command>),
     #[command(about = "Connect a service through its provider's own sign-in or with its token")]
     Connect(Connect),
     #[command(about = "End a runner's authorization for one of your integrations")]
-    Deauthorize(Org<deauthorize::Command>),
+    Deauthorize(OrgProject<deauthorize::Command>),
     #[command(about = "List your integrations with where each may run, or show one")]
     List(Org<list::Command>),
     #[command(about = "Revoke one of your integrations everywhere")]
@@ -74,9 +79,9 @@ struct Connect {
     org: Option<OrganizationArg>,
 }
 
-/// A leaf of `useful integration` but `connect`: the arguments of the `useful grant` leaf `C` and
-/// `--org`, with which `list` keeps one organization's side alone and `authorize`, `deauthorize`
-/// and `revoke` act on the organization's token (REQ-INTEGRATION-17, REQ-INTEGRATION-19).
+/// `list` and `revoke` of `useful integration`: the arguments of the `useful grant` leaf `C` and
+/// `--org`, with which `list` keeps one organization's side alone and `revoke` acts on the
+/// organization's token (REQ-INTEGRATION-17, REQ-INTEGRATION-19).
 #[derive(Debug, Args)]
 struct Org<C: Args> {
     #[command(flatten)]
@@ -86,18 +91,86 @@ struct Org<C: Args> {
     org: Option<OrganizationArg>,
 }
 
+/// `authorize` and `deauthorize` of `useful integration`: the arguments of the `useful grant`
+/// leaf `C`, `--org` as [`Org`] takes it, with which the leaf acts on the organization's token,
+/// and `--project-id` and `--connection-id`, with which it acts on a runner's authorization for
+/// one of the organization's connections in that project in place of a grant or a token
+/// (REQ-INTEGRATION-17, REQ-INTEGRATION-33). `--project-id` requires `--org` and conflicts with
+/// what [`ProjectLeaf::CONFLICTS`] names of `C`, and `--connection-id` requires `--project-id`.
+#[derive(Debug, Args)]
+struct OrgProject<C: ProjectLeaf> {
+    // First: derive reads the fields in order and takes each value out of the matches, and the
+    // leaf's confirmation reads `project_id` from them to state what it refuses.
+    #[command(flatten)]
+    command: C,
+
+    #[arg(long = "org", value_name = OrganizationArg::VALUE_NAME, help = ORG_HELP)]
+    org: Option<OrganizationArg>,
+
+    #[arg(
+        long,
+        value_name = ProjectArg::VALUE_NAME,
+        help = ProjectArg::HELP,
+        requires = "org",
+        conflicts_with_all = C::CONFLICTS
+    )]
+    project_id: Option<ProjectArg>,
+
+    #[arg(
+        long,
+        value_name = "CONNECTION",
+        help = C::CONNECTION_HELP,
+        requires = "project_id"
+    )]
+    connection_id: Option<String>,
+}
+
+/// A `useful grant` leaf that `useful integration` gives `--project-id` and `--connection-id`.
+trait ProjectLeaf: Args {
+    /// The leaf's arguments that `--project-id` conflicts with.
+    const CONFLICTS: &'static [&'static str];
+    /// The leaf's help of `--connection-id`: what the leaf does with the connection it names and
+    /// without one.
+    const CONNECTION_HELP: &'static str;
+}
+
+impl ProjectLeaf for authorize::Command {
+    // `--all` ranges over the grants or the organization's tokens, which name no project.
+    const CONFLICTS: &'static [&'static str] = &["all"];
+    const CONNECTION_HELP: &'static str = "Organization connection ID, as useful integration list prints it; omit to take the one active connection";
+}
+
+impl ProjectLeaf for deauthorize::Command {
+    // `deauthorize` has no `--all`.
+    const CONFLICTS: &'static [&'static str] = &[];
+    // The authorization in force names its own connection, so the option only keeps one.
+    const CONNECTION_HELP: &'static str = "Organization connection ID, as useful integration list prints it; omit to end the authorization whichever connection it names";
+}
+
 impl Command {
     pub(super) fn execute(self) -> super::CommandResult {
         grant::execute(self.command, &["integration"], |command| match command {
-            IntegrationCommand::Authorize(Org { command, org }) => {
-                Leaf::Authorize(command, Reach::integration(Named::Authorize, org))
-            }
+            IntegrationCommand::Authorize(OrgProject {
+                command,
+                org,
+                project_id,
+                connection_id,
+            }) => Leaf::Authorize(
+                command,
+                Reach::integration(Named::Authorize, org).in_project(project_id, connection_id),
+            ),
             IntegrationCommand::Connect(Connect { command, org }) => {
                 Leaf::Create(command, Reach::integration(Named::Connect, org))
             }
-            IntegrationCommand::Deauthorize(Org { command, org }) => {
-                Leaf::Deauthorize(command, Reach::integration(Named::Deauthorize, org))
-            }
+            IntegrationCommand::Deauthorize(OrgProject {
+                command,
+                org,
+                project_id,
+                connection_id,
+            }) => Leaf::Deauthorize(
+                command,
+                Reach::integration(Named::Deauthorize, org).in_project(project_id, connection_id),
+            ),
             IntegrationCommand::List(Org { command, org }) => {
                 Leaf::List(command, Reach::integration(Named::List, org))
             }
@@ -108,15 +181,22 @@ impl Command {
     }
 }
 
-/// What only `useful integration` hands a leaf: whether token services are in reach, and the
+/// What only `useful integration` hands a leaf: whether token services are in reach, the
 /// organization `--org` names, by ID or slug, whose side the leaf acts on in place of the
-/// member's (REQ-INTEGRATION-16, REQ-INTEGRATION-17). `useful grant` hands [`Reach::GRANTS`],
-/// which reaches grants alone, so its leaves send and print what they did (REQ-INTEGRATION-15).
-/// A leaf reaches the token code through this, never directly.
+/// member's (REQ-INTEGRATION-16, REQ-INTEGRATION-17), and for `authorize` and `deauthorize` the
+/// project `--project-id` names and the connection `--connection-id` names (REQ-INTEGRATION-33).
+/// `useful grant` hands [`Reach::GRANTS`], which reaches grants alone, so its leaves send and
+/// print what they did (REQ-INTEGRATION-15). A leaf reaches the token and connection
+/// authorization code through this, never directly.
 #[derive(Debug)]
 pub(in crate::cli) struct Reach {
     tokens: bool,
     org: Option<OrganizationArg>,
+    /// The project of the connection authorization the leaf acts on; none on a leaf that takes
+    /// no `--project-id` and under `useful grant`.
+    project: Option<ProjectArg>,
+    /// The connection `--connection-id` names, which only a project's leaf takes.
+    connection: Option<String>,
     /// The leaf of `useful integration` handed this, whose refusal of `--org` it words; none
     /// under `useful grant`, which takes no `--org`.
     leaf: Option<Named>,
@@ -147,6 +227,8 @@ impl Reach {
     pub(in crate::cli) const GRANTS: Self = Self {
         tokens: false,
         org: None,
+        project: None,
+        connection: None,
         leaf: None,
     };
 
@@ -155,7 +237,19 @@ impl Reach {
         Self {
             tokens: true,
             org,
+            project: None,
+            connection: None,
             leaf: Some(leaf),
+        }
+    }
+
+    /// This, for a leaf given the project `--project-id` names and the connection
+    /// `--connection-id` names.
+    fn in_project(self, project: Option<ProjectArg>, connection: Option<String>) -> Self {
+        Self {
+            project,
+            connection,
+            ..self
         }
     }
 
@@ -167,6 +261,31 @@ impl Reach {
     /// The organization `--org` names, by ID or slug.
     pub(in crate::cli) fn org(&self) -> Option<&str> {
         self.org.as_deref()
+    }
+
+    /// The project `--project-id` names, with which the leaf acts on a connection authorization
+    /// (REQ-INTEGRATION-33).
+    pub(in crate::cli) fn project(&self) -> Option<&str> {
+        self.project.as_deref()
+    }
+
+    /// The organization's connection authorizations the leaf at `command` acts on for `name`
+    /// (REQ-INTEGRATION-33): where `--org` and `--project-id` were given and `name` is `github`,
+    /// `gitlab.com` or `linear`, those of that organization at that provider in that project,
+    /// with the connection `--connection-id` names; otherwise none, and the leaf finds a grant or
+    /// a token, or refuses `--project-id` with [`Reach::refuse_project`].
+    pub(in crate::cli) fn connection_authorizations(
+        &self,
+        name: &str,
+        command: &'static str,
+    ) -> Option<ConnectionAuthorizations<'_>> {
+        Some(ConnectionAuthorizations::new(
+            command,
+            self.org()?,
+            self.project()?,
+            connection::organization::Provider::named(name)?,
+            self.connection.as_deref(),
+        ))
     }
 
     /// The side `list` states of each grant, which only `useful integration list` states
@@ -236,8 +355,11 @@ impl Reach {
     /// `useful connection` family, with the flow's `--allow-insecure-http`: with `--org` that
     /// organization's three reads by the reference as given, else each membership's
     /// organization's, the installations only where the member is its owner
-    /// (REQ-INTEGRATION-22). A read Cloud refuses or cannot serve is passed over; any other
-    /// failure is the inner error. Nothing is read where token services are out of reach.
+    /// (REQ-INTEGRATION-22); then, where it shows a connection of an organization and the member
+    /// is its owner or `--org` names it, the organization's connection authorizations, each under
+    /// the connection it names (REQ-INTEGRATION-34). A read Cloud refuses or cannot serve is
+    /// passed over; any other failure is the inner error. Nothing is read where token services
+    /// are out of reach.
     pub(in crate::cli) fn connections_listed(
         &self,
         deployment: &Deployment,
@@ -343,12 +465,15 @@ impl Reach {
 
     /// The refusal of `--org` for `name`, a provider or a grant's ID, exit 2, before anything is
     /// sent (REQ-INTEGRATION-17, REQ-INTEGRATION-21). For `github`, `gitlab.com` and `linear` an
-    /// organization's connection is made and removed by `useful connection`: `connect` names the
-    /// steps of a GitLab connection, and the other leaves say that a connection acts for Cloud
-    /// and is authorized for no runner, `revoke` naming the command that removes one. Anything
-    /// else names a grant, the member's own: a coding agent's, whose login serves the
-    /// organization its `--organization` named, where `native`, and otherwise an OAuth
-    /// provider's. `example` is the leaf's command line for it without `--org`.
+    /// organization's connection is made and removed by `useful connection` and is authorized for
+    /// a runner only by a connection authorization (REQ-INTEGRATION-26): `connect` names the
+    /// steps of a GitLab connection, `authorize` and `deauthorize` the `--project-id` form that
+    /// authorizes a runner for it in one project or ends that (REQ-INTEGRATION-33), `revoke`,
+    /// which removes no connection, the command that removes one, and any other leaf says that a
+    /// connection acts for Cloud. Anything else names a grant, the member's own: a coding
+    /// agent's, whose login serves the organization its `--organization` named, where `native`,
+    /// and otherwise an OAuth provider's. `example` is the leaf's command line for it without
+    /// `--org`.
     pub(in crate::cli) fn org_refused(
         &self,
         name: &str,
@@ -362,13 +487,24 @@ impl Reach {
                     .to_owned()
             }
             ("github" | "gitlab.com" | "linear", Some(Named::Revoke)) => format!(
-                "An organization's {name} connection acts for Cloud and is authorized for no \
-                 runner. Remove it with:\n  {}",
+                "Revoke removes no organization's connection. Remove the {name} connection \
+                 with:\n  {}",
                 removal(name)
             ),
+            ("github" | "gitlab.com" | "linear", Some(Named::Authorize)) => format!(
+                "Authorize a runner for an organization's {name} connection in one project:\n  \
+                 useful integration authorize {name} RUNNER --org ORGANIZATION --project-id \
+                 PROJECT --yes\nor name your own {name} grant without --org:\n  {example}"
+            ),
+            ("github" | "gitlab.com" | "linear", Some(Named::Deauthorize)) => format!(
+                "End a runner's authorization for an organization's {name} connection in one \
+                 project:\n  useful integration deauthorize {name} RUNNER --org ORGANIZATION \
+                 --project-id PROJECT --yes\nor name your own {name} grant without --org:\n  \
+                 {example}"
+            ),
             ("github" | "gitlab.com" | "linear", _) => format!(
-                "An organization's {name} connection acts for Cloud and is authorized for no \
-                 runner. Name your own {name} grant without --org:\n  {example}"
+                "An organization's {name} connection acts for Cloud. Name your own {name} grant \
+                 without --org:\n  {example}"
             ),
             _ if native => format!(
                 "A {name} grant is yours, for the organization --organization names:\n  {example}"
@@ -379,6 +515,29 @@ impl Reach {
             anyhow::anyhow!("--org does not apply to {name}\n\n{remedy}"),
             ExitCode::UsageError,
         )
+    }
+
+    /// The refusal of `--project-id` for `name`, a provider name that is not a coding agent's,
+    /// exit 2, before anything is sent (REQ-INTEGRATION-33): `--project-id` names the project of
+    /// an organization's connection at `github`, `gitlab.com` or `linear`, which go on, and a
+    /// runner's authorization for an organization's token is made or ended without it.
+    pub(in crate::cli) fn refuse_project(&self, name: &str) -> Result<(), CommandFailure> {
+        if connection::organization::Provider::named(name).is_some() {
+            return Ok(());
+        }
+        let (act, leaf) = match self.leaf {
+            Some(Named::Deauthorize) => ("End a runner's authorization", "deauthorize"),
+            _ => ("Authorize a runner", "authorize"),
+        };
+        Err(CommandFailure::with_exit_code(
+            anyhow::anyhow!(
+                "--project-id does not apply to {name}\n\n--project-id names the project of an \
+                 organization's connection at github, gitlab.com or linear. {act} for an \
+                 organization's token without it:\n  useful integration {leaf} {name} RUNNER \
+                 --org ORGANIZATION --yes"
+            ),
+            ExitCode::UsageError,
+        ))
     }
 }
 

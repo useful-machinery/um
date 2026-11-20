@@ -1,35 +1,39 @@
 //! What `useful integration list` prints of the organizations' side beside the member's grants:
 //! their tokens and then their connections at GitHub, Linear and GitLab, which the connection
 //! family reads and this family shows, each as side `org` (REQ-INTEGRATION-19,
-//! REQ-INTEGRATION-22).
+//! REQ-INTEGRATION-22), with the runners' authorizations in force for it (REQ-INTEGRATION-34).
 
 use std::io::{self, Write};
 
 use serde::{Serialize, Serializer};
 
+use super::authorizations;
 use super::output::ConnectionView;
 use super::tokens::{self, Tokens};
 use crate::cli::connection::organization::{self, OrganizationConnection};
 use crate::exit_code::ExitCode;
-use useful_api::{MemberGrantApi, MemberGrantFailure};
+use useful_api::{ConnectionAuthorization, MemberGrantApi, MemberGrantFailure};
 use useful_human_auth::Deployment;
 
 /// An organization whose connections the list reads: by the reference it is read by, with the
-/// ID and slug the command knows of it, and whether its installations are read, which Cloud
-/// serves an owner alone.
+/// ID and slug the command knows of it, and whether it is read as its owner's, which decides
+/// whether its installations and its connection authorizations are read, which Cloud serves an
+/// owner alone.
 struct Organization {
     reference: String,
     id: Option<String>,
     slug: Option<String>,
-    installations: bool,
+    as_owner: bool,
 }
 
-/// A connection as the list prints it: its named fields, and its organization's ID and slug,
-/// the membership read's, or with `--org` the reference as given and the ID the record states.
+/// A connection as the list prints it: its named fields, its organization's ID and slug, the
+/// membership read's, or with `--org` the reference as given and the ID the record states, and
+/// the authorizations in force that name it, where the organization's were read and answered.
 struct ListedConnection {
     connection: OrganizationConnection,
     organization_id: Option<String>,
     slug: Option<String>,
+    authorizations: Option<Vec<ConnectionAuthorization>>,
 }
 
 impl ListedConnection {
@@ -38,6 +42,7 @@ impl ListedConnection {
             &self.connection,
             self.organization_id.as_deref(),
             self.slug.as_deref(),
+            self.authorizations.as_deref(),
         )
     }
 }
@@ -84,7 +89,7 @@ impl Listing {
         let organizations = memberships
             .into_iter()
             .map(|membership| Organization {
-                installations: membership.owner,
+                as_owner: membership.owner,
                 reference: membership.organization_id.clone(),
                 id: Some(membership.organization_id),
                 slug: Some(membership.slug),
@@ -98,8 +103,8 @@ impl Listing {
     }
 
     /// The tokens of the organization `reference` names, an ID or a slug, which `list --org`
-    /// prints alone, with that organization, whose installations are read whatever the member's
-    /// role, since no membership is read.
+    /// prints alone, with that organization, read as its owner's whatever the member's role,
+    /// since no membership is read.
     pub(super) fn organization_side(
         api: &MemberGrantApi,
         reference: &str,
@@ -112,15 +117,19 @@ impl Listing {
                 reference: reference.to_owned(),
                 id: id.then(|| reference.to_owned()),
                 slug: (!id).then(|| reference.to_owned()),
-                installations: true,
+                as_owner: true,
             }],
         })
     }
 
     /// Reads the connections of each of the listing's organizations, in its order, through the
-    /// connection family, each read under a session of its own (REQ-INTEGRATION-22). A read the
-    /// connection family passes over leaves the organization's other reads to run; any other
-    /// failure is the inner error.
+    /// connection family, each read under a session of its own (REQ-INTEGRATION-22), and then,
+    /// where it read one and the organization is read as its owner's, the organization's
+    /// connection authorizations in force, each attached to the connection it names in the order
+    /// Cloud answers them; one that names a connection not listed is dropped
+    /// (REQ-INTEGRATION-34). A read the connection family passes over leaves the organization's
+    /// other reads to run, and an authorizations read passed over leaves its connections without
+    /// any; any other failure is the inner error.
     pub(super) fn with_connections(
         mut self,
         deployment: &Deployment,
@@ -130,12 +139,24 @@ impl Listing {
             let read = organization::of_organization(
                 deployment,
                 &organization.reference,
-                organization.installations,
+                organization.as_owner,
                 allow_insecure_http,
             )?;
             let connections = match read {
                 Ok(connections) => connections,
                 Err(failure) => return Ok(Err(failure)),
+            };
+            let authorizations = if organization.as_owner && !connections.is_empty() {
+                match authorizations::of_organization(
+                    deployment,
+                    &organization.reference,
+                    allow_insecure_http,
+                )? {
+                    Ok(authorizations) => authorizations,
+                    Err(failure) => return Ok(Err(failure)),
+                }
+            } else {
+                None
             };
             self.connections
                 .0
@@ -146,6 +167,15 @@ impl Listing {
                             .clone()
                             .or_else(|| connection.organization_id.clone()),
                         slug: organization.slug.clone(),
+                        authorizations: authorizations.as_ref().map(|authorizations| {
+                            authorizations
+                                .iter()
+                                .filter(|authorization| {
+                                    authorization.connection_id == connection.id
+                                })
+                                .cloned()
+                                .collect()
+                        }),
                         connection,
                     }
                 }));

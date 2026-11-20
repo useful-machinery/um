@@ -60,6 +60,21 @@ pub enum CancelOrganizationDeletionError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`create_connection_authorization`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum CreateConnectionAuthorizationError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status413(models::Problem),
+    Status415(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`create_organization`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -144,6 +159,18 @@ pub enum LeaveOrganizationError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`list_connection_authorizations`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ListConnectionAuthorizationsError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`list_organization_audit_records`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -223,6 +250,19 @@ pub enum PreviewInvitationError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum RequestOrganizationDeletionError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status500(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
+/// struct for typed errors of method [`revoke_connection_authorization`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RevokeConnectionAuthorizationError {
     Status400(models::Problem),
     Status401(models::Problem),
     Status403(models::Problem),
@@ -517,6 +557,74 @@ pub fn cancel_organization_deletion(
     } else {
         let content = resp.text()?;
         let entity: Option<CancelOrganizationDeletionError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Authorizes one runner of the organization to use one of the organization's connections at one provider for the app runs of one of its projects, and answers 201 with the authorization (REQ-INTEGRATION-26, REQ-INTEGRATION-27). An authorization holds no credential and delivers none: Cloud delivers an organization's connection to no step (REQ-INTEGRATION-24).  The answer's `scope` is what the provider grants the connection, read from the provider for this answer (REQ-INTEGRATION-32). It is the connection's whole reach at the provider, and the authorization narrows it to neither its project nor its runner. A provider that cannot be read makes the `scope` `unavailable` and fails nothing: the authorization is made and answered as it would have been.  Only an active human who is an owner of the organization may authorize: another active member is answered 403 with nothing changed, and a caller who is not an active member is answered as any other read of the organization answers them, each before anything else about the request is judged. Then, in this order: a provider that is not eligible, today any but `github`, is `connection-authorization-provider-ineligible`; a project that is unknown or another organization's is `connection-authorization-project-not-found`; a runner that is unknown, deleted or another organization's is `connection-authorization-runner-not-found`; a `connectionId` that names no connection of the organization at the provider is `connection-authorization-connection-not-found`; a connection that is not `active` is `connection-authorization-connection-inactive`; and where an authorization is already in force for the project, runner and provider, for this connection or another, the request is `connection-authorization-already-authorized`. A body without one of its four members is 400. Every refusal changes nothing. An archived project is authorized as any other.  Idempotency-Key is scoped to the exact acting OIDC identity, the organization and a semantic fingerprint containing projectId, runnerId, provider and connectionId. Exact replay returns the original created response with the authorization as it now is, its `scope` read again for the replay. Reusing the key for another request conflicts.  Problem types: 404 `connection-authorization-connection-not-found`, `connection-authorization-project-not-found`, `connection-authorization-runner-not-found`; 409 `connection-authorization-already-authorized`, `connection-authorization-connection-inactive`, `connection-authorization-provider-ineligible`.
+pub fn create_connection_authorization(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    idempotency_key: &str,
+    create_connection_authorization_request: models::CreateConnectionAuthorizationRequest,
+) -> Result<models::ConnectionAuthorization, Error<CreateConnectionAuthorizationError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_header_idempotency_key = idempotency_key;
+    let p_body_create_connection_authorization_request = create_connection_authorization_request;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/connection-authorizations",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::POST, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+    req_builder = req_builder.json(&p_body_create_connection_authorization_request);
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::ConnectionAuthorization`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::ConnectionAuthorization`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<CreateConnectionAuthorizationError> =
+            serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,
@@ -845,6 +953,95 @@ pub fn leave_organization(
     } else {
         let content = resp.text()?;
         let entity: Option<LeaveOrganizationError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Returns one page of the organization's connection authorizations in force, oldest first by creation time and opaque authorization ID (REQ-INTEGRATION-28), each with its ID, the organization's ID, its provider, its project's ID and name, its runner's ID and name, its connection's ID and the account that connection's own read names, the member who made it and when, and its `scope`. `projectId`, `runnerId`, `provider` and `connectionId` each keep the authorizations that name exactly that value, and a value that is not of its member's form is 400. An authorization that has ended is not listed; the organization's audit history holds it (REQ-INTEGRATION-30). The cursor is opaque and may be used only with this operation.  Each authorization's `scope` is what the provider grants its connection, read from the provider for this answer, once for each connection the page names (REQ-INTEGRATION-32). It is the connection's whole reach at the provider, and no authorization narrows it to its project or its runner. A provider that cannot be read makes that `scope` `unavailable` and fails nothing: the page is answered as it would have been.  Only an active human who is an owner of the organization is served: another active member is answered 403, and a caller who is not an active member is answered as any other read of the organization answers them.
+pub fn list_connection_authorizations(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    limit: Option<i32>,
+    cursor: Option<&str>,
+    project_id: Option<&str>,
+    runner_id: Option<&str>,
+    provider: Option<&str>,
+    connection_id: Option<&str>,
+) -> Result<models::ConnectionAuthorizationList, Error<ListConnectionAuthorizationsError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_query_limit = limit;
+    let p_query_cursor = cursor;
+    let p_query_project_id = project_id;
+    let p_query_runner_id = runner_id;
+    let p_query_provider = provider;
+    let p_query_connection_id = connection_id;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/connection-authorizations",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref)
+    );
+    let mut req_builder = configuration.client.request(reqwest::Method::GET, &uri_str);
+
+    if let Some(ref param_value) = p_query_limit {
+        req_builder = req_builder.query(&[("limit", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_cursor {
+        req_builder = req_builder.query(&[("cursor", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_project_id {
+        req_builder = req_builder.query(&[("projectId", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_runner_id {
+        req_builder = req_builder.query(&[("runnerId", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_provider {
+        req_builder = req_builder.query(&[("provider", &param_value.to_string())]);
+    }
+    if let Some(ref param_value) = p_query_connection_id {
+        req_builder = req_builder.query(&[("connectionId", &param_value.to_string())]);
+    }
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+    let content_type = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream");
+    let content_type = super::ContentType::from(content_type);
+
+    if !status.is_client_error() && !status.is_server_error() {
+        let content = resp.text()?;
+        match content_type {
+            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
+            ContentType::Text => {
+                return Err(Error::from(serde_json::Error::custom(
+                    "Received `text/plain` content type response that cannot be converted to `models::ConnectionAuthorizationList`",
+                )));
+            }
+            ContentType::Unsupported(unknown_type) => {
+                return Err(Error::from(serde_json::Error::custom(format!(
+                    "Received `{unknown_type}` content type response that cannot be converted to `models::ConnectionAuthorizationList`"
+                ))));
+            }
+        }
+    } else {
+        let content = resp.text()?;
+        let entity: Option<ListConnectionAuthorizationsError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,
@@ -1326,6 +1523,55 @@ pub fn request_organization_deletion(
     } else {
         let content = resp.text()?;
         let entity: Option<RequestOrganizationDeletionError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Ends one of the organization's connection authorizations and answers 204; one already ended, whatever ended it, answers 204 too (REQ-INTEGRATION-29). The request accepts no body. Ending one asks no run to stop, and the same project, runner and provider may then be authorized again, for that connection or another, as a new authorization. An authorization that is unknown or another organization's is `connection-authorization-not-found`.  Only an active human who is an owner of the organization may end one: another active member is answered 403 with nothing changed, and a caller who is not an active member is answered as any other read of the organization answers them.  Idempotency-Key is scoped to the exact acting OIDC identity, the organization and a semantic fingerprint containing authorizationId. Exact replay returns the original 204 response. Reusing the key for another authorization conflicts.  Problem types: 404 `connection-authorization-not-found`.
+pub fn revoke_connection_authorization(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    authorization_id: &str,
+    idempotency_key: &str,
+) -> Result<(), Error<RevokeConnectionAuthorizationError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_authorization_id = authorization_id;
+    let p_header_idempotency_key = idempotency_key;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/connection-authorizations/{authorizationId}",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        authorizationId = crate::generated::apis::urlencode(p_path_authorization_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::DELETE, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+
+    if !status.is_client_error() && !status.is_server_error() {
+        Ok(())
+    } else {
+        let content = resp.text()?;
+        let entity: Option<RevokeConnectionAuthorizationError> =
+            serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,

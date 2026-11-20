@@ -535,16 +535,22 @@ pub(super) fn write_runner_required(
     Ok(ExitCode::UsageError)
 }
 
-/// Reports that a command given no `RUNNER` has none to offer (REQ-GRANT-81) for the grant or
-/// token `noun` names, with exit 1 and a remedy.
+/// Reports that a command given no `RUNNER` has none to offer (REQ-GRANT-81) for `holder`, a
+/// grant where none is named, with exit 1 and a remedy: an organization's connection's
+/// authorizations are the organization's to list (REQ-INTEGRATION-33).
 pub(super) fn write_nothing_offered(
     deployment: &str,
     nothing: Nothing,
-    noun: &str,
+    holder: Option<Holder<'_>>,
     json: bool,
 ) -> anyhow::Result<ExitCode> {
     let refused = |outcome, summary: String, remedy: String| {
         ApiFailureReport::new(outcome, summary, remedy, OutcomeClass::GeneralFailure)
+    };
+    let noun = holder.map_or("grant", Holder::noun);
+    let listed = match holder {
+        Some(Holder::Connection(_)) => "useful integration list --org ORGANIZATION",
+        _ => "useful integration list INTEGRATION",
     };
     match nothing {
         Nothing::RunnerNotFound => refused(
@@ -555,7 +561,7 @@ pub(super) fn write_nothing_offered(
         Nothing::AlreadyAuthorized => refused(
             "already_authorized",
             format!("error: this {noun} is already authorized for every runner it can serve"),
-            format!("Show the {noun}'s authorizations:\n  useful integration list INTEGRATION"),
+            format!("Show the {noun}'s authorizations:\n  {listed}"),
         ),
         Nothing::AuthorizedElsewhere => authorized_elsewhere(),
         Nothing::AuthorizationNotFound => refused(
@@ -951,7 +957,12 @@ pub(in crate::cli) fn report(deployment: &str, failure: &MemberGrantFailure) -> 
         MemberGrantFailure::Unreachable { category } => {
             ApiFailureReport::unreachable(deployment, *category)
         }
-        MemberGrantFailure::InvalidResponse { .. } => ApiFailureReport::invalid_response(SUBJECT),
+        // Only an organization's connection authorization routes answer such a refusal, and
+        // the `useful integration` commands that act on them word it with the organization and
+        // the provider (`integration::output::connection_authorization_report`) before a
+        // failure reaches this, so here it is an answer no read or change defines.
+        MemberGrantFailure::ConnectionAuthorizationRefused(_)
+        | MemberGrantFailure::InvalidResponse { .. } => ApiFailureReport::invalid_response(SUBJECT),
     }
 }
 

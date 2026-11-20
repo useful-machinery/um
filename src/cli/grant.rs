@@ -479,8 +479,10 @@ fn report_under(
 /// Refuses `--org` for `name` before anything is read, exit 2 (REQ-INTEGRATION-17,
 /// REQ-INTEGRATION-21): a coding agent's name or a grant's ID names a grant, which is the
 /// member's own, and `github`, `gitlab.com` and `linear` name what an organization holds as a
-/// connection, which acts for Cloud and is authorized for no runner; `example` is the leaf's
-/// command line for it without `--org`.
+/// connection, which acts for Cloud and is authorized for a runner only in one project;
+/// `example` is the leaf's command line for it without `--org`. With `--project-id` those three
+/// go on to the connection authorization, and any other provider name but a coding agent's is
+/// refused for `--project-id` (REQ-INTEGRATION-33).
 fn refuse_org_for_a_grant(
     reach: &Reach,
     name: &GrantArg,
@@ -488,6 +490,13 @@ fn refuse_org_for_a_grant(
 ) -> Result<(), CommandFailure> {
     if reach.org().is_none() {
         return Ok(());
+    }
+    if reach.project().is_some()
+        && let GrantArg::Provider(provider) = name
+        && MemberGrantProvider::from_wire(provider)
+            .is_none_or(|provider| provider.kind() != MemberGrantKind::GrantKindNative)
+    {
+        return reach.refuse_project(provider);
     }
     let native = match name {
         GrantArg::Provider(provider) => match MemberGrantProvider::from_wire(provider) {

@@ -203,6 +203,7 @@ pub enum OrganizationAuditSubjectKind {
     RunnerCredential,
     RunnerJoinKey,
     IntegrationToken,
+    ConnectionAuthorization,
     GithubInstallation,
     GitlabConnection,
     GitlabCandidate,
@@ -1195,6 +1196,10 @@ impl TryFrom<models::OrganizationAuditSubject> for OrganizationAuditSubject {
             Kind::RunnerCredential => (OrganizationAuditSubjectKind::RunnerCredential, "rrc_"),
             Kind::RunnerJoinKey => (OrganizationAuditSubjectKind::RunnerJoinKey, "rjk_"),
             Kind::IntegrationToken => (OrganizationAuditSubjectKind::IntegrationToken, "itk_"),
+            Kind::ConnectionAuthorization => (
+                OrganizationAuditSubjectKind::ConnectionAuthorization,
+                "cna_",
+            ),
             Kind::GithubInstallation => (OrganizationAuditSubjectKind::GithubInstallation, "ghi_"),
             Kind::GitlabConnection => (OrganizationAuditSubjectKind::GitlabConnection, "glc_"),
             Kind::GitlabCandidate => (OrganizationAuditSubjectKind::GitlabCandidate, "glca_"),
@@ -1286,6 +1291,7 @@ impl From<models::OrganizationAuditChange> for OrganizationAuditChange {
             Field::NoEffectReason => "no_effect_reason",
             Field::Provider => "provider",
             Field::RunnerId => "runner_id",
+            Field::ConnectionId => "connection_id",
         };
         Self {
             field: field.to_owned(),

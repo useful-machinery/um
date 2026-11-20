@@ -797,10 +797,9 @@ fn update_and_membership_list_classify_only_their_contracted_failures() {
     }
 }
 
-// REQ-AUDIT-44
-// REQ-AUDIT-44: the listing asks for vocabulary 4, and a page in it whose record names an
-// integration token, with the token's provider and the runner it was authorized for,
-// decodes.
+// REQ-AUDIT-44, REQ-AUDIT-48
+// REQ-AUDIT-44, REQ-AUDIT-48: the listing asks for vocabulary 5, and a page in it whose
+// record names a connection authorization, with the connection it authorizes, decodes.
 #[test]
 fn audit_listing_asks_for_the_vocabulary_this_release_decodes() {
     let page = serde_json::to_vec(&serde_json::json!({"items": [{
@@ -812,33 +811,36 @@ fn audit_listing_asks_for_the_vocabulary_this_release_decodes() {
         },
         "detailsStatus": "details_available",
         "actor": {"kind": "principal", "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc"},
-        "action": "integration_token.runner_authorized",
-        "subject": {"kind": "integration_token", "id": "itk_01k0z6r1w8f4jy2m7q9v3x5abc"},
-        "changes": [{"field": "runner_id", "after": "rnr_01k0z6r1w8f4jy2m7q9v3x5abc"}]
+        "action": "connection_authorization.authorized",
+        "subject": {"kind": "connection_authorization", "id": "cna_01k0z6r1w8f4jy2m7q9v3x5abc"},
+        "changes": [{"field": "connection_id", "after": "gac_01k0z6r1w8f4jy2m7q9v3x5abc"}]
     }]}))
     .unwrap();
     let server = ScriptedHttpServer::respond(response("200 OK", Some(JSON_MEDIA_TYPE), &[], &page));
     let outcome =
         list_organization_audit_records(&http_client(), &server.api_url, TOKEN, "acme", None, None)
-            .expect("an integration token record should decode");
+            .expect("a connection authorization record should decode");
     let ListOrganizationAuditRecordsOutcome::Listed(page) = outcome else {
         panic!("audit page = {outcome:?}");
     };
     let encoded = serde_json::to_value(&page).unwrap();
-    assert_eq!(encoded["items"][0]["subject"]["kind"], "integration_token");
+    assert_eq!(
+        encoded["items"][0]["subject"]["kind"],
+        "connection_authorization"
+    );
     assert_eq!(
         encoded["items"][0]["subject"]["id"],
-        "itk_01k0z6r1w8f4jy2m7q9v3x5abc"
+        "cna_01k0z6r1w8f4jy2m7q9v3x5abc"
     );
-    assert_eq!(encoded["items"][0]["changes"][0]["field"], "runner_id");
+    assert_eq!(encoded["items"][0]["changes"][0]["field"], "connection_id");
     server.finish_one();
 
     for (limit, cursor, query) in [
-        (None, None, "?vocabulary=4"),
+        (None, None, "?vocabulary=5"),
         (
             Some(100),
             Some("opaque cursor"),
-            "?limit=100&cursor=opaque+cursor&vocabulary=4",
+            "?limit=100&cursor=opaque+cursor&vocabulary=5",
         ),
     ] {
         let page = serde_json::to_vec(&serde_json::json!({"items": []})).unwrap();

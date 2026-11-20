@@ -467,8 +467,8 @@ pub(in crate::cli) fn write_session_note(output: &mut impl Write) -> io::Result<
 }
 
 /// What a runner's authorization was made or ended on: a grant, an integration token
-/// (REQ-INTEGRATION-20), or, for the earlier agent-login commands, an agent login, each under the
-/// member its result has always named.
+/// (REQ-INTEGRATION-20), an organization's connection (REQ-INTEGRATION-33), or, for the earlier
+/// agent-login commands, an agent login, each under the member its result has always named.
 #[derive(Clone, Copy, Serialize)]
 pub(in crate::cli) enum Holder<'a> {
     #[serde(rename = "agentLoginId")]
@@ -477,6 +477,8 @@ pub(in crate::cli) enum Holder<'a> {
     Grant(&'a str),
     #[serde(rename = "integrationTokenId")]
     IntegrationToken(&'a str),
+    #[serde(rename = "connectionId")]
+    Connection(&'a str),
 }
 
 impl Holder<'_> {
@@ -486,12 +488,16 @@ impl Holder<'_> {
             Self::AgentLogin(_) => "agent login",
             Self::Grant(_) => "grant",
             Self::IntegrationToken(_) => "token",
+            Self::Connection(_) => "connection",
         }
     }
 
     fn write_human(self, output: &mut impl Write) -> io::Result<()> {
         match self {
-            Self::AgentLogin(id) | Self::Grant(id) | Self::IntegrationToken(id) => {
+            Self::AgentLogin(id)
+            | Self::Grant(id)
+            | Self::IntegrationToken(id)
+            | Self::Connection(id) => {
                 writeln!(output, "{}: {id}", self.noun())
             }
         }

@@ -138,6 +138,8 @@ pub enum Field {
     Provider,
     #[serde(rename = "runner_id")]
     RunnerId,
+    #[serde(rename = "connection_id")]
+    ConnectionId,
 }
 
 impl Default for Field {

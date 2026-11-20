@@ -147,6 +147,13 @@ pub(in crate::cli) trait Stated: Args {
     fn chooses_runner(_matches: &ArgMatches) -> bool {
         false
     }
+
+    /// The lines the refusal of a missing `--yes` states for what `matches` name: every line of
+    /// the statement, unless the leaf states other lines for some of its arguments, as
+    /// `authorize` with `--project-id` states a connection authorization's (REQ-INTEGRATION-33).
+    fn refusal_lines(_matches: &ArgMatches) -> Vec<String> {
+        Self::STATEMENT.every_line()
+    }
 }
 
 /// States `lines`, on standard error under `heading`: what a leaf is about to do.
@@ -194,8 +201,9 @@ pub(super) fn go_on(asks: bool) -> anyhow::Result<Result<(), ExitCode>> {
 }
 
 /// The `--yes` of a `Stated` leaf `C`, required like `ConfirmationArgs`, whose absence is
-/// refused with the leaf's statement: clap's own refusal of a missing required argument cannot
-/// carry it. A leaf that chooses the runner (`Stated::chooses_runner`) runs without it.
+/// refused with the leaf's statement, its lines as `Stated::refusal_lines` answers them for the
+/// command line: clap's own refusal of a missing required argument cannot carry it. A leaf that
+/// chooses the runner (`Stated::chooses_runner`) runs without it.
 pub(in crate::cli) struct Confirmation<C> {
     /// Whether `--yes` was given: always, unless the leaf chooses the runner.
     pub(in crate::cli) yes: bool,
@@ -245,8 +253,7 @@ impl<C: Stated> FromArgMatches for Confirmation<C> {
         error.insert(
             ContextKind::Suggested,
             ContextValue::StyledStrs(
-                C::STATEMENT
-                    .every_line()
+                C::refusal_lines(matches)
                     .into_iter()
                     .chain([remedy])
                     .map(Into::into)

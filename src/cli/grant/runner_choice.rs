@@ -1,21 +1,25 @@
 //! What `useful integration authorize` and `useful integration deauthorize` offer when given no
-//! `RUNNER` (REQ-GRANT-81), for a grant or a token (REQ-INTEGRATION-20): the runners they read,
-//! in the order they offer them, and the outcome when there is none to offer; and the runner they act on, named by `RUNNER` or chosen from the
-//! list where the command can prompt (REQ-GRANT-82, INV-CLI-16), or all of them chosen as one
-//! (REQ-GRANT-83).
+//! `RUNNER` (REQ-GRANT-81), for a grant or a token (REQ-INTEGRATION-20) or, with `--project-id`,
+//! an organization's connection (REQ-INTEGRATION-33): the runners they read, in the order they
+//! offer them, and the outcome when there is none to offer; and the runner they act on, named by
+//! `RUNNER` or chosen from the list where the command can prompt (REQ-GRANT-82, INV-CLI-16), or
+//! all of them chosen as one (REQ-GRANT-83).
 
 use std::collections::BTreeSet;
 
 use anyhow::Context;
 
 use crate::exit_code::ExitCode;
-use useful_api::{MemberGrantFailure, MemberGrantProvider, RunnerFailure, RunnerRegistration};
+use useful_api::{
+    ConnectionAuthorization, MemberGrantFailure, MemberGrantProvider, RunnerFailure,
+    RunnerRegistration,
+};
 use useful_human_auth::Deployment;
 
 use super::super::PrincipalAuthenticationArgs;
 use super::authorization::Holder;
 use super::runner_picker::{self, Picked};
-use super::{Options, Subject, confirmation, every_page, organization, output, with_api};
+use super::{InForce, Options, Subject, confirmation, every_page, organization, output, with_api};
 
 // The largest page the runner registration list serves.
 const PAGE: u16 = 200;
@@ -138,21 +142,50 @@ pub(super) fn to_authorize(
             Err(failure) => return Ok(Offer::GrantFailure(failure)),
         },
     };
-    Ok(match registered(deployment, options, &organizations)? {
+    Ok(unauthorized(
+        registered(deployment, options, &organizations)?,
+        |runner_id| {
+            in_force
+                .iter()
+                .any(|authorization| authorization.runner_id == runner_id)
+        },
+    ))
+}
+
+/// The runners `authorize NAME --org ORGANIZATION --project-id PROJECT` offers
+/// (REQ-INTEGRATION-33): those registered in the organization `org` names, read by that
+/// reference, less those `in_force` names, which hold an authorization in force for the project
+/// and the provider. One runner is chosen at a time, never all as one.
+pub(super) fn to_authorize_connection(
+    deployment: &Deployment,
+    options: &Options,
+    org: &str,
+    in_force: &[String],
+) -> anyhow::Result<Offer> {
+    Ok(unauthorized(
+        registered(deployment, options, &BTreeSet::from([org.to_owned()]))?,
+        |runner_id| in_force.iter().any(|authorized| authorized == runner_id),
+    ))
+}
+
+/// The registered runners `read` gave less those `authorized` names, as a command authorizing
+/// one offers them: none registered is no runner found, and every one authorized already is
+/// nothing more to authorize.
+fn unauthorized(
+    read: Result<Vec<Runner>, RunnerFailure>,
+    authorized: impl Fn(&str) -> bool,
+) -> Offer {
+    match read {
         Err(failure) => Offer::RunnerFailure(failure),
         Ok(runners) if runners.is_empty() => Offer::Nothing(Nothing::RunnerNotFound),
         Ok(runners) => offered(
             runners
                 .into_iter()
-                .filter(|runner| {
-                    !in_force
-                        .iter()
-                        .any(|authorization| authorization.runner_id == runner.id)
-                })
+                .filter(|runner| !authorized(&runner.id))
                 .collect(),
             Nothing::AlreadyAuthorized,
         ),
-    })
+    }
 }
 
 /// The runners `authorize --all` offers: those of every organization the member is an active
@@ -184,7 +217,37 @@ pub(super) fn to_deauthorize(
     options: &Options,
     subject: &Subject,
 ) -> anyhow::Result<Offer> {
-    let in_force = subject.in_force();
+    authorized(deployment, options, &subject.in_force())
+}
+
+/// The runners `deauthorize NAME --org ORGANIZATION --project-id PROJECT` offers
+/// (REQ-INTEGRATION-33): those `in_force` names, the organization's authorizations in force for
+/// the project and the provider, each with its registration read as [`to_deauthorize`] reads
+/// it. None in force is offered none, and nothing is read. One runner is chosen at a time.
+pub(super) fn to_deauthorize_connection(
+    deployment: &Deployment,
+    options: &Options,
+    in_force: &[ConnectionAuthorization],
+) -> anyhow::Result<Offer> {
+    let in_force: Vec<_> = in_force
+        .iter()
+        .map(|authorization| InForce {
+            id: &authorization.id,
+            runner_id: &authorization.runner_id,
+            organization_id: &authorization.organization_id,
+        })
+        .collect();
+    authorized(deployment, options, &in_force)
+}
+
+/// The runners `in_force` names, each with the registration read from its authorization's
+/// organization, or by its ID alone when there is none; none in force is offered none, and
+/// nothing is read.
+fn authorized(
+    deployment: &Deployment,
+    options: &Options,
+    in_force: &[InForce<'_>],
+) -> anyhow::Result<Offer> {
     if in_force.is_empty() {
         return Ok(Offer::Nothing(Nothing::AuthorizationNotFound));
     }
@@ -352,12 +415,7 @@ fn refuse(
             let diagnostic = format!("name the runner {purpose}");
             output::write_runner_required(api_url, holder, &runners, &diagnostic, &example, json)
         }
-        Offer::Nothing(nothing) => output::write_nothing_offered(
-            api_url,
-            nothing,
-            holder.map_or("grant", Holder::noun),
-            json,
-        ),
+        Offer::Nothing(nothing) => output::write_nothing_offered(api_url, nothing, holder, json),
         Offer::GrantFailure(failure) => output::failure(api_url, &failure, json),
         Offer::RunnerFailure(failure) => super::super::runner::write_failure(
             deployment,

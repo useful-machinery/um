@@ -1,8 +1,11 @@
-//! An organization's connections as `useful integration list` shows them (REQ-INTEGRATION-22):
-//! its GitHub App installations, its Linear connections and its GitLab connections, each read
-//! with the client and the session of the `useful connection` leaf that lists them and stated in
-//! the word that leaf prints for its state. Only named fields are kept, never a record whole, and
-//! a read Cloud refuses or answers that it cannot serve is passed over.
+//! An organization's connections as `useful integration` reads them: all of them, as `list`
+//! shows them (REQ-INTEGRATION-22), its GitHub App installations, its Linear connections and its
+//! GitLab connections, and one provider's, as `authorize` given `--project-id` chooses the one it
+//! authorizes a runner for (REQ-INTEGRATION-33). Each provider's are read with the client and the
+//! session of the `useful connection` leaf that lists them and stated in the word that leaf
+//! prints for its state. Only named fields are kept, never a record whole. The list passes over a
+//! read Cloud refuses or answers that it cannot serve; the one provider's read passes over
+//! nothing.
 
 use serde_json::Value;
 
@@ -21,6 +24,33 @@ const GITLAB_PAGE: i32 = 200;
 const INVALID: MemberGrantFailure = MemberGrantFailure::InvalidResponse {
     credential_rejected: false,
 };
+
+/// A provider at which an organization holds connections this family reads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::cli) enum Provider {
+    /// GitHub App installations, which Cloud lists to an owner alone.
+    GitHub,
+    Linear,
+    GitLab,
+}
+
+impl Provider {
+    /// The provider `name` names: `github`, `linear` or `gitlab.com`.
+    pub(in crate::cli) fn named(name: &str) -> Option<Self> {
+        [Self::GitHub, Self::Linear, Self::GitLab]
+            .into_iter()
+            .find(|provider| provider.name() == name)
+    }
+
+    /// The provider's wire name.
+    pub(in crate::cli) const fn name(self) -> &'static str {
+        match self {
+            Self::GitHub => "github",
+            Self::Linear => "linear",
+            Self::GitLab => "gitlab.com",
+        }
+    }
+}
 
 /// One connection of an organization, by its named fields.
 pub(in crate::cli) struct OrganizationConnection {
@@ -51,63 +81,109 @@ pub(in crate::cli) fn of_organization(
     installations: bool,
     allow_insecure_http: bool,
 ) -> anyhow::Result<Result<Vec<OrganizationConnection>, MemberGrantFailure>> {
-    let http = || HttpOptions {
-        allow_insecure_http,
-    };
+    let providers = installations
+        .then_some(Provider::GitHub)
+        .into_iter()
+        .chain([Provider::Linear, Provider::GitLab]);
     let mut connections = Vec::new();
-    if installations {
-        let read = super::github::with_api(
-            deployment,
-            http().transport_policy(),
-            &PrincipalAuthenticationArgs::default(),
-            |api| api.list_installations(organization),
-        )?;
-        match kept(read, github_failure) {
-            Ok(items) => connections.extend(items.iter().map(installation)),
-            Err(failure) => return Ok(Err(failure)),
+    for provider in providers {
+        match read(deployment, organization, provider, allow_insecure_http)? {
+            Ok(items) => connections.extend(items),
+            Err(Judged {
+                failure,
+                passed_over: false,
+            }) => return Ok(Err(failure)),
+            Err(Judged { .. }) => {}
         }
-    }
-    let options = CommonArgs::new(false, PrincipalAuthenticationArgs::default(), http());
-    let read = super::with_api(deployment, &options, |api| {
-        grant::every_page(linear_invalid(), |cursor| {
-            api.list(organization, Some(LINEAR_PAGE), cursor)
-                .map(|page| (page.items, page.next_cursor))
-        })
-    })?;
-    match kept(read, linear_failure) {
-        Ok(items) => connections.extend(items.iter().map(linear_connection)),
-        Err(failure) => return Ok(Err(failure)),
-    }
-    let options = CommonArgs::new(false, PrincipalAuthenticationArgs::default(), http());
-    let read = super::gitlab::with_options(deployment, &options, |api| {
-        grant::every_page(GitLabFailure::Protocol, |cursor| {
-            let page = api.list(organization, Some(GITLAB_PAGE), cursor)?;
-            let items = page["items"]
-                .as_array()
-                .ok_or(GitLabFailure::Protocol)?
-                .iter()
-                .map(|item| gitlab_connection(item).ok_or(GitLabFailure::Protocol))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok((items, page["nextCursor"].as_str().map(str::to_owned)))
-        })
-    })?;
-    match kept(read, gitlab_failure) {
-        Ok(items) => connections.extend(items),
-        Err(failure) => return Ok(Err(failure)),
     }
     Ok(Ok(connections))
 }
 
-/// What a read gave: its items, none where `judged` passes its failure over, or the failure
-/// `judged` names.
-fn kept<T, F>(
-    read: Result<Vec<T>, F>,
-    judged: impl FnOnce(F) -> Option<MemberGrantFailure>,
-) -> Result<Vec<T>, MemberGrantFailure> {
-    match read {
-        Ok(items) => Ok(items),
-        Err(failure) => judged(failure).map_or_else(|| Ok(Vec::new()), Err),
+/// The connections of the organization `organization` names at `provider` alone, read as
+/// [`of_organization`] reads them but passing nothing over: `403` is `Forbidden`, `404`
+/// `OrganizationNotFound` and a `5xx` the unreachable or provider-unavailable failure nearest it.
+pub(in crate::cli) fn at_provider(
+    deployment: &Deployment,
+    organization: &str,
+    provider: Provider,
+    allow_insecure_http: bool,
+) -> anyhow::Result<Result<Vec<OrganizationConnection>, MemberGrantFailure>> {
+    Ok(
+        read(deployment, organization, provider, allow_insecure_http)?
+            .map_err(|judged| judged.failure),
+    )
+}
+
+/// A failed read as the nearest failure of a member's read, and whether the list passes it over:
+/// Cloud refused it or answered that it cannot serve it.
+struct Judged {
+    failure: MemberGrantFailure,
+    passed_over: bool,
+}
+
+impl Judged {
+    /// A failure the list passes over: Cloud refused the read or could not serve it.
+    const fn refused(failure: MemberGrantFailure) -> Self {
+        Self {
+            failure,
+            passed_over: true,
+        }
     }
+
+    /// A failure that fails the list.
+    const fn failed(failure: MemberGrantFailure) -> Self {
+        Self {
+            failure,
+            passed_over: false,
+        }
+    }
+}
+
+/// The connections of `organization` at `provider`, read to the last page under a session of
+/// that provider's client, or the read's failure judged.
+fn read(
+    deployment: &Deployment,
+    organization: &str,
+    provider: Provider,
+    allow_insecure_http: bool,
+) -> anyhow::Result<Result<Vec<OrganizationConnection>, Judged>> {
+    let http = || HttpOptions {
+        allow_insecure_http,
+    };
+    // Each client's own options, which differ in their JSON output alone and print nothing here.
+    let options = || CommonArgs::new(false, PrincipalAuthenticationArgs::default(), http());
+    let gitlab_options = || CommonArgs::new(false, PrincipalAuthenticationArgs::default(), http());
+    Ok(match provider {
+        Provider::GitHub => super::github::with_api(
+            deployment,
+            http().transport_policy(),
+            &PrincipalAuthenticationArgs::default(),
+            |api| api.list_installations(organization),
+        )?
+        .map(|items| items.iter().map(installation).collect())
+        .map_err(github_failure),
+        Provider::Linear => super::with_api(deployment, &options(), |api| {
+            grant::every_page(linear_invalid(), |cursor| {
+                api.list(organization, Some(LINEAR_PAGE), cursor)
+                    .map(|page| (page.items, page.next_cursor))
+            })
+        })?
+        .map(|items| items.iter().map(linear_connection).collect())
+        .map_err(linear_failure),
+        Provider::GitLab => super::gitlab::with_options(deployment, &gitlab_options(), |api| {
+            grant::every_page(GitLabFailure::Protocol, |cursor| {
+                let page = api.list(organization, Some(GITLAB_PAGE), cursor)?;
+                let items = page["items"]
+                    .as_array()
+                    .ok_or(GitLabFailure::Protocol)?
+                    .iter()
+                    .map(|item| gitlab_connection(item).ok_or(GitLabFailure::Protocol))
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((items, page["nextCursor"].as_str().map(str::to_owned)))
+            })
+        })?
+        .map_err(gitlab_failure),
+    })
 }
 
 fn installation(installation: &GitHubInstallation) -> OrganizationConnection {
@@ -146,67 +222,84 @@ fn gitlab_connection(item: &Value) -> Option<OrganizationConnection> {
     })
 }
 
-/// A failure of the installations read: passed over where Cloud refused it or could not serve
-/// it, else the member's read failure nearest it.
-fn github_failure(failure: GitHubFailure) -> Option<MemberGrantFailure> {
+/// A failure of the installations read: one the list passes over where Cloud refused it or could
+/// not serve it, as the nearest failure of a member's read.
+fn github_failure(failure: GitHubFailure) -> Judged {
     match failure {
-        GitHubFailure::Forbidden
-        | GitHubFailure::NotFound
-        | GitHubFailure::Unreachable(UnreachableCategory::Server) => None,
-        GitHubFailure::Unauthenticated => Some(MemberGrantFailure::Unauthenticated),
-        GitHubFailure::Unreachable(category) => Some(MemberGrantFailure::Unreachable { category }),
+        GitHubFailure::Forbidden => Judged::refused(MemberGrantFailure::Forbidden),
+        GitHubFailure::NotFound => Judged::refused(MemberGrantFailure::OrganizationNotFound),
+        GitHubFailure::Unreachable(UnreachableCategory::Server) => {
+            Judged::refused(MemberGrantFailure::Unreachable {
+                category: UnreachableCategory::Server,
+            })
+        }
+        GitHubFailure::Unauthenticated => Judged::failed(MemberGrantFailure::Unauthenticated),
+        GitHubFailure::Unreachable(category) => {
+            Judged::failed(MemberGrantFailure::Unreachable { category })
+        }
         GitHubFailure::Protocol {
             credential_rejected,
-        } => Some(MemberGrantFailure::InvalidResponse {
+        } => Judged::failed(MemberGrantFailure::InvalidResponse {
             credential_rejected,
         }),
         // A list read defines neither answer.
-        GitHubFailure::InvalidInput | GitHubFailure::SourceConnectionConflict => Some(INVALID),
+        GitHubFailure::InvalidInput | GitHubFailure::SourceConnectionConflict => {
+            Judged::failed(INVALID)
+        }
     }
 }
 
 /// A failure of the Linear read, judged as [`github_failure`] judges one.
-fn linear_failure(failure: LinearFailure) -> Option<MemberGrantFailure> {
+fn linear_failure(failure: LinearFailure) -> Judged {
     match failure {
-        LinearFailure::Forbidden
-        | LinearFailure::NotFound
-        | LinearFailure::Unreachable {
+        LinearFailure::Forbidden => Judged::refused(MemberGrantFailure::Forbidden),
+        LinearFailure::NotFound => Judged::refused(MemberGrantFailure::OrganizationNotFound),
+        LinearFailure::Unreachable {
             category: UnreachableCategory::Server,
-        } => None,
-        LinearFailure::Unauthenticated => Some(MemberGrantFailure::Unauthenticated),
+        } => Judged::refused(MemberGrantFailure::Unreachable {
+            category: UnreachableCategory::Server,
+        }),
+        LinearFailure::Unauthenticated => Judged::failed(MemberGrantFailure::Unauthenticated),
         LinearFailure::Unreachable { category } => {
-            Some(MemberGrantFailure::Unreachable { category })
+            Judged::failed(MemberGrantFailure::Unreachable { category })
         }
         LinearFailure::RateLimited { retry_after } => {
-            Some(MemberGrantFailure::RateLimited { retry_after })
+            Judged::failed(MemberGrantFailure::RateLimited { retry_after })
         }
         LinearFailure::InvalidResponse {
             credential_rejected,
-        } => Some(MemberGrantFailure::InvalidResponse {
+        } => Judged::failed(MemberGrantFailure::InvalidResponse {
             credential_rejected,
         }),
         // A list read defines neither answer.
-        LinearFailure::InvalidInput { .. } | LinearFailure::Conflict => Some(INVALID),
+        LinearFailure::InvalidInput { .. } | LinearFailure::Conflict => Judged::failed(INVALID),
     }
 }
 
 /// A failure of the GitLab read, judged as [`github_failure`] judges one; a deployment without
 /// GitLab answers `ServiceUnavailable` or `ProviderUnavailable`.
-fn gitlab_failure(failure: GitLabFailure) -> Option<MemberGrantFailure> {
+fn gitlab_failure(failure: GitLabFailure) -> Judged {
     match failure {
-        GitLabFailure::Forbidden
-        | GitLabFailure::NotFound
-        | GitLabFailure::Unreachable(UnreachableCategory::Server)
-        | GitLabFailure::ServiceUnavailable
-        | GitLabFailure::ProviderUnavailable => None,
-        GitLabFailure::Unauthenticated => Some(MemberGrantFailure::Unauthenticated),
-        GitLabFailure::Unreachable(category) => Some(MemberGrantFailure::Unreachable { category }),
+        GitLabFailure::Forbidden => Judged::refused(MemberGrantFailure::Forbidden),
+        GitLabFailure::NotFound => Judged::refused(MemberGrantFailure::OrganizationNotFound),
+        GitLabFailure::Unreachable(UnreachableCategory::Server) => {
+            Judged::refused(MemberGrantFailure::Unreachable {
+                category: UnreachableCategory::Server,
+            })
+        }
+        GitLabFailure::ServiceUnavailable | GitLabFailure::ProviderUnavailable => {
+            Judged::refused(MemberGrantFailure::ProviderUnavailable)
+        }
+        GitLabFailure::Unauthenticated => Judged::failed(MemberGrantFailure::Unauthenticated),
+        GitLabFailure::Unreachable(category) => {
+            Judged::failed(MemberGrantFailure::Unreachable { category })
+        }
         // A list read defines none of these answers.
         GitLabFailure::InvalidInput
         | GitLabFailure::Conflict
         | GitLabFailure::CandidateUnavailable
         | GitLabFailure::IdentityMismatch
-        | GitLabFailure::Protocol => Some(INVALID),
+        | GitLabFailure::Protocol => Judged::failed(INVALID),
     }
 }
 
