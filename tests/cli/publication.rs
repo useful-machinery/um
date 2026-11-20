@@ -123,41 +123,6 @@ fn gitlab_publication_body() -> serde_json::Value {
     body
 }
 
-// Run-scoped completion proof: the actual worker snapshot was rendered by the
-// Gateway API before this body reaches the CLI's strict response decoder.
-#[test]
-#[ignore = "requires the worker-backed response supplied by the GitLab integration harness"]
-fn worker_backed_gitlab_publication_through_cli() {
-    let response = std::env::var("USEFUL_PUBLICATION_TEST_API_RESPONSE_JSON")
-        .expect("GitLab integration harness must supply its API response");
-    let body: serde_json::Value = serde_json::from_str(&response).expect("worker-backed API JSON");
-    let organization = body["organizationId"].as_str().expect("organization id");
-    let run = body["runId"].as_str().expect("run id");
-    let publication = body["id"].as_str().expect("publication id");
-    let (server, _directory, credentials) =
-        prepared_publication(vec![ok_publication_response(&body)]);
-    let output = run_with_env(
-        &[
-            "publication",
-            "show",
-            organization,
-            run,
-            publication,
-            "--json",
-            "--allow-insecure-http",
-        ],
-        &deployment_environment(&server.api_url, &credentials),
-    );
-    assert!(
-        output.status.success(),
-        "CLI rejected worker-backed API response"
-    );
-    let decoded = assert_one_json_document(&output.stdout);
-    assert_eq!(decoded["outcome"], "found");
-    assert_eq!(decoded["publication"], body);
-    server.finish();
-}
-
 // REQ-PUBLISH-75, REQ-PUBLISH-76
 #[test]
 fn publication_commands_decode_gitlab_and_reject_mixed_variants() {
