@@ -2345,14 +2345,35 @@ fn validate_private_file(metadata: &Metadata) -> Result<(), EnrollmentError> {
     private_file(metadata).map_err(EnrollmentError::from)
 }
 
+/// Whether `metadata` is a regular file of the effective user at mode `0600`,
+/// whatever its link count.
+fn private_regular_file(metadata: &Metadata) -> bool {
+    metadata.file_type().is_file()
+        && metadata.uid() == rustix::process::geteuid().as_raw()
+        && metadata.mode() & 0o7777 == FILE_MODE
+}
+
+const NOT_PRIVATE: &str = "runner state file must be owned by the current user with mode 0600";
+
 fn private_file(metadata: &Metadata) -> Result<(), PrivateFileFailure> {
-    if !metadata.file_type().is_file()
-        || metadata.uid() != rustix::process::geteuid().as_raw()
-        || metadata.mode() & 0o7777 != FILE_MODE
-        || metadata.nlink() != 1
-    {
+    if !private_regular_file(metadata) || metadata.nlink() != 1 {
         return Err(PrivateFileFailure::refused(
-            "runner state file must be owned by the current user with mode 0600",
+            NOT_PRIVATE,
+            io::ErrorKind::PermissionDenied,
+        ));
+    }
+    Ok(())
+}
+
+/// `private_file` as a read requires it, of the path and of the opened file:
+/// at most one link where `private_file` requires exactly one. A file that
+/// `write_private_file_atomically` renames over reports no link, to a stat of
+/// the path that the rename lands in as well as to the file opened before it,
+/// and is still the runner's own whole file (INV-RUNNER-44).
+fn private_file_for_read(metadata: &Metadata) -> Result<(), PrivateFileFailure> {
+    if !private_regular_file(metadata) || metadata.nlink() > 1 {
+        return Err(PrivateFileFailure::refused(
+            NOT_PRIVATE,
             io::ErrorKind::PermissionDenied,
         ));
     }
@@ -2461,7 +2482,7 @@ pub(crate) fn read_private_document(
 ) -> Result<Option<Vec<u8>>, PrivateFileFailure> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => {
-            private_file(&metadata)?;
+            private_file_for_read(&metadata)?;
             let bytes = read_bounded_regular_file(path, limit, true)?;
             Ok(Some(bytes))
         }
@@ -2477,7 +2498,6 @@ fn read_bounded_regular_file(
     limit: u64,
     private: bool,
 ) -> Result<Vec<u8>, PrivateFileFailure> {
-    const OVER_LIMIT: &str = "input file exceeds its size limit";
     let metadata =
         fs::symlink_metadata(path).map_err(PrivateFileFailure::new("cannot inspect input file"))?;
     if !metadata.file_type().is_file() {
@@ -2487,7 +2507,7 @@ fn read_bounded_regular_file(
         ));
     }
     if private {
-        private_file(&metadata)?;
+        private_file_for_read(&metadata)?;
     }
     if metadata.len() > limit {
         return Err(PrivateFileFailure::refused(
@@ -2500,10 +2520,30 @@ fn read_bounded_regular_file(
         .custom_flags(NOFOLLOW_FLAG)
         .open(path)
         .map_err(PrivateFileFailure::new("cannot open input file"))?;
+    read_opened_bounded_file(file, limit, private)
+}
+
+const OVER_LIMIT: &str = "input file exceeds its size limit";
+
+/// The half of `read_bounded_regular_file` after its open: checks the opened
+/// file and reads at most `limit` bytes of it.
+///
+/// A private file with no link is the one the path named at the open, since
+/// renamed over by `write_private_file_atomically` or removed. The replace
+/// never writes the earlier file, so it is read as it stands: its bytes are
+/// the whole earlier version (INV-RUNNER-44). A second link is still refused.
+/// The path's own checks before the open admit a stat that reports no link
+/// for the same reason, and this check of the opened file is the one that
+/// decides what is read.
+fn read_opened_bounded_file(
+    file: File,
+    limit: u64,
+    private: bool,
+) -> Result<Vec<u8>, PrivateFileFailure> {
     let opened = file
         .metadata()
         .map_err(PrivateFileFailure::new("cannot inspect opened input file"))?;
-    if !opened.file_type().is_file() || private && private_file(&opened).is_err() {
+    if !opened.file_type().is_file() || private && private_file_for_read(&opened).is_err() {
         return Err(PrivateFileFailure::refused(
             "opened input file is unsafe",
             io::ErrorKind::PermissionDenied,

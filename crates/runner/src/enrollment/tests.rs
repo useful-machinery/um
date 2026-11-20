@@ -2655,3 +2655,106 @@ fn an_enrolled_host_accepts_only_the_recorded_organization_and_pool_or_their_ids
     }
     assert!(server.finish().is_empty());
 }
+
+fn open_without_following(path: &Path) -> File {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(NOFOLLOW_FLAG)
+        .open(path)
+        .expect("open private document")
+}
+
+// INV-RUNNER-44
+#[test]
+fn a_private_document_replaced_after_its_open_reads_as_the_whole_earlier_version() {
+    let directory = tempfile::TempDir::new().expect("create directory");
+    fs::set_permissions(directory.path(), Permissions::from_mode(0o700))
+        .expect("protect directory");
+    let path = directory.path().join("document.json");
+    atomic_write_json(
+        &path,
+        &serde_json::json!({"schemaVersion": 1, "version": "first"}),
+    )
+    .expect("write first document");
+    let first = fs::read(&path).expect("read first document");
+    let opened = open_without_following(&path);
+
+    atomic_write_json(
+        &path,
+        &serde_json::json!({"schemaVersion": 1, "version": "second"}),
+    )
+    .expect("replace document");
+    let second = fs::read(&path).expect("read second document");
+    assert_ne!(first, second);
+
+    let read = read_opened_bounded_file(opened, 64 * 1024, true)
+        .unwrap_or_else(|failure| panic!("read the replaced file: {:?}", failure.error));
+    assert_eq!(read, first);
+    let current = read_private_document(&path, 64 * 1024)
+        .unwrap_or_else(|failure| panic!("read the document: {:?}", failure.error));
+    assert_eq!(current, Some(second));
+}
+
+// INV-RUNNER-44
+#[test]
+fn an_opened_private_file_given_a_second_name_or_another_mode_is_refused() {
+    let directory = tempfile::TempDir::new().expect("create directory");
+    fs::set_permissions(directory.path(), Permissions::from_mode(0o700))
+        .expect("protect directory");
+
+    let linked = directory.path().join("linked.json");
+    atomic_write_json(&linked, &serde_json::json!({"schemaVersion": 1})).expect("write document");
+    let opened = open_without_following(&linked);
+    fs::hard_link(&linked, directory.path().join("second-name.json")).expect("link document");
+    let failure = read_opened_bounded_file(opened, 64 * 1024, true)
+        .expect_err("a file with a second name is refused");
+    assert_eq!(failure.error.kind(), io::ErrorKind::PermissionDenied);
+
+    let readable = directory.path().join("readable.json");
+    atomic_write_json(&readable, &serde_json::json!({"schemaVersion": 1})).expect("write document");
+    let opened = open_without_following(&readable);
+    fs::set_permissions(&readable, Permissions::from_mode(0o644)).expect("widen mode");
+    let failure = read_opened_bounded_file(opened, 64 * 1024, true)
+        .expect_err("a file of another mode is refused");
+    assert_eq!(failure.error.kind(), io::ErrorKind::PermissionDenied);
+}
+
+// INV-RUNNER-44
+#[test]
+fn a_private_document_read_while_it_is_replaced_always_answers_a_whole_version() {
+    // Each replace syncs the file and its directory, so the count is kept low.
+    // It is still far more than a regression needs: while the path's own
+    // checks required exactly one link, about one read in twenty was refused.
+    const REPLACES: u64 = 100;
+    let directory = tempfile::TempDir::new().expect("create directory");
+    fs::set_permissions(directory.path(), Permissions::from_mode(0o700))
+        .expect("protect directory");
+    let path = directory.path().join("document.json");
+    let document = |version: u64| serde_json::json!({"schemaVersion": 1, "version": version});
+    atomic_write_json(&path, &document(0)).expect("write document");
+
+    std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            for version in 1..=REPLACES {
+                atomic_write_json(&path, &document(version)).expect("replace document");
+            }
+        });
+        while !writer.is_finished() {
+            let bytes = read_private_document(&path, 64 * 1024)
+                .unwrap_or_else(|failure| {
+                    panic!(
+                        "read during a replace: {} ({:?})",
+                        failure.requirement, failure.error
+                    )
+                })
+                .expect("the document is never absent");
+            let read: serde_json::Value =
+                serde_json::from_slice(&bytes).expect("a whole version of the document");
+            assert!(
+                read["version"]
+                    .as_u64()
+                    .is_some_and(|version| version <= REPLACES)
+            );
+        }
+    });
+}
