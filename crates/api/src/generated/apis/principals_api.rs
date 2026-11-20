@@ -65,16 +65,6 @@ pub enum AuthorizeIntegrationTokenRunnerError {
     UnknownValue(serde_json::Value),
 }
 
-/// struct for typed errors of method [`begin_docs_account_handoff`]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum BeginDocsAccountHandoffError {
-    Status400(models::Problem),
-    Status404(models::Problem),
-    Status500(models::Problem),
-    UnknownValue(serde_json::Value),
-}
-
 /// struct for typed errors of method [`cancel_current_principal_deletion`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -83,18 +73,6 @@ pub enum CancelCurrentPrincipalDeletionError {
     Status401(models::Problem),
     Status403(models::Problem),
     Status409(models::Problem),
-    Status500(models::Problem),
-    UnknownValue(serde_json::Value),
-}
-
-/// struct for typed errors of method [`complete_docs_account_handoff`]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum CompleteDocsAccountHandoffError {
-    Status400(models::Problem),
-    Status401(models::Problem),
-    Status403(models::Problem),
-    Status404(models::Problem),
     Status500(models::Problem),
     UnknownValue(serde_json::Value),
 }
@@ -170,16 +148,6 @@ pub enum GetAgentLoginError {
 pub enum GetCurrentPrincipalError {
     Status401(models::Problem),
     Status403(models::Problem),
-    Status500(models::Problem),
-    UnknownValue(serde_json::Value),
-}
-
-/// struct for typed errors of method [`get_docs_account_handoff_status`]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum GetDocsAccountHandoffStatusError {
-    Status400(models::Problem),
-    Status404(models::Problem),
     Status500(models::Problem),
     UnknownValue(serde_json::Value),
 }
@@ -376,16 +344,6 @@ pub enum ListIntegrationTokensError {
     Status403(models::Problem),
     Status500(models::Problem),
     Status503(models::Problem),
-    UnknownValue(serde_json::Value),
-}
-
-/// struct for typed errors of method [`redeem_docs_account_handoff`]
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum RedeemDocsAccountHandoffError {
-    Status400(models::Problem),
-    Status404(models::Problem),
-    Status500(models::Problem),
     UnknownValue(serde_json::Value),
 }
 
@@ -788,61 +746,6 @@ pub fn authorize_integration_token_runner(
     }
 }
 
-/// Google identity is not a Cloud bearer. State and verifier remain private to Apps Script server code.
-pub fn begin_docs_account_handoff(
-    configuration: &configuration::Configuration,
-    docs_handoff_begin_request: models::DocsHandoffBeginRequest,
-) -> Result<models::DocsHandoffStatus, Error<BeginDocsAccountHandoffError>> {
-    // add a prefix to parameters to efficiently prevent name collisions
-    let p_body_docs_handoff_begin_request = docs_handoff_begin_request;
-
-    let uri_str = format!("{}/v1/docs/account-handoffs", configuration.base_path);
-    let mut req_builder = configuration
-        .client
-        .request(reqwest::Method::POST, &uri_str);
-
-    if let Some(ref user_agent) = configuration.user_agent {
-        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
-    }
-    req_builder = req_builder.json(&p_body_docs_handoff_begin_request);
-
-    let req = req_builder.build()?;
-    let resp = configuration.client.execute(req)?;
-
-    let status = resp.status();
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream");
-    let content_type = super::ContentType::from(content_type);
-
-    if !status.is_client_error() && !status.is_server_error() {
-        let content = resp.text()?;
-        match content_type {
-            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
-            ContentType::Text => {
-                return Err(Error::from(serde_json::Error::custom(
-                    "Received `text/plain` content type response that cannot be converted to `models::DocsHandoffStatus`",
-                )));
-            }
-            ContentType::Unsupported(unknown_type) => {
-                return Err(Error::from(serde_json::Error::custom(format!(
-                    "Received `{unknown_type}` content type response that cannot be converted to `models::DocsHandoffStatus`"
-                ))));
-            }
-        }
-    } else {
-        let content = resp.text()?;
-        let entity: Option<BeginDocsAccountHandoffError> = serde_json::from_str(&content).ok();
-        Err(Error::ResponseError(ResponseContent {
-            status,
-            content,
-            entity,
-        }))
-    }
-}
-
 /// Cancellation requires the same linked human identity, a different verified bearer fingerprint, and an issuer `iat` strictly later than the scheduling bearer's issuer `iat`, all before the deletion deadline.  Problem types: 403 `reauthentication-required`; 409 `lifecycle-transition-unavailable`.
 pub fn cancel_current_principal_deletion(
     configuration: &configuration::Configuration,
@@ -894,51 +797,6 @@ pub fn cancel_current_principal_deletion(
         let content = resp.text()?;
         let entity: Option<CancelCurrentPrincipalDeletionError> =
             serde_json::from_str(&content).ok();
-        Err(Error::ResponseError(ResponseContent {
-            status,
-            content,
-            entity,
-        }))
-    }
-}
-
-/// The browser callback provides an authenticated human Cloud bearer and an issuer authorization code, not tokens. The Gateway exchanges the code with the configured Docs OAuth client and checks that its bearer belongs to the same human.
-pub fn complete_docs_account_handoff(
-    configuration: &configuration::Configuration,
-    handoff_id: &str,
-    docs_handoff_completion: models::DocsHandoffCompletion,
-) -> Result<(), Error<CompleteDocsAccountHandoffError>> {
-    // add a prefix to parameters to efficiently prevent name collisions
-    let p_path_handoff_id = handoff_id;
-    let p_body_docs_handoff_completion = docs_handoff_completion;
-
-    let uri_str = format!(
-        "{}/v1/docs/account-handoffs/{handoffId}/completion",
-        configuration.base_path,
-        handoffId = crate::generated::apis::urlencode(p_path_handoff_id)
-    );
-    let mut req_builder = configuration
-        .client
-        .request(reqwest::Method::POST, &uri_str);
-
-    if let Some(ref user_agent) = configuration.user_agent {
-        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
-    }
-    if let Some(ref token) = configuration.bearer_access_token {
-        req_builder = req_builder.bearer_auth(token.to_owned());
-    };
-    req_builder = req_builder.json(&p_body_docs_handoff_completion);
-
-    let req = req_builder.build()?;
-    let resp = configuration.client.execute(req)?;
-
-    let status = resp.status();
-
-    if !status.is_client_error() && !status.is_server_error() {
-        Ok(())
-    } else {
-        let content = resp.text()?;
-        let entity: Option<CompleteDocsAccountHandoffError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,
@@ -1313,66 +1171,6 @@ pub fn get_current_principal(
     } else {
         let content = resp.text()?;
         let entity: Option<GetCurrentPrincipalError> = serde_json::from_str(&content).ok();
-        Err(Error::ResponseError(ResponseContent {
-            status,
-            content,
-            entity,
-        }))
-    }
-}
-
-pub fn get_docs_account_handoff_status(
-    configuration: &configuration::Configuration,
-    handoff_id: &str,
-    docs_handoff_proof: models::DocsHandoffProof,
-) -> Result<models::DocsHandoffStatus, Error<GetDocsAccountHandoffStatusError>> {
-    // add a prefix to parameters to efficiently prevent name collisions
-    let p_path_handoff_id = handoff_id;
-    let p_body_docs_handoff_proof = docs_handoff_proof;
-
-    let uri_str = format!(
-        "{}/v1/docs/account-handoffs/{handoffId}/status",
-        configuration.base_path,
-        handoffId = crate::generated::apis::urlencode(p_path_handoff_id)
-    );
-    let mut req_builder = configuration
-        .client
-        .request(reqwest::Method::POST, &uri_str);
-
-    if let Some(ref user_agent) = configuration.user_agent {
-        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
-    }
-    req_builder = req_builder.json(&p_body_docs_handoff_proof);
-
-    let req = req_builder.build()?;
-    let resp = configuration.client.execute(req)?;
-
-    let status = resp.status();
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream");
-    let content_type = super::ContentType::from(content_type);
-
-    if !status.is_client_error() && !status.is_server_error() {
-        let content = resp.text()?;
-        match content_type {
-            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
-            ContentType::Text => {
-                return Err(Error::from(serde_json::Error::custom(
-                    "Received `text/plain` content type response that cannot be converted to `models::DocsHandoffStatus`",
-                )));
-            }
-            ContentType::Unsupported(unknown_type) => {
-                return Err(Error::from(serde_json::Error::custom(format!(
-                    "Received `{unknown_type}` content type response that cannot be converted to `models::DocsHandoffStatus`"
-                ))));
-            }
-        }
-    } else {
-        let content = resp.text()?;
-        let entity: Option<GetDocsAccountHandoffStatusError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,
@@ -2386,66 +2184,6 @@ pub fn list_integration_tokens(
     } else {
         let content = resp.text()?;
         let entity: Option<ListIntegrationTokensError> = serde_json::from_str(&content).ok();
-        Err(Error::ResponseError(ResponseContent {
-            status,
-            content,
-            entity,
-        }))
-    }
-}
-
-pub fn redeem_docs_account_handoff(
-    configuration: &configuration::Configuration,
-    handoff_id: &str,
-    docs_handoff_redemption: models::DocsHandoffRedemption,
-) -> Result<models::DocsHandoffCredentials, Error<RedeemDocsAccountHandoffError>> {
-    // add a prefix to parameters to efficiently prevent name collisions
-    let p_path_handoff_id = handoff_id;
-    let p_body_docs_handoff_redemption = docs_handoff_redemption;
-
-    let uri_str = format!(
-        "{}/v1/docs/account-handoffs/{handoffId}/redemption",
-        configuration.base_path,
-        handoffId = crate::generated::apis::urlencode(p_path_handoff_id)
-    );
-    let mut req_builder = configuration
-        .client
-        .request(reqwest::Method::POST, &uri_str);
-
-    if let Some(ref user_agent) = configuration.user_agent {
-        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
-    }
-    req_builder = req_builder.json(&p_body_docs_handoff_redemption);
-
-    let req = req_builder.build()?;
-    let resp = configuration.client.execute(req)?;
-
-    let status = resp.status();
-    let content_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("application/octet-stream");
-    let content_type = super::ContentType::from(content_type);
-
-    if !status.is_client_error() && !status.is_server_error() {
-        let content = resp.text()?;
-        match content_type {
-            ContentType::Json => serde_json::from_str(&content).map_err(Error::from),
-            ContentType::Text => {
-                return Err(Error::from(serde_json::Error::custom(
-                    "Received `text/plain` content type response that cannot be converted to `models::DocsHandoffCredentials`",
-                )));
-            }
-            ContentType::Unsupported(unknown_type) => {
-                return Err(Error::from(serde_json::Error::custom(format!(
-                    "Received `{unknown_type}` content type response that cannot be converted to `models::DocsHandoffCredentials`"
-                ))));
-            }
-        }
-    } else {
-        let content = resp.text()?;
-        let entity: Option<RedeemDocsAccountHandoffError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,

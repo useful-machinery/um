@@ -498,7 +498,6 @@ const fn audit_subject_kind(kind: OrganizationAuditSubjectKind) -> &'static str 
         OrganizationAuditSubjectKind::LinearTrigger => "linear_trigger",
         OrganizationAuditSubjectKind::LinearLifecycleUpdate => "linear_lifecycle_update",
         OrganizationAuditSubjectKind::LinearLifecycleBinding => "linear_lifecycle_binding",
-        OrganizationAuditSubjectKind::GoogleDocsAction => "google_docs_action",
         OrganizationAuditSubjectKind::Schedule => "schedule",
         OrganizationAuditSubjectKind::WorkflowDefinition => "workflow_definition",
     }

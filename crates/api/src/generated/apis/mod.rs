@@ -122,7 +122,6 @@ impl From<&str> for ContentType {
 
 pub mod artifacts_api;
 pub mod delegations_api;
-pub mod google_docs_actions_api;
 pub mod linear_triggers_api;
 pub mod organizations_api;
 pub mod principals_api;

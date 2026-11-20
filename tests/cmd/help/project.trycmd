@@ -5,7 +5,6 @@ Manage Useful Machinery projects
 Usage: useful project [COMMAND]
 
 Commands:
-  action       Manage a project's actions
   archive      Archive a project
   create       Create a project
   list         List projects

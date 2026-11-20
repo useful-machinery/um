@@ -12,7 +12,6 @@ mod current_principal;
 mod delegations;
 mod github;
 mod gitlab;
-mod google_docs_actions;
 mod grants;
 mod http_client;
 mod http_util;
@@ -102,11 +101,6 @@ pub use delegations::{
 pub use generated::models::submit_git_lab_candidate_request::{
     AccountUse as GitLabAccountUse, Kind as GitLabTokenKind,
 };
-pub use generated::models::{
-    CreateGoogleDocsActionRequest, GoogleDocsAction, GoogleDocsActionList,
-    GoogleDocsActionTombstone, GoogleDocsBinding, GoogleDocsPresentation,
-    PatchGoogleDocsActionRequest, google_docs_binding,
-};
 pub use generated::models::{CreateWebhookSubscriptionRequest, PatchWebhookSubscriptionRequest};
 pub use generated::models::{
     create_grant_session_request, provider_grant, provider_grant_session, provider_grant_use,
@@ -121,7 +115,6 @@ pub use github::{
 pub use gitlab::{
     GitLabApi, GitLabFailure, GitLabRepositoryQuery, GitLabSelection, GitLabSubmission,
 };
-pub use google_docs_actions::{ActionApi, ActionFailure, ActionRead, Lifecycle as ActionLifecycle};
 pub use grants::{
     Grant, GrantApi, GrantApiError, GrantFailure, GrantList, GrantSession, GrantSessionReason,
     GrantSessionStatus, GrantState, GrantUse, GrantUseList,

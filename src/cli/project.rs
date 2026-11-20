@@ -1,4 +1,3 @@
-mod action;
 mod output;
 mod webhook;
 
@@ -23,7 +22,7 @@ pub(super) use output::blocker_list;
 pub(super) const ABOUT: &str = "Manage Useful Machinery projects";
 /// What to do about a refusal that names an archived project, shared by the
 /// commands whose refusal is not a project outcome of its own: `useful project
-/// webhook`, `useful project action` and run creation.
+/// webhook` and run creation.
 pub(super) const ARCHIVED_REMEDY: &str = "The project is archived. As an organization owner, unarchive it with `useful project unarchive` first.";
 const NAME: &str = "project";
 
@@ -35,8 +34,6 @@ pub(super) struct Command {
 
 #[derive(Debug, Subcommand)]
 enum ProjectCommand {
-    #[command(about = "Manage a project's actions")]
-    Action(action::Command),
     #[command(about = "Archive a project")]
     Archive(ArchiveCommand),
     #[command(
@@ -300,7 +297,6 @@ impl Command {
             return super::print_help(&[NAME]);
         };
         match command {
-            ProjectCommand::Action(command) => command.execute(),
             ProjectCommand::Archive(command) => execute_leaf(command, ArchiveCommand::archive),
             ProjectCommand::Create(command) => execute_leaf(command, CreateCommand::execute),
             ProjectCommand::List(command) => execute_leaf(command, ListCommand::execute),

@@ -214,7 +214,6 @@ pub enum OrganizationAuditSubjectKind {
     LinearLifecycleUpdate,
     LinearLifecycleBinding,
     Project,
-    GoogleDocsAction,
     WebhookSubscription,
     WebhookDelivery,
     RepositoryConnection,
@@ -1217,7 +1216,6 @@ impl TryFrom<models::OrganizationAuditSubject> for OrganizationAuditSubject {
                 (OrganizationAuditSubjectKind::LinearLifecycleBinding, "run_")
             }
             Kind::Project => (OrganizationAuditSubjectKind::Project, "prj_"),
-            Kind::GoogleDocsAction => (OrganizationAuditSubjectKind::GoogleDocsAction, "gda_"),
             Kind::WebhookSubscription => {
                 (OrganizationAuditSubjectKind::WebhookSubscription, "whs_")
             }

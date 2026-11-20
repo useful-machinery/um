@@ -205,16 +205,6 @@ pub enum OrganizationAuditAction {
     LinearConnectionDisconnected,
     #[serde(rename = "linear_connection.deleted")]
     LinearConnectionDeleted,
-    #[serde(rename = "google_docs_action.created")]
-    GoogleDocsActionCreated,
-    #[serde(rename = "google_docs_action.patch")]
-    GoogleDocsActionPatch,
-    #[serde(rename = "google_docs_action.enable")]
-    GoogleDocsActionEnable,
-    #[serde(rename = "google_docs_action.disable")]
-    GoogleDocsActionDisable,
-    #[serde(rename = "google_docs_action.delete")]
-    GoogleDocsActionDelete,
     #[serde(rename = "linear_evaluation.retry_requested")]
     LinearEvaluationRetryRequested,
     #[serde(rename = "linear_trigger.lifecycle_enabled")]
@@ -423,11 +413,6 @@ impl std::fmt::Display for OrganizationAuditAction {
             Self::LinearConnectionReauthorized => write!(f, "linear_connection.reauthorized"),
             Self::LinearConnectionDisconnected => write!(f, "linear_connection.disconnected"),
             Self::LinearConnectionDeleted => write!(f, "linear_connection.deleted"),
-            Self::GoogleDocsActionCreated => write!(f, "google_docs_action.created"),
-            Self::GoogleDocsActionPatch => write!(f, "google_docs_action.patch"),
-            Self::GoogleDocsActionEnable => write!(f, "google_docs_action.enable"),
-            Self::GoogleDocsActionDisable => write!(f, "google_docs_action.disable"),
-            Self::GoogleDocsActionDelete => write!(f, "google_docs_action.delete"),
             Self::LinearEvaluationRetryRequested => write!(f, "linear_evaluation.retry_requested"),
             Self::LinearTriggerLifecycleEnabled => write!(f, "linear_trigger.lifecycle_enabled"),
             Self::LinearTriggerLifecycleDisabled => write!(f, "linear_trigger.lifecycle_disabled"),

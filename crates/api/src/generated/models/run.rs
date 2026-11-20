@@ -134,7 +134,7 @@ pub struct Run {
     pub source_display_snapshot: Option<Box<models::SourceDisplaySnapshot>>,
     #[serde(rename = "inputs")]
     pub inputs: Box<models::RunInputSummary>,
-    /// Complete private immutable run metadata supplied by the caller or trigger, except keys beginning `um.`, which only Useful Machinery sets, such as a Google Docs launch's `um.integration`. Keys and values cannot contain U+0000. Encoded size uses compact UTF-8 JSON with the shortest JSON-required escapes; `<`, `>`, `&`, U+2028, and U+2029 retain their literal UTF-8 size.
+    /// Complete private immutable run metadata supplied by the caller or trigger, except keys beginning `um.`, which only Useful Machinery sets, such as a schedule trigger's `um.integration`. Keys and values cannot contain U+0000. Encoded size uses compact UTF-8 JSON with the shortest JSON-required escapes; `<`, `>`, `&`, U+2028, and U+2029 retain their literal UTF-8 size.
     #[serde(rename = "integrationContext")]
     pub integration_context: std::collections::HashMap<String, String>,
     #[serde(rename = "actor")]

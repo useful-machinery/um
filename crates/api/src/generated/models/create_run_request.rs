@@ -40,7 +40,7 @@ pub struct CreateRunRequest {
     pub input_set_id: Option<Option<String>>,
     #[serde(rename = "publication", skip_serializing_if = "Option::is_none")]
     pub publication: Option<Box<models::RunPublicationRequest>>,
-    /// Private immutable per-run string metadata returned by run readers and never supplied to workflow execution. Omission, null, and an empty object normalize to the same empty object. Keys are nonempty and limited to 64 UTF-8 bytes, values to 1024 UTF-8 bytes, and compact encoded JSON to 16 KiB. Keys and values cannot contain U+0000. Keys beginning `um.` are reserved for context Useful Machinery sets, such as a Google Docs launch's, and are rejected. Encoded size uses compact UTF-8 JSON with the shortest JSON-required escapes; `<`, `>`, `&`, U+2028, and U+2029 retain their literal UTF-8 size.
+    /// Private immutable per-run string metadata returned by run readers and never supplied to workflow execution. Omission, null, and an empty object normalize to the same empty object. Keys are nonempty and limited to 64 UTF-8 bytes, values to 1024 UTF-8 bytes, and compact encoded JSON to 16 KiB. Keys and values cannot contain U+0000. Keys beginning `um.` are reserved for context Useful Machinery sets, such as a schedule trigger's, and are rejected. Encoded size uses compact UTF-8 JSON with the shortest JSON-required escapes; `<`, `>`, `&`, U+2028, and U+2029 retain their literal UTF-8 size.
     #[serde(
         rename = "integrationContext",
         default,

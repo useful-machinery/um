@@ -1,7 +1,5 @@
 use super::*;
 
-#[path = "project/action.rs"]
-mod action;
 #[path = "project/webhook.rs"]
 mod webhook;
 

@@ -78,8 +78,6 @@ pub enum Kind {
     LinearLifecycleBinding,
     #[serde(rename = "project")]
     Project,
-    #[serde(rename = "google_docs_action")]
-    GoogleDocsAction,
     #[serde(rename = "webhook_subscription")]
     WebhookSubscription,
     #[serde(rename = "webhook_delivery")]

@@ -36,11 +36,8 @@ pub(super) const INTERNAL_SERVER_ERROR: &str =
 pub(super) const PROJECT_ARCHIVED: &str =
     "https://api.usefulmachinery.com/problems/project-archived";
 /// The `reason` a conflict carries when its project is archived, under a type a published CLI
-/// already reads as a conflict (`webhook-conflict`, `google-docs-action-conflict`).
+/// already reads as a conflict (`webhook-conflict`).
 pub(super) const PROJECT_ARCHIVED_REASON: &str = "project-archived";
-/// The `reason` a `google-docs-action-conflict` carries when its project is bound to a GitLab
-/// repository (REQ-DOCSACTION-128).
-pub(super) const GOOGLE_DOCS_PROJECT_UNSUPPORTED_REASON: &str = "google-docs-project-unsupported";
 
 pub(super) fn decode_type(
     response: &super::http_util::BufferedResponse,
