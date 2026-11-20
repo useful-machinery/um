@@ -2626,7 +2626,7 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
         // `issue.unblocked_in_state` ones from 3 and the `run.ended` one from 4; a request
         // naming none is vocabulary 1.
         let vocabulary = evaluation_vocabulary(request);
-        let answer = match evaluation.strip_prefix('/') {
+        let mut answer = match evaluation.strip_prefix('/') {
             Some(CLOUD_PUSH_EVALUATION) if vocabulary < 2 => return gateway_not_found(),
             Some(CLOUD_WAITING_EVALUATION | CLOUD_UNBLOCKED_EVALUATION) if vocabulary < 3 => {
                 return gateway_not_found();
@@ -2637,6 +2637,8 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
             Some(CLOUD_UNBLOCKED_EVALUATION) => gateway_unblocked_evaluation(id),
             Some(CLOUD_RUN_ENDED_EVALUATION) => gateway_run_ended_evaluation(id),
             Some(CLOUD_NOT_READY_EVALUATION) => gateway_not_ready_evaluation(id),
+            Some(CLOUD_DIAGNOSED_EVALUATION) => gateway_diagnosed_evaluation(id),
+            Some(CLOUD_STAGE_DIAGNOSED_EVALUATION) => gateway_stage_diagnosed_evaluation(id),
             Some(evaluation) => gateway_evaluation(id, evaluation),
             None => {
                 let mut items = Vec::new();
@@ -2653,6 +2655,8 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
                     items.push(gateway_push_evaluation(id));
                 }
                 items.extend([
+                    gateway_diagnosed_evaluation(id),
+                    gateway_stage_diagnosed_evaluation(id),
                     gateway_evaluation(id, CLOUD_EVALUATION),
                     gateway_blocked_evaluation(id),
                     gateway_not_ready_evaluation(id),
@@ -2660,6 +2664,14 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
                 json!({"items": items, "nextCursor": "older-evaluations"})
             }
         };
+        // As Cloud does (REQ-TRIGGER-165), an evaluation's diagnostic is answered only to a
+        // request that asks for representation 4 or later; a request naming none is 1.
+        if query_number(request, "representation").unwrap_or(1) < 4 {
+            match answer.get_mut("items").and_then(Value::as_array_mut) {
+                Some(items) => items.iter_mut().for_each(withhold_diagnostic),
+                None => withhold_diagnostic(&mut answer),
+            }
+        }
         return super::json_http_response("200 OK", answer);
     }
     if let Some(id) = route.strip_prefix(&format!("GET {definitions}/")) {
@@ -2906,6 +2918,47 @@ fn gateway_unblocked_evaluation(id: &str) -> Value {
     evaluation["reason"] = Value::Null;
     evaluation["runId"] = json!(CLOUD_UNBLOCKED_RUN);
     evaluation
+}
+
+const CLOUD_DIAGNOSED_EVALUATION: &str = "wev_01k0z6r1w8f4jy2m7q9v3x5abk";
+const CLOUD_STAGE_DIAGNOSED_EVALUATION: &str = "wev_01k0z6r1w8f4jy2m7q9v3x5abm";
+
+/// A start evaluation `evaluation` of definition `id` that failed `issue_unavailable` with
+/// `diagnostic`, which Cloud answers from representation 4 (REQ-TRIGGER-190).
+fn gateway_issue_unavailable_evaluation(id: &str, evaluation: &str, diagnostic: Value) -> Value {
+    let mut evaluation = gateway_evaluation(id, evaluation);
+    evaluation["reason"] = json!("issue_unavailable");
+    evaluation["observations"] = json!({"observedAt": CLOUD_TIME, "diagnostic": diagnostic});
+    evaluation
+}
+
+/// An evaluation of definition `id` whose issue read Linear refused with HTTP 401.
+fn gateway_diagnosed_evaluation(id: &str) -> Value {
+    gateway_issue_unavailable_evaluation(
+        id,
+        CLOUD_DIAGNOSED_EVALUATION,
+        json!({"stage": "issue_read", "errorType": "token_refused", "httpStatus": 401}),
+    )
+}
+
+/// An evaluation of definition `id` whose issue read Cloud could not classify further.
+fn gateway_stage_diagnosed_evaluation(id: &str) -> Value {
+    gateway_issue_unavailable_evaluation(
+        id,
+        CLOUD_STAGE_DIAGNOSED_EVALUATION,
+        json!({"stage": "issue_read"}),
+    )
+}
+
+/// Drops `observations.diagnostic` from `evaluation`, as Cloud answers it below
+/// representation 4.
+fn withhold_diagnostic(evaluation: &mut Value) {
+    if let Some(observations) = evaluation
+        .get_mut("observations")
+        .and_then(Value::as_object_mut)
+    {
+        observations.remove("diagnostic");
+    }
 }
 
 /// What a create or publication request asks its revision to publish.
@@ -4264,15 +4317,16 @@ fn asks_for_vocabulary_2(request: &GatewayRequest) -> bool {
 
 /// The evaluation vocabulary `request`'s query names, 1 when it names none (REQ-TRIGGER-166).
 fn evaluation_vocabulary(request: &GatewayRequest) -> u32 {
-    request
-        .path
-        .split_once('?')
-        .and_then(|(_, query)| {
-            query
-                .split('&')
-                .find_map(|pair| pair.strip_prefix("vocabulary="))
-        })
-        .map_or(1, |number| number.parse().expect("a vocabulary number"))
+    query_number(request, "vocabulary").unwrap_or(1)
+}
+
+/// The number `request`'s query names for `key`, `None` when it names none.
+fn query_number(request: &GatewayRequest, key: &str) -> Option<u32> {
+    let (_, query) = request.path.split_once('?')?;
+    query.split('&').find_map(|pair| {
+        let (name, number) = pair.split_once('=')?;
+        (name == key).then(|| number.parse().expect("a number"))
+    })
 }
 
 const CLOUD_BOUND_DEFINITION: &str = "def_01k0z6r1w8f4jy2m7q9v3x5abe";
@@ -4766,7 +4820,7 @@ fn cloud_group_reports_the_stage_and_check_of_an_invalid_response() {
 }
 
 // REQ-CLOUDDEF-15: `evaluation list` sends its filters and page as typed and `evaluation
-// show` reads one evaluation, both asking for representation 3; both report each
+// show` reads one evaluation, both asking for representation 4; both report each
 // evaluation's state, stored reason and blocking run, `-` when it has none, and the
 // readiness blockers of an evaluation whose project was not ready.
 #[test]
@@ -4813,7 +4867,7 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
         [
             "cursor=page-2",
             "limit=5",
-            "representation=3",
+            "representation=4",
             &format!("runId={run_id}"),
             "state=failed",
             "vocabulary=4"
@@ -4850,7 +4904,7 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert_eq!(
         requests[0].path,
-        format!("{evaluations}?representation=3&vocabulary=4")
+        format!("{evaluations}?representation=4&vocabulary=4")
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_contains_all(
@@ -4911,7 +4965,7 @@ fn cloud_evaluations_are_listed_with_their_filters_and_shown_with_their_reason()
             .map(|request| &request.path)
             .collect::<Vec<_>>(),
         [&format!(
-            "{evaluations}/{CLOUD_EVALUATION}?representation=3&vocabulary=4"
+            "{evaluations}/{CLOUD_EVALUATION}?representation=4&vocabulary=4"
         )]
     );
     let shown = report(&output);
@@ -5010,7 +5064,7 @@ fn cloud_evaluations_list_and_show_a_push_with_its_branch_and_commit() {
     assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].path,
-        format!("{evaluations}/{CLOUD_PUSH_EVALUATION}?representation=3&vocabulary=4")
+        format!("{evaluations}/{CLOUD_PUSH_EVALUATION}?representation=4&vocabulary=4")
     );
     let shown = report(&output);
     assert_eq!(shown["outcome"], "shown", "{shown}");
@@ -5076,7 +5130,7 @@ fn cloud_evaluations_ask_for_vocabulary_4_and_show_a_run_end_with_its_run_attemp
     assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].path,
-        format!("{evaluations}/{CLOUD_RUN_ENDED_EVALUATION}?representation=3&vocabulary=4")
+        format!("{evaluations}/{CLOUD_RUN_ENDED_EVALUATION}?representation=4&vocabulary=4")
     );
     let shown = report(&output);
     assert_eq!(shown["outcome"], "shown", "{shown}");
@@ -5176,12 +5230,12 @@ fn cloud_show_asks_for_binding_vocabulary_2_and_prints_a_definition_binding() {
 }
 
 // REQ-CLOUDDEF-15, REQ-TRIGGER-165, REQ-TRIGGER-166, REQ-TRIGGER-181: `evaluation list` and
-// `evaluation show` ask for representation 3 and an evaluation vocabulary that holds
+// `evaluation show` ask for representation 4 and an evaluation vocabulary that holds
 // `issue.unblocked_in_state`, so such an evaluation is listed and read, printed as Cloud sent
 // it under `--json` and in human output with its issue and its blocker wait: when the wait
 // began and the blockers still open, each by its identifier or else its Linear id.
 #[test]
-fn cloud_evaluations_ask_for_representation_3_and_show_an_evaluation_with_its_blocker_wait() {
+fn cloud_evaluations_ask_for_representation_4_and_show_an_evaluation_with_its_blocker_wait() {
     let home = Home::new();
     let gateway = FakeGateway::new();
     let definition = format!("{CLOUD_ID_STEM}c");
@@ -5215,7 +5269,7 @@ fn cloud_evaluations_ask_for_representation_3_and_show_an_evaluation_with_its_bl
     assert_eq!(path, evaluations);
     let mut pairs = query.split('&').collect::<Vec<_>>();
     pairs.sort_unstable();
-    assert_eq!(pairs, ["representation=3", "vocabulary=4"]);
+    assert_eq!(pairs, ["representation=4", "vocabulary=4"]);
     let listed = report(&output);
     assert_eq!(listed["outcome"], "listed", "{listed}");
     let items = listed["evaluations"].as_array().expect("evaluations");
@@ -5241,7 +5295,7 @@ fn cloud_evaluations_ask_for_representation_3_and_show_an_evaluation_with_its_bl
     assert_eq!(requests.len(), 1);
     assert_eq!(
         requests[0].path,
-        format!("{evaluations}/{CLOUD_WAITING_EVALUATION}?representation=3&vocabulary=4")
+        format!("{evaluations}/{CLOUD_WAITING_EVALUATION}?representation=4&vocabulary=4")
     );
     let shown = report(&output);
     assert_eq!(shown["outcome"], "shown", "{shown}");
@@ -5312,5 +5366,122 @@ fn cloud_evaluations_ask_for_representation_3_and_show_an_evaluation_with_its_bl
         " -",
     );
     assert_eq!(field(&show(CLOUD_EVALUATION), "blocker wait: "), "-");
+    assert!(home.workflow_entries().is_empty());
+}
+
+// REQ-CLOUDDEF-15, REQ-TRIGGER-190: `evaluation list` and `evaluation show` ask for
+// representation 4, so the diagnostic of an evaluation that could not read its issue is
+// printed as Cloud sent it under `--json` and in human output as its labelled facts, absent
+// members left out, at the end of the listed line and on a `diagnostic:` line after `blocker
+// wait:`, which reads `-` for an evaluation with none.
+#[test]
+fn cloud_evaluations_ask_for_representation_4_and_show_an_evaluation_with_its_diagnostic() {
+    let home = Home::new();
+    let gateway = FakeGateway::new();
+    let definition = format!("{CLOUD_ID_STEM}c");
+    gateway.define(&definition, 2);
+    let evaluations = format!(
+        "/api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions/{definition}/evaluations"
+    );
+    let diagnosed = gateway_diagnosed_evaluation(&definition);
+    let evaluation = |leaf: &str, extra: &[&str]| {
+        let mut all = vec![
+            "workflow",
+            "definition",
+            "cloud",
+            "evaluation",
+            leaf,
+            CLOUD_ORGANIZATION,
+            definition.as_str(),
+        ];
+        all.extend_from_slice(extra);
+        all.extend_from_slice(&["--project-id", CLOUD_PROJECT, "--allow-insecure-http"]);
+        let (output, requests) = gateway.run(&home, &all);
+        super::assert_no_secret_output(&output, &[CLOUD_TOKEN]);
+        (output, requests)
+    };
+    let pairs = |requests: &[GatewayRequest], path: &str| {
+        assert_eq!(requests.len(), 1);
+        let (requested, query) = requests[0].path.split_once('?').expect("a query");
+        assert_eq!(requested, path);
+        let mut pairs = query.split('&').map(str::to_owned).collect::<Vec<_>>();
+        pairs.sort_unstable();
+        pairs
+    };
+
+    let (output, requests) = evaluation("list", &["--state", "failed", "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        pairs(&requests, &evaluations),
+        ["representation=4", "state=failed", "vocabulary=4"]
+    );
+    let listed = report(&output);
+    assert_eq!(listed["outcome"], "listed", "{listed}");
+    let items = listed["evaluations"].as_array().expect("evaluations");
+    assert!(items.contains(&diagnosed), "{listed}");
+
+    let (output, requests) = evaluation("show", &[CLOUD_DIAGNOSED_EVALUATION, "--json"]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        pairs(
+            &requests,
+            &format!("{evaluations}/{CLOUD_DIAGNOSED_EVALUATION}")
+        ),
+        ["representation=4", "vocabulary=4"]
+    );
+    let shown = report(&output);
+    assert_eq!(shown["outcome"], "shown", "{shown}");
+    assert_eq!(shown["evaluation"], diagnosed);
+    assert_eq!(
+        shown["evaluation"]["observations"]["diagnostic"],
+        json!({"stage": "issue_read", "errorType": "token_refused", "httpStatus": 401})
+    );
+
+    let full = "stage issue_read, error type token_refused, http status 401";
+    let (output, _) = evaluation("list", &[]);
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = |id: &str| {
+        stdout
+            .lines()
+            .find(|line| line.contains(id))
+            .unwrap_or_else(|| panic!("a line for {id}: {stdout}"))
+    };
+    let diagnosed_line = line(CLOUD_DIAGNOSED_EVALUATION);
+    assert_contains_all(diagnosed_line, &["failed", "issue_unavailable"]);
+    assert!(
+        diagnosed_line.ends_with(&format!(" · blocking run - · diagnostic {full}")),
+        "{stdout}"
+    );
+    assert!(
+        line(CLOUD_STAGE_DIAGNOSED_EVALUATION).ends_with(" · diagnostic stage issue_read"),
+        "{stdout}"
+    );
+    for id in [CLOUD_EVALUATION, CLOUD_WAITING_EVALUATION] {
+        assert!(!line(id).contains(" · diagnostic "), "{stdout}");
+    }
+
+    // The diagnostic line follows the blocker wait line.
+    let diagnostic = |id: &str| {
+        let (output, _) = evaluation("show", &[id]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let lines = stdout.lines().collect::<Vec<_>>();
+        let wait = lines
+            .iter()
+            .position(|line| line.starts_with("blocker wait: "))
+            .unwrap_or_else(|| panic!("a blocker wait line: {stdout}"));
+        lines
+            .get(wait + 1)
+            .and_then(|line| line.strip_prefix("diagnostic: "))
+            .map(str::to_owned)
+            .unwrap_or_else(|| panic!("a diagnostic line after the blocker wait: {stdout}"))
+    };
+    assert_eq!(diagnostic(CLOUD_DIAGNOSED_EVALUATION), full);
+    assert_eq!(
+        diagnostic(CLOUD_STAGE_DIAGNOSED_EVALUATION),
+        "stage issue_read"
+    );
+    assert_eq!(diagnostic(CLOUD_EVALUATION), "-");
     assert!(home.workflow_entries().is_empty());
 }

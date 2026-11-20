@@ -41,6 +41,8 @@ pub struct WorkflowDefinitionEvaluationObservations {
     pub project: Option<Box<models::WorkflowDefinitionEvaluationObservationsProject>>,
     #[serde(rename = "blockerWait", skip_serializing_if = "Option::is_none")]
     pub blocker_wait: Option<Box<models::WorkflowDefinitionEvaluationObservationsBlockerWait>>,
+    #[serde(rename = "diagnostic", skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<Box<models::WorkflowDefinitionEvaluationObservationsDiagnostic>>,
 }
 
 impl WorkflowDefinitionEvaluationObservations {
@@ -57,6 +59,7 @@ impl WorkflowDefinitionEvaluationObservations {
             admission_failure: None,
             project: None,
             blocker_wait: None,
+            diagnostic: None,
         }
     }
 }

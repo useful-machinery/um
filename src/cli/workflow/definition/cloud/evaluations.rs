@@ -3,7 +3,8 @@
 //! (REQ-TRIGGER-166), listed with the exact `state` and `runId` filters and read one at a
 //! time, each with its stored reason, what its event names (a Linear issue, a push's branch
 //! and commit, or an ended run with its attempt and outcome) and, when it waited for its
-//! issue's blockers, that blocker wait (REQ-TRIGGER-181).
+//! issue's blockers, that blocker wait (REQ-TRIGGER-181) and, when it could not read its
+//! issue, its diagnostic (REQ-TRIGGER-190).
 
 use std::io::{self, Write};
 
@@ -181,7 +182,7 @@ impl Show {
 
 /// One evaluation on a line in vocabulary 4: id, state with its reason, trigger, revision,
 /// event, run, the run blocking it and, when Cloud observed them, its project's readiness
-/// blockers and its blocker wait.
+/// blockers, its blocker wait and its diagnostic.
 fn summary(evaluation: &WorkflowDefinitionEvaluation) -> String {
     let line = format!(
         "{} · {} · reason {} · trigger {} · revision {} · {} {} · accepted {} · run {} · blocking run {}",
@@ -200,8 +201,12 @@ fn summary(evaluation: &WorkflowDefinitionEvaluation) -> String {
         Some(blockers) => format!("{line} · project blockers {blockers}"),
         None => line,
     };
-    match blocker_wait(evaluation) {
+    let line = match blocker_wait(evaluation) {
         Some(wait) => format!("{line} · blocker wait {wait}"),
+        None => line,
+    };
+    match diagnostic(evaluation) {
+        Some(facts) => format!("{line} · diagnostic {facts}"),
         None => line,
     }
 }
@@ -247,6 +252,11 @@ fn write_evaluation(
         out,
         "blocker wait: {}",
         blocker_wait(evaluation).unwrap_or_else(|| "-".to_owned())
+    )?;
+    writeln!(
+        out,
+        "diagnostic: {}",
+        diagnostic(evaluation).unwrap_or_else(|| "-".to_owned())
     )?;
     writeln!(
         out,
@@ -319,6 +329,31 @@ fn blocker_wait(evaluation: &WorkflowDefinitionEvaluation) -> Option<String> {
         "since {} · blocked by {blockers}",
         display(&wait.since)
     ))
+}
+
+/// The safe facts of the failure the evaluation's reason names, each member Cloud returned as
+/// `stage <stage>`, `error type <errorType>` and `http status <httpStatus>`, joined with `, `;
+/// `None` when Cloud returned no diagnostic or one with no member (REQ-TRIGGER-190,
+/// REQ-DIAG-43).
+fn diagnostic(evaluation: &WorkflowDefinitionEvaluation) -> Option<String> {
+    let diagnostic = evaluation.observations.as_ref()?.diagnostic.as_ref()?;
+    let facts = [
+        diagnostic
+            .stage
+            .as_deref()
+            .map(|stage| format!("stage {}", display(stage))),
+        diagnostic
+            .error_type
+            .as_deref()
+            .map(|error_type| format!("error type {}", display(error_type))),
+        diagnostic
+            .http_status
+            .map(|status| format!("http status {status}")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    (!facts.is_empty()).then(|| facts.join(", "))
 }
 
 fn or_dash(value: Option<&str>) -> String {

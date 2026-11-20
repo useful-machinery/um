@@ -50,8 +50,9 @@ const EVALUATION_ID_PREFIX: &str = "wev_";
 /// answered in the vocabulary of releases before the parameter.
 const EVALUATION_VOCABULARY: &str = "4";
 /// The evaluation representation whose members this release's generated model knows: 2
-/// adds `observations.project` and 3 `observations.blockerWait` (REQ-TRIGGER-165).
-const EVALUATION_REPRESENTATION: (&str, &str) = ("representation", "3");
+/// adds `observations.project`, 3 `observations.blockerWait` and 4 `observations.diagnostic`
+/// (REQ-TRIGGER-165). An older Cloud answers it as its own latest, so there is no fallback.
+const EVALUATION_REPRESENTATION: (&str, &str) = ("representation", "4");
 /// The binding vocabulary this release decodes (REQ-CLOUDDEF-8): its revision models hold the
 /// kinds `connection`, `linear.team`, `linear.state`, `github.repository`, `member` and
 /// `members` and the kind `definition`. A request that named none would be answered without a
@@ -568,7 +569,7 @@ impl<'a> WorkflowDefinitionApi<'a> {
     }
 
     /// One page of definition `id`'s retained start evaluations, newest first, with the next
-    /// page's cursor (REQ-TRIGGER-132), in representation 3 (REQ-TRIGGER-165); `filter`,
+    /// page's cursor (REQ-TRIGGER-132), in representation 4 (REQ-TRIGGER-165); `filter`,
     /// `limit` and `cursor` select the page, and the request asks for `EVALUATION_VOCABULARY`.
     pub fn evaluations(
         &self,
@@ -601,7 +602,8 @@ impl<'a> WorkflowDefinitionApi<'a> {
     }
 
     /// The start evaluation `evaluation` of definition `id` (REQ-TRIGGER-132), in
-    /// representation 3 (REQ-TRIGGER-165) and asked for in `EVALUATION_VOCABULARY`.
+    /// representation 4 (REQ-TRIGGER-165), with its `observations.diagnostic`, and asked for
+    /// in `EVALUATION_VOCABULARY`.
     pub fn evaluation(
         &self,
         organization: &str,
