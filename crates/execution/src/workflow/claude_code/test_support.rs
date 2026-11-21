@@ -39,6 +39,7 @@ use crate::workflow::process_group::{
     ProcessGuardStoreError,
 };
 use crate::workflow::runtime::{ActionId, TransitionSequence};
+use crate::workflow::test_support::record_fixture_progress;
 
 const MAXIMUM_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAXIMUM_PROVIDER_REQUEST_BYTES: usize = 16 * 1024 * 1024;
@@ -56,13 +57,7 @@ pub(crate) struct FixtureSignal {
 
 impl FixtureSignal {
     pub(crate) fn create(path: PathBuf) -> Self {
-        mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
-        let reader = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&path)
-            .unwrap();
+        let reader = create_fixture_fifo(&path);
         Self {
             path: Arc::from(path),
             reader: Arc::new(reader),
@@ -83,12 +78,55 @@ impl FixtureSignal {
                 reader.read(&mut signal)
             }) {
                 Ok(Ok(0)) => panic!("fixture signal closed without a value"),
-                Ok(Ok(read)) => return signal[..read].to_vec(),
+                Ok(Ok(read)) => {
+                    let signal = signal[..read].to_vec();
+                    record_fixture_progress(format!(
+                        "fixture signal {} received {:?}",
+                        self.path.file_name().unwrap().to_string_lossy(),
+                        String::from_utf8_lossy(&signal)
+                    ));
+                    return signal;
+                }
                 Ok(Err(error)) => panic!("failed to read fixture signal: {error}"),
                 Err(_) => {}
             }
         }
     }
+}
+
+/// The case's side of a fixture's `release` FIFO (INV-TESTING-29): a non-blocking read/write
+/// handle held from creation to drop, through which each release is written on the caller's
+/// thread. Because the case always holds a writer, a fixture that opens the FIFO to wait for a
+/// release never waits for a writer and never reads end of file while the case lives, and a
+/// release never waits for the fixture to open the FIFO.
+pub(crate) struct FixtureRelease {
+    writer: fs::File,
+}
+
+impl FixtureRelease {
+    pub(crate) fn create(path: &Path) -> Self {
+        Self {
+            writer: create_fixture_fifo(path),
+        }
+    }
+
+    /// Writes one `release` line for the fixture's next wait to take.
+    pub(crate) fn release(&self) {
+        (&self.writer).write_all(b"release\n").unwrap();
+        record_fixture_progress("fixture release written".to_owned());
+    }
+}
+
+/// Makes the FIFO at `path` and opens it for reading and writing, non-blocking, so that the
+/// open neither waits for the fixture nor leaves the FIFO without a reader or a writer.
+fn create_fixture_fifo(path: &Path) -> fs::File {
+    mkfifo(path, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
+    fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .unwrap()
 }
 
 pub(super) use crate::workflow::test_support::{

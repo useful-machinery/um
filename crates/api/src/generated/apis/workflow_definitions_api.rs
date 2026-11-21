@@ -64,6 +64,20 @@ pub enum CreateWorkflowTreeUploadError {
     UnknownValue(serde_json::Value),
 }
 
+/// struct for typed errors of method [`delete_workflow_definition`]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DeleteWorkflowDefinitionError {
+    Status400(models::Problem),
+    Status401(models::Problem),
+    Status403(models::Problem),
+    Status404(models::Problem),
+    Status409(models::Problem),
+    Status500(models::Problem),
+    Status503(models::Problem),
+    UnknownValue(serde_json::Value),
+}
+
 /// struct for typed errors of method [`disable_workflow_definition`]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
@@ -257,7 +271,7 @@ pub enum UnarchiveWorkflowDefinitionError {
     UnknownValue(serde_json::Value),
 }
 
-/// Owner only. An archived definition refuses publications and new runs with 409 `definition-archived`; its revisions stay readable and it is never deleted. While the project is archived the change is 409 `project-archived` with `reason` `project-archived` and changes nothing; a completed request repeated with its key returns its recorded result.
+/// Owner only. An archived definition refuses publications and new runs with 409 `definition-archived`; its revisions stay readable. Only `deleteWorkflowDefinition` deletes a definition, once it is archived. While the project is archived the change is 409 `project-archived` with `reason` `project-archived` and changes nothing; a completed request repeated with its key returns its recorded result.
 pub fn archive_workflow_definition(
     configuration: &configuration::Configuration,
     organization_ref: &str,
@@ -453,6 +467,57 @@ pub fn create_workflow_tree_upload(
     } else {
         let content = resp.text()?;
         let entity: Option<CreateWorkflowTreeUploadError> = serde_json::from_str(&content).ok();
+        Err(Error::ResponseError(ResponseContent {
+            status,
+            content,
+            entity,
+        }))
+    }
+}
+
+/// Owner only, and only of an archived definition: an active one is 409 `definition-not-archived` and changes nothing. While the project is archived the delete is 409 `project-archived` with `reason` `project-archived` and changes nothing. The request accepts no body, and the answer is 204 without one. After the delete the definition is not found, and so is everything under its path: its revisions, their outlines, its evaluations and every change of it, a second delete included. A run creation naming it is 404 `not-found`, as one naming a definition of another project is. Its runs keep the revision, tree and bindings they pinned, and go on to their ends. There is no restore. A completed delete repeated with its key answers 204 again; the key sent to delete another definition, or for another change of a definition, is 409 `idempotency-conflict`.
+pub fn delete_workflow_definition(
+    configuration: &configuration::Configuration,
+    organization_ref: &str,
+    project_id: &str,
+    definition_id: &str,
+    idempotency_key: &str,
+) -> Result<(), Error<DeleteWorkflowDefinitionError>> {
+    // add a prefix to parameters to efficiently prevent name collisions
+    let p_path_organization_ref = organization_ref;
+    let p_path_project_id = project_id;
+    let p_path_definition_id = definition_id;
+    let p_header_idempotency_key = idempotency_key;
+
+    let uri_str = format!(
+        "{}/v1/organizations/{organizationRef}/projects/{projectId}/workflow-definitions/{definitionId}",
+        configuration.base_path,
+        organizationRef = crate::generated::apis::urlencode(p_path_organization_ref),
+        projectId = crate::generated::apis::urlencode(p_path_project_id),
+        definitionId = crate::generated::apis::urlencode(p_path_definition_id)
+    );
+    let mut req_builder = configuration
+        .client
+        .request(reqwest::Method::DELETE, &uri_str);
+
+    if let Some(ref user_agent) = configuration.user_agent {
+        req_builder = req_builder.header(reqwest::header::USER_AGENT, user_agent.clone());
+    }
+    req_builder = req_builder.header("Idempotency-Key", p_header_idempotency_key.to_string());
+    if let Some(ref token) = configuration.bearer_access_token {
+        req_builder = req_builder.bearer_auth(token.to_owned());
+    };
+
+    let req = req_builder.build()?;
+    let resp = configuration.client.execute(req)?;
+
+    let status = resp.status();
+
+    if !status.is_client_error() && !status.is_server_error() {
+        Ok(())
+    } else {
+        let content = resp.text()?;
+        let entity: Option<DeleteWorkflowDefinitionError> = serde_json::from_str(&content).ok();
         Err(Error::ResponseError(ResponseContent {
             status,
             content,

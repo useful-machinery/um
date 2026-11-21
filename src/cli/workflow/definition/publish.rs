@@ -27,6 +27,8 @@ const COMMAND_NAME: &str = "useful workflow definition publish";
 const REFUSED: &str = "Publish refused.";
 /// The problem slug of a reuse that matched several identical Cloud definitions.
 const DEFINITION_REUSE_AMBIGUOUS: &str = "definition-reuse-ambiguous";
+/// The problem slug of a Cloud definition the project does not hold, a deleted one included.
+const NOT_FOUND: &str = "not-found";
 
 #[derive(Debug, Args)]
 pub(super) struct Command {
@@ -575,7 +577,22 @@ fn write_cloud_published(
             }
             let ambiguous =
                 refusal.is_some_and(|refusal| refusal.problem == DEFINITION_REUSE_AMBIGUOUS);
+            // The addressed definition, named or recorded, is not found in the project: the
+            // owner creates another or names one, as the next attempt at the same target
+            // would be refused again (REQ-CLOUDDEF-14).
+            let addressed_not_found =
+                addressed.is_some() && refusal.is_some_and(|refusal| refusal.problem == NOT_FOUND);
             match target.named() {
+                _ if addressed_not_found => writeln!(
+                    stderr,
+                    "\nRevision {} of {} stays recorded locally. Cloud does not hold that definition in the project. Publish again to create another Cloud definition, or to one that you choose:\n  useful workflow definition publish <DIR> --cloud {} --project {} --cloud-new\n  useful workflow definition publish <DIR> --cloud {} --project {} --cloud-to <CLOUD_ID>",
+                    published.revision.n,
+                    display(&published.record.id),
+                    display(&target.organization),
+                    display(&target.project),
+                    display(&target.organization),
+                    display(&target.project)
+                )?,
                 // The record's Cloud definition was not changed, so the next attempt names
                 // the target again.
                 Some(id) => writeln!(

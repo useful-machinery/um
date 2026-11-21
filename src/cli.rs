@@ -3036,6 +3036,7 @@ mod tests {
             "workflow definition",
             "workflow definition cloud",
             "workflow definition cloud archive",
+            "workflow definition cloud delete",
             "workflow definition cloud disable",
             "workflow definition cloud enable",
             "workflow definition cloud evaluation",

@@ -1,10 +1,13 @@
 use super::admission::{AdmittedWorkflow, ExecutionContext, ResolvedInputs, admit_workflow};
+use super::agent::AgentOutcome;
 use super::resolution;
 use super::runtime::{
     self, ConditionOutput, ExecutionSeed, ExecutionStart, InitialCancellation, Reduction,
     RuntimeDefinition,
 };
+use std::cell::RefCell;
 use std::fmt;
+use std::future::Future;
 use std::path::Path;
 
 use std::fs;
@@ -256,6 +259,53 @@ pub(crate) use fixtures::{
 pub(crate) use useful_test_support::watchdog::{
     host_scaled_watchdog, host_scaled_watchdog_with_diagnosis,
 };
+
+thread_local! {
+    /// The last progress a harness adapter case's fixture made on this test thread, which
+    /// `fixture_progress_watchdog` names when it expires. The Codex and Claude Code adapter
+    /// suites set no runtime flavor, so the fixture's drivers, the adapter's task and the case
+    /// body share `#[tokio::test]`'s current thread, and the thread is the case.
+    static LAST_FIXTURE_PROGRESS: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn record_fixture_progress(progress: String) {
+    LAST_FIXTURE_PROGRESS.with(|last| *last.borrow_mut() = Some(progress));
+}
+
+pub(crate) fn record_invocation_end(outcome: &AgentOutcome) {
+    record_fixture_progress(match outcome {
+        AgentOutcome::Completed(_) => "invocation ended Completed".to_owned(),
+        AgentOutcome::Failed(failure) => {
+            format!("invocation ended Failed: {:?}", failure.cause())
+        }
+        AgentOutcome::Cancelled { reason } => format!("invocation ended Cancelled: {reason:?}"),
+    });
+}
+
+/// The watchdog's diagnosis: the last progress the case's fixture recorded, or `none`.
+fn last_fixture_progress() -> Option<String> {
+    let last = LAST_FIXTURE_PROGRESS.with(|last| last.borrow().clone());
+    Some(format!(
+        "last fixture progress: {}",
+        last.as_deref().unwrap_or("none")
+    ))
+}
+
+/// `host_scaled_watchdog_with_diagnosis` for a harness adapter case, whose expiry names the
+/// last fixture progress recorded since the case started. A plain function, not an
+/// `async fn`: the body reaches the watchdog's heap pin before the block that clears the cell
+/// exists (INV-TESTING-18).
+pub(crate) fn fixture_progress_watchdog<Output>(
+    case: impl Into<String>,
+    base: Duration,
+    future: impl Future<Output = Output>,
+) -> impl Future<Output = Output> {
+    let bounded = host_scaled_watchdog_with_diagnosis(case, base, last_fixture_progress, future);
+    async move {
+        LAST_FIXTURE_PROGRESS.with(|last| last.borrow_mut().take());
+        bounded.await
+    }
+}
 
 /// A validator for one `$defs` definition of a JSON Schema document, so a test checks a
 /// fragment of a published schema without a whole document around it.

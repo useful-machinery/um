@@ -1900,10 +1900,12 @@ a reused definition records no revision, and `cloud.revision` is its current one
 nothing was uploaded; tree reuse is storage and says nothing of the definition. When more
 than one of the project's definitions is identical, Cloud refuses with
 `definition-reuse-ambiguous` and the report names their ids (`cloud.workflow.definitionIds`):
-choose one with `--cloud-to`, or create another with `--cloud-new`.
+choose one with `--cloud-to`, or create another with `--cloud-new`. A home whose Cloud
+definition is not found, as after `useful workflow definition cloud delete`, publishes again
+with `--cloud-new` or `--cloud-to`.
 
-`useful workflow definition cloud` reads and changes a project's Cloud definitions, and lists
-and shows a definition's start evaluations, newest first:
+`useful workflow definition cloud` reads, changes and deletes a project's Cloud definitions,
+and lists and shows a definition's start evaluations, newest first:
 
 ```sh
 useful workflow definition cloud list acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc --limit 20
@@ -1912,6 +1914,9 @@ useful workflow definition cloud show acme-labs DEFINITION \
 # enable, disable, archive and unarchive take the same arguments.
 useful workflow definition cloud disable acme-labs DEFINITION \
   --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc
+# delete requires --yes and deletes only an archived definition.
+useful workflow definition cloud delete acme-labs DEFINITION \
+  --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc --yes
 useful workflow definition cloud set-principal acme-labs DEFINITION PRINCIPAL \
   --project-id prj_01k0z6r1w8f4jy2m7q9v3x5abc
 useful workflow definition cloud evaluation list acme-labs DEFINITION \

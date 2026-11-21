@@ -2185,11 +2185,11 @@ impl GatewayRequest {
 
 /// What the fake Gateway holds between invocations: the file contents the organization
 /// retains, the sealed tree digests, each definition, whether the next publication to an id
-/// loses a race to another publisher or is forbidden, whether the reply to the next create
-/// or publication is lost after it is applied, the problems the next keyed definition
+/// loses a race to another publisher or is forbidden, whether the reply to the next create,
+/// publication or delete is lost after it is applied, the problems the next keyed definition
 /// requests are answered with before they are applied, the fault the next request on the
-/// route it names is answered with, and each create or publication reply, with its status, by
-/// its `Idempotency-Key`.
+/// route it names is answered with, each create or publication reply, with its status, by
+/// its `Idempotency-Key`, and the `Idempotency-Key` of each applied delete.
 #[derive(Default)]
 struct GatewayState {
     retained: std::collections::BTreeSet<String>,
@@ -2201,6 +2201,7 @@ struct GatewayState {
     keyed_problems: std::collections::VecDeque<(&'static str, u16, &'static str, Value)>,
     fault: Option<Fault>,
     publications: std::collections::BTreeMap<String, (&'static str, Value)>,
+    deletions: std::collections::BTreeSet<String>,
 }
 
 impl GatewayState {
@@ -2245,7 +2246,7 @@ pub(super) enum Fault {
     CreateHtmlNotFound,
     /// A definition read is answered with the definition under `CLOUD_TARGET`'s id.
     ReadOtherDefinition,
-    /// A setting change is applied and answered without its `Idempotency-Key`.
+    /// A setting change or a delete is applied and answered without its `Idempotency-Key`.
     ChangeWithoutKey,
 }
 
@@ -2310,7 +2311,7 @@ impl FakeGateway {
         self.state.lock().unwrap().forbid_next_publication = true;
     }
 
-    /// Applies the next create or publication but sends no reply to it.
+    /// Applies the next create, publication or delete but sends no reply to it.
     pub(super) fn drop_next_publication_reply(&self) {
         self.state.lock().unwrap().drop_next_publication_reply = true;
     }
@@ -2596,9 +2597,10 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
                     }
                 }
             }
+            // Counting the deleted ones too, so that, as in Cloud, an id is never minted again.
             let id = format!(
                 "{CLOUD_ID_STEM}{}",
-                ['c', 'd', 'e', 'f', 'g', 'h'][state.definitions.len()]
+                ['c', 'd', 'e', 'f', 'g', 'h'][state.definitions.len() + state.deletions.len()]
             );
             state.definitions.insert(
                 id.clone(),
@@ -2613,6 +2615,9 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
                 gateway_publication(&id, &state.definitions[&id]),
             ))
         });
+    }
+    if let Some(id) = route.strip_prefix(&format!("DELETE {definitions}/")) {
+        return respond_delete(state, id, &key);
     }
     if let Some(response) = respond_settings(state, request, &definitions, keyed) {
         return response;
@@ -3867,6 +3872,94 @@ fn publish_cloud_to_refusals_create_nothing_and_leave_the_record_unlinked() {
     assert_eq!(gateway_definitions(&gateway), vec![(cloud_id, 3)]);
 }
 
+// REQ-CLOUDDEF-14, REQ-CLOUDDEF-20: a publication addressed to a Cloud definition that is no
+// longer found, by the record's `cloudId` or by `--cloud-to`, is refused without a create,
+// keeps the recorded id and says to publish again with `--cloud-new` or `--cloud-to`.
+#[test]
+fn publish_cloud_to_a_deleted_definition_is_refused_and_says_how_to_publish_again() {
+    let home = Home::new();
+    let tree = Tree::engineering();
+    let bindings = tree.engineering_bindings();
+    let gateway = FakeGateway::new();
+
+    let (output, _) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let created = report(&output);
+    let deleted = cloud_definition(&created);
+    for leaf in [vec!["archive"], vec!["delete", "--yes"]] {
+        let mut args = vec![
+            "workflow",
+            "definition",
+            "cloud",
+            leaf[0],
+            CLOUD_ORGANIZATION,
+            &deleted,
+            "--project-id",
+            CLOUD_PROJECT,
+            "--allow-insecure-http",
+        ];
+        args.extend_from_slice(&leaf[1..]);
+        let (output, _) = gateway.run(&home, &args);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+    }
+
+    let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let failed = report(&output);
+    assert_eq!(failed["outcome"], "cloud_failed", "{failed}");
+    assert_eq!(failed["cloud"]["failure"], "refused");
+    assert_eq!(failed["cloud"]["status"], 404);
+    assert_eq!(failed["cloud"]["problem"], "not-found");
+    assert_eq!(failed["cloud"]["target"], deleted.as_str());
+    assert_eq!(
+        published_record(&home, &failed)["cloudId"],
+        deleted.as_str()
+    );
+    assert_no_definition_created(&requests);
+
+    // The indented command lines of a human report's remedy.
+    let commands = |output: &std::process::Output| {
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .filter_map(|line| line.strip_prefix("  useful workflow definition publish "))
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let named = format!("--cloud-to {deleted}");
+    for extra in [vec![], vec!["--cloud-to", deleted.as_str()]] {
+        let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &extra));
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        assert_no_definition_created(&requests);
+        let commands = commands(&output);
+        assert!(
+            commands.iter().any(|line| line.ends_with("--cloud-new")),
+            "{output:?}"
+        );
+        assert!(
+            commands.iter().any(|line| line.contains("--cloud-to")),
+            "{output:?}"
+        );
+        assert!(
+            !commands.iter().any(|line| line.ends_with(&named)),
+            "{output:?}"
+        );
+    }
+
+    let (output, _) = gateway.run(
+        &home,
+        &cloud_publish_args(&tree, &bindings, &["--cloud-new", "--json"]),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let republished = report(&output);
+    assert_eq!(republished["cloud"]["created"], true, "{republished}");
+    let fresh = cloud_definition(&republished);
+    assert_ne!(fresh, deleted);
+    assert_eq!(
+        published_record(&home, &republished)["cloudId"],
+        fresh.as_str()
+    );
+}
+
 /// The Cloud definition id `report` reached.
 fn cloud_definition(report: &Value) -> String {
     text(&report["cloud"]["definition"], "cloud definition id").to_owned()
@@ -4344,6 +4437,41 @@ fn gateway_definition_binding() -> (Value, Value) {
     )
 }
 
+/// The answer to a delete of definition `id` under `key`, as Cloud answers it (REQ-CLOUDDEF-40):
+/// 204 with the key again for a key already applied, `not-found` for an id the fake does not
+/// hold and 409 `definition-not-archived` for an active one; an archived one is removed and the
+/// key recorded.
+fn respond_delete(state: &mut GatewayState, id: &str, key: &str) -> Vec<u8> {
+    let deleted = |headers: &[(&str, &str)]| {
+        super::http_response_with_headers("204 No Content", None, headers, b"")
+    };
+    if state.deletions.contains(key) {
+        return deleted(&[("Idempotency-Key", key)]);
+    }
+    let Some(definition) = state.definitions.get(id) else {
+        return gateway_not_found();
+    };
+    if !definition.archived {
+        return super::problem_http_response(
+            "409 Conflict",
+            json!({
+                "type": format!("{PROBLEMS}definition-not-archived"),
+                "title": "Definition not archived",
+                "status": 409,
+            }),
+        );
+    }
+    state.definitions.remove(id);
+    state.deletions.insert(key.to_owned());
+    if std::mem::take(&mut state.drop_next_publication_reply) {
+        return Vec::new();
+    }
+    if state.fault(Fault::ChangeWithoutKey) {
+        return deleted(&[]);
+    }
+    deleted(&[("Idempotency-Key", key)])
+}
+
 /// The definition list, the revision reads and the setting changes; an enable without an
 /// execution principal is refused 409 `definition-not-startable`. As Cloud does, a revision
 /// read or listing that asks for binding vocabulary 2 is answered with the `verify` binding.
@@ -4586,6 +4714,118 @@ fn cloud_group_lists_shows_and_administers_cloud_definitions() {
     assert!(home.workflow_entries().is_empty());
 }
 
+// REQ-CLOUDDEF-40, REQ-CLOUDDEF-15, REQ-CLOUDDEF-25: `delete` sends nothing without `--yes`,
+// is refused for a definition that is still active with the archive to run first, deletes an
+// archived one under one key that it sends again when the reply is lost, and then finds it
+// no more; it touches nothing under the `useful` home.
+#[test]
+fn cloud_delete_deletes_an_archived_definition_under_one_key() {
+    fn target<'a>(leaf: &'a str, id: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+        let mut args = vec![leaf, CLOUD_ORGANIZATION, id, "--project-id", CLOUD_PROJECT];
+        args.extend_from_slice(extra);
+        args
+    }
+    let home = Home::new();
+    let gateway = FakeGateway::new();
+    let first = format!("{CLOUD_ID_STEM}c");
+    let second = format!("{CLOUD_ID_STEM}d");
+    gateway.define(&first, 2);
+    let definitions = format!(
+        "/api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions"
+    );
+    let deleted_route = format!("DELETE {definitions}/{first}");
+    let cloud = |args: &[&str]| {
+        let mut all = vec!["workflow", "definition", "cloud"];
+        all.extend_from_slice(args);
+        all.push("--allow-insecure-http");
+        let (output, requests) = gateway.run(&home, &all);
+        super::assert_no_secret_output(&output, &[CLOUD_TOKEN]);
+        (output, requests)
+    };
+    let listed = || {
+        let (output, _) = cloud(&["list", CLOUD_ORGANIZATION, CLOUD_PROJECT, "--json"]);
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        report(&output)["definitions"]
+            .as_array()
+            .expect("definitions")
+            .iter()
+            .map(|item| text(&item["id"], "id").to_owned())
+            .collect::<Vec<_>>()
+    };
+
+    let (output, requests) = cloud(&target("delete", &first, &["--json"]));
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(requests.is_empty());
+    assert!(
+        gateway
+            .state
+            .lock()
+            .unwrap()
+            .definitions
+            .contains_key(&first)
+    );
+
+    let (output, requests) = cloud(&target("delete", &first, &["--yes", "--json"]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let refused = report(&output);
+    assert_eq!(refused["outcome"], "refused", "{refused}");
+    assert_eq!(refused["status"], 409);
+    assert_eq!(refused["problem"], "definition-not-archived");
+    assert_eq!(routes(&requests), vec![deleted_route.clone()]);
+    assert!(
+        requests[0]
+            .header("idempotency-key")
+            .is_some_and(|key| !key.is_empty())
+    );
+    let (output, _) = cloud(&target("delete", &first, &["--yes"]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("definition-not-archived"), "{stderr}");
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.starts_with("  useful workflow definition cloud archive")),
+        "{stderr}"
+    );
+
+    let (output, _) = cloud(&target("archive", &first, &["--json"]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    gateway.drop_next_publication_reply();
+    let (output, requests) = cloud(&target("delete", &first, &["--yes", "--json"]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let deleted = report(&output);
+    assert_eq!(deleted["outcome"], "deleted", "{deleted}");
+    assert_eq!(deleted["definitionId"], first.as_str());
+    assert_eq!(deleted["organizationRef"], CLOUD_ORGANIZATION);
+    assert_eq!(deleted["projectId"], CLOUD_PROJECT);
+    assert!(deleted.get("definition").is_none(), "{deleted}");
+    assert_eq!(
+        routes(&requests),
+        vec![deleted_route.clone(), deleted_route.clone()]
+    );
+    let key = requests[0].header("idempotency-key");
+    assert!(key.is_some_and(|key| !key.is_empty()));
+    assert_eq!(requests[1].header("idempotency-key"), key);
+    assert!(!listed().contains(&first));
+
+    let (output, _) = cloud(&target("delete", &first, &["--yes", "--json"]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let missing = report(&output);
+    assert_eq!(missing["status"], 404, "{missing}");
+    assert_eq!(missing["problem"], "not-found");
+
+    gateway.define(&second, 1);
+    let (output, _) = cloud(&target("archive", &second, &[]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let (output, _) = cloud(&target("delete", &second, &["--yes"]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains(&second),
+        "{output:?}"
+    );
+    assert!(home.workflow_entries().is_empty());
+}
+
 // REQ-CLOUDDEF-15, REQ-CLOUDDEF-8: `show` of a revision holding integration bindings prints,
 // after the flat resolution, each integration's account with its id and each of its bindings
 // as `<id>.<name>` with its value, kind and resolved id; `--json` carries both members as
@@ -4751,8 +4991,8 @@ fn cloud_group_resends_a_change_answered_with_a_transient_problem_once() {
     assert!(home.workflow_entries().is_empty());
 }
 
-// REQ-CLOUDDEF-28, REQ-CLOUDDEF-23: a `cloud` leaf whose answer fails a check reports
-// `invalid_response` with the stage and the check that failed.
+// REQ-CLOUDDEF-28, REQ-CLOUDDEF-23, REQ-CLOUDDEF-40: a `cloud` leaf whose answer fails a
+// check reports `invalid_response` with the stage and the check that failed.
 #[test]
 fn cloud_group_reports_the_stage_and_check_of_an_invalid_response() {
     let home = Home::new();
@@ -4767,6 +5007,29 @@ fn cloud_group_reports_the_stage_and_check_of_an_invalid_response() {
         .get_mut(&id)
         .expect("seeded definition")
         .principal = Some(CLOUD_PRINCIPAL.to_owned());
+    let archived = format!("{CLOUD_ID_STEM}d");
+    gateway.define(&archived, 1);
+    gateway
+        .state
+        .lock()
+        .unwrap()
+        .definitions
+        .get_mut(&archived)
+        .expect("seeded definition")
+        .archived = true;
+    let deleting = vec![
+        "workflow",
+        "definition",
+        "cloud",
+        "delete",
+        CLOUD_ORGANIZATION,
+        archived.as_str(),
+        "--project-id",
+        CLOUD_PROJECT,
+        "--yes",
+        "--allow-insecure-http",
+        "--json",
+    ];
     let leaf = |leaf: &'static str, json: bool| {
         let mut args = vec![
             "workflow",
@@ -4794,6 +5057,11 @@ fn cloud_group_reports_the_stage_and_check_of_an_invalid_response() {
         (
             Fault::ChangeWithoutKey,
             leaf("enable", true),
+            json!({"stage": "definition_change", "check": "idempotency_key"}),
+        ),
+        (
+            Fault::ChangeWithoutKey,
+            deleting,
             json!({"stage": "definition_change", "check": "idempotency_key"}),
         ),
     ] {

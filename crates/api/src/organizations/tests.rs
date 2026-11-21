@@ -776,9 +776,10 @@ fn update_and_membership_list_classify_only_their_contracted_failures() {
     }
 }
 
-// REQ-AUDIT-44, REQ-AUDIT-48
-// REQ-AUDIT-44, REQ-AUDIT-48: the listing asks for vocabulary 5, and a page in it whose
-// record names a connection authorization, with the connection it authorizes, decodes.
+// REQ-AUDIT-44, REQ-AUDIT-48, REQ-CLOUDDEF-12
+// REQ-AUDIT-44, REQ-AUDIT-48, REQ-CLOUDDEF-12: the listing asks for vocabulary 6, and a page
+// in it decodes whose records name a connection authorization, with the connection it
+// authorizes, and a workflow definition's deletion, with its state and version.
 #[test]
 fn audit_listing_asks_for_the_vocabulary_this_release_decodes() {
     let page = serde_json::to_vec(&serde_json::json!({"items": [{
@@ -793,6 +794,21 @@ fn audit_listing_asks_for_the_vocabulary_this_release_decodes() {
         "action": "connection_authorization.authorized",
         "subject": {"kind": "connection_authorization", "id": "cna_01k0z6r1w8f4jy2m7q9v3x5abc"},
         "changes": [{"field": "connection_id", "after": "gac_01k0z6r1w8f4jy2m7q9v3x5abc"}]
+    }, {
+        "id": "aud_01k0z6r1w8f4jy2m7q9v3x5abd",
+        "occurredAt": "2026-11-18T12:05:00Z",
+        "retention": {
+            "identifier": "identity-tenancy-production-730d-v1",
+            "retainUntil": "2028-11-17T12:05:00Z"
+        },
+        "detailsStatus": "details_available",
+        "actor": {"kind": "principal", "principalId": "prn_01k0z6r1w8f4jy2m7q9v3x5abc"},
+        "action": "workflow_definition.deleted",
+        "subject": {"kind": "workflow_definition", "id": "def_01k0z6r1w8f4jy2m7q9v3x5abc"},
+        "changes": [
+            {"field": "state", "before": "archived", "after": "deleted"},
+            {"field": "version", "before": "2", "after": "2"}
+        ]
     }]}))
     .unwrap();
     let server = ScriptedHttpServer::respond(response("200 OK", Some(JSON_MEDIA_TYPE), &[], &page));
@@ -812,14 +828,25 @@ fn audit_listing_asks_for_the_vocabulary_this_release_decodes() {
         "cna_01k0z6r1w8f4jy2m7q9v3x5abc"
     );
     assert_eq!(encoded["items"][0]["changes"][0]["field"], "connection_id");
+    let deletion = &encoded["items"][1];
+    assert_eq!(deletion["action"], "workflow_definition.deleted");
+    assert_eq!(deletion["subject"]["kind"], "workflow_definition");
+    assert_eq!(deletion["subject"]["id"], "def_01k0z6r1w8f4jy2m7q9v3x5abc");
+    assert_eq!(
+        deletion["changes"],
+        serde_json::json!([
+            {"field": "state", "before": "archived", "after": "deleted"},
+            {"field": "version", "before": "2", "after": "2"}
+        ])
+    );
     server.finish_one();
 
     for (limit, cursor, query) in [
-        (None, None, "?vocabulary=5"),
+        (None, None, "?vocabulary=6"),
         (
             Some(100),
             Some("opaque cursor"),
-            "?limit=100&cursor=opaque+cursor&vocabulary=5",
+            "?limit=100&cursor=opaque+cursor&vocabulary=6",
         ),
     ] {
         let page = serde_json::to_vec(&serde_json::json!({"items": []})).unwrap();

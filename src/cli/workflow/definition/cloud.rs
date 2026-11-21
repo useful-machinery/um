@@ -1,6 +1,6 @@
-//! `useful workflow definition cloud` (REQ-CLOUDDEF-15): lists, shows and changes the Cloud
-//! workflow definitions of a project through the public API (REQ-CLOUDDEF-1), and lists and
-//! shows a definition's start evaluations, with the CLI's session handling and each
+//! `useful workflow definition cloud` (REQ-CLOUDDEF-15): lists, shows, changes and deletes the
+//! Cloud workflow definitions of a project through the public API (REQ-CLOUDDEF-1), and lists
+//! and shows a definition's start evaluations, with the CLI's session handling and each
 //! refusal's problem type.
 
 mod evaluations;
@@ -35,6 +35,8 @@ pub(super) struct Command {
 enum Leaf {
     #[command(about = "Archive a Cloud workflow definition and turn off its automatic starts")]
     Archive(Target),
+    #[command(about = "Delete an archived Cloud workflow definition")]
+    Delete(Delete),
     #[command(about = "Turn off automatic starts of a Cloud workflow definition")]
     Disable(Target),
     #[command(about = "Turn on automatic starts of a Cloud workflow definition")]
@@ -73,6 +75,14 @@ struct Target {
     project_id: ProjectArg,
     #[command(flatten)]
     options: Options,
+}
+
+#[derive(Debug, Args)]
+struct Delete {
+    #[command(flatten)]
+    target: Target,
+    #[command(flatten)]
+    confirmation: cli::ConfirmationArgs,
 }
 
 #[derive(Debug, Args)]
@@ -157,6 +167,7 @@ impl Command {
                 Leaf::Enable(target) => target.change(deployment, Change::Enable),
                 Leaf::Disable(target) => target.change(deployment, Change::Disable),
                 Leaf::Archive(target) => target.change(deployment, Change::Archive),
+                Leaf::Delete(delete) => delete.target.delete(deployment),
                 Leaf::Unarchive(target) => target.change(deployment, Change::Unarchive),
                 Leaf::SetPrincipal(command) => command
                     .target
@@ -224,14 +235,38 @@ impl Target {
     /// Applies `change` under one fresh key, sent again once when the response is lost or is
     /// a transient problem (REQ-CLOUDDEF-25).
     fn change(&self, deployment: &Deployment, change: Change<'_>) -> cli::CommandResult {
-        let key = useful_support::generate_idempotency_key()
-            .context("generate Cloud workflow definition request identity")?;
-        let changed = with_api(deployment, &self.options, |api| {
-            resend_once(|| change.apply(api, self, &key))
-        })?;
+        let changed = self.keyed(deployment, |api, key| change.apply(api, self, key))?;
         let scope = self.scope(change.leaf());
         report::finish(&scope, changed.as_ref(), |definition| {
             report::changed(&scope, change.outcome(), definition)
+        })
+    }
+
+    /// Deletes the definition (REQ-CLOUDDEF-40) under one fresh key, sent again once when the
+    /// response is lost or is a transient problem (REQ-CLOUDDEF-25).
+    fn delete(&self, deployment: &Deployment) -> cli::CommandResult {
+        let (organization, project, id) = (
+            &*self.organization,
+            &*self.project_id,
+            self.definition.as_str(),
+        );
+        let deleted = self.keyed(deployment, |api, key| {
+            api.delete(organization, project, id, key)
+        })?;
+        report::finish_delete(&self.scope("delete"), id, deleted.as_ref())
+    }
+
+    /// Sends `send` under one fresh `Idempotency-Key`, and once more under that key when Cloud
+    /// does not answer or answers with a transient problem.
+    fn keyed<T>(
+        &self,
+        deployment: &Deployment,
+        send: impl Fn(&WorkflowDefinitionApi<'_>, &str) -> Result<T, WorkflowDefinitionFailure>,
+    ) -> anyhow::Result<Result<T, WorkflowDefinitionFailure>> {
+        let key = useful_support::generate_idempotency_key()
+            .context("generate Cloud workflow definition request identity")?;
+        with_api(deployment, &self.options, |api| {
+            resend_once(|| send(api, &key))
         })
     }
 }

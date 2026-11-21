@@ -295,6 +295,8 @@ pub enum OrganizationAuditAction {
     WorkflowDefinitionUnarchived,
     #[serde(rename = "workflow_definition.execution_principal_changed")]
     WorkflowDefinitionExecutionPrincipalChanged,
+    #[serde(rename = "workflow_definition.deleted")]
+    WorkflowDefinitionDeleted,
 }
 
 impl std::fmt::Display for OrganizationAuditAction {
@@ -468,6 +470,7 @@ impl std::fmt::Display for OrganizationAuditAction {
             Self::WorkflowDefinitionExecutionPrincipalChanged => {
                 write!(f, "workflow_definition.execution_principal_changed")
             }
+            Self::WorkflowDefinitionDeleted => write!(f, "workflow_definition.deleted"),
         }
     }
 }

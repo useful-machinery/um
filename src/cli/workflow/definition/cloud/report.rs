@@ -21,6 +21,9 @@ use useful_api::{
     WorkflowProblemDetail,
 };
 
+/// The problem slug Cloud refuses a delete of a definition that is still active with.
+const DEFINITION_NOT_ARCHIVED: &str = "definition-not-archived";
+
 /// The leaf a report is for and where it reached.
 pub(super) struct Scope<'a> {
     pub(super) leaf: &'static str,
@@ -64,9 +67,31 @@ pub(super) fn finish<T>(
     result: Result<&T, &WorkflowDefinitionFailure>,
     write: impl FnOnce(&T) -> anyhow::Result<()>,
 ) -> super::super::super::super::CommandResult {
+    finish_for(scope, None, result, write)
+}
+
+/// Writes the delete of `definition` as [`finish`] writes a result: `deleted`, or the failure,
+/// a refusal `definition-not-archived` saying to archive the definition first.
+pub(super) fn finish_delete(
+    scope: &Scope<'_>,
+    definition: &str,
+    result: Result<&(), &WorkflowDefinitionFailure>,
+) -> super::super::super::super::CommandResult {
+    finish_for(scope, Some(definition), result, |()| {
+        deleted(scope, definition)
+    })
+}
+
+/// As [`finish`], for the leaf addressed to `definition` when it is given.
+fn finish_for<T>(
+    scope: &Scope<'_>,
+    definition: Option<&str>,
+    result: Result<&T, &WorkflowDefinitionFailure>,
+    write: impl FnOnce(&T) -> anyhow::Result<()>,
+) -> super::super::super::super::CommandResult {
     let (written, exit_code) = match result {
         Ok(value) => (write(value), ExitCode::Success),
-        Err(failure) => (failed(scope, failure), cloud_failure(failure).1),
+        Err(failure) => (failed(scope, definition, failure), cloud_failure(failure).1),
     };
     written.with_context(|| format!("write {} result", scope.command()))?;
     Ok(exit_code)
@@ -231,6 +256,25 @@ pub(super) fn changed(
     Ok(())
 }
 
+/// The delete of `definition` (REQ-CLOUDDEF-40): with `--json` the group's document with its
+/// `definitionId`, without it one line naming the id.
+fn deleted(scope: &Scope<'_>, definition: &str) -> anyhow::Result<()> {
+    if scope.json {
+        return scope.write(
+            "deleted",
+            DeletedBody {
+                definition_id: definition,
+            },
+        );
+    }
+    writeln!(
+        io::stdout().lock(),
+        "✓ Cloud workflow definition {} deleted.",
+        display(definition)
+    )?;
+    Ok(())
+}
+
 fn write_definition(out: &mut impl Write, definition: &WorkflowDefinition) -> io::Result<()> {
     writeln!(out, "definition: {}", display(&definition.id))?;
     writeln!(
@@ -259,7 +303,13 @@ fn write_definition(out: &mut impl Write, definition: &WorkflowDefinition) -> io
     writeln!(out, "current: {}", definition.current_revision)
 }
 
-fn failed(scope: &Scope<'_>, failure: &WorkflowDefinitionFailure) -> anyhow::Result<()> {
+/// Writes `failure`; `definition` is the definition the leaf addressed, given for a delete,
+/// whose refusal `definition-not-archived` ends with the archive to run first.
+fn failed(
+    scope: &Scope<'_>,
+    definition: Option<&str>,
+    failure: &WorkflowDefinitionFailure,
+) -> anyhow::Result<()> {
     let name = cloud_failure(failure).0;
     let refusal = match failure {
         WorkflowDefinitionFailure::Refused(refusal) => Some(refusal),
@@ -314,6 +364,18 @@ fn failed(scope: &Scope<'_>, failure: &WorkflowDefinitionFailure) -> anyhow::Res
         if let Some(current) = detail.current_revision {
             writeln!(stderr, "current revision: {current}")?;
         }
+    }
+    if let Some(definition) = definition
+        && refusal.problem == DEFINITION_NOT_ARCHIVED
+    {
+        writeln!(
+            stderr,
+            "\nArchive the definition before deleting it:\n  useful workflow definition cloud archive {} {} --project-id {}",
+            display(scope.organization),
+            display(definition),
+            display(scope.project)
+        )?;
+        return Ok(());
     }
     writeln!(
         stderr,
@@ -378,6 +440,12 @@ struct ShownBody<'a> {
 #[derive(Serialize)]
 struct ChangedBody<'a> {
     definition: &'a WorkflowDefinition,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeletedBody<'a> {
+    definition_id: &'a str,
 }
 
 #[derive(Serialize)]

@@ -175,7 +175,7 @@ pub enum WorkflowDefinitionStage {
     RevisionList,
     EvaluationRead,
     EvaluationList,
-    /// Enable, disable, archive, unarchive and the execution principal.
+    /// Enable, disable, archive, unarchive, delete and the execution principal.
     DefinitionChange,
 }
 
@@ -657,6 +657,26 @@ impl<'a> WorkflowDefinitionApi<'a> {
         self.change(organization, project, id, key, Change::Archive)
     }
 
+    /// Deletes archived definition `id` under `key` (REQ-CLOUDDEF-37): accepted only as a 204
+    /// carrying the key, whose body is not read.
+    pub fn delete(
+        &self,
+        organization: &str,
+        project: &str,
+        id: &str,
+        key: &str,
+    ) -> Result<(), WorkflowDefinitionFailure> {
+        let endpoint = self.definitions_endpoint(organization, project, &[id]);
+        let request = mutation_request(&self.configuration, Method::DELETE, &endpoint, key);
+        receive_status(
+            request,
+            &[StatusCode::NO_CONTENT],
+            Some(key),
+            Stage::DefinitionChange,
+        )
+        .map(|_| ())
+    }
+
     /// Restores archived definition `id` under `key` (REQ-CLOUDDEF-10).
     pub fn unarchive(
         &self,
@@ -998,6 +1018,20 @@ fn receive_accepted(
     key: Option<&str>,
     stage: Stage,
 ) -> Result<RawResponse, WorkflowDefinitionFailure> {
+    let response = receive_status(request, accepted, key, stage)?;
+    validate_json_media_type(&response.headers)
+        .map_err(|_| check_failed(stage, Check::MediaType))?;
+    Ok(response)
+}
+
+/// A response whose status is one of `accepted`, its key confirmed when `key` is given, with
+/// neither its media type nor its body checked; any other status is classified.
+fn receive_status(
+    request: reqwest::blocking::RequestBuilder,
+    accepted: &[StatusCode],
+    key: Option<&str>,
+    stage: Stage,
+) -> Result<RawResponse, WorkflowDefinitionFailure> {
     // `receive_raw` fails only unreachable or, for a body over the bound, as an invalid
     // response that keeps a 401's rejected session.
     let response = receive_raw(request).map_err(|failure| match failure {
@@ -1017,8 +1051,6 @@ fn receive_accepted(
         validate_mutation_key(&response.headers, key)
             .map_err(|_| check_failed(stage, Check::IdempotencyKey))?;
     }
-    validate_json_media_type(&response.headers)
-        .map_err(|_| check_failed(stage, Check::MediaType))?;
     Ok(response)
 }
 
@@ -1935,6 +1967,88 @@ mod tests {
                 "{read:?} {fault:?}"
             );
         }
+    }
+
+    // REQ-CLOUDDEF-40: a delete is a keyed `DELETE` of the definition's path, accepted only as
+    // a 204 carrying its key, whose body is not read; a refusal keeps its slug.
+    // REQ-CLOUDDEF-28: a 204 without the key, or an answer under another status that is no
+    // problem response, is an invalid response at stage `definition_change`.
+    #[test]
+    fn a_delete_is_accepted_only_as_no_content_echoing_its_key() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let delete = |response: Vec<u8>| {
+            let server = ScriptedHttpServer::respond(response);
+            let storage = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).expect("client");
+            let api = WorkflowDefinitionApi::new(&server.api_url, "fixture-token", &storage)
+                .expect("api");
+            let deleted = api.delete(ORGANIZATION, PROJECT, DEFINITION, "delete-key");
+            (deleted, server.finish_one())
+        };
+        let no_content = |echo_key: bool| {
+            let key = if echo_key {
+                format!("Idempotency-Key: {REQUEST_IDEMPOTENCY_KEY_ECHO}\r\n")
+            } else {
+                String::new()
+            };
+            format!(
+                "HTTP/1.1 204 No Content\r\n{key}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .into_bytes()
+        };
+
+        let (deleted, request) = delete(no_content(true));
+        assert_eq!(deleted, Ok(()));
+        assert!(
+            request.starts_with(&format!(
+                "DELETE /api/v1/organizations/{ORGANIZATION}/projects/{PROJECT}/workflow-definitions/{DEFINITION} HTTP/1.1\r\n"
+            )),
+            "{request}"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("idempotency-key: delete-key\r\n"),
+            "{request}"
+        );
+
+        let (deleted, _) = delete(no_content(false));
+        invalid_response(
+            deleted,
+            Stage::DefinitionChange,
+            Check::IdempotencyKey,
+            Source::None,
+        );
+
+        let (deleted, _) = delete(response(
+            "200 OK",
+            "application/json",
+            true,
+            &definition_answer(2),
+        ));
+        let invalid = invalid_response(
+            deleted,
+            Stage::DefinitionChange,
+            Check::ProblemDecode,
+            Source::None,
+        );
+        assert_eq!(invalid.status(), Some(200));
+
+        let (deleted, _) = delete(response_bytes(
+            "409 Conflict",
+            "application/problem+json",
+            false,
+            &problem_fixture(409, "definition-not-archived"),
+        ));
+        assert_eq!(
+            deleted,
+            Err(WorkflowDefinitionFailure::Refused(Box::new(
+                WorkflowRefusal {
+                    status: 409,
+                    problem: "definition-not-archived".to_owned(),
+                    workflow: None,
+                }
+            )))
+        );
     }
 
     fn tree_answer(digest: &str, state: &str, sealed_at: Option<&str>) -> serde_json::Value {

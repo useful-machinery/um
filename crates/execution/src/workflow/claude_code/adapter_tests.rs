@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::future::{Future, pending};
-use std::io::{BufRead as _, Write as _};
+use std::io::{BufRead as _, Read as _, Write as _};
 use std::num::{NonZeroU64, NonZeroUsize};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
@@ -10,12 +10,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use nix::sys::stat::Mode;
-use nix::unistd::mkfifo;
 use rustix::process::{Pid, getpgid};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, watch};
 use useful_test_support::mcp::McpServerProcess;
+use useful_test_support::watchdog::{FIXTURE_WAIT_BASE, host_scaled_recv};
 
 use super::adapter::{
     ClaudeCodeStreamJsonV1Adapter, MAXIMUM_INLINE_ATTACHMENT_FRAME_BYTES,
@@ -24,7 +23,8 @@ use super::adapter::{
 };
 use super::result_tool::TOOL_NAME;
 use super::test_support::{
-    FixtureSignal, PendingClock, RecordingObservationSink, admitted_adapter, invocation_identity,
+    FixtureRelease, FixtureSignal, PendingClock, RecordingObservationSink, admitted_adapter,
+    invocation_identity,
 };
 use super::*;
 use crate::workflow::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
@@ -49,8 +49,9 @@ use crate::workflow::test_support::claude_validation::{
     FailingValidationWorker, PendingValidation, PendingValidationWorker,
 };
 use crate::workflow::test_support::{
-    host_scaled_watchdog, process_fixture_interrupt_receiver, spawn_process_fixture,
-    write_process_fixture_id, write_process_fixture_signal,
+    fixture_progress_watchdog, process_fixture_interrupt_receiver, record_fixture_progress,
+    record_invocation_end, spawn_process_fixture, write_process_fixture_id,
+    write_process_fixture_signal,
 };
 
 const MODEL: &str = "scherzo-loopback";
@@ -183,6 +184,8 @@ struct ProcessFixture {
     ready: FixtureSignal,
     descendant_ready: FixtureSignal,
     interrupted: FixtureSignal,
+    /// The case's side of the `release` FIFO beside `ready` (INV-TESTING-29).
+    release_channel: FixtureRelease,
     expected_cwd: PathBuf,
     diagnostic_directory: PathBuf,
 }
@@ -215,34 +218,18 @@ impl ProcessFixture {
     /// A fake Claude Code that is the scripted process fixture, performing `actions` in order
     /// (see `scripted_process_fixture`).
     fn scripted(value_mode: AgentValueMode, actions: &[Value]) -> Self {
-        let fixture = Self::build(
+        Self::build(
             value_mode,
             1024,
             &[],
             SCRIPTED_FAKE_CLAUDE,
             Some(Value::Array(actions.to_vec())),
-        );
-        mkfifo(
-            &fixture.ready.path().with_file_name("release"),
-            Mode::S_IRUSR | Mode::S_IWUSR,
         )
-        .unwrap();
-        fixture
     }
 
-    /// Lets the scripted fixture past its next `release` action.
-    async fn release(&self) {
-        let release = self.ready.path().with_file_name("release");
-        tokio::task::spawn_blocking(move || {
-            std::fs::write(
-                release,
-                b"release
-",
-            )
-        })
-        .await
-        .unwrap()
-        .unwrap();
+    /// Lets the fixture past its next wait for a release (`await_fixture_release`).
+    fn release(&self) {
+        self.release_channel.release();
     }
 
     fn build(
@@ -288,6 +275,7 @@ impl ProcessFixture {
         let ready = FixtureSignal::create(controls.join("ready"));
         let descendant_ready = FixtureSignal::create(controls.join("descendant-ready"));
         let interrupted = FixtureSignal::create(controls.join("interrupted"));
+        let release_channel = FixtureRelease::create(&controls.join("release"));
         let mut runner_environment = BTreeMap::from([
             (
                 OsString::from("PATH"),
@@ -459,6 +447,7 @@ impl ProcessFixture {
             ready,
             descendant_ready,
             interrupted,
+            release_channel,
             expected_cwd,
             diagnostic_directory,
         }
@@ -668,6 +657,7 @@ impl StagedClockControl {
     pub(super) async fn registered(&mut self, deadline: Duration) {
         while let Some(registered) = self.registrations.recv().await {
             if registered == deadline {
+                record_fixture_progress(format!("staged clock registered {deadline:?}"));
                 return;
             }
         }
@@ -681,7 +671,9 @@ impl StagedClockControl {
             .wait_for(|pending| pending.len() == 1 && pending.first().copied() > after)
             .await
             .unwrap();
-        *pending.first().unwrap()
+        let armed = *pending.first().unwrap();
+        record_fixture_progress(format!("staged clock armed quiet bound {armed}"));
+        armed
     }
 }
 
@@ -775,7 +767,9 @@ where
     let (started, start) = agent_start_channel();
     let (terminal, outcome) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
-        let _ = terminal.send(adapter.invoke(invocation, started).await);
+        let outcome = adapter.invoke(invocation, started).await;
+        record_invocation_end(&outcome);
+        let _ = terminal.send(outcome);
     });
     (task, start, outcome)
 }
@@ -867,6 +861,7 @@ pub(super) async fn wait_for_turn_completed(observations: &RecordingObservationS
             )
         })
         .await;
+    record_fixture_progress("adapter read a result frame".to_owned());
 }
 
 pub(super) fn adapter_warnings(observations: &RecordingObservationSink) -> Vec<Arc<str>> {
@@ -1025,17 +1020,26 @@ fn write_fixture_frames(protocol: &mut std::fs::File, values: &[Value]) {
     protocol.flush().unwrap();
 }
 
-/// Each release is one line the test writes to the `release` FIFO beside the ready signal.
+/// Each release is one line the case writes to the `release` FIFO beside the ready signal.
 fn await_fixture_release() {
     let ready = PathBuf::from(std::env::var_os("CLAUDE_FIXTURE_READY").unwrap());
-    let release = std::fs::File::open(ready.with_file_name("release")).unwrap();
-    let mut line = String::new();
-    assert!(
-        std::io::BufReader::new(release)
-            .read_line(&mut line)
-            .unwrap()
-            > 0
-    );
+    read_fixture_release(&ready.with_file_name("release"));
+}
+
+/// Opens the `release` FIFO at `path` and takes one release from it, a byte at a time so that
+/// a release queued behind it stays for the next wait (INV-TESTING-29). The case holds a writer
+/// for its life, so the open returns at once and end of file means the case has gone away.
+fn read_fixture_release(path: &Path) {
+    let mut release = std::fs::File::open(path).unwrap();
+    let mut byte = [0_u8; 1];
+    loop {
+        release
+            .read_exact(&mut byte)
+            .expect("the release FIFO ended before a release");
+        if byte[0] == b'\n' {
+            return;
+        }
+    }
 }
 
 /// Reads the prompt frame from stdin without buffering past it, so that what follows it is
@@ -1146,14 +1150,60 @@ fn scripted_process_fixture() {
     .unwrap();
 }
 
-// A plain function, not an `async fn`: the body reaches `host_scaled_watchdog`'s heap pin
-// before any wrapper state holds it.
+// Plain functions, not `async fn`: the body reaches the watchdog's heap pin before any
+// wrapper state holds it. An expiry names the last fixture progress the case recorded.
 fn with_watchdog<Output>(future: impl Future<Output = Output>) -> impl Future<Output = Output> {
-    host_scaled_watchdog(
-        "ClaudeCodeStreamJsonV1 fixture",
-        Duration::from_secs(10),
-        future,
-    )
+    with_watchdog_limit(future, Duration::from_secs(10))
+}
+
+fn with_watchdog_limit<Output>(
+    future: impl Future<Output = Output>,
+    base: Duration,
+) -> impl Future<Output = Output> {
+    fixture_progress_watchdog("ClaudeCodeStreamJsonV1 fixture", base, future)
+}
+
+/// The panic message of a case `with_watchdog_limit` bounded for a millisecond.
+async fn expired_watchdog_message(body: impl Future<Output = ()> + Send + 'static) -> String {
+    let expired = tokio::spawn(with_watchdog_limit(body, Duration::from_millis(1)))
+        .await
+        .unwrap_err();
+    *expired.into_panic().downcast::<String>().unwrap()
+}
+
+// INV-TESTING-18
+#[tokio::test]
+async fn fixture_watchdog_expiry_names_the_last_fixture_progress() {
+    let message = expired_watchdog_message(async {
+        record_fixture_progress("probe progress".to_owned());
+        pending::<()>().await;
+    })
+    .await;
+    assert!(
+        message.starts_with("ClaudeCodeStreamJsonV1 fixture watchdog expired after")
+            && message.ends_with("; last fixture progress: probe progress"),
+        "{message:?}"
+    );
+
+    let message = expired_watchdog_message(pending::<()>()).await;
+    assert!(
+        message.ends_with("; last fixture progress: none"),
+        "{message:?}"
+    );
+
+    // The suite's own waits record what they saw.
+    let temporary = tempfile::tempdir().unwrap();
+    let signal = FixtureSignal::create(temporary.path().join("probe"));
+    std::fs::write(signal.path(), b"probe\n").unwrap();
+    let message = expired_watchdog_message(async move {
+        signal.receive().await;
+        pending::<()>().await;
+    })
+    .await;
+    assert!(
+        message.contains("; last fixture progress: ") && !message.ends_with("none"),
+        "{message:?}"
+    );
 }
 
 #[test]
@@ -1475,8 +1525,6 @@ async fn slow_startup_does_not_expire_initial_input_delivery() {
     with_watchdog(async {
         let mut fixture =
             process_fixture_with_large_native_attachment(DELAYED_INPUT_FAKE_CLAUDE, 0x24);
-        let release_input = fixture.ready.path().with_file_name("release");
-        mkfifo(&release_input, Mode::S_IRUSR | Mode::S_IWUSR).unwrap();
         let invocation = fixture.invocation.take().unwrap();
         let (clock, control) = StagedClock::new();
         // Every deadline but the quiet bound has already expired. A large initial frame
@@ -1495,8 +1543,7 @@ async fn slow_startup_does_not_expire_initial_input_delivery() {
             ready = fixture.ready.receive() => assert_eq!(ready, b"ready\n"),
             outcome = &mut task => panic!("initial input ended before the reader was released: {outcome:?}"),
         }
-        tokio::task::spawn_blocking(move || std::fs::write(release_input, b"release\n"))
-            .await.unwrap().unwrap();
+        fixture.release();
         assert_eq!(task.await.unwrap(), AgentOutcome::Completed(CompletedAgentInvocation::NoValue));
         assert!(start.receive().await.is_ok());
     })
@@ -1679,6 +1726,37 @@ async fn an_init_naming_another_version_fails_at_start() {
     .await;
 }
 
+// INV-TESTING-29
+#[test]
+fn a_release_neither_waits_for_the_fixture_nor_ends_its_next_wait() {
+    let temporary = tempfile::tempdir().unwrap();
+    let path = temporary.path().join("release");
+    let release = FixtureRelease::create(&path);
+    // Nothing reads the FIFO yet: both releases return, and both stay queued.
+    release.release();
+    release.release();
+    // The fixture's side waits on its own thread, so a wait that never returns expires the
+    // bound here; a wait that read end of file panics and drops `taken` unsent.
+    let (taken, waited) = std::sync::mpsc::channel();
+    let waiter = std::thread::spawn(move || {
+        for _ in 0..3 {
+            read_fixture_release(&path);
+            taken.send(()).unwrap();
+        }
+    });
+    let wait_taken = || {
+        host_scaled_recv("Claude Code fixture release", FIXTURE_WAIT_BASE, &waited).unwrap();
+    };
+    // Each queued release is one wait's,
+    wait_taken();
+    wait_taken();
+    // and a wait that opens beside the earlier releases' writer takes the next line rather
+    // than end of file.
+    release.release();
+    wait_taken();
+    waiter.join().unwrap();
+}
+
 // REQ-AGENT-88
 // INV-HARNESS-24
 #[tokio::test]
@@ -1715,11 +1793,11 @@ async fn a_silent_claude_code_is_stopped_at_the_quiet_bound() {
         assert_eq!(fixture.ready.receive().await, b"ready\n");
         let mut bound = control.fresh_bound(None).await;
         // A stdout byte arms the bound afresh,
-        fixture.release().await;
+        fixture.release();
         assert_eq!(fixture.ready.receive().await, b"ready\n");
         bound = control.fresh_bound(Some(bound)).await;
         // and so does a request on the result channel.
-        fixture.release().await;
+        fixture.release();
         assert_eq!(fixture.ready.receive().await, b"ready\n");
         control.fresh_bound(Some(bound)).await;
 

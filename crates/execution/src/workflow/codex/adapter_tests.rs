@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::future::Future;
@@ -39,6 +38,7 @@ use crate::workflow::runtime::{ActionId, TransitionSequence};
 use crate::workflow::test_support::codex_clock::ReleasedClock;
 use crate::workflow::test_support::{
     ControlledClock, InlineValidationWorker, PendingClock, RecordingObservationSink,
+    fixture_progress_watchdog, record_fixture_progress, record_invocation_end,
 };
 
 // Keep this slug in the pinned Codex catalog: unknown slugs lose apply_patch and tool_search.
@@ -760,18 +760,6 @@ fn captured_requests(path: &Path) -> Vec<Value> {
 const FIXTURE_WATCHDOG_CASE: &str = "CodexAppServerV1 fixture";
 const FIXTURE_WATCHDOG_BASE: Duration = Duration::from_secs(10);
 
-thread_local! {
-    /// The last progress a case's fixture made on this test thread, which the watchdog names
-    /// when it expires. No case sets a runtime flavor, so the loopback provider, the adapter's
-    /// task and the case body share `#[tokio::test]`'s current thread, and the thread is the
-    /// case.
-    static LAST_FIXTURE_PROGRESS: RefCell<Option<String>> = const { RefCell::new(None) };
-}
-
-fn record_fixture_progress(progress: String) {
-    LAST_FIXTURE_PROGRESS.with(|last| *last.borrow_mut() = Some(progress));
-}
-
 // Plain functions, not `async fn`: the body reaches `host_scaled_watchdog`'s heap pin before
 // any wrapper state holds it.
 fn with_watchdog<Output>(future: impl Future<Output = Output>) -> impl Future<Output = Output> {
@@ -782,57 +770,21 @@ fn with_watchdog_limit<Output>(
     future: impl Future<Output = Output>,
     limit: Duration,
 ) -> impl Future<Output = Output> {
-    let bounded = crate::workflow::test_support::host_scaled_watchdog_with_diagnosis(
-        FIXTURE_WATCHDOG_CASE,
-        limit,
-        last_fixture_progress,
-        future,
-    );
-    async move {
-        LAST_FIXTURE_PROGRESS.with(|last| last.borrow_mut().take());
-        bounded.await
-    }
+    fixture_progress_watchdog(FIXTURE_WATCHDOG_CASE, limit, future)
 }
 
 // A launch slows with the tests running beside it while the one-minute load the watchdog
 // scales by lags them, so a test that drives several fixtures in sequence bounds each
-// launch on its own and the expiry names the scenario that hung. The body is heap-pinned
-// before the block that owns the scenario's case name exists, so that block holds a pointer.
+// launch on its own and the expiry names the scenario that hung.
 fn with_scenario_watchdog<Output>(
     scenario: &str,
     future: impl Future<Output = Output>,
 ) -> impl Future<Output = Output> {
-    let case = format!("{FIXTURE_WATCHDOG_CASE} {scenario}");
-    let future = Box::pin(future);
-    async move {
-        LAST_FIXTURE_PROGRESS.with(|last| last.borrow_mut().take());
-        crate::workflow::test_support::host_scaled_watchdog_with_diagnosis(
-            case,
-            FIXTURE_WATCHDOG_BASE,
-            last_fixture_progress,
-            future,
-        )
-        .await
-    }
-}
-
-/// The watchdog's diagnosis: the last progress a case's fixture recorded, or `none`.
-fn last_fixture_progress() -> Option<String> {
-    let last = LAST_FIXTURE_PROGRESS.with(|last| last.borrow().clone());
-    Some(format!(
-        "last fixture progress: {}",
-        last.as_deref().unwrap_or("none")
-    ))
-}
-
-fn record_invocation_end(outcome: &AgentOutcome) {
-    record_fixture_progress(match outcome {
-        AgentOutcome::Completed(_) => "invocation ended Completed".to_owned(),
-        AgentOutcome::Failed(failure) => {
-            format!("invocation ended Failed: {:?}", failure.cause())
-        }
-        AgentOutcome::Cancelled { reason } => format!("invocation ended Cancelled: {reason:?}"),
-    });
+    fixture_progress_watchdog(
+        format!("{FIXTURE_WATCHDOG_CASE} {scenario}"),
+        FIXTURE_WATCHDOG_BASE,
+        future,
+    )
 }
 
 // INV-TESTING-18
