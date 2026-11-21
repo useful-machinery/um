@@ -42,7 +42,7 @@ where
 {
     tokio::pin!(execution);
     let mut infrastructure_interruption = *infrastructure_updates.borrow_and_update();
-    loop {
+    'supervision: loop {
         let authority = authority_updates.borrow_and_update().clone();
         if let Some(interruption) = *infrastructure_updates.borrow_and_update() {
             infrastructure_interruption = Some(interruption);
@@ -108,6 +108,7 @@ where
                 }
                 match causal_lease.request_renewal(
                     authority.sequence,
+                    authority.renewal_retry_interval,
                     assignment_id,
                     attempt_id,
                     lease_clock,
@@ -128,27 +129,22 @@ where
                         ).await;
                     }
                 }
-                tokio::select! {
-                    biased;
-                    wait = wait_for_lease_deadline(lease_clock, authority.cancellation_start) => {
-                        if let Err(error) = wait {
-                            return fail_lease_timer(&mut execution, failure, error).await;
-                        }
-                        let latest_authority = authority_updates.borrow_and_update().clone();
-                        if latest_authority != authority {
-                            continue;
-                        }
-                        return finish_after_lease_loss(
-                            &mut execution,
-                            cancellation,
-                            lease_clock,
-                            &authority,
-                            post_stop_fence,
-                            process_guards,
-                        ).await;
-                    }
-                    changed = authority_updates.changed() => {
-                        if changed.is_err() {
+                let mut asked_at = now;
+                let cancellation_wait = wait_for_lease_deadline(lease_clock, authority.cancellation_start);
+                tokio::pin!(cancellation_wait);
+                // Until a grant replaces the authority, ask again every retry interval;
+                // `CausalLease` withholds a repeat while the last request is retained.
+                loop {
+                    tokio::select! {
+                        biased;
+                        wait = &mut cancellation_wait => {
+                            if let Err(error) = wait {
+                                return fail_lease_timer(&mut execution, failure, error).await;
+                            }
+                            let latest_authority = authority_updates.borrow_and_update().clone();
+                            if latest_authority != authority {
+                                continue 'supervision;
+                            }
                             return finish_after_lease_loss(
                                 &mut execution,
                                 cancellation,
@@ -158,23 +154,57 @@ where
                                 process_guards,
                             ).await;
                         }
-                    }
-                    changed = infrastructure_updates.changed() => {
-                        if changed.is_ok()
-                            && let Some(interruption) = *infrastructure_updates.borrow_and_update()
-                        {
-                            infrastructure_interruption = Some(interruption);
-                        }
-                    }
-                    result = &mut execution => {
-                        return complete_ready_execution(
-                            result,
-                            failure,
+                        wait = wait_to_ask_again(
                             lease_clock,
-                            &authority,
-                            infrastructure_interruption,
-                            false,
-                        );
+                            asked_at,
+                            authority.renewal_retry_interval,
+                            authority.cancellation_start,
+                        ) => {
+                            asked_at = match wait {
+                                Ok(asked_at) => asked_at,
+                                Err(error) => return fail_lease_timer(&mut execution, failure, error).await,
+                            };
+                            if causal_lease.request_renewal(
+                                authority.sequence,
+                                authority.renewal_retry_interval,
+                                assignment_id,
+                                attempt_id,
+                                lease_clock,
+                                outbox,
+                            ) == Err(RenewalRequestFailure::LeaseClock) {
+                                return fail_lease_clock(LeaseClockError::ClockUnavailable, cancellation, post_stop_fence, process_guards);
+                            }
+                        }
+                        changed = authority_updates.changed() => {
+                            if changed.is_err() {
+                                return finish_after_lease_loss(
+                                    &mut execution,
+                                    cancellation,
+                                    lease_clock,
+                                    &authority,
+                                    post_stop_fence,
+                                    process_guards,
+                                ).await;
+                            }
+                            continue 'supervision;
+                        }
+                        changed = infrastructure_updates.changed() => {
+                            if changed.is_ok()
+                                && let Some(interruption) = *infrastructure_updates.borrow_and_update()
+                            {
+                                infrastructure_interruption = Some(interruption);
+                            }
+                        }
+                        result = &mut execution => {
+                            return complete_ready_execution(
+                                result,
+                                failure,
+                                lease_clock,
+                                &authority,
+                                infrastructure_interruption,
+                                false,
+                            );
+                        }
                     }
                 }
             }
@@ -427,6 +457,23 @@ pub(super) async fn wait_for_lease_deadline(
     deadline: LeaseInstant,
 ) -> Result<(), LeaseClockError> {
     wait_for_lease_deadline_or_armed(lease_clock, deadline, None).await
+}
+
+/// Waits until `retry_interval` after `asked_at`, when the renewal was last asked for, and
+/// returns the lease clock's time then, when it is asked for again. It never completes when
+/// that instant is not before `bound`, where the caller stops asking.
+pub(super) async fn wait_to_ask_again(
+    lease_clock: &LeaseClock,
+    asked_at: LeaseInstant,
+    retry_interval: Duration,
+    bound: LeaseInstant,
+) -> Result<LeaseInstant, LeaseClockError> {
+    let next_ask = asked_at.checked_add(retry_interval)?;
+    if next_ask.checked_cmp(bound)? != std::cmp::Ordering::Less {
+        return std::future::pending().await;
+    }
+    wait_for_lease_deadline(lease_clock, next_ask).await?;
+    lease_clock.now()
 }
 
 pub(super) async fn wait_for_lease_deadline_or_armed(

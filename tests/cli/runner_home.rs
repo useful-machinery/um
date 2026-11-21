@@ -170,15 +170,26 @@ impl ServeHome {
     }
 
     fn serve(&self, arguments: &[&str]) -> ServeProcess {
-        ServeProcess::start(
-            serve_with_homes(
-                arguments,
-                Some(&self.useful_home()),
-                Some(self.root.path()),
-                &self.empty_path,
-            ),
-            StandardInput::Null,
+        ServeProcess::start(self.serve_command(arguments), StandardInput::Null)
+    }
+
+    /// `serve` with no arguments, its standard error a pipe whose read end
+    /// is already closed.
+    fn serve_with_standard_error_closed(&self) -> ServeProcess {
+        ServeProcess::start_with_standard_error_closed(self.serve_command(&[]), StandardInput::Null)
+    }
+
+    fn serve_command(&self, arguments: &[&str]) -> Command {
+        serve_with_homes(
+            arguments,
+            Some(&self.useful_home()),
+            Some(self.root.path()),
+            &self.empty_path,
         )
+    }
+
+    fn log(&self) -> PathBuf {
+        self.runner().join("logs").join("runner.log")
     }
 }
 
@@ -279,6 +290,96 @@ fn serve_without_a_configuration_connects_with_the_homes_enrolled_state() {
 
     assert_eq!(connection_bearer(home.serve(&[]), &witness), bearer);
     assert_eq!(fs::read(home.state()).unwrap(), state);
+}
+
+/// Waits, once `witness` has seen `serve` connect, until the home's log holds
+/// past its first `written` bytes a complete record of the connection's,
+/// one whose `event.name` starts `runner.gateway_`.
+fn wait_for_logged_connection(
+    home: &ServeHome,
+    witness: &ConnectionWitness,
+    serve: &mut ServeProcess,
+    written: usize,
+) {
+    if witness.next_connection(serve).is_none() {
+        panic!("Runner Serve stopped before connecting");
+    }
+    poll_until(
+        "a logged connection record",
+        || {
+            let bytes = fs::read(home.log()).unwrap_or_default();
+            let added = bytes.get(written..).unwrap_or_default();
+            let complete = added
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(&[][..], |end| &added[..end]);
+            complete
+                .split(|byte| *byte == b'\n')
+                .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+                .filter_map(|record| record["event.name"].as_str().map(str::to_owned))
+                .find(|name| name.starts_with("runner.gateway_"))
+        },
+        Option::is_some,
+    );
+}
+
+// REQ-TELEMETRY-52, REQ-TELEMETRY-1, REQ-RUNNERENROLL-109
+#[test]
+fn serve_appends_its_records_to_the_homes_log_whatever_happens_to_standard_error() {
+    let witness = ConnectionWitness::new();
+    let home = ServeHome::new();
+    home.write_development_config(&home.state());
+    home.write_enrolled_state(&witness.url);
+
+    let mut serve = home.serve_with_standard_error_closed();
+    wait_for_logged_connection(&home, &witness, &mut serve, 0);
+    serve.stop();
+
+    assert_eq!(mode(&home.runner().join("logs")), 0o700);
+    assert_eq!(mode(&home.log()), 0o600);
+    let first = fs::read(home.log()).unwrap();
+    let mut serve = home.serve_with_standard_error_closed();
+    wait_for_logged_connection(&home, &witness, &mut serve, first.len());
+    serve.stop();
+
+    let both = fs::read(home.log()).unwrap();
+    assert!(both.starts_with(&first));
+    let mut boots = BTreeSet::new();
+    for line in both
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        let record: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(line)
+            .unwrap_or_else(|error| panic!("{error}: {}", String::from_utf8_lossy(line)));
+        assert!(record["time"].is_string(), "{record:?}");
+        boots.insert(record["service.instance.id"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(boots.len(), 2, "{boots:?}");
+}
+
+// REQ-RUNNERENROLL-42, REQ-TELEMETRY-52
+#[test]
+fn status_shows_the_log_the_serving_runner_writes() {
+    let witness = ConnectionWitness::new();
+    let home = ServeHome::new();
+    home.write_development_config(&home.state());
+    home.write_enrolled_state(&witness.url);
+
+    let mut serve = home.serve(&[]);
+    if witness.next_connection(&mut serve).is_none() {
+        panic!("Runner Serve stopped before connecting");
+    }
+    let output = home.run(&["runner", "status"]);
+    serve.stop();
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let log = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("log:"))
+        .unwrap_or_else(|| panic!("no log line: {stdout}"));
+    assert_eq!(Path::new(log.trim_start()), home.log());
+    assert!(home.log().is_file());
 }
 
 // REQ-RUNNERENROLL-97

@@ -177,6 +177,13 @@ impl ObservationOutbox {
         Some(entry.observation)
     }
 
+    /// Takes Cloud's acknowledgement of observation `id`, for tests outside the assignment
+    /// module that hold only an outbox.
+    #[cfg(test)]
+    pub(in crate::service) fn acknowledge_observation(&self, id: u64) {
+        self.acknowledge(id);
+    }
+
     pub(super) async fn wait_for_continuation_ready(
         &self,
         id: u64,

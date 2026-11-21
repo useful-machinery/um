@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::num::NonZeroU8;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
@@ -14,7 +16,13 @@ use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{SdkTracer, SdkTracerProvider};
 use serde_json::{Map, Number, Value};
+use time::format_description::well_known::Iso8601;
+use time::format_description::well_known::iso8601::{
+    Config as Iso8601Config, EncodedConfig, TimePrecision,
+};
+use time::{OffsetDateTime, UtcOffset};
 
+mod log_file;
 mod otlp;
 pub(crate) mod attribute {
     /// A `runner.agent_login_setup` record names each provider whose
@@ -155,6 +163,15 @@ const DURATION_MS: &str = "duration_ms";
 const TRACE_ID: &str = "trace_id";
 const SPAN_ID: &str = "span_id";
 const PARENT_SPAN_ID: &str = "parent_span_id";
+const TIME: &str = "time";
+// A record's `time` is UTC with exactly three subsecond digits and `Z`, for
+// example `2026-11-19T04:54:24.993Z`; well-known RFC 3339 would print a
+// varying number of digits.
+const RECORD_TIME_FORMAT: EncodedConfig = Iso8601Config::DEFAULT
+    .set_time_precision(TimePrecision::Second {
+        decimal_digits: NonZeroU8::new(3),
+    })
+    .encode();
 const EVENT_QUEUE_CAPACITY: usize = 128;
 const EVENT_QUEUE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -187,6 +204,11 @@ impl Outcome {
     }
 }
 
+/// The wall clock a local record's `time` is read from when the record is
+/// serialized (REQ-TELEMETRY-51). Production passes the service's
+/// `Sleeper::utc_now`.
+pub(crate) type RecordClock = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
+
 pub(crate) trait EventWriter: Send + Sync {
     fn write(&self, event: &Map<String, Value>) -> io::Result<()>;
 }
@@ -198,7 +220,7 @@ pub(crate) trait DroppedRecordObserver: Send + Sync {
     fn record_dropped(&self);
 }
 
-// Drops is what the event source and the writer thread share of the records
+// Drops is what the event source and the output threads share of the records
 // they drop: the count the next completed main record reports, and the
 // observer the serving loop may set once.
 #[derive(Default)]
@@ -225,9 +247,52 @@ impl Drops {
     }
 }
 
+/// One serialized record as a local output's queue holds it. Every output
+/// the record is offered to holds the same bytes and the same tally of the
+/// outputs that may still take it (REQ-TELEMETRY-14).
+#[derive(Clone)]
 struct QueuedRecord {
-    bytes: Vec<u8>,
+    bytes: Arc<[u8]>,
     represented_dropped_count: u64,
+    holders: Arc<AtomicUsize>,
+}
+
+impl QueuedRecord {
+    // serialize frames one local record as a JSON line stamped with `time`,
+    // the UTC time it was written (REQ-TELEMETRY-51), to be offered to
+    // `outputs` outputs. The stamp is added here, once per record, so every
+    // output carries the same bytes and the stamp never reaches an exported
+    // span.
+    fn serialize(
+        event: &Map<String, Value>,
+        written_at: OffsetDateTime,
+        outputs: usize,
+    ) -> io::Result<Self> {
+        let time = written_at
+            .to_offset(UtcOffset::UTC)
+            .format(&Iso8601::<RECORD_TIME_FORMAT>)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut record = event.clone();
+        record.insert(TIME.to_owned(), Value::String(time));
+        let mut bytes = serde_json::to_vec(&record)?;
+        bytes.push(b'\n');
+        Ok(Self {
+            bytes: Arc::from(bytes),
+            represented_dropped_count: event
+                .get(DROPPED_COUNT)
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            holders: Arc::new(AtomicUsize::new(outputs)),
+        })
+    }
+
+    // release records that one output will not take the record, its queue
+    // having refused it or its write having failed, and answers whether
+    // that output was the last that could: the record then reached none and
+    // its caller counts it dropped, once.
+    fn release(&self) -> bool {
+        self.holders.fetch_sub(1, Ordering::AcqRel) == 1
+    }
 }
 
 enum QueueMessage {
@@ -236,26 +301,52 @@ enum QueueMessage {
     Drain(SyncSender<()>),
 }
 
+/// What a local output's thread writes each record to: standard error or
+/// the log file.
+trait RecordSink {
+    fn write_record(&mut self, record: &[u8]) -> io::Result<()>;
+    fn flush(&mut self) -> io::Result<()>;
+}
+
+/// One local output: a queue of `EVENT_QUEUE_CAPACITY` records and the
+/// thread that writes them to its sink, so an output that is slow, blocked
+/// or failing delays neither the runner nor another output.
 struct QueuedWriter {
     sender: Option<SyncSender<QueueMessage>>,
 }
 
 impl QueuedWriter {
-    fn stderr(drops: Arc<Drops>) -> Self {
+    // start spawns the output's thread `name`, which makes its sink with
+    // `open` and then writes each queued record to it, and answers once the
+    // thread has made the sink: an output whose sink could not be made is
+    // no output, and its thread has ended.
+    fn start<S: RecordSink, E: Send + 'static>(
+        name: &str,
+        open: impl FnOnce() -> Result<S, E> + Send + 'static,
+        drops: Arc<Drops>,
+    ) -> Result<Self, OutputStartError<E>> {
         let (sender, receiver) = sync_channel::<QueueMessage>(EVENT_QUEUE_CAPACITY);
-        let worker = thread::Builder::new()
-            .name("useful-runner-events".to_owned())
+        let (opened, open_answer) = sync_channel::<Result<(), E>>(1);
+        thread::Builder::new()
+            .name(name.to_owned())
             .spawn(move || {
-                let mut stderr = FramedWriter::new(io::stderr());
+                let mut sink = match open() {
+                    Ok(sink) => sink,
+                    Err(error) => {
+                        let _ = opened.send(Err(error));
+                        return;
+                    }
+                };
+                let _ = opened.send(Ok(()));
                 while let Ok(message) = receiver.recv() {
                     match message {
                         QueueMessage::Record(record) => {
-                            if stderr.write_record(&record.bytes).is_err() {
+                            if sink.write_record(&record.bytes).is_err() && record.release() {
                                 drops.dropped(record.represented_dropped_count);
                             }
                         }
                         QueueMessage::Flush(completed) => {
-                            let _ = completed.send(stderr.flush());
+                            let _ = completed.send(sink.flush());
                         }
                         QueueMessage::Drain(completed) => {
                             let _ = completed.send(());
@@ -263,10 +354,20 @@ impl QueuedWriter {
                         }
                     }
                 }
-            });
-        Self {
-            sender: worker.ok().map(|_| sender),
-        }
+            })
+            .map_err(OutputStartError::Thread)?;
+        open_answer
+            .recv()
+            .map_err(|_| {
+                OutputStartError::Thread(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "runner event writer stopped",
+                ))
+            })?
+            .map_err(OutputStartError::Open)?;
+        Ok(Self {
+            sender: Some(sender),
+        })
     }
 
     #[cfg(test)]
@@ -274,6 +375,27 @@ impl QueuedWriter {
         Self {
             sender: Some(sender),
         }
+    }
+
+    // offer queues `record` without waiting, refusing it when the queue is
+    // full or its thread has stopped.
+    fn offer(&self, record: QueuedRecord) -> io::Result<()> {
+        let Some(sender) = &self.sender else {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "runner event writer unavailable",
+            ));
+        };
+        sender
+            .try_send(QueueMessage::Record(record))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => {
+                    io::Error::new(io::ErrorKind::WouldBlock, "runner event queue is full")
+                }
+                TrySendError::Disconnected(_) => {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "runner event writer stopped")
+                }
+            })
     }
 
     fn flush(&self) -> io::Result<()> {
@@ -293,34 +415,11 @@ impl QueuedWriter {
     }
 }
 
-impl EventWriter for QueuedWriter {
-    fn write(&self, event: &Map<String, Value>) -> io::Result<()> {
-        let mut bytes = serde_json::to_vec(event)?;
-        bytes.push(b'\n');
-        let record = QueuedRecord {
-            bytes,
-            represented_dropped_count: event
-                .get(DROPPED_COUNT)
-                .and_then(Value::as_u64)
-                .unwrap_or(0),
-        };
-        let Some(sender) = &self.sender else {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "runner event writer unavailable",
-            ));
-        };
-        sender
-            .try_send(QueueMessage::Record(record))
-            .map_err(|error| match error {
-                TrySendError::Full(_) => {
-                    io::Error::new(io::ErrorKind::WouldBlock, "runner event queue is full")
-                }
-                TrySendError::Disconnected(_) => {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "runner event writer stopped")
-                }
-            })
-    }
+/// Why a local output did not start: its thread did not start or stopped
+/// before answering, or its sink could not be made.
+enum OutputStartError<E> {
+    Thread(io::Error),
+    Open(E),
 }
 
 impl Drop for QueuedWriter {
@@ -339,6 +438,48 @@ impl Drop for QueuedWriter {
     }
 }
 
+/// The runner's local outputs behind its one `EventWriter`: standard error
+/// and, when it opened, the log file (REQ-TELEMETRY-14, INV-TELEMETRY-17).
+/// A record is serialized and stamped once and the same bytes are offered
+/// to each output without waiting on any.
+struct LocalOutputs {
+    outputs: Vec<QueuedWriter>,
+    clock: RecordClock,
+}
+
+impl LocalOutputs {
+    fn new(outputs: Vec<QueuedWriter>, clock: RecordClock) -> Self {
+        Self { outputs, clock }
+    }
+
+    fn flush(&self) -> io::Result<()> {
+        self.outputs.iter().try_for_each(QueuedWriter::flush)
+    }
+}
+
+impl EventWriter for LocalOutputs {
+    // write answers `Err` when the record reached no output, so its caller
+    // counts it dropped; a record some output may still write is `Ok`, and
+    // an output's thread counts it if every holder then fails to write it.
+    fn write(&self, event: &Map<String, Value>) -> io::Result<()> {
+        if self.outputs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "runner event writer unavailable",
+            ));
+        }
+        let record = QueuedRecord::serialize(event, (self.clock)(), self.outputs.len())?;
+        for output in &self.outputs {
+            if let Err(error) = output.offer(record.clone())
+                && record.release()
+            {
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+}
+
 struct FramedWriter<W> {
     output: W,
     separator_required: bool,
@@ -346,12 +487,29 @@ struct FramedWriter<W> {
 
 impl<W: Write> FramedWriter<W> {
     fn new(output: W) -> Self {
-        Self {
-            output,
-            separator_required: false,
-        }
+        Self::resuming(output, false)
     }
 
+    // resuming frames records after output whose last line is unfinished
+    // when `unterminated`, ending that line before the first record.
+    fn resuming(output: W, unterminated: bool) -> Self {
+        Self {
+            output,
+            separator_required: unterminated,
+        }
+    }
+}
+
+impl<W> FramedWriter<W> {
+    // framed_len is the number of bytes writing `record` adds to the output.
+    fn framed_len(&self, record: &[u8]) -> usize {
+        record
+            .len()
+            .saturating_add(usize::from(self.separator_required))
+    }
+}
+
+impl<W: Write> RecordSink for FramedWriter<W> {
     fn write_record(&mut self, record: &[u8]) -> io::Result<()> {
         if self.separator_required {
             self.output.write_all(b"\n")?;
@@ -372,6 +530,7 @@ impl<W: Write> FramedWriter<W> {
 pub(crate) struct Recorder {
     provider: SdkTracerProvider,
     source: EventSource,
+    log_path: Option<PathBuf>,
 }
 
 // EventSource is what starting an event needs: the tracer, the sink and the
@@ -393,26 +552,116 @@ impl fmt::Debug for Recorder {
 }
 
 impl Recorder {
-    pub(crate) fn stderr(service_instance_id: &str, service_version: &str) -> Arc<Self> {
+    /// The serving runner's recorder, whose local outputs are standard error
+    /// and, given `log_directory`, the log file `runner.log` in it
+    /// (REQ-TELEMETRY-52). It waits for the log's thread to answer whether
+    /// the log opened; a log that did not open leaves standard error the
+    /// only local output, is reported as `open_failed` and never fails the
+    /// recorder (REQ-TELEMETRY-54).
+    pub(crate) fn open(
+        service_instance_id: &str,
+        service_version: &str,
+        clock: RecordClock,
+        log_directory: Option<PathBuf>,
+    ) -> Arc<Self> {
+        Self::open_with(
+            service_instance_id,
+            service_version,
+            clock,
+            || Ok(FramedWriter::new(io::stderr())),
+            log_directory.map(|directory| {
+                (
+                    log_file::path_in(&directory),
+                    move |clock: RecordClock, reporter: log_file::LogReporter| {
+                        log_file::LogFile::open(
+                            &directory,
+                            log_file::RUNNER_LOG_LIMITS,
+                            clock,
+                            reporter,
+                        )
+                    },
+                )
+            }),
+        )
+    }
+
+    // open_with is `open` with standard error's sink made by `stderr` and
+    // the log's, when there is one, by the opener `log` gives with the path
+    // of the file it opens, from the clock and the reporter of the log's
+    // failures, on the outputs' own threads. The recorder keeps the path only
+    // when the log opened.
+    fn open_with<E, L, O>(
+        service_instance_id: &str,
+        service_version: &str,
+        clock: RecordClock,
+        stderr: impl FnOnce() -> io::Result<E> + Send + 'static,
+        log: Option<(PathBuf, O)>,
+    ) -> Arc<Self>
+    where
+        E: RecordSink,
+        L: RecordSink,
+        O: FnOnce(RecordClock, log_file::LogReporter) -> Result<L, log_file::OpenError>
+            + Send
+            + 'static,
+    {
         let drops = Arc::new(Drops::default());
-        let queued_writer = Arc::new(QueuedWriter::stderr(Arc::clone(&drops)));
-        let writer: Arc<dyn EventWriter> = queued_writer.clone();
+        let stderr = QueuedWriter::start("useful-runner-events", stderr, Arc::clone(&drops));
+        let reporter = log_file::LogReporter::default();
+        let mut log_path = None;
+        let log = log.and_then(|(path, open)| {
+            let clock = Arc::clone(&clock);
+            let log_reporter = reporter.clone();
+            let started = QueuedWriter::start(
+                "useful-runner-log",
+                move || {
+                    open(clock, log_reporter.clone())
+                        .map(|sink| log_file::ReportedWrites::new(sink, log_reporter))
+                },
+                Arc::clone(&drops),
+            );
+            match started {
+                Ok(log) => {
+                    log_path = Some(path);
+                    Some(log)
+                }
+                Err(OutputStartError::Thread(error)) => {
+                    reporter.report(log_file::LogFailure::Open, error.kind());
+                    None
+                }
+                Err(OutputStartError::Open(error)) => {
+                    reporter.report(log_file::LogFailure::Open, error.kind());
+                    None
+                }
+            }
+        });
+        let outputs = Arc::new(LocalOutputs::new(
+            stderr.into_iter().chain(log).collect(),
+            clock,
+        ));
+        let writer: Arc<dyn EventWriter> = outputs.clone();
         let mut provider = SdkTracerProvider::builder();
         if let Some(processor) = otlp::configured_processor(Arc::clone(&writer)) {
             provider = provider.with_span_processor(processor);
         }
-        // Configuration diagnostics are startup output. Establish that every accepted
-        // record has reached stderr before Runner Serve can terminate on a later error.
-        let _ = queued_writer.flush();
         let resource = runner_resource(service_version, service_instance_id);
         let provider = provider.with_resource(resource).build();
-        Arc::new(Self::with_drops(
+        let mut recorder = Self::with_drops(
             provider,
             writer,
             service_version,
             service_instance_id,
             drops,
-        ))
+        );
+        recorder.log_path = log_path;
+        let recorder = Arc::new(recorder);
+        // The log's failures until now, its open's among them, are written
+        // through the recorder from here.
+        reporter.attach(&recorder);
+        // Configuration and log diagnostics are startup output. Establish that every
+        // accepted record has reached its outputs before Runner Serve can terminate on a
+        // later error.
+        let _ = outputs.flush();
+        recorder
     }
 
     /// Sets the observer told of each record dropped from now on. Only the first observer
@@ -427,6 +676,13 @@ impl Recorder {
 
     pub(crate) fn boot_id(&self) -> &str {
         &self.source.service_instance_id
+    }
+
+    /// The path of the log file the recorder writes, when it opened one
+    /// (REQ-TELEMETRY-52); none when it was given no log directory or the
+    /// log did not open (REQ-TELEMETRY-54).
+    pub(crate) fn log_path(&self) -> Option<&Path> {
+        self.log_path.as_deref()
     }
 
     #[cfg(test)]
@@ -462,6 +718,7 @@ impl Recorder {
                 service_version: Arc::from(service_version),
                 service_instance_id: Arc::from(service_instance_id),
             },
+            log_path: None,
         }
     }
 
@@ -843,20 +1100,39 @@ pub(crate) fn test_recorder(service_instance_id: &str) -> (Arc<Recorder>, TestCa
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::io::{self, Write};
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-    use std::sync::mpsc::sync_channel;
+    use std::sync::mpsc::{self, sync_channel};
     use std::thread;
 
     use opentelemetry::KeyValue;
     use opentelemetry::trace::SpanId;
     use serde_json::Value;
 
+    use super::log_file::{self, LogReporter};
     use super::{
-        DROPPED_COUNT, DroppedRecordObserver, EventWriter, FramedWriter, Outcome, QueuedWriter,
-        Recorder, TEST_SERVICE_VERSION, TestCapture, test_recorder,
+        DROPPED_COUNT, DroppedRecordObserver, EventWriter, FramedWriter, LocalOutputs, Outcome,
+        QueueMessage, QueuedWriter, RecordClock, RecordSink as _, Recorder, TEST_SERVICE_VERSION,
+        TestCapture, test_recorder,
     };
+
+    fn epoch_clock() -> RecordClock {
+        Arc::new(|| time::OffsetDateTime::UNIX_EPOCH)
+    }
+
+    /// The record `receiver` holds next, as the line its output would write.
+    fn queued_line(
+        receiver: &std::sync::mpsc::Receiver<QueueMessage>,
+    ) -> Option<(Vec<u8>, serde_json::Map<String, Value>)> {
+        let Ok(QueueMessage::Record(record)) = receiver.try_recv() else {
+            return None;
+        };
+        let line = serde_json::from_slice(&record.bytes).expect("record is one JSON object");
+        Some((record.bytes.to_vec(), line))
+    }
 
     // REQ-TELEMETRY-2
     #[test]
@@ -1140,7 +1416,7 @@ mod tests {
     #[test]
     fn a_full_output_queue_drops_without_waiting() {
         let (sender, _receiver) = sync_channel(1);
-        let writer = QueuedWriter::from_sender(sender);
+        let writer = LocalOutputs::new(vec![QueuedWriter::from_sender(sender)], epoch_clock());
         let event = serde_json::Map::new();
 
         writer.write(&event).expect("fill event queue");
@@ -1149,6 +1425,105 @@ mod tests {
             .expect_err("full queue should drop event");
 
         assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    // REQ-TELEMETRY-51
+    #[test]
+    fn every_local_record_carries_the_utc_time_it_was_written() {
+        // The clock reads the instant 2026-11-19T04:54:24.993Z with a finer
+        // fraction and in another offset: the record carries it in UTC to
+        // the millisecond.
+        let written_at = time::OffsetDateTime::parse(
+            "2026-11-19T06:54:24.993456789+02:00",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("parse fixed clock");
+        let clock: RecordClock = Arc::new(move || written_at);
+        let (sender, receiver) = sync_channel(4);
+        let writer = Arc::new(LocalOutputs::new(
+            vec![QueuedWriter::from_sender(sender)],
+            clock,
+        ));
+        let spans = TestCapture::default();
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_simple_exporter(spans.clone())
+            .build();
+        let recorder = Recorder::new(provider, writer, TEST_SERVICE_VERSION, "rbt_fixture");
+
+        recorder
+            .start("runner.finished", [])
+            .finish(Outcome::Success);
+        recorder.record("runner.recorded", []);
+
+        for name in ["runner.finished", "runner.recorded"] {
+            let Ok(QueueMessage::Record(record)) = receiver.try_recv() else {
+                panic!("{name} should be queued as a record");
+            };
+            let line: serde_json::Map<String, Value> =
+                serde_json::from_slice(&record.bytes).expect("record is one JSON object");
+            assert_eq!(line["event.name"], name);
+            assert_eq!(line["time"], "2026-11-19T04:54:24.993Z");
+        }
+        let finished = spans
+            .spans()
+            .into_iter()
+            .find(|span| span.name == "runner.finished")
+            .expect("finished event exports a span");
+        assert!(
+            finished
+                .attributes
+                .iter()
+                .all(|attribute| attribute.key.as_str() != "time")
+        );
+    }
+
+    // REQ-TELEMETRY-14, INV-TELEMETRY-17
+    #[test]
+    fn a_record_is_dropped_only_when_no_output_takes_it() {
+        let (first_sender, first) = sync_channel(1);
+        let (second_sender, second) = sync_channel(3);
+        let writer = Arc::new(LocalOutputs::new(
+            vec![
+                QueuedWriter::from_sender(first_sender),
+                QueuedWriter::from_sender(second_sender),
+            ],
+            epoch_clock(),
+        ));
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let recorder = Recorder::new(provider, writer, TEST_SERVICE_VERSION, "rbt_fixture");
+        let finish = |name: &'static str| recorder.start(name, []).finish(Outcome::Success);
+
+        finish("runner.both");
+        let (first_bytes, _) = queued_line(&first).expect("the first output takes the record");
+        let (second_bytes, line) = queued_line(&second).expect("the second output takes it");
+        assert_eq!(first_bytes, second_bytes);
+        assert_eq!(line["event.name"], "runner.both");
+
+        // With the first queue full, the second output alone takes a record,
+        // which is not counted dropped.
+        finish("runner.fills_first");
+        finish("runner.first_full");
+        finish("runner.after_first_full");
+        // With both queues full, the record reaches no output and is counted.
+        finish("runner.dropped");
+        for name in [
+            "runner.fills_first",
+            "runner.first_full",
+            "runner.after_first_full",
+        ] {
+            let (_, line) = queued_line(&second).expect("the second output takes the record");
+            assert_eq!(line["event.name"], name);
+            assert!(line.get(DROPPED_COUNT).is_none(), "{line:?}");
+        }
+        assert!(queued_line(&second).is_none());
+        finish("runner.after_drop");
+
+        let (_, line) = queued_line(&second).expect("the second output takes the record");
+        assert_eq!(line["event.name"], "runner.after_drop");
+        assert_eq!(line[DROPPED_COUNT], 1);
+        let (_, line) = queued_line(&first).expect("the first output held one record");
+        assert_eq!(line["event.name"], "runner.fills_first");
+        assert!(queued_line(&first).is_none());
     }
 
     #[test]
@@ -1194,6 +1569,184 @@ mod tests {
         assert!(serde_json::from_slice::<Value>(lines[0]).is_err());
         let recovered: Value = serde_json::from_slice(lines[1]).expect("decode recovery record");
         assert_eq!(recovered["event.name"], "runner.recovered");
+    }
+
+    // Standard error's output as a channel of the lines written to it, one
+    // message for each record.
+    struct ChannelOutput(mpsc::Sender<Vec<u8>>);
+
+    impl Write for ChannelOutput {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            let _ = self.0.send(buffer.to_vec());
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn channel_stderr() -> (
+        impl FnOnce() -> io::Result<FramedWriter<ChannelOutput>> + Send + 'static,
+        mpsc::Receiver<Vec<u8>>,
+    ) {
+        let (sender, lines) = mpsc::channel();
+        (move || Ok(FramedWriter::new(ChannelOutput(sender))), lines)
+    }
+
+    fn line(bytes: &[u8]) -> serde_json::Map<String, Value> {
+        serde_json::from_slice(bytes).expect("a record is one JSON object")
+    }
+
+    fn log_reports(
+        lines: &[serde_json::Map<String, Value>],
+    ) -> Vec<serde_json::Map<String, Value>> {
+        lines
+            .iter()
+            .filter(|line| line["event.name"] == "runner.telemetry_log")
+            .cloned()
+            .collect()
+    }
+
+    // REQ-TELEMETRY-54, REQ-TELEMETRY-13
+    #[test]
+    fn a_log_that_cannot_open_is_reported_once_and_the_recorder_serves() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let logs = root.path().join("logs");
+        fs::write(&logs, b"not a directory\n").expect("write logs as a file");
+        let (stderr, lines) = channel_stderr();
+        let directory = logs.clone();
+
+        let recorder = Recorder::open_with(
+            "rbt_fixture",
+            TEST_SERVICE_VERSION,
+            epoch_clock(),
+            stderr,
+            Some((
+                log_file::path_in(&logs),
+                move |clock: RecordClock, reporter: LogReporter| {
+                    log_file::LogFile::open(
+                        &directory,
+                        log_file::RUNNER_LOG_LIMITS,
+                        clock,
+                        reporter,
+                    )
+                },
+            )),
+        );
+        assert_eq!(recorder.log_path(), None);
+
+        let startup = lines
+            .try_iter()
+            .map(|bytes| line(&bytes))
+            .collect::<Vec<_>>();
+        let reports = log_reports(&startup);
+        assert_eq!(reports.len(), 1, "{startup:?}");
+        let report = &reports[0];
+        assert_eq!(report["diagnostic.classification"], "open_failed");
+        assert_eq!(
+            report["error.type"],
+            super::io_error_class(io::ErrorKind::NotADirectory)
+        );
+        assert_eq!(report["um.main"], false);
+        let mut keys = report.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "diagnostic.classification",
+                "error.type",
+                "event.name",
+                "service.instance.id",
+                "service.name",
+                "service.version",
+                "time",
+                "um.event.schema_version",
+                "um.main",
+            ]
+        );
+
+        recorder.record("runner.serving", []);
+        let serving = line(&lines.recv().expect("standard error takes the record"));
+        assert_eq!(serving["event.name"], "runner.serving");
+        assert_eq!(fs::read(&logs).expect("read logs"), b"not a directory\n");
+        let entries = fs::read_dir(root.path())
+            .expect("list the state directory")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, ["logs"]);
+    }
+
+    // REQ-TELEMETRY-54, REQ-TELEMETRY-14
+    #[test]
+    fn a_log_whose_writes_fail_is_reported_once_and_drops_nothing() {
+        // The log's output: every write fails, and tells the test it did.
+        struct FailingOutput(mpsc::Sender<()>);
+
+        impl Write for FailingOutput {
+            fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+                let _ = self.0.send(());
+                Err(io::ErrorKind::StorageFull.into())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (stderr, lines) = channel_stderr();
+        let (failed, failures) = mpsc::channel();
+        let recorder = Recorder::open_with(
+            "rbt_fixture",
+            TEST_SERVICE_VERSION,
+            epoch_clock(),
+            stderr,
+            Some((
+                PathBuf::from("/failing/runner.log"),
+                move |_clock: RecordClock, _reporter: LogReporter| {
+                    Ok(FramedWriter::new(FailingOutput(failed)))
+                },
+            )),
+        );
+        assert_eq!(recorder.log_path(), Some(Path::new("/failing/runner.log")));
+
+        let names = ["runner.first", "runner.second", "runner.third"];
+        for name in names {
+            recorder.record(name, []);
+        }
+        // The three records and the one report of their failure each fail
+        // in the log.
+        for _ in 0..4 {
+            failures.recv().expect("the log tries the record");
+        }
+        recorder
+            .start("runner.finished", [])
+            .finish(Outcome::Success);
+
+        let mut received = Vec::new();
+        loop {
+            let line = line(&lines.recv().expect("standard error takes the record"));
+            let finished = line["event.name"] == "runner.finished";
+            received.push(line);
+            if finished {
+                break;
+            }
+        }
+        let reports = log_reports(&received);
+        assert_eq!(reports.len(), 1, "{received:?}");
+        assert_eq!(reports[0]["diagnostic.classification"], "write_failed");
+        assert_eq!(
+            reports[0]["error.type"],
+            super::io_error_class(io::ErrorKind::StorageFull)
+        );
+        for name in names {
+            assert!(
+                received.iter().any(|line| line["event.name"] == name),
+                "{name} reaches standard error"
+            );
+        }
+        let finished = received.last().expect("the finished event");
+        assert!(finished.get(DROPPED_COUNT).is_none(), "{finished:?}");
     }
 
     #[test]

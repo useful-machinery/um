@@ -10,6 +10,9 @@ pub(in crate::service) struct LeaseAuthority {
     pub(in crate::service) force_stop_end: LeaseInstant,
     pub(in crate::service) local_expiry: LeaseInstant,
     pub(in crate::service) terminal_report_delivery_budget: Duration,
+    /// How long after asking for the next lease the runner asks again while no grant
+    /// has replaced this authority: the renewal lead, `max(renewal_delivery_budget, 30 s)`.
+    pub(in crate::service) renewal_retry_interval: Duration,
     pub(in crate::service) revoked: bool,
 }
 
@@ -54,15 +57,15 @@ impl LeaseAuthority {
         let local_expiry = basis.checked_add(lease_duration)?;
         let force_stop_start = local_expiry.checked_sub(fencing_margin)?;
         let cancellation_start = force_stop_start.checked_sub(cancellation_grace)?;
-        // The advertised delivery budget is a minimum, not a scheduling target.
-        // Welcomed policies reserve two full leads in the maximum-grace window,
-        // so every admitted grace can use the ordinary 30-second target.
+        // Ask a third of the way into the cancellation window, so two thirds of it
+        // remain for the answer: a connection lost after the request and back within
+        // that remainder still delivers the grant before cancellation must begin. A
+        // welcomed policy fits two renewal leads in the smallest window, so the
+        // remainder always holds more than one.
         let cancellation_window = cancellation_start.checked_duration_since(basis)?;
-        let renewal_lead = renewal_delivery_budget
-            .max(MINIMUM_RENEWAL_HEADROOM)
-            .min(cancellation_window / 2);
-        let renewal_request = cancellation_start.checked_sub(renewal_lead)?;
+        let renewal_request = basis.checked_add(cancellation_window / 3)?;
         let force_stop_end = force_stop_start.checked_add(force_stop_reap_budget)?;
+        let renewal_retry_interval = renewal_delivery_budget.max(MINIMUM_RENEWAL_HEADROOM);
         Ok(Self {
             sequence,
             basis,
@@ -72,6 +75,7 @@ impl LeaseAuthority {
             force_stop_end,
             local_expiry,
             terminal_report_delivery_budget,
+            renewal_retry_interval,
             revoked: false,
         })
     }

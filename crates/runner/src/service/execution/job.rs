@@ -719,6 +719,7 @@ impl ExecutionJob {
             ) {
                 match self.causal_lease.request_renewal(
                     authority.sequence,
+                    authority.renewal_retry_interval,
                     assignment_id,
                     self.accepted.attempt_id(),
                     &self.lease_clock,
@@ -745,6 +746,9 @@ impl ExecutionJob {
                         return Ok(internal_delivery_failure("preparation"));
                     }
                 }
+                // Until a grant replaces the authority, come round and ask again every
+                // retry interval; `CausalLease` withholds a repeat while the last request
+                // is retained and ignores one the outbox refuses.
                 tokio::select! {
                     result = &mut completion => return Ok(self.delivery_completion(result)),
                     changed = authority_updates.changed() => {
@@ -757,6 +761,14 @@ impl ExecutionJob {
                         result?;
                         self.artifact_delivery.cancel_assignment(assignment_id);
                         return Ok(ArtifactDeliveryOutcome::AuthorityLost);
+                    }
+                    result = wait_to_ask_again(
+                        &self.lease_clock,
+                        now,
+                        authority.renewal_retry_interval,
+                        authority.local_expiry,
+                    ) => {
+                        result?;
                     }
                 }
                 continue;

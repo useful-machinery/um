@@ -591,7 +591,30 @@ pub(super) struct ServeProcess {
 impl ServeProcess {
     /// Starts `command` reading `standard_input`, with its standard error
     /// collected.
-    pub(super) fn start(mut command: Command, standard_input: StandardInput<'_>) -> Self {
+    pub(super) fn start(command: Command, standard_input: StandardInput<'_>) -> Self {
+        let mut serve = Self::spawn(command, standard_input);
+        let mut stderr = serve.child.stderr.take().unwrap();
+        serve.stderr = Some(thread::spawn(move || {
+            let mut output = String::new();
+            let _ = stderr.read_to_string(&mut output);
+            output
+        }));
+        serve
+    }
+
+    /// Starts `command` as [`ServeProcess::start`] does, except that the read
+    /// end of its standard error is closed at once: no one reads what it
+    /// writes there, and each of its writes there fails.
+    pub(super) fn start_with_standard_error_closed(
+        command: Command,
+        standard_input: StandardInput<'_>,
+    ) -> Self {
+        let mut serve = Self::spawn(command, standard_input);
+        drop(serve.child.stderr.take());
+        serve
+    }
+
+    fn spawn(mut command: Command, standard_input: StandardInput<'_>) -> Self {
         command
             .stdin(match standard_input {
                 StandardInput::Null => Stdio::null(),
@@ -605,16 +628,18 @@ impl ServeProcess {
             let mut stdin = child.stdin.take().unwrap();
             stdin.write_all(standard_input.as_bytes()).unwrap();
         }
-        let mut stderr = child.stderr.take().unwrap();
-        let stderr = thread::spawn(move || {
-            let mut output = String::new();
-            let _ = stderr.read_to_string(&mut output);
-            output
-        });
         Self {
             child,
-            stderr: Some(stderr),
+            stderr: None,
         }
+    }
+
+    /// What the process wrote to its standard error, when it was collected.
+    fn collected_stderr(&mut self) -> String {
+        self.stderr
+            .take()
+            .map(|stderr| stderr.join().unwrap())
+            .unwrap_or_default()
     }
 
     pub(super) fn exited(&mut self) -> Option<ExitStatus> {
@@ -623,7 +648,7 @@ impl ServeProcess {
 
     pub(super) fn wait_for_exit(mut self) -> (ExitStatus, String) {
         let status = poll_until("Runner Serve exit", || self.exited(), Option::is_some).unwrap();
-        (status, self.stderr.take().unwrap().join().unwrap())
+        (status, self.collected_stderr())
     }
 
     pub(super) fn stop(mut self) -> String {
@@ -631,7 +656,7 @@ impl ServeProcess {
             self.child.kill().unwrap();
         }
         self.child.wait().unwrap();
-        self.stderr.take().unwrap().join().unwrap()
+        self.collected_stderr()
     }
 }
 

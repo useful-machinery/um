@@ -11,6 +11,9 @@ use useful_execution::{
     ValidatedClaudeCodeInstallation, ValidatedCodexInstallation, ValidatedPiInstallation,
 };
 
+/// The directory beside the state file that holds the runner's log.
+const LOG_DIRECTORY: &str = "logs";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct RepositoryUrlPolicy {
     allow_file: bool,
@@ -54,6 +57,7 @@ pub struct Config {
     startup_pending: Option<PendingCredential>,
     state_access: Option<RunnerStateAccess>,
     control_socket_path: Option<PathBuf>,
+    log_directory: Option<PathBuf>,
     assignment: AssignmentConfig,
     repository_url_policy: RepositoryUrlPolicy,
     pi_installation: Option<ValidatedPiInstallation>,
@@ -163,6 +167,11 @@ impl Config {
         )
         .map_err(|_| ConfigError::InvalidOperatorConfiguration)?;
         config.startup_pending = startup_pending;
+        config.log_directory = enrolled
+            .state_access
+            .path()
+            .parent()
+            .map(|directory| directory.join(LOG_DIRECTORY));
         config.state_access = Some(enrolled.state_access);
         config.control_socket_path = Some(enrolled.control_socket_path);
         Ok(config)
@@ -194,6 +203,7 @@ impl Config {
             startup_pending: None,
             state_access: None,
             control_socket_path: None,
+            log_directory: None,
             assignment,
             repository_url_policy,
             pi_installation: None,
@@ -220,6 +230,13 @@ impl Config {
 
     pub(crate) fn control_socket_path(&self) -> Option<&Path> {
         self.control_socket_path.as_deref()
+    }
+
+    /// The directory the serving runner keeps its log in, `logs` beside its
+    /// state file (REQ-TELEMETRY-52); none for a configuration that names no
+    /// state, so it writes no log.
+    pub(crate) fn log_directory(&self) -> Option<&Path> {
+        self.log_directory.as_deref()
     }
 
     pub(crate) fn with_pending_credential(

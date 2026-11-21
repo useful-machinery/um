@@ -100,6 +100,40 @@ impl AssignmentManager {
         self.grant_token_refresh = Some(GrantTokenRefreshing { sleeper, status });
     }
 
+    /// Accepts a connection's `welcome`: retains its lease policy (`retain_lease_policy`),
+    /// then asks Cloud again at once for the next lease of every running assignment whose
+    /// request Cloud acknowledged and has not answered (REQ-RUNNERENROLL-151,
+    /// INV-RUNNER-48). A request still in the outbox is replayed by the outbox, so a second
+    /// welcome on one connection adds nothing.
+    pub(in crate::service) fn accept_welcome(
+        &mut self,
+        policy: &ExecutionLeasePolicy,
+    ) -> Result<(), WelcomePolicyFailure> {
+        self.retain_lease_policy(policy)?;
+        self.drain_events();
+        let clock_failure = self.held.values().find_map(|held| {
+            let HeldAssignment::Running(running) = held else {
+                return None;
+            };
+            running
+                .causal_lease
+                .repeat_renewal_request(
+                    running.current_grant.sequence,
+                    &running.identity.assignment_id,
+                    &running.identity.attempt_id,
+                    &self.lease_clock,
+                    &self.outbox,
+                )
+                .err()
+                .map(|error| (running.identity.assignment_id.clone(), error))
+        });
+        if let Some((assignment_id, error)) = clock_failure {
+            // The connection loop observes the failure as it does one met in a renewal.
+            self.fail_lease_clock(&assignment_id, error);
+        }
+        Ok(())
+    }
+
     pub(in crate::service) fn retain_lease_policy(
         &mut self,
         policy: &ExecutionLeasePolicy,
@@ -542,25 +576,25 @@ impl AssignmentManager {
             // until the assignment ends (REQ-GRANT-86, INV-RUNNER-28),
             // keeping each file current while it runs (REQ-GRANT-89).
             // Whatever the setup meets, a panic included, the admission goes
-            // on with what is on disk.
-            if let Some(setup) = &agent_login_setup {
-                runtime.grant_tokens =
-                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        setup.set_up(
-                            &runs_beside,
-                            &worker_offer.run_id,
-                            &worker_offer.assignment_id,
-                        )
-                    }))
-                    .ok()
-                    .flatten()
-                    .map(|mut tokens| {
-                        if let Some(refreshing) = &grant_token_refresh {
-                            refreshing.start(&mut tokens);
-                        }
-                        Arc::new(tokens)
-                    });
-            }
+            // on with what is on disk. The worker is the hold's only owner
+            // until it publishes the admission's outcome, which carries it.
+            let grant_tokens = agent_login_setup.as_ref().and_then(|setup| {
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    setup.set_up(
+                        &runs_beside,
+                        &worker_offer.run_id,
+                        &worker_offer.assignment_id,
+                    )
+                }))
+                .ok()
+                .flatten()
+                .map(|mut tokens| {
+                    if let Some(refreshing) = &grant_token_refresh {
+                        refreshing.start(&mut tokens);
+                    }
+                    tokens
+                })
+            });
             // The steps draw from the process environment with the agent
             // logins the runner keeps now, looked at for this admission
             // (REQ-GRANT-37, REQ-GRANT-44), and a tree run's `useful` commands
@@ -574,7 +608,7 @@ impl AssignmentManager {
             let offered = crate::agent_login::offer_with_grant_tokens(
                 &runtime.environment,
                 agent_login_directory.as_ref(),
-                runtime.grant_tokens.as_deref(),
+                grant_tokens.as_ref(),
             );
             // The admission reports where each provider's credential comes
             // from to Cloud once, before any step starts, from what the
@@ -585,8 +619,7 @@ impl AssignmentManager {
             // offer as it is; a report Cloud does not take is the setup's
             // own record (REQ-TELEMETRY-48).
             if let Some(setup) = &agent_login_setup {
-                let sources =
-                    crate::agent_login::reported_sources(&offered, runtime.grant_tokens.as_deref());
+                let sources = crate::agent_login::reported_sources(&offered, grant_tokens.as_ref());
                 let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     setup.report_sources(&worker_offer.assignment_id, sources);
                 }));
@@ -640,7 +673,7 @@ impl AssignmentManager {
                     offer: Box::new(worker_offer),
                     prepare_effect_id,
                     deadline,
-                    admission: Box::new(admission),
+                    admission: Box::new(handing_over(admission, grant_tokens)),
                 });
                 wake.wake();
                 return;
@@ -843,7 +876,7 @@ impl AssignmentManager {
                 offer: Box::new(worker_offer),
                 prepare_effect_id,
                 deadline,
-                admission: Box::new(admission),
+                admission: Box::new(handing_over(admission, grant_tokens)),
             });
             wake.wake();
         });
@@ -1113,6 +1146,28 @@ impl AssignmentManager {
             }
         }
         Ok(())
+    }
+}
+
+/// `admission`, as an admission's worker publishes it, with the grant token
+/// hold the worker alone owned until then: handed to the accepted assignment,
+/// or ended with a declined one. Once the outcome is published nothing of the
+/// worker holds the tokens, so the manager letting go of the assignment ends
+/// its refresh and removes its directory whatever the worker still does
+/// (INV-RUNNER-28).
+fn handing_over(
+    admission: Result<AcceptedAssignment, Box<(AssignmentRoot, AssignmentDecline)>>,
+    grant_tokens: Option<AssignmentGrantTokens>,
+) -> Result<AcceptedAssignment, Box<(AssignmentRoot, AssignmentDecline)>> {
+    match admission {
+        Ok(accepted) => Ok(AcceptedAssignment {
+            grant_tokens,
+            ..accepted
+        }),
+        Err(declined) => {
+            drop(grant_tokens);
+            Err(declined)
+        }
     }
 }
 

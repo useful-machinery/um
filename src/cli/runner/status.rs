@@ -52,6 +52,9 @@ fn write_status(output: &mut impl Write, status: &StatusSnapshot) -> io::Result<
         "uptime:         {}",
         format_uptime(status.uptime_milliseconds)
     )?;
+    if let Some(log_path) = &status.log_path {
+        writeln!(output, "log:            {log_path}")?;
+    }
     writeln!(
         output,
         "connection:     {}",
@@ -192,6 +195,7 @@ mod tests {
             process_state: ProcessState::Running,
             boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             uptime_milliseconds: 273_600_000,
+            log_path: None,
             connection_state: ConnectionState::Connected,
             last_connected_at: Some("2026-08-06T19:00:00Z".to_owned()),
             current_credential_id: Some("rrc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned()),
@@ -218,5 +222,40 @@ mod tests {
         ]
         .concat();
         assert_eq!(String::from_utf8(output).unwrap(), expected);
+    }
+
+    // REQ-RUNNERENROLL-42: the log the process writes is shown directly after its uptime.
+    #[test]
+    fn renders_the_log_path_after_the_uptime() {
+        let status = StatusSnapshot {
+            process_state: ProcessState::Running,
+            boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+            uptime_milliseconds: 10_000,
+            log_path: Some("/var/lib/runner/logs/runner.log".to_owned()),
+            connection_state: ConnectionState::Connecting,
+            last_connected_at: None,
+            current_credential_id: None,
+            pending_credential_id: None,
+            assignment_counts: AssignmentCounts::default(),
+            last_connection_failure: None,
+            agent_logins: None,
+            held_runs: Vec::new(),
+        };
+        let mut output = Vec::new();
+        write_status(&mut output, &status).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        let lines = output.lines().collect::<Vec<_>>();
+        let uptime = lines
+            .iter()
+            .position(|line| line.starts_with("uptime:"))
+            .unwrap();
+        assert_eq!(
+            lines[uptime + 1],
+            "log:            /var/lib/runner/logs/runner.log"
+        );
+        assert_eq!(
+            lines.iter().filter(|line| line.starts_with("log:")).count(),
+            1
+        );
     }
 }

@@ -1534,6 +1534,7 @@ mod tests {
             force_stop_end: now.checked_add(Duration::from_secs(55)).unwrap(),
             local_expiry: now.checked_add(Duration::from_secs(60)).unwrap(),
             terminal_report_delivery_budget: Duration::from_secs(5),
+            renewal_retry_interval: Duration::from_secs(30),
             revoked: false,
         };
         let (sender, _) = tokio::sync::watch::channel(authority);

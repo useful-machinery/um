@@ -386,6 +386,117 @@ pub(crate) fn fixture_sleeper() -> Arc<dyn Sleeper> {
     Arc::new(FixtureSleeper)
 }
 
+/// The thread a preparation fence waits for its deadline on.
+const PREPARATION_DEADLINE_THREAD: &str = "runner-preparation-deadline";
+
+/// Whether the test has let go of a `PreparationTeardownHold`.
+#[derive(Default)]
+struct TeardownGate {
+    open: Mutex<bool>,
+    opened: std::sync::Condvar,
+}
+
+/// What holds an admission's worker in its teardown until it is dropped,
+/// which a failed assertion's unwinding does too, so a red test ends rather
+/// than waiting for the worker.
+pub(crate) struct PreparationTeardownHold {
+    gate: Arc<TeardownGate>,
+}
+
+impl PreparationTeardownHold {
+    /// Lets the held teardown go on.
+    pub(crate) fn let_go(self) {}
+}
+
+impl Drop for PreparationTeardownHold {
+    fn drop(&mut self) {
+        *self
+            .gate
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+        self.gate.opened.notify_all();
+    }
+}
+
+/// A sleeper that answers as `fixture_sleeper()` does, except that a sleep
+/// dropped on a preparation fence's thread waits, as it is dropped, until
+/// the test lets go of the hold.
+struct TeardownHoldingSleeper {
+    fixture: Arc<dyn Sleeper>,
+    gate: Arc<TeardownGate>,
+}
+
+impl Sleeper for TeardownHoldingSleeper {
+    fn now(&self) -> Instant {
+        self.fixture.now()
+    }
+
+    fn utc_now(&self) -> time::OffsetDateTime {
+        self.fixture.utc_now()
+    }
+
+    fn sleep(&self, duration: Duration) -> super::SleepFuture<'_> {
+        Box::pin(HeldSleep {
+            sleep: self.fixture.sleep(duration),
+            gate: Arc::clone(&self.gate),
+        })
+    }
+}
+
+/// A sleep of a `TeardownHoldingSleeper`.
+struct HeldSleep<'a> {
+    sleep: super::SleepFuture<'a>,
+    gate: Arc<TeardownGate>,
+}
+
+impl Future for HeldSleep<'_> {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<()> {
+        self.sleep.as_mut().poll(context)
+    }
+}
+
+impl Drop for HeldSleep<'_> {
+    fn drop(&mut self) {
+        // Only the fence's own thread waits: a sleep dropped on the test's
+        // runtime would stop the runtime that lets the hold go.
+        if std::thread::current().name() != Some(PREPARATION_DEADLINE_THREAD) {
+            return;
+        }
+        let open = self
+            .gate
+            .open
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(
+            self.gate
+                .opened
+                .wait_while(open, |open| !*open)
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+    }
+}
+
+/// A manager sleeper that holds each admission's worker in its teardown,
+/// past the outcome it published and before what it captured is dropped,
+/// until the test lets go of the returned hold: the worker drops its
+/// preparation fence's deadline sleep on the fence's thread, and joins that
+/// thread before its captures drop. Otherwise it answers as
+/// `fixture_sleeper()` does.
+pub(crate) fn preparation_teardown_holding_sleeper() -> (Arc<dyn Sleeper>, PreparationTeardownHold)
+{
+    let gate = Arc::new(TeardownGate::default());
+    (
+        Arc::new(TeardownHoldingSleeper {
+            fixture: fixture_sleeper(),
+            gate: Arc::clone(&gate),
+        }),
+        PreparationTeardownHold { gate },
+    )
+}
+
 pub(crate) fn controlled_sleeper() -> (
     Arc<dyn Sleeper>,
     mpsc::UnboundedReceiver<(Duration, SleepRelease)>,

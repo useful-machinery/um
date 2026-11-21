@@ -202,8 +202,9 @@ pub(super) struct AcceptedAssignment {
     /// project uses the host's own Git access and has none (REQ-WORKSPACE-42).
     pub(super) workflow_git: Option<WorkflowGitAuthority>,
     /// The assignment's grant token files, which the manager holds with the
-    /// assignment until it ends (INV-RUNNER-28).
-    pub(super) grant_tokens: Option<Arc<AssignmentGrantTokens>>,
+    /// assignment until it ends, their only holder once the admission's worker
+    /// handed them over (INV-RUNNER-28).
+    pub(super) grant_tokens: Option<AssignmentGrantTokens>,
 }
 
 /// What an accepted assignment executes: an admitted workflow on the embedded engine,
@@ -604,7 +605,7 @@ struct RunningAssignment {
     /// The assignment's grant token files, held only to be dropped: they are
     /// removed when the manager lets go of the running assignment, whatever
     /// ends it (INV-RUNNER-28).
-    _grant_tokens: Option<Arc<AssignmentGrantTokens>>,
+    _grant_tokens: Option<AssignmentGrantTokens>,
     /// Whether a tree run is working, as its loop last reported it, which agent-login setup
     /// and the offer rule read (INV-RUNNER-15, INV-RUNNER-40); none for a run on the
     /// embedded engine, which always works.
@@ -879,10 +880,6 @@ struct AdmissionRuntime {
     /// What notes how the provider answered each use of a login the
     /// admission's offer added (REQ-GRANT-52).
     harness_login_observer: Option<Arc<dyn HarnessLoginObserver>>,
-    /// The grant token files the admission's setup kept for the assignment
-    /// (REQ-GRANT-86), handed to the accepted assignment; once nothing holds
-    /// them, their files are removed (INV-RUNNER-28).
-    grant_tokens: Option<Arc<AssignmentGrantTokens>>,
     execution_version: Arc<str>,
     outbox: ObservationOutbox,
     guard_processes: bool,
@@ -1059,7 +1056,9 @@ impl AdmissionRuntime {
             process_guards,
             guard_processes: self.guard_processes,
             workflow_git,
-            grant_tokens: self.grant_tokens.clone(),
+            // The admission's worker hands its hold over as it publishes
+            // the outcome (INV-RUNNER-28).
+            grant_tokens: None,
         })
     }
 }
@@ -1476,12 +1475,19 @@ pub(super) mod test_support {
         }
 
         pub(in crate::service) async fn wait_until_execution_observes_renewal(&mut self) {
-            let expected = self
-                .authority
-                .borrow()
-                .renewal_request
-                .checked_duration_since(self.clock.now().expect("read fixture lease clock"))
-                .expect("renewed authority request remains in the future");
+            // A renewal applied late in the window can leave the renewed authority's
+            // request already due, whose timer the controlled clock arms at zero.
+            let renewal_request = self.authority.borrow().renewal_request;
+            let now = self.clock.now().expect("read fixture lease clock");
+            let expected = match renewal_request
+                .checked_cmp(now)
+                .expect("compare fixture lease instants")
+            {
+                std::cmp::Ordering::Greater => renewal_request
+                    .checked_duration_since(now)
+                    .expect("measure renewed authority request"),
+                std::cmp::Ordering::Equal | std::cmp::Ordering::Less => Duration::ZERO,
+            };
             let (renewal_wait, _renewal_release) = super::super::test_support::with_watchdog(
                 self.waits
                     .as_mut()
@@ -1515,11 +1521,28 @@ pub(super) mod test_support {
         }
     }
 
+    /// Installs `offer` as a running assignment whose renewal was requested at the initial
+    /// authority's `renewal_request` and whose clock stands one second before its
+    /// `cancellation_start`, so a renewal applied now has one second to spare.
     pub(in crate::service) fn install_running_renewal_fixture(
         manager: &mut AssignmentManager,
         offer: AssignmentOffer,
     ) -> RenewalTimingFixture {
-        install_running_renewal_fixture_after_request(manager, offer, Duration::from_secs(29))
+        install_running_renewal_fixture_after_request(manager, offer, |remainder| {
+            remainder
+                .checked_sub(Duration::from_secs(1))
+                .expect("fixture headroom fits the renewal remainder")
+        })
+    }
+
+    /// Installs `offer` as a running assignment whose renewal was requested at the initial
+    /// authority's `renewal_request` and whose clock still stands at that request, so the
+    /// grant a renewal applies now is not yet due for renewal itself.
+    pub(in crate::service) fn install_running_renewal_fixture_at_request(
+        manager: &mut AssignmentManager,
+        offer: AssignmentOffer,
+    ) -> RenewalTimingFixture {
+        install_running_renewal_fixture_after_request(manager, offer, |_| Duration::ZERO)
     }
 
     /// Installs `offer` as a running assignment beside the one `beside` installed, on the
@@ -1560,10 +1583,13 @@ pub(super) mod test_support {
         )
     }
 
+    /// Installs `offer` as a running assignment whose renewal was requested at the initial
+    /// authority's `renewal_request`, with the clock advanced past that request by what
+    /// `elapsed_since_request` answers for the remainder before `cancellation_start`.
     fn install_running_renewal_fixture_after_request(
         manager: &mut AssignmentManager,
         offer: AssignmentOffer,
-        elapsed_since_request: Duration,
+        elapsed_since_request: impl FnOnce(Duration) -> Duration,
     ) -> RenewalTimingFixture {
         let (clock, control, waits) = super::super::lease_clock::controlled_lease_clock();
         manager.lease_clock = clock.clone();
@@ -1582,6 +1608,12 @@ pub(super) mod test_support {
                 .expect("measure fixture renewal schedule"),
         );
         let renewal = clock.now().expect("read fixture renewal basis");
+        let elapsed_since_request = elapsed_since_request(
+            initial_authority
+                .cancellation_start
+                .checked_duration_since(renewal)
+                .expect("measure fixture renewal remainder"),
+        );
         control.advance(elapsed_since_request);
         install_running_assignment(
             manager,
@@ -1622,7 +1654,14 @@ pub(super) mod test_support {
         {
             let mut state = causal_lease.lock();
             state.bases.insert(2, bases.renewal);
-            state.renewal_requests.insert(2);
+            // Outbox ids start at 1, so the request reads as one Cloud has acknowledged.
+            state.renewal_requests.insert(
+                2,
+                RenewalRequest {
+                    observation_id: 0,
+                    enqueued_at: bases.renewal,
+                },
+            );
         }
         let remaining = initial_authority
             .cancellation_start
@@ -2323,10 +2362,12 @@ pub(super) mod test_support {
             .running(&offer.assignment_id)
             .expect("the renewed assignment runs");
         let sequence = running.current_grant.sequence;
+        let retry_interval = running.authority_updates.borrow().renewal_retry_interval;
         running
             .causal_lease
             .request_renewal(
                 sequence,
+                retry_interval,
                 &offer.assignment_id,
                 &offer.attempt_id,
                 &manager.lease_clock,

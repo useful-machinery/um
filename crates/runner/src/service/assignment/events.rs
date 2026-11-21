@@ -806,7 +806,6 @@ impl AssignmentManager {
                 self.environment.clone(),
             ),
             harness_login_observer: None,
-            grant_tokens: None,
             execution_version: Arc::clone(&self.execution_version),
             outbox: self.outbox.clone(),
             guard_processes: self.guard_processes,

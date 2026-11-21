@@ -215,6 +215,8 @@ fn collapse_causes_are_variant_based_and_ignore_error_text() {
     }
 }
 
+const LEASE_RENEWAL_RETRY_INTERVAL: Duration = Duration::from_millis(500);
+
 fn lease_authority(basis: LeaseInstant) -> LeaseAuthority {
     LeaseAuthority {
         sequence: 4,
@@ -225,6 +227,8 @@ fn lease_authority(basis: LeaseInstant) -> LeaseAuthority {
         force_stop_end: basis.checked_add(Duration::from_secs(8)).unwrap(),
         local_expiry: basis.checked_add(Duration::from_secs(12)).unwrap(),
         terminal_report_delivery_budget: Duration::from_secs(7),
+        // Two repeats fit between the request at 2 s and cancellation at 4 s.
+        renewal_retry_interval: LEASE_RENEWAL_RETRY_INTERVAL,
         revoked: false,
     }
 }
@@ -468,6 +472,90 @@ async fn lease_renewal_continues_while_command_launch_is_stalled() {
     ));
 }
 
+fn pending_renewal_requests(outbox: &ObservationOutbox) -> Vec<u64> {
+    outbox
+        .pending(&BTreeSet::new(), 32)
+        .into_iter()
+        .filter(|pending| {
+            matches!(
+                pending.observation,
+                AssignmentObservation::LeaseRenewalRequested {
+                    current_lease_sequence: 4,
+                    ..
+                }
+            )
+        })
+        .map(|pending| pending.id)
+        .collect()
+}
+
+async fn wait_for_renewal_requests(outbox: &ObservationOutbox, count: usize) -> Vec<u64> {
+    let notification = outbox.notification();
+    with_watchdog(async {
+        loop {
+            let notified = notification.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let requests = pending_renewal_requests(outbox);
+            if requests.len() >= count {
+                break requests;
+            }
+            notified.await;
+        }
+    })
+    .await
+    .expect("the lease supervision did not ask for the next lease")
+}
+
+// REQ-RUNNERENROLL-150
+#[tokio::test]
+async fn unanswered_renewal_is_asked_again_each_lead_from_the_first_basis() {
+    let (lease_clock, _control, mut waits) = controlled_lease_clock();
+    let basis = lease_clock.now().unwrap();
+    let (result, released) = tokio::sync::oneshot::channel();
+    let supervised = supervise_execution(lease_clock, lease_authority(basis), async {
+        released.await.expect("fixture result")
+    });
+
+    lease_wait_request(&mut waits, Duration::from_secs(2))
+        .await
+        .release();
+    let first = wait_for_renewal_requests(&supervised.outbox, 1).await;
+    assert_eq!(first.len(), 1);
+
+    // Still in the outbox, the request is the transport's to deliver: none is added.
+    with_watchdog(lease_wait_request(&mut waits, LEASE_RENEWAL_RETRY_INTERVAL))
+        .await
+        .expect("the supervision armed no repeat a retry interval after the request")
+        .release();
+    let repeat = with_watchdog(lease_wait_request(&mut waits, LEASE_RENEWAL_RETRY_INTERVAL))
+        .await
+        .expect("the supervision armed no further repeat while the request was retained");
+    assert_eq!(pending_renewal_requests(&supervised.outbox), first);
+    assert_eq!(supervised.cancellation.cancellation_reason(), None);
+
+    // Acknowledged and unanswered, it is asked again for the same lease.
+    supervised.outbox.acknowledge_observation(first[0]);
+    repeat.release();
+    let second = wait_for_renewal_requests(&supervised.outbox, 1).await;
+    assert_eq!(second.len(), 1);
+    assert_ne!(second, first);
+    assert_eq!(supervised.cancellation.cancellation_reason(), None);
+
+    result.send("completed-unrenewed").unwrap();
+    assert!(matches!(
+        with_watchdog(supervised.task)
+            .await
+            .expect("lease supervision timed out")
+            .expect("lease supervision task failed"),
+        LeaseExecution::Completed {
+            output: "completed-unrenewed",
+            infrastructure_interruption: None,
+        }
+    ));
+    assert_eq!(supervised.cancellation.cancellation_reason(), None);
+}
+
 #[tokio::test]
 async fn sixty_second_lease_grace_allows_clean_exit_after_thirty_seconds() {
     let (lease_clock, _control, _lease_waits) = controlled_lease_clock();
@@ -485,6 +573,7 @@ async fn sixty_second_lease_grace_allows_clean_exit_after_thirty_seconds() {
             force_stop_end: basis.checked_add(Duration::from_secs(65)).unwrap(),
             local_expiry: basis.checked_add(Duration::from_secs(72)).unwrap(),
             terminal_report_delivery_budget: Duration::from_secs(7),
+            renewal_retry_interval: Duration::from_secs(30),
             revoked: false,
         },
         async move {

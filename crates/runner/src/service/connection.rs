@@ -1367,7 +1367,7 @@ where
                     .assignment_manager
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .retain_lease_policy(&lease_policy);
+                    .accept_welcome(&lease_policy);
                 let cause = match policy {
                     Ok(()) => None,
                     Err(WelcomePolicyFailure::Invalid) => {
@@ -2377,7 +2377,7 @@ where
                 let policy_result = assignment_manager
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .retain_lease_policy(&lease_policy);
+                    .accept_welcome(&lease_policy);
                 let cause = match policy_result {
                     Ok(()) => None,
                     Err(WelcomePolicyFailure::Invalid) => {
@@ -3780,7 +3780,7 @@ mod tests {
             timing.wait_until_execution_observes_renewal().await;
             timing.advance(Duration::from_secs(2));
             assert!(!timing.cancellation_started());
-            assert!(timing.cancellation_headroom() > Some(Duration::from_secs(270)));
+            assert!(timing.cancellation_headroom() > Some(Duration::from_secs(100)));
             execution.complete().await;
             inbound.send(Message::Close(None));
         };
@@ -3794,7 +3794,7 @@ mod tests {
             .finish(Outcome::Disconnected, None);
         let event = context.capture.event("runner.effect_acknowledgement");
         assert_eq!(event["um.lease.disposition"], "applied");
-        assert_eq!(event["um.lease.request_age_ms"], 29_000);
+        assert_eq!(event["um.lease.request_age_ms"], 238_333);
         assert_eq!(event["um.lease.cancellation_headroom_ms"], 1_000);
     }
 
@@ -3857,7 +3857,7 @@ mod tests {
             timing.advance(Duration::from_secs(2));
             assert!(!timing.cancellation_started());
             assert!(
-                timing.cancellation_headroom() > Some(Duration::from_secs(270)),
+                timing.cancellation_headroom() > Some(Duration::from_secs(100)),
                 "renewed authority did not remain positive past the old cancellation boundary"
             );
             gate.release();
@@ -3871,7 +3871,7 @@ mod tests {
         effect_event.finish(Outcome::Disconnected);
         let event = context.capture.event("runner.effect_acknowledgement");
         assert_eq!(event["um.lease.disposition"], "applied");
-        assert_eq!(event["um.lease.request_age_ms"], 29_000);
+        assert_eq!(event["um.lease.request_age_ms"], 238_333);
         assert_eq!(event["um.lease.cancellation_headroom_ms"], 1_000);
         assert!(event["um.lease.decision_delay_ms"].as_u64().is_some());
     }

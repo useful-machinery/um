@@ -115,6 +115,13 @@
         "processState": { "enum": ["running", "stopping"] },
         "bootId": { "type": "string", "pattern": "^rbt_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
         "uptimeMilliseconds": { "type": "integer", "minimum": 0 },
+        "logPath": {
+          "description": "The absolute path of the log file runner.log the serving process appends its records to; present exactly when the process opened its log.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096,
+          "pattern": "^/"
+        },
         "connectionState": { "enum": ["connecting", "connected", "backing_off", "authentication_failed", "protocol_failed", "stopping"] },
         "lastConnectedAt": { "type": "string", "format": "date-time" },
         "currentCredentialId": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" },

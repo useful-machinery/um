@@ -279,6 +279,7 @@ impl LiveStatusState {
 pub(super) struct LiveStatus {
     boot_id: String,
     started_at: Instant,
+    log_path: Option<String>,
     state: Mutex<LiveStatusState>,
     connected: tokio::sync::Notify,
     /// The runner's own events, recorded once the state's lock is released.
@@ -294,6 +295,7 @@ impl LiveStatus {
         Self {
             boot_id,
             started_at: useful_support::monotonic_now(),
+            log_path: None,
             state: Mutex::new(LiveStatusState {
                 process_state: ProcessState::Running,
                 connection_state: ConnectionState::Connecting,
@@ -308,6 +310,19 @@ impl LiveStatus {
             }),
             connected: tokio::sync::Notify::new(),
             events: Arc::new(EventLog::new()),
+        }
+    }
+
+    /// The status of a process that writes its log at `log_path`, the path the
+    /// recorder answered when its log opened (REQ-RUNNERENROLL-42). A path that is not
+    /// UTF-8 or not absolute cannot travel in the snapshot and is shown as no log.
+    pub(super) fn with_log_path(self, log_path: Option<&Path>) -> Self {
+        Self {
+            log_path: log_path
+                .filter(|path| path.is_absolute())
+                .and_then(Path::to_str)
+                .map(str::to_owned),
+            ..self
         }
     }
 
@@ -440,6 +455,7 @@ impl LiveStatus {
             process_state: state.process_state,
             boot_id: self.boot_id.clone(),
             uptime_milliseconds,
+            log_path: self.log_path.clone(),
             connection_state: state.connection_state,
             last_connected_at: state.last_connected_at.clone(),
             current_credential_id: state.current_credential_id.clone(),

@@ -126,6 +126,11 @@ pub struct StatusSnapshot {
     pub process_state: ProcessState,
     pub boot_id: String,
     pub uptime_milliseconds: u64,
+    /// The absolute path of the log file `runner.log` the process appends its records
+    /// to, present exactly when the process opened its log (REQ-RUNNERENROLL-42,
+    /// REQ-TELEMETRY-52).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_path: Option<String>,
     pub connection_state: ConnectionState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_connected_at: Option<String>,
@@ -828,6 +833,15 @@ fn valid_status(status: &StatusSnapshot) -> bool {
             .as_deref()
             .is_none_or(valid_timestamp)
         && status.agent_logins.as_ref().is_none_or(valid_readiness)
+        && status.log_path.as_deref().is_none_or(valid_log_path)
+}
+
+/// The longest log path a status may carry, in characters.
+const MAXIMUM_LOG_PATH: usize = 4096;
+
+/// A status's log path: an absolute path of at most `MAXIMUM_LOG_PATH` characters.
+fn valid_log_path(path: &str) -> bool {
+    path.starts_with('/') && path.chars().count() <= MAXIMUM_LOG_PATH
 }
 
 /// The most runs a status may list, the most assignments a runner holds.
@@ -1842,6 +1856,7 @@ mod tests {
             process_state: ProcessState::Running,
             boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             uptime_milliseconds: 0,
+            log_path: None,
             connection_state: ConnectionState::Connecting,
             last_connected_at: None,
             current_credential_id: None,
@@ -1932,6 +1947,37 @@ mod tests {
             let encoded = encode_response(&Response::Status(refused)).unwrap();
             assert_eq!(decode_response(&encoded), Err(ProtocolFailure::Invalid));
         }
+    }
+
+    // REQ-RUNNERENROLL-42: the path of the log the process writes travels as an absolute
+    // path; a status whose log path is relative or empty is refused.
+    #[test]
+    fn status_with_a_log_path_decodes_and_a_relative_or_empty_one_is_refused() {
+        let cli_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let fixtures = cli_root.join("tests/fixtures/runner-control/v1");
+        let read = |path: &str| std::fs::read(fixtures.join(path)).unwrap();
+
+        let valid = read("valid/status-log-path-response.json");
+        let Ok(Response::Status(status)) = decode_response(&valid) else {
+            panic!("the log-path snapshot did not decode");
+        };
+        assert_eq!(
+            status.log_path.as_deref(),
+            Some("/var/lib/runner/logs/runner.log")
+        );
+        assert_eq!(
+            encode_response(&Response::Status(status.clone())).unwrap(),
+            valid
+        );
+
+        let relative = read("invalid/status-log-path-relative.json");
+        assert_eq!(decode_response(&relative), Err(ProtocolFailure::Invalid));
+        let empty = StatusSnapshot {
+            log_path: Some(String::new()),
+            ..status
+        };
+        let encoded = encode_response(&Response::Status(empty)).unwrap();
+        assert_eq!(decode_response(&encoded), Err(ProtocolFailure::Invalid));
     }
 
     fn readiness() -> AgentLoginReadiness {
@@ -2650,6 +2696,7 @@ mod tests {
             process_state: ProcessState::Running,
             boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             uptime_milliseconds: 10,
+            log_path: None,
             connection_state: ConnectionState::Connecting,
             last_connected_at: None,
             current_credential_id: Some("rrc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned()),

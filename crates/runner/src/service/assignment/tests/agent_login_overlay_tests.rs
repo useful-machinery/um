@@ -23,6 +23,7 @@ use crate::service::test_support::{
     FakeAgentLoginCloud, FakeGrantToken, SleepRelease, controlled_sleeper,
     fake_agent_login_material, fake_agent_login_setup, fake_agent_login_setup_serving,
     fake_codex_answer, fake_codex_authorized, fake_grant_expiry, fake_grant_token,
+    preparation_teardown_holding_sleeper,
 };
 use crate::telemetry::test_recorder;
 
@@ -1360,7 +1361,7 @@ async fn an_agent_step_starts_with_a_grant_name_unset() {
     assert!(fixture.temporary.path().join("codex.calls").exists());
 }
 
-// REQ-GRANT-89
+// REQ-GRANT-89, INV-RUNNER-28
 #[tokio::test]
 async fn a_running_assignment_has_its_token_file_replaced_and_an_ended_one_does_not() {
     let wait = Duration::from_secs(60);
@@ -1408,16 +1409,23 @@ async fn a_running_assignment_has_its_token_file_replaced_and_an_ended_one_does_
         2
     );
 
-    // An assignment that has ended asks nothing when its wait passes.
+    // An assignment that has ended asks nothing when its wait passes, even
+    // while the worker that admitted it is still ending (INV-RUNNER-28).
     let fixture = SettingUp::running(&workflow, FakeAgentLoginCloud::new(Ok(Vec::new())));
     let mut sleeps = fixture.refreshing();
+    let (sleeper, teardown) = preparation_teardown_holding_sleeper();
+    fixture.manager.lock().unwrap().sleeper = sleeper;
     fixture
         .cloud
         .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(1));
     let ended = offer("bh");
     fixture.admit(&ended).await;
-    // Only the assignment's task keeps the sleeper now, so its sleeps end
-    // with it.
+    let tokens = LoginDirectory::beside(&fixture.temporary.path().join("runner-state.json"))
+        .assignment(&ended.assignment_id)
+        .expect("the assignment has a token directory");
+    assert!(tokens.is_dir());
+    // Only the assignment's task and the held worker keep the sleeper now,
+    // so its sleeps end with both.
     fixture.manager.lock().unwrap().grant_token_refresh = None;
     let (_, release) = sleeps.recv().await.unwrap();
     fixture.release(&ended).await;
@@ -1426,6 +1434,16 @@ async fn a_running_assignment_has_its_token_file_replaced_and_an_ended_one_does_
         .answer_grant_token(AgentLoginProvider::Github, FakeGrantToken::Issue(2));
 
     release.release();
+
+    // The assignment's hold ended with it: its directory is removed and
+    // its task asks for no further sleep and nothing of Cloud.
+    wait_for_fixture_path_removal(&tokens).await;
+    assert!(matches!(
+        sleeps.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    ));
+    assert_eq!(fixture.cloud.grant_requests().len(), 3);
+    teardown.let_go();
 
     assert!(
         with_watchdog(sleeps.recv())

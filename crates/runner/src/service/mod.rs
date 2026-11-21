@@ -21,7 +21,7 @@ mod workspace;
 
 use std::fmt;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
@@ -570,7 +570,13 @@ async fn run_until_cancelled(
     let frame_source: Arc<dyn FrameSource> = Arc::new(SystemFrameSource);
     let sleeper: Arc<dyn Sleeper> = Arc::new(TokioSleeper);
     let boot_id = frame_source.public_id("rbt_");
-    let recorder = Recorder::stderr(&boot_id, service_version);
+    let clock_sleeper = Arc::clone(&sleeper);
+    let recorder = Recorder::open(
+        &boot_id,
+        service_version,
+        Arc::new(move || clock_sleeper.utc_now()),
+        config.log_directory().map(Path::to_path_buf),
+    );
     let lease_clock = LeaseClock::system().map_err(ServiceError::LeaseClock)?;
     let mut shutdown = ProcessShutdown::new()?;
     let agent_login_setup = config.state_access().and_then(|state| {
@@ -796,13 +802,16 @@ async fn connection_loop_with_work_root(
         source_broker,
         agent_login_setup,
     } = dependencies;
-    let live_status = Arc::new(LiveStatus::new(
-        boot_id.clone(),
-        config.credential().credential_id().to_owned(),
-        config
-            .startup_pending()
-            .map(|pending| pending.credential_id.clone()),
-    ));
+    let live_status = Arc::new(
+        LiveStatus::new(
+            boot_id.clone(),
+            config.credential().credential_id().to_owned(),
+            config
+                .startup_pending()
+                .map(|pending| pending.credential_id.clone()),
+        )
+        .with_log_path(recorder.log_path()),
+    );
     recorder.set_dropped_record_observer(Arc::<history::EventLog>::clone(live_status.events()));
     let assignment_dependencies = AssignmentDependencies::production(
         &config,

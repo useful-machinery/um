@@ -2709,6 +2709,7 @@ the files it names:
 ├── config.json     operator configuration
 ├── state.json      enrolled state, written by runner enroll, a registration or a join
 ├── control.sock    control socket, created by a serving runner
+├── logs/           runner.log and its rotated files, created by a serving runner
 └── work/           work root
 ```
 
@@ -3138,6 +3139,19 @@ runner's transport acknowledgement; the runner does not emit `runner.run` yet. C
 JSON records enter a bounded non-blocking queue, so a stalled standard-error consumer
 cannot delay runner protocol work; saturation or output failure drops and counts a
 record.
+
+The runner also appends each of those records to `logs/runner.log` in the directory that
+holds its state file, `<useful home>/runner/logs/runner.log` for the runner home, whatever
+its standard error is: a terminal, a pipe nobody reads or a closed stream. The log has its
+own queue, so neither output delays the other, and a record counts as dropped only when
+neither took it. Every record on both outputs carries `time`, the UTC time it was written,
+for example `2026-11-19T04:54:24.993Z`. The log is appended to across restarts, each process
+told apart by `service.instance.id`. It rotates into `runner.log.1` through `runner.log.7`
+at 32 MiB a file, and a rotated file whose last record is more than 30 days old is removed,
+so the directory holds at most 256 MiB; the limits are fixed. `runner status` prints the
+path of the log the serving process writes on its `log:` line. A log the runner cannot
+open, write, rotate or prune never stops it: it keeps serving with standard error and
+reports each kind of failure once as a `runner.telemetry_log` record.
 
 `runner serve` can also send those same reviewed spans to a user-owned OTLP/HTTP
 protobuf receiver. There is no default destination: export is enabled only when
