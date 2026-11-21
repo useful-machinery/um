@@ -1339,9 +1339,14 @@ pub(crate) enum Occurrence<Provisional, Cause, Output, Deadline> {
         operation: CancellationOperationId,
         deadline: Deadline,
     },
+    /// The stopped invocation has quiesced. `launched` is false only when the driver withdrew
+    /// a start before its command was run, its agent dispatched or its child run begun
+    /// (`quiesce_unlaunched`); the reducer cannot tell that from a `Starting` state, which a
+    /// launch may already have left (REQ-WFEXEC-69).
     StepQuiesced {
         step: String,
         action: ActionId,
+        launched: bool,
     },
     /// A stop control in force for a `workflow` step the reducer authorized: the step does
     /// not start and the run enters a `stop` wait at it (REQ-WFEXEC-62).
@@ -2024,7 +2029,11 @@ where
             }
             return apply_force_abort(reduction, operation, deadline);
         }
-        Occurrence::StepQuiesced { step, action } => {
+        Occurrence::StepQuiesced {
+            step,
+            action,
+            launched,
+        } => {
             let Some((cancelling_reason, active)) =
                 cancelling_step(&reduction.state, &step, action)
             else {
@@ -2050,8 +2059,11 @@ where
                     return true;
                 }
                 // Any other `workflow` step whose child had not started fails at `start`
-                // (REQ-WFEXEC-70).
-                let detail = if reduction.state.unstarted_children.contains(&step) {
+                // (REQ-WFEXEC-70), as does a command or agent step whose first execution was
+                // withdrawn before it launched (REQ-WFEXEC-69).
+                let detail = if reduction.state.unstarted_children.contains(&step)
+                    || (!launched && unlaunched_first_execution(&reduction.state, &step, active))
+                {
                     FailureDetail::interrupted_before_start()
                 } else {
                     FailureDetail::interrupted_in_execution()
@@ -2963,6 +2975,26 @@ where
         (Some(_), Some(_)) => InterruptedCompletion::Fail,
         (Some(_), None) => InterruptedCompletion::Route(None),
     }
+}
+
+// Whether a quiescing that launched nothing ends the step before it ever ran: its first
+// target execution of a command or agent step. A re-execution leaves an earlier one that ran,
+// a recovery handler leaves the failed target, and a `workflow` step keeps its own rules
+// (REQ-WFEXEC-69, REQ-WFEXEC-70).
+fn unlaunched_first_execution<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    step: &str,
+    active: ActiveStepInvocation,
+) -> bool {
+    active
+        == ActiveStepInvocation::Target {
+            execution_number: TargetExecutionNumber::FIRST,
+        }
+        && state
+            .definition
+            .steps
+            .get(step)
+            .is_some_and(|definition| definition.edges.is_none())
 }
 
 fn cancelling_step<Cause, Output, Deadline>(

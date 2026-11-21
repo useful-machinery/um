@@ -658,7 +658,8 @@ async fn run_no_value_agent_transcript() -> AgentEngineTranscript {
                 ExecutionObservation::Agent(observation) => Some(observation.clone()),
                 ExecutionObservation::Transition(_)
                 | ExecutionObservation::CommandOutput(_)
-                | ExecutionObservation::CommandOutputClosed(_) => None,
+                | ExecutionObservation::CommandOutputClosed(_)
+                | ExecutionObservation::StartHeld(_) => None,
             })
             .collect();
         let terminal_transitions = entries
@@ -682,7 +683,8 @@ async fn run_no_value_agent_transcript() -> AgentEngineTranscript {
                 },
                 ExecutionObservation::CommandOutput(_)
                 | ExecutionObservation::CommandOutputClosed(_)
-                | ExecutionObservation::Agent(_) => None,
+                | ExecutionObservation::Agent(_)
+                | ExecutionObservation::StartHeld(_) => None,
             })
             .collect();
         AgentEngineTranscript {

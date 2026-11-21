@@ -52,7 +52,9 @@ use super::execution_root::{
 use super::git_capture::{GitAwareCaptureDeclaration, GitCaptureFailure};
 use super::input::{InputPreparationFailure, InputStaging, InputValue, InputView};
 use super::invocation_accounting::InvocationAccountingLog;
-use super::observation::{ExecutionObservation, ExecutionObserver, NoopExecutionObserver};
+use super::observation::{
+    ExecutionObservation, ExecutionObserver, NoopExecutionObserver, StartHeldObservation,
+};
 use super::process_group::{
     AuthenticatedProcessGroup, ProcessGuardRegistration, ProcessGuardRegistry,
     capture_process_group_identity, interrupt_authenticated_process_group,
@@ -67,6 +69,7 @@ use super::runtime::{
     ProvisionalStepResources, RecoveryDecision, RecoveryRoundNumber, RecoveryRoundRecord,
     RequestedAction, later_step,
 };
+use super::start_gate::{START_GATE_REREAD, StartGateReading, StepStartGate};
 use super::validated::{
     ChosenSources, ResolvedOutputSource, ResolvedValueSource, ValidatedAgentStep,
     ValidatedCommandStep, ValidatedCommonStep, ValidatedEdgeTarget, ValidatedMessageSource,
@@ -852,6 +855,8 @@ pub(crate) struct StepRuntime<
     inputs: InputStaging,
     agents: AgentExecution<Dispatcher>,
     children: ChildRuns<Children>,
+    /// The gate a command or agent step waits at before it is prepared (INV-ENGINE-46).
+    start_gate: Option<Arc<dyn StepStartGate>>,
     clock: Clock,
     observer: Observer,
     work: Arc<Mutex<CommandWorkRegistry<Clock::Instant>>>,
@@ -1024,6 +1029,7 @@ where
             inputs,
             agents,
             children: ChildRuns::Disabled,
+            start_gate: None,
             clock,
             observer,
             work: Arc::new(Mutex::new(CommandWorkRegistry::new())),
@@ -1051,6 +1057,7 @@ where
             inputs: self.inputs,
             agents: self.agents,
             children,
+            start_gate: self.start_gate,
             clock: self.clock,
             observer: self.observer,
             work: self.work,
@@ -1071,6 +1078,12 @@ where
     Dispatcher: WorkflowAgentDispatcher<Clock::Instant, Observer>,
     Children: ChildRunDispatcher,
 {
+    /// The same runtime holding command and agent steps at `start_gate` (INV-ENGINE-46).
+    fn with_start_gate(mut self, start_gate: Option<Arc<dyn StepStartGate>>) -> Self {
+        self.start_gate = start_gate;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) async fn execute_step(
         &self,
@@ -1180,7 +1193,7 @@ where
         action: ActionId,
         inputs: BTreeMap<String, ActionInput<CapturedValue>>,
         input_sources: ChosenSources,
-        cancellation: oneshot::Receiver<()>,
+        mut cancellation: oneshot::Receiver<()>,
     ) -> Result<(), StepRuntimeError> {
         let preparation_runtime = self.clone();
         let preparation_step = step.clone();
@@ -1215,6 +1228,13 @@ where
                     .settle_unlaunched(action, DriverOccurrence::stop_entered(step, action))
                     .await;
             }
+        }
+        if let Some(gate) = self.gated_start(&step)
+            && let StartGateWait::Woken = self
+                .wait_at_start_gate(gate, &step, action, &mut cancellation)
+                .await
+        {
+            return self.withdraw_woken(step, action).await;
         }
         let prepared = tokio::task::spawn_blocking(move || {
             preparation_runtime.prepare_step(&preparation_step, action, &inputs, &input_sources)
@@ -1266,6 +1286,11 @@ where
         cancellation: oneshot::Receiver<()>,
     ) -> Result<(), StepRuntimeError> {
         let _ = cancellation.await;
+        self.withdraw_woken(step, action).await
+    }
+
+    // An unlaunched start whose wake has fired ends as its cancellation says.
+    async fn withdraw_woken(&self, step: String, action: ActionId) -> Result<(), StepRuntimeError> {
         match self.cancellation_for(action) {
             Some(cancellation) => self.quiesce_unlaunched(action, cancellation).await,
             None => {
@@ -1275,6 +1300,67 @@ where
                     StepStartFailure::PreparationTaskUnavailable,
                 )
                 .await
+            }
+        }
+    }
+
+    // The start gate stands only before a command or agent step of the workflow's own steps:
+    // a finalizer is not one of them, a recovery handler never reaches the driver's start
+    // path, and a `workflow` step's child holds its own steps (INV-ENGINE-46).
+    fn gated_start(&self, step: &str) -> Option<&Arc<dyn StepStartGate>> {
+        let gate = self.start_gate.as_ref()?;
+        let gated = self.admitted.workflow().definition.steps.contains_key(step)
+            && matches!(
+                workflow_node(&self.admitted, step).map(StepBody::from),
+                Some(StepBody::Command(_) | StepBody::Agent(_))
+            );
+        gated.then_some(gate)
+    }
+
+    // A held step stays `starting` with nothing prepared: the driver reports the hold once
+    // for this start and reads the gate again each `START_GATE_REREAD` of the runtime's
+    // clock, until the gate is open or the start's wake fires (INV-ENGINE-46). A read whose
+    // worker is lost counts as open, so a broken gate never holds a run.
+    async fn wait_at_start_gate(
+        &self,
+        gate: &Arc<dyn StepStartGate>,
+        step: &str,
+        action: ActionId,
+        cancellation: &mut oneshot::Receiver<()>,
+    ) -> StartGateWait {
+        let mut reported = false;
+        loop {
+            let reading_gate = Arc::clone(gate);
+            let reading = tokio::select! {
+                biased;
+                _ = &mut *cancellation => return StartGateWait::Woken,
+                reading = tokio::task::spawn_blocking(move || reading_gate.read()) => {
+                    reading.unwrap_or(StartGateReading::Open)
+                }
+            };
+            let StartGateReading::DiskLow {
+                available_bytes,
+                minimum_free_bytes,
+            } = reading
+            else {
+                return StartGateWait::Open;
+            };
+            if !reported {
+                reported = true;
+                self.observer
+                    .observe(ExecutionObservation::StartHeld(StartHeldObservation {
+                        step: step.to_owned(),
+                        invocation: action,
+                        available_bytes,
+                        minimum_free_bytes,
+                    }))
+                    .await;
+            }
+            let reread_at = self.clock.clone().now() + START_GATE_REREAD;
+            tokio::select! {
+                biased;
+                _ = &mut *cancellation => return StartGateWait::Woken,
+                () = self.clock.wait_until(reread_at) => {}
             }
         }
     }
@@ -2652,12 +2738,19 @@ where
         self.finish_cancellation(action, cancellation).await
     }
 
+    // The one path for a stopped start that launched nothing: its quiescing says so, and the
+    // reducer fails an interrupted command or agent step at `start` (REQ-WFEXEC-69).
     async fn quiesce_unlaunched(
         &self,
         action: ActionId,
         cancellation: CommandCancellation<Clock::Instant>,
     ) -> Result<(), StepRuntimeError> {
-        self.finish_cancellation(action, cancellation).await
+        let cancellation = self.release_cancelled_work(action, cancellation).await;
+        self.send(DriverOccurrence::step_quiesced_unlaunched(
+            cancellation.step,
+            cancellation.action,
+        ))
+        .await
     }
 
     /// Retires a stopped step's work once its forced deadline, if any, has finished, and
@@ -4208,6 +4301,7 @@ pub struct WorkflowExecutionStart {
     process_guards: ProcessGuardRegistry,
     seed: super::runtime::ExecutionSeed<CapturedValue>,
     finalization_identity: Option<(String, String)>,
+    start_gate: Option<Arc<dyn StepStartGate>>,
 }
 
 impl WorkflowExecutionStart {
@@ -4223,11 +4317,19 @@ impl WorkflowExecutionStart {
             process_guards,
             seed,
             finalization_identity: None,
+            start_gate: None,
         }
     }
 
     pub fn with_finalization_identity(mut self, run_id: String, attempt_id: String) -> Self {
         self.finalization_identity = Some((run_id, attempt_id));
+        self
+    }
+
+    /// Holds each command and agent step of the run at `start_gate` before it is prepared
+    /// (INV-ENGINE-46).
+    pub fn with_start_gate(mut self, start_gate: Arc<dyn StepStartGate>) -> Self {
+        self.start_gate = Some(start_gate);
         self
     }
 }
@@ -4352,6 +4454,7 @@ where
         process_guards,
         seed,
         finalization_identity,
+        start_gate,
     } = start.into();
     if !artifacts.is_bound_to(admitted.execution()) {
         return Err(CoordinationError::ArtifactStagingMismatch);
@@ -4381,7 +4484,8 @@ where
         agents,
         process_guards,
     )
-    .with_children(children);
+    .with_children(children)
+    .with_start_gate(start_gate);
     let lifecycle = actions.clone();
     let result = Coordinator::new_seeded(admitted, receiver, clock, commits, actions, seed)
         .with_finalization_identity(finalization_identity)
@@ -4396,6 +4500,13 @@ where
         lifecycle.shutdown().await;
     }
     result
+}
+
+/// How a wait at the start gate ended.
+enum StartGateWait {
+    Open,
+    /// The start's wake fired while it was held.
+    Woken,
 }
 
 enum StepBody<'a> {

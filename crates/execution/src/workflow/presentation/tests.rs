@@ -18,7 +18,7 @@ use crate::workflow::artifact::ArtifactStaging;
 use crate::workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use crate::workflow::observation::{
     CommandOutputClosedObservation, CommandOutputObservation, CommandOutputSource,
-    ObservedExecutions, SourceSequence, TransitionObservation,
+    ObservedExecutions, SourceSequence, StartHeldObservation, TransitionObservation,
 };
 use crate::workflow::publication::{
     WorkflowRunCancellation, WorkflowRunStepKind, WorkflowRunTiming, WorkflowStepTiming,
@@ -2003,6 +2003,84 @@ steps:
             "a[2].produce done exit"
         ]
     );
+    assert!(presentation.failure().is_none());
+}
+
+fn start_held(step: &str) -> ExecutionObservation<OffsetDateTime> {
+    ExecutionObservation::StartHeld(StartHeldObservation {
+        step: step.to_owned(),
+        invocation: action(),
+        available_bytes: 3 * 1024 * 1024 * 1024 + 512 * 1024 * 1024,
+        minimum_free_bytes: 5 * 1024 * 1024 * 1024,
+    })
+}
+
+// REQ-LOCALRUN-222, REQ-LOCALRUN-200: a held start writes one `held` record after the step's
+// `start` record, giving the space available and the minimum as `format_bytes` writes them;
+// a child step's is forwarded under `<step>.<child step>`.
+#[tokio::test]
+async fn a_held_start_writes_one_held_record_for_a_root_or_child_step() {
+    let parent = Fixture::new(workflow_source());
+    let child = Fixture::new(
+        "schemaVersion: 1
+steps:
+  produce:
+    kind: cmd
+    command:
+      argv: [\"true\"]
+",
+    );
+    let stdout = SharedWriter::default();
+    let presentation = WorkflowRunOutput::new(
+        config(RequestedPresentationMode::Plain, ColorChoice::Never),
+        stdout.clone(),
+        SharedWriter::default(),
+    )
+    .start(
+        &parent.workflow,
+        1,
+        TestClock::fixed("2026-08-02T12:01:44Z"),
+    )
+    .unwrap();
+    let scope = presentation
+        .child_scope(&child.workflow, "a", None)
+        .unwrap();
+
+    presentation
+        .observe(step_transition("c", StepStateKind::Starting, None))
+        .await;
+    presentation.observe(start_held("c")).await;
+    presentation
+        .observe(step_transition("a", StepStateKind::Starting, None))
+        .await;
+    scope
+        .observe(step_transition("produce", StepStateKind::Starting, None))
+        .await;
+    scope.observe(start_held("produce")).await;
+    presentation.flush_pending().await;
+
+    assert_eq!(
+        step_records(&stdout),
+        [
+            "c start cmd",
+            "c held disk",
+            "a start cmd",
+            "a.produce start cmd",
+            "a.produce held disk",
+        ]
+    );
+    let text = stdout.text();
+    let held = text
+        .lines()
+        .filter(|line| line.split_whitespace().nth(2) == Some("held"))
+        .collect::<Vec<_>>();
+    assert_eq!(held.len(), 2);
+    for line in held {
+        assert!(line.contains(&crate::format_bytes(
+            3 * 1024 * 1024 * 1024 + 512 * 1024 * 1024
+        )));
+        assert!(line.contains(&crate::format_bytes(5 * 1024 * 1024 * 1024)));
+    }
     assert!(presentation.failure().is_none());
 }
 

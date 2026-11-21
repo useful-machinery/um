@@ -46,7 +46,7 @@ use crate::service::test_support::tree_fixture::{
 };
 use useful_execution::{
     CancellationReason, CaptureCancellation, EnvironmentSnapshot, ResolvedAttachment, ResolvedFile,
-    ResolvedInput, ResolvedInputs, ResolvedJsonInput,
+    ResolvedInput, ResolvedInputs, ResolvedJsonInput, RunnerDiskGate,
 };
 use useful_runner_protocol::{
     AssignmentDecline, CancellationMode, CloudFrame, ContinuationOffer, ExecutionSpecInvalidReason,
@@ -2353,7 +2353,16 @@ fn control_wait_fixture_bounded(
     variables: &[(&str, &str)],
     bound: Duration,
 ) -> Fixture {
-    let fixture = fixture_bounded(
+    control_wait_fixture_tuned(kind, variables, tuned(bound))
+}
+
+/// `control_wait_fixture`, its tree-run dependencies those `tune` makes of the defaults.
+fn control_wait_fixture_tuned(
+    kind: &str,
+    variables: &[(&str, &str)],
+    tune: impl FnOnce(TreeRunDependencies) -> TreeRunDependencies,
+) -> Fixture {
+    let fixture = fixture_sourced(
         TREE_DIGEST,
         "waiting",
         "null",
@@ -2368,10 +2377,65 @@ fn control_wait_fixture_bounded(
         ]
         .concat(),
         None,
-        bound,
+        tune,
+        fixture_source_broker,
+        TREE_FILES,
     );
     fs::write(fixture.log.join("proceed"), b"").unwrap();
     fixture
+}
+
+/// The work root and minimum the disk-gate tests give a tree run's `useful` commands.
+const GATED_WORK_ROOT: &str = "/var/lib/useful/runner/work";
+const GATED_MINIMUM: u64 = 5 * 1024 * 1024 * 1024;
+
+/// The `create` and `resume` environments' `USEFUL_RUNNER_DISK_GATE` lines of a run that
+/// waited for an answer and was resumed once, the tree-run dependencies carrying `gate` and
+/// the daemon's environment holding `variables`.
+async fn disk_gate_lines(
+    gate: Option<RunnerDiskGate>,
+    variables: &[(&str, &str)],
+) -> [Vec<String>; 2] {
+    let mut fixture = control_wait_fixture_tuned("answer", variables, move |dependencies| {
+        let dependencies = tuned(super::command::SHORT_COMMAND_BOUND)(dependencies);
+        match gate {
+            Some(gate) => dependencies.with_disk_gate(gate),
+            None => dependencies,
+        }
+    });
+    answer_after(&mut fixture, || ()).await;
+    ["create.env", "resume.env"].map(|name| {
+        logged_lines(&fixture.log, name)
+            .into_iter()
+            .filter(|line| line.starts_with("USEFUL_RUNNER_DISK_GATE="))
+            .collect()
+    })
+}
+
+// REQ-RUNNERENROLL-155: a tree run's `create` and its `resume` are each told the work root's
+// disk and the minimum they hold a step by.
+#[tokio::test]
+async fn a_gated_tree_runs_useful_commands_carry_the_disk_gate() {
+    let gate = RunnerDiskGate::new(PathBuf::from(GATED_WORK_ROOT), GATED_MINIMUM).unwrap();
+    let expected = format!("USEFUL_RUNNER_DISK_GATE={GATED_MINIMUM}:{GATED_WORK_ROOT}");
+
+    let [created, resumed] = disk_gate_lines(Some(gate), &[]).await;
+
+    assert_eq!(created, std::slice::from_ref(&expected));
+    assert_eq!(resumed, [expected]);
+}
+
+// REQ-RUNNERENROLL-155: without a gate the variable is removed from what the daemon's
+// environment offers, so no `useful` command holds a step for disk space.
+#[tokio::test]
+async fn an_ungated_tree_runs_useful_commands_carry_no_disk_gate() {
+    let offered = format!("{GATED_MINIMUM}:{GATED_WORK_ROOT}");
+
+    let [created, resumed] =
+        disk_gate_lines(None, &[("USEFUL_RUNNER_DISK_GATE", offered.as_str())]).await;
+
+    assert_eq!(created, Vec::<String>::new());
+    assert_eq!(resumed, Vec::<String>::new());
 }
 
 async fn wait_for_waiting(fixture: &mut Fixture) {

@@ -13,6 +13,7 @@ use super::artifact_delivery::{
     ArtifactCloudResponse, ArtifactDeliveryBroker, ArtifactDeliveryProtocolFailure,
 };
 use super::config::Config;
+use super::disk::DiskReadingHandle;
 use super::execution::{
     AssignmentProcessGuards, AssignmentRunView, ExecutionAuthority, ExecutionJob,
     InfrastructureInterruption,
@@ -38,7 +39,7 @@ use useful_execution::{
     ConditionCapacityBounds, EnvironmentSnapshot, ExecutionContext, HarnessLoginObserver,
     MAXIMUM_CANCELLATION_GRACE, MAXIMUM_ENCODED_OUTBOX_BYTES, MAXIMUM_PARALLEL_STEPS,
     MINIMUM_CANCELLATION_GRACE, OrdinaryCancellationRequestResult, ResolvedInputs,
-    ResolvedWorkflow, SourceRevisionProvenance, ValidatedClaudeCodeInstallation,
+    ResolvedWorkflow, RunnerDiskGate, SourceRevisionProvenance, ValidatedClaudeCodeInstallation,
     ValidatedCodexInstallation, ValidatedPiInstallation, WorkflowCapacityBudget,
     admit_runner_workflow, default_execution_policy_limits, valid_condition_capacity,
 };
@@ -1078,6 +1079,9 @@ pub(super) struct AssignmentDependencies {
     /// The log the manager and its outbox record the runner's events in
     /// (REQ-RUNNERENROLL-138).
     events: Arc<EventLog>,
+    /// The disk monitor's published reading, which the offer rule declines a new run on
+    /// while it is low (INV-RUNNER-50); empty, and so never low, without a monitor.
+    disk: DiskReadingHandle,
 }
 
 impl AssignmentDependencies {
@@ -1102,6 +1106,7 @@ impl AssignmentDependencies {
             recorder,
             guard_processes,
             events: Arc::new(EventLog::new()),
+            disk: DiskReadingHandle::new(),
         }
     }
 
@@ -1109,6 +1114,24 @@ impl AssignmentDependencies {
     /// (REQ-RUNNERENROLL-138).
     pub(super) fn with_events(mut self, events: Arc<EventLog>) -> Self {
         self.events = events;
+        self
+    }
+
+    /// Declines offers of new runs while the reading `disk` publishes is low
+    /// (REQ-RUNNERENROLL-154, INV-RUNNER-50), and holds a running run's next step while it
+    /// is (REQ-RUNNERENROLL-155): a single-workflow run's engine consults `disk`, and a tree
+    /// run's `useful` commands are given `tree_gate`, the same disk and minimum, which they
+    /// read themselves; none, when the minimum is 0, gives them nothing to hold by. Call it
+    /// after `with_tree_run`, whose dependencies carry the tree run's gate.
+    pub(super) fn with_disk(
+        mut self,
+        disk: DiskReadingHandle,
+        tree_gate: Option<RunnerDiskGate>,
+    ) -> Self {
+        self.disk = disk;
+        if let Some(gate) = tree_gate {
+            self.tree_run = self.tree_run.with_disk_gate(gate);
+        }
         self
     }
 
@@ -1217,6 +1240,9 @@ pub(super) struct AssignmentManager {
     /// accepted continuation in (REQ-RUNNERENROLL-138); its outbox records in it too.
     pub(in crate::service) runner_events: Arc<EventLog>,
     runner_id: String,
+    /// The disk monitor's published reading, copied by the offer rule and never read from
+    /// the filesystem under the manager's lock (INV-RUNNER-50).
+    disk_reading: DiskReadingHandle,
     run_events: BTreeMap<String, RunEvent>,
     /// What each held or reporting assignment's offer said, by assignment ID, which the
     /// overview gives (REQ-RUNNERENROLL-134).
@@ -2832,6 +2858,11 @@ fn release_unclaimed_assignment_root(root: AssignmentRoot) {
 
 fn environment_unavailable() -> AssignmentDecline {
     AssignmentDecline::RunnerUnable(RunnerUnableReason::ExecutionEnvironmentUnavailable)
+}
+
+/// The decline of an offer of a new run while the work root's disk is low (REQ-DIAG-44).
+fn disk_space_low() -> AssignmentDecline {
+    AssignmentDecline::CapacityUnavailable.diagnosed("host_disk", "disk_space_low")
 }
 
 fn cancellation_application(

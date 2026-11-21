@@ -122,6 +122,7 @@
           "maxLength": 4096,
           "pattern": "^/"
         },
+        "disk": { "$ref": "#/$defs/statusDisk" },
         "connectionState": { "enum": ["connecting", "connected", "backing_off", "authentication_failed", "protocol_failed", "stopping"] },
         "lastConnectedAt": { "type": "string", "format": "date-time" },
         "currentCredentialId": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
@@ -135,6 +136,20 @@
           "maxItems": 128,
           "items": { "$ref": "#/$defs/heldRun" }
         }
+      }
+    },
+    "statusDisk": {
+      "description": "The serving process's newest reading of the work root's disk; present exactly when its disk monitor has published one.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "availableBytes", "totalBytes", "minimumFreeBytes", "low", "readAt"],
+      "properties": {
+        "path": { "description": "The work root read.", "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^/" },
+        "availableBytes": { "type": "integer", "minimum": 0 },
+        "totalBytes": { "type": "integer", "minimum": 0 },
+        "minimumFreeBytes": { "type": "integer", "minimum": 0 },
+        "low": { "description": "Whether availableBytes is below minimumFreeBytes.", "type": "boolean" },
+        "readAt": { "description": "When the read ended.", "type": "string", "format": "date-time" }
       }
     },
     "agentLoginReadiness": {
@@ -314,6 +329,7 @@
       "required": ["runner", "connection", "assignmentCounts", "unacknowledgedReports", "assignments"],
       "properties": {
         "runner": { "$ref": "#/$defs/overviewRunner" },
+        "disk": { "$ref": "#/$defs/overviewDisk" },
         "connection": { "$ref": "#/$defs/overviewConnection" },
         "currentCredentialId": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
         "pendingCredentialId": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
@@ -390,6 +406,19 @@
           "type": "integer",
           "minimum": 0
         }
+      }
+    },
+    "overviewDisk": {
+      "description": "The disk reading as status gives it; absent while the serving process has none.",
+      "type": "object",
+      "required": ["path", "availableBytes", "totalBytes", "minimumFreeBytes", "low", "readAt"],
+      "properties": {
+        "path": { "description": "The work root read.", "type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^/" },
+        "availableBytes": { "type": "integer", "minimum": 0 },
+        "totalBytes": { "type": "integer", "minimum": 0 },
+        "minimumFreeBytes": { "type": "integer", "minimum": 0 },
+        "low": { "description": "Whether availableBytes is below minimumFreeBytes.", "type": "boolean" },
+        "readAt": { "description": "When the read ended.", "type": "string", "format": "date-time" }
       }
     },
     "overviewConnection": {
@@ -517,7 +546,7 @@
       "properties": {
         "at": { "type": "string", "format": "date-time" },
         "kind": {
-          "description": "One of connected, connection_failed, credential_reloaded, credential_reload_failed, agent_logins_set_up, lease_lost, run_continued, workspaces_found, observation_refused, telemetry_dropped or stopping.",
+          "description": "One of connected, connection_failed, credential_reloaded, credential_reload_failed, agent_logins_set_up, lease_lost, run_continued, workspaces_found, observation_refused, telemetry_dropped, disk_space_low, disk_space_recovered, disk_low_offer_declined or stopping.",
           "type": "string"
         },
         "count": {
@@ -543,7 +572,17 @@
         "setupResult": { "description": "One of finished, runner_busy or failed.", "type": "string" },
         "runId": { "type": "string", "pattern": "^run_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
         "assignmentId": { "type": "string", "pattern": "^asn_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
-        "workspaces": { "type": "integer", "minimum": 0 }
+        "workspaces": { "type": "integer", "minimum": 0 },
+        "availableBytes": {
+          "description": "The space available on the work root's disk, of disk_space_low and disk_space_recovered.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "minimumFreeBytes": {
+          "description": "The minimum the disk fell below, of disk_space_low.",
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "overviewWait": {

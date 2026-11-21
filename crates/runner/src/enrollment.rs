@@ -215,6 +215,17 @@ struct OperatorConfig {
     runner_state_path: PathBuf,
     control_socket_path: PathBuf,
     work_root: PathBuf,
+    /// The free space kept on the work root's disk (REQ-RUNNERENROLL-152); the default
+    /// where absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    minimum_free_disk_bytes: Option<u64>,
+}
+
+impl OperatorConfig {
+    fn minimum_free_disk_bytes(&self) -> u64 {
+        self.minimum_free_disk_bytes
+            .unwrap_or(useful_execution::DEFAULT_MINIMUM_FREE_DISK_BYTES)
+    }
 }
 
 // RunnerServiceConfiguration is the validated startup projection shared by
@@ -229,6 +240,7 @@ pub(crate) struct RunnerServiceConfiguration {
     pub(super) state_access: RunnerStateAccess,
     pub(super) control_socket_path: PathBuf,
     pub(super) work_root: PathBuf,
+    pub(super) minimum_free_disk_bytes: u64,
 }
 
 #[derive(Clone)]
@@ -1443,6 +1455,7 @@ pub(crate) fn load_runner_service_configuration(
             credential_id: credential.id,
             credential_secret: credential.secret,
         });
+    let minimum_free_disk_bytes = config.minimum_free_disk_bytes();
     Ok(RunnerServiceConfiguration {
         runner_id: state.runner_id,
         connection_url: state.connection_url,
@@ -1453,6 +1466,7 @@ pub(crate) fn load_runner_service_configuration(
             path: config.runner_state_path,
             deployment_mode: config.deployment_mode,
         },
+        minimum_free_disk_bytes,
         control_socket_path: config.control_socket_path,
         work_root: config.work_root,
     })
@@ -1472,6 +1486,15 @@ pub(crate) fn load_runner_state_path(path: &Path) -> Result<PathBuf, EnrollmentE
 /// taking the state lock or reading the state.
 pub(crate) fn load_work_root(path: &Path) -> Result<PathBuf, EnrollmentError> {
     Ok(load_operator_config(path)?.work_root)
+}
+
+/// The work root and the minimum of free space kept on its disk, `minimumFreeDiskBytes`
+/// or the default where the configuration names none (REQ-RUNNERENROLL-152), read without
+/// taking the state lock or reading the state.
+pub(crate) fn load_disk_space_settings(path: &Path) -> Result<(PathBuf, u64), EnrollmentError> {
+    let config = load_operator_config(path)?;
+    let minimum = config.minimum_free_disk_bytes();
+    Ok((config.work_root, minimum))
 }
 
 pub fn replacement_disposition(
@@ -1579,6 +1602,9 @@ fn load_operator_config(path: &Path) -> Result<OperatorConfig, EnrollmentError> 
         || !config.runner_state_path.is_absolute()
         || !config.control_socket_path.is_absolute()
         || !config.work_root.is_absolute()
+        || config
+            .minimum_free_disk_bytes
+            .is_some_and(|minimum| minimum > useful_execution::MAXIMUM_MINIMUM_FREE_DISK_BYTES)
     {
         return Err(EnrollmentError::InvalidConfig);
     }

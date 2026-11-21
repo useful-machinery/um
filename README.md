@@ -2523,6 +2523,9 @@ useful runner doctor --check credentials.agent-logins
 useful runner doctor \
   --check credentials.agent-logins --config /etc/useful/runner.json
 
+# Check the free space on the disk the runner's work root is on.
+useful runner doctor --check environment.disk-space
+
 # List IDs without running any checks.
 useful runner doctor --list-checks
 
@@ -2626,8 +2629,9 @@ The opt-in `credentials.agent-logins` check reads the readiness document
 `useful runner serve` records beside `runnerStatePath`, found through `--config PATH` or,
 without it, the runner home's configuration (see [Runner serve](#runner-serve)); a runner
 home that holds no configuration is read as its default layout, with the state at
-`runner/state.json`. No other check reads the configuration or anything under the `useful`
-home, so the default checks run with neither `USEFUL_HOME` nor `HOME` set. It passes when every agent login Cloud authorized
+`runner/state.json`. Only this check and `environment.disk-space` read the configuration or
+anything under the `useful` home, so the default checks run with neither `USEFUL_HOME` nor
+`HOME` set. It passes when every agent login Cloud authorized
 for the runner is `ready` and was not refused at its last use, or Cloud authorized none
 (`revoked` or `not_authorized`), and otherwise fails with that provider's state as its code,
 such as `install_failed`, `unsupported_target`, `stale_generation` or `cloud_unavailable`, or
@@ -2640,6 +2644,16 @@ no configuration included, `config_invalid` for a configuration it cannot load, 
 `config_required` when no `--config` is given and the `useful` home cannot be located because
 neither `USEFUL_HOME` nor `HOME` is set. It takes no lock, creates nothing, never reads the
 runner credential, contacts nothing, and reports no login material.
+
+The opt-in `environment.disk-space` check reads the work root and the minimum free space
+from the same configuration and reads that disk itself, by the rule the serving runner
+uses (see [Runner serve](#runner-serve)), so it answers whether or not a runner is serving.
+It passes when the free space is at least the minimum and fails `disk_space_low` when it is
+below it, its details giving `available_bytes`, `total_bytes` and `minimum_free_bytes`
+either way. It fails `disk_space_unreadable` when the disk cannot be read, `config_invalid`
+for a configuration it cannot load, and `config_required` when no `--config` is given and
+the runner home holds no configuration or the `useful` home cannot be located. It asks
+neither Cloud nor a serving runner and creates nothing.
 
 Checks are registered statically by components compiled into this executable. The
 command does not load plugins or change runner configuration, and it reads human
@@ -2756,8 +2770,13 @@ run:            run_01k0z6r1w8f4jy2m7q9v3x5abp · working
 run:            run_01k0z6r1w8f4jy2m7q9v3x5abq · waiting
 ```
 
+After its `log:` line `runner status` prints a `disk:` line with the free space and the size
+of the disk the work root is on and the path read and, while the free space is below the
+minimum, a `disk warning:` line that gives the minimum.
+
 `runner watch` shows the same live runner in a full-screen terminal view that it refreshes
-every second: the runner's ID, boot ID, version and uptime, its connection and credential
+every second: the runner's ID, boot ID, version and uptime, the free space on its work
+root's disk with a warning while it is below the minimum, its connection and credential
 IDs, each provider's agent-login readiness, one entry for each run it holds, with the steps
 running or what a waiting run waits for, the runs that ended recently and the runner's own
 events, times of day in UTC. `↑`/`↓` (or `k`/`j`) move through the runs, `C` reloads the
@@ -2815,6 +2834,17 @@ work root it names must exist before startup:
 ```sh
 useful runner serve --config /etc/useful/runner.json
 ```
+
+A configuration may also name `minimumFreeDiskBytes`, an integer from 0 to
+9007199254740991: the free space the runner keeps on the disk its work root is on. Without
+it the minimum is 5 GiB (5368709120 bytes). `runner serve` reads that disk when it starts
+and every 30 seconds while it serves. While the free space is below the minimum it declines
+each new run it is offered with `capacity_unavailable` and the cause `disk_space_low`, so
+the run stays queued, and a run it is working on starts no further command or agent step:
+the step waits and starts once space is back. A step already running is not stopped, and a
+run that continues an earlier attempt on this runner is still taken. With a minimum of 0
+the disk is never low. The runner writes a `runner.disk_space` record to its log when the
+disk turns low and when it recovers.
 
 Production operators should follow the private monorepo's
 `docs/operations/runner-v1-deployment.md` runbook for confidential activation transfer,

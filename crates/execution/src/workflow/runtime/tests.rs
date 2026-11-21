@@ -1667,6 +1667,7 @@ fn runtime_cancellation_cancels_each_active_action_and_waits_for_quiescence() {
         Occurrence::StepQuiesced {
             step: "aStarting".to_owned(),
             action: action_id(8),
+            launched: true,
         },
     );
     assert_eq!(
@@ -1687,6 +1688,7 @@ fn runtime_cancellation_cancels_each_active_action_and_waits_for_quiescence() {
             Occurrence::StepQuiesced {
                 step: "aStarting".to_owned(),
                 action: action_id(8),
+                launched: true,
             },
         ),
         (
@@ -1717,6 +1719,7 @@ fn runtime_cancellation_cancels_each_active_action_and_waits_for_quiescence() {
         Occurrence::StepQuiesced {
             step: "bRunning".to_owned(),
             action: action_id(9),
+            launched: true,
         },
     );
     assert_eq!(
@@ -1738,6 +1741,7 @@ fn runtime_cancellation_cancels_each_active_action_and_waits_for_quiescence() {
         Occurrence::StepQuiesced {
             step: "cCapturing".to_owned(),
             action: action_id(10),
+            launched: true,
         },
     );
     let expected_exports = BTreeMap::from([
@@ -1784,6 +1788,7 @@ fn runtime_cancellation_cancels_each_active_action_and_waits_for_quiescence() {
         Occurrence::StepQuiesced {
             step: "cCapturing".to_owned(),
             action: action_id(10),
+            launched: true,
         },
         Occurrence::CancellationOperationRequested {
             operation: CancellationOperationId::fixture(1),
@@ -2550,6 +2555,7 @@ fn failure_first_remains_failed_when_later_cancellation_stops_a_sibling() {
         Occurrence::StepQuiesced {
             step: "cActive".to_owned(),
             action: action_id(12),
+            launched: true,
         },
     );
     let expected_exports = BTreeMap::from([
@@ -2668,6 +2674,7 @@ fn cancellation_first_makes_a_later_failure_stale() {
         Occurrence::StepQuiesced {
             step: "aFail".to_owned(),
             action: action_id(6),
+            launched: true,
         },
     );
     assert!(first_quiesced.actions.is_empty());
@@ -2680,6 +2687,7 @@ fn cancellation_first_makes_a_later_failure_stale() {
         Occurrence::StepQuiesced {
             step: "bActive".to_owned(),
             action: action_id(7),
+            launched: true,
         },
     );
     assert_eq!(
@@ -2754,6 +2762,7 @@ fn advisory_failure_before_cancellation_leaves_the_run_cancelled() {
         Occurrence::StepQuiesced {
             step: "build".to_owned(),
             action: cancel.id,
+            launched: true,
         },
     );
 
@@ -2868,6 +2877,7 @@ fn an_interruption_stops_the_active_step_as_a_cancellation_and_fails_it() {
         Occurrence::StepQuiesced {
             step: "aRunning".to_owned(),
             action: stop.id,
+            launched: true,
         },
     );
     assert_eq!(
@@ -2922,6 +2932,7 @@ fn an_interruption_stops_the_active_step_as_a_cancellation_and_fails_it() {
         Occurrence::StepQuiesced {
             step: "aRunning".to_owned(),
             action: stop.id,
+            launched: true,
         },
     );
     assert_eq!(cloud.steps["aRunning"].state, cancelled_state(reason));
@@ -2953,6 +2964,7 @@ fn an_interrupted_advisory_step_is_the_primary_issue() {
         Occurrence::StepQuiesced {
             step: "lint".to_owned(),
             action: stop.id,
+            launched: true,
         },
     );
     let primary_issue = PrimaryIssue::failed(
@@ -3013,6 +3025,7 @@ fn a_required_issue_before_an_interruption_stays_the_primary_issue() {
         Occurrence::StepQuiesced {
             step: "bActive".to_owned(),
             action: stop.id,
+            launched: true,
         },
     );
     assert_eq!(
@@ -3169,6 +3182,7 @@ fn an_interruption_before_a_continuation_starts_a_step_keeps_its_wait() {
         Occurrence::StepQuiesced {
             step: "build".to_owned(),
             action: stop.id,
+            launched: true,
         },
     );
     assert!(quiesced.occurrence_accepted);
@@ -3187,6 +3201,7 @@ fn an_interruption_before_a_continuation_starts_a_step_keeps_its_wait() {
         Occurrence::StepQuiesced {
             step: "build".to_owned(),
             action: stop.actions[0].id,
+            launched: true,
         },
     );
     for state in [&cancelled.state, &state] {
@@ -3231,6 +3246,7 @@ fn an_interrupted_step_with_recovery_gets_no_recovery_round() {
         Occurrence::StepQuiesced {
             step: "fetch".to_owned(),
             action: stop.id,
+            launched: true,
         },
     );
     assert_eq!(
@@ -3289,6 +3305,7 @@ fn an_interrupted_step_with_recovery_gets_no_recovery_round() {
         Occurrence::StepQuiesced {
             step: "fetch".to_owned(),
             action: stop.id,
+            launched: true,
         },
     );
     assert_eq!(
@@ -3300,6 +3317,95 @@ fn an_interrupted_step_with_recovery_gets_no_recovery_round() {
         1
     );
     assert!(started_step(&quiesced, "fetch").is_none());
+}
+
+// REQ-WFEXEC-69: a `starting` command or agent step fails at `start` when its quiescing
+// reports that nothing was launched, and at `execution` when its start had launched.
+#[test]
+fn an_interrupted_step_that_never_launched_fails_at_start() {
+    let reason = CancellationReason::UserRequest;
+    for (is_agent, launched, phase) in [
+        (false, false, FailurePhase::Start),
+        (false, true, FailurePhase::Execution),
+        (true, false, FailurePhase::Start),
+    ] {
+        let mut graph = definition(&[("build", &[], &[]), ("later", &["build"], &[])], &[], 1);
+        graph.steps.get_mut("build").unwrap().is_agent = is_agent;
+        let initialization = initialize_test(graph);
+        assert!(started_step(&initialization, "build").is_some());
+        let mut state = initialization.state;
+        let interrupted = reduce_and_advance(&mut state, interruption(1, reason, 40));
+        let [stop] = interrupted.actions.as_slice() else {
+            panic!("the interruption did not stop exactly the starting step");
+        };
+        assert!(matches!(&stop.action, Action::CancelStep { step, .. } if step == "build"));
+        let finished = reduce_and_advance(
+            &mut state,
+            Occurrence::StepQuiesced {
+                step: "build".to_owned(),
+                action: stop.id,
+                launched,
+            },
+        );
+        assert_eq!(state.steps["build"].state, interrupted_state(phase));
+        assert_eq!(state.steps["later"].state, cancelled_state(reason));
+        assert_eq!(
+            finished_outcome(&finished),
+            Some(&RunOutcome::Failed {
+                primary_issue: PrimaryIssue::failed(
+                    ordinary_node("build"),
+                    interrupted_detail(phase)
+                ),
+                later_cancellation: Some(reason),
+            })
+        );
+    }
+}
+
+// REQ-WFEXEC-69: a recovery's re-execution withdrawn before it launched leaves the step's
+// earlier execution, so the step still fails at `execution`.
+#[test]
+fn an_unlaunched_re_execution_after_recovery_fails_in_execution() {
+    let mut graph = definition(&[("fetch", &[], &["result"])], &[], 1);
+    configure_recovery(&mut graph, "fetch", 2, None, 1_000);
+    let initialization = initialize_test(graph);
+    let first = started_step(&initialization, "fetch").unwrap();
+    let mut state = initialization.state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStarted {
+            step: "fetch".to_owned(),
+            action: first,
+        },
+    );
+    let recheck = reduce_and_advance(
+        &mut state,
+        Occurrence::StepExecutionFailed {
+            step: "fetch".to_owned(),
+            action: first,
+            cause: "exit 75".to_owned(),
+        },
+    );
+    assert!(started_step(&recheck, "fetch").is_some());
+    let interrupted = reduce_and_advance(
+        &mut state,
+        interruption(1, CancellationReason::UserRequest, 90),
+    );
+    let [stop] = interrupted.actions.as_slice() else {
+        panic!("the interruption did not stop the starting re-execution");
+    };
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepQuiesced {
+            step: "fetch".to_owned(),
+            action: stop.id,
+            launched: false,
+        },
+    );
+    assert_eq!(
+        state.steps["fetch"].state,
+        interrupted_state(FailurePhase::Execution)
+    );
 }
 
 // REQ-WFEXEC-69, REQ-WFFINALIZE-15
@@ -3452,6 +3558,7 @@ fn committed_success_survives_later_cancellation() {
         Occurrence::StepQuiesced {
             step: "bActive".to_owned(),
             action: action_id(7),
+            launched: true,
         },
     );
     let expected_exports = BTreeMap::from([
@@ -4396,6 +4503,7 @@ fn trace_force_abort_during_ordinary_execution_contains_work_and_suppresses_fina
         Occurrence::StepQuiesced {
             step: "aWork".into(),
             action: force_action,
+            launched: true,
         },
     );
     assert_eq!(
@@ -4482,6 +4590,7 @@ fn ordinary_force_escalation_preserves_an_earlier_graceful_reason() {
         Occurrence::StepQuiesced {
             step: "work".into(),
             action: force_action,
+            launched: true,
         },
     );
     assert_eq!(
@@ -4599,6 +4708,7 @@ fn trace_force_abort_waits_for_owned_work_to_quiesce_and_repeated_force_abort_is
         Occurrence::StepQuiesced {
             step: "release".into(),
             action: force_id,
+            launched: true,
         },
     );
     assert_eq!(
@@ -4793,6 +4903,7 @@ fn trace_fresh_finalization_cancellation_does_not_replay_ordinary_cancellation()
         Occurrence::StepQuiesced {
             step: "release".into(),
             action: cancel,
+            launched: true,
         },
     );
     assert_eq!(
@@ -5178,6 +5289,7 @@ fn force_abort_escalation_preserves_the_graceful_reason_and_deadline() {
         Occurrence::StepQuiesced {
             step: "release".into(),
             action: forced_action,
+            launched: true,
         },
     );
     let summary = state.finalization_summary.as_ref().unwrap();
@@ -6462,6 +6574,7 @@ fn recovery_trace_cancellation_preempts_all_five_active_phases() {
             Occurrence::StepQuiesced {
                 step: "verify".into(),
                 action: cancel.id,
+                launched: true,
             },
         );
         assert_eq!(state.steps["verify"].state.kind(), StepStateKind::Cancelled);

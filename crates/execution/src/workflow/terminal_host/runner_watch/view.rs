@@ -28,6 +28,8 @@ pub struct RunnerWatchOverview {
     pub boot_id: String,
     pub version: String,
     pub uptime: Duration,
+    /// The runner's newest reading of its work root's disk, when the answer gives one.
+    pub disk: Option<RunnerWatchDisk>,
     /// The time left of the stop's bound, only while the runner is stopping.
     pub stop_time_left: Option<Duration>,
     pub connection: RunnerWatchConnection,
@@ -48,6 +50,16 @@ pub struct RunnerWatchOverview {
     pub events: Vec<RunnerWatchEvent>,
     /// The events the answer itself left out.
     pub events_omitted: u64,
+}
+
+/// The space of the disk holding the runner's work root, and whether it is below the
+/// configured minimum.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RunnerWatchDisk {
+    pub available_bytes: u64,
+    pub total_bytes: u64,
+    pub minimum_free_bytes: u64,
+    pub low: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

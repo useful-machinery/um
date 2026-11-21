@@ -1213,7 +1213,8 @@ async fn controlled_cancellation_orders_events_and_waits_for_terminal_delivery()
                 ExecutionObservation::Transition(transition) => Some(&transition.event),
                 ExecutionObservation::CommandOutput(_)
                 | ExecutionObservation::CommandOutputClosed(_)
-                | ExecutionObservation::Agent(_) => None,
+                | ExecutionObservation::Agent(_)
+                | ExecutionObservation::StartHeld(_) => None,
             })
             .collect::<Vec<_>>();
         let accepted = transitions.iter().position(|transition| matches!(
@@ -1289,7 +1290,8 @@ async fn initial_cancellation_is_observed_without_starting_a_step() {
                 ExecutionObservation::Transition(transition) => Some(transition.event.clone()),
                 ExecutionObservation::CommandOutput(_)
                 | ExecutionObservation::CommandOutputClosed(_)
-                | ExecutionObservation::Agent(_) => None,
+                | ExecutionObservation::Agent(_)
+                | ExecutionObservation::StartHeld(_) => None,
             })
             .collect::<Vec<_>>();
         assert!(matches!(

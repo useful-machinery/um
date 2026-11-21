@@ -742,6 +742,8 @@ impl WorkflowRunViewState {
                     self.log_capacity,
                 );
             }
+            // A held start is presented by the progress stream alone (REQ-LOCALRUN-222).
+            PresentationRecordKind::StartHeld(_) => {}
         }
     }
 

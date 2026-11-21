@@ -108,6 +108,20 @@ pub(super) enum LoggedEvent {
     ObservationRefused,
     /// The telemetry writer dropped a runner record.
     TelemetryDropped,
+    /// The work root's disk turned low: `available_bytes` below `minimum_free_bytes`.
+    DiskSpaceLow {
+        available_bytes: u64,
+        minimum_free_bytes: u64,
+    },
+    /// The work root's disk stopped being low.
+    DiskSpaceRecovered {
+        available_bytes: u64,
+    },
+    /// The runner declined an offer because the work root's disk was low.
+    DiskLowOfferDeclined {
+        run_id: String,
+        assignment_id: String,
+    },
     Stopping,
 }
 
@@ -186,6 +200,26 @@ impl LoggedEntry {
             },
             LoggedEvent::ObservationRefused => event(RunnerEventKind::ObservationRefused)?,
             LoggedEvent::TelemetryDropped => event(RunnerEventKind::TelemetryDropped)?,
+            LoggedEvent::DiskSpaceLow {
+                available_bytes,
+                minimum_free_bytes,
+            } => OverviewEvent {
+                available_bytes: Some(available_bytes),
+                minimum_free_bytes: Some(minimum_free_bytes),
+                ..event(RunnerEventKind::DiskSpaceLow)?
+            },
+            LoggedEvent::DiskSpaceRecovered { available_bytes } => OverviewEvent {
+                available_bytes: Some(available_bytes),
+                ..event(RunnerEventKind::DiskSpaceRecovered)?
+            },
+            LoggedEvent::DiskLowOfferDeclined {
+                run_id,
+                assignment_id,
+            } => OverviewEvent {
+                run_id: Some(run_id),
+                assignment_id: Some(assignment_id),
+                ..event(RunnerEventKind::DiskLowOfferDeclined)?
+            },
             LoggedEvent::Stopping => event(RunnerEventKind::Stopping)?,
         })
     }
@@ -211,6 +245,8 @@ pub(super) fn listed_event(
         run_id: None,
         assignment_id: None,
         workspaces: None,
+        available_bytes: None,
+        minimum_free_bytes: None,
     })
 }
 

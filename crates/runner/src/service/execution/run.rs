@@ -275,7 +275,9 @@ impl ExecutionJob {
             }
             None => WorkflowExecutionStart::initial(process_guard_registry),
         };
-        let start = start.with_finalization_identity(run_id.to_owned(), attempt_id.to_owned());
+        let start = start
+            .with_finalization_identity(run_id.to_owned(), attempt_id.to_owned())
+            .with_start_gate(Arc::clone(&self.start_gate));
         let cloud_commit = CloudStepCommitPort::new(
             self.accepted.root.private.path().to_path_buf(),
             attempt_id.to_owned(),

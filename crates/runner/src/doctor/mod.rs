@@ -1,6 +1,7 @@
 mod agent_logins;
 mod claude_code;
 mod codex;
+mod disk_space;
 mod git;
 mod pi;
 mod workflow_credentials;
@@ -13,6 +14,7 @@ use useful_execution::{HarnessQualification, UntestedHarnessAdvisory};
 use agent_logins::AgentLoginsCheck;
 use claude_code::ClaudeCodeCheck;
 use codex::CodexCheck;
+use disk_space::DiskSpaceCheck;
 use git::GitCheck;
 use pi::PiCheck;
 
@@ -243,7 +245,8 @@ pub fn built_in_registry(config: Option<OperatorConfigSource>) -> Result<Registr
     registry.register(Box::new(PiCheck))?;
     registry.register(Box::new(ClaudeCodeCheck))?;
     registry.register(Box::new(CodexCheck))?;
-    registry.register(Box::new(AgentLoginsCheck::new(config)))?;
+    registry.register(Box::new(AgentLoginsCheck::new(config.clone())))?;
+    registry.register(Box::new(DiskSpaceCheck::new(config)))?;
     Ok(registry)
 }
 
@@ -538,7 +541,7 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 0);
     }
 
-    // REQ-AGENT-47
+    // REQ-AGENT-47, REQ-RUNNERENROLL-153
     #[test]
     fn built_in_registry_contains_the_default_git_check() {
         let registry = built_in_registry(None).unwrap();
@@ -569,6 +572,11 @@ mod tests {
                 CheckDescriptor {
                     id: "credentials.agent-logins",
                     title: "Agent logins",
+                    default: false,
+                },
+                CheckDescriptor {
+                    id: "environment.disk-space",
+                    title: "Disk space",
                     default: false,
                 },
             ]

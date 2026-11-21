@@ -59,6 +59,7 @@ pub(crate) mod runtime;
 mod schema;
 mod schema_common;
 pub(crate) mod socket_alias;
+pub(crate) mod start_gate;
 pub(crate) mod step_runtime;
 mod strict_yaml;
 pub(crate) mod structure;

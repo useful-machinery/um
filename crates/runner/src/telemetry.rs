@@ -118,6 +118,12 @@ pub(crate) mod attribute {
     pub(crate) const RUNNER_CREDENTIALS_REMOVED: &str = "um.teardown.runner_credentials_removed";
     pub(crate) const RUNNER_CREDENTIALS_REVOKED: &str = "um.teardown.runner_credentials_revoked";
     pub(crate) const WORKSPACE_PATH: &str = "um.workspace.path";
+    /// A `runner.disk_space` record gives the state the work root's disk turned to, `low`
+    /// or `ok`, with the reading that turned it (REQ-TELEMETRY-55).
+    pub(crate) const DISK_STATE: &str = "um.disk.state";
+    pub(crate) const DISK_AVAILABLE_BYTES: &str = "um.disk.available_bytes";
+    pub(crate) const DISK_TOTAL_BYTES: &str = "um.disk.total_bytes";
+    pub(crate) const DISK_MINIMUM_FREE_BYTES: &str = "um.disk.minimum_free_bytes";
     pub(crate) const PROTOCOL_ACKNOWLEDGED_MESSAGE_ID: &str = "um.protocol.acknowledged_message_id";
     pub(crate) const PROTOCOL_ACKNOWLEDGED_SEQUENCE: &str = "um.protocol.acknowledged_sequence";
     pub(crate) const PROTOCOL_CLOSE_CODE: &str = "um.protocol.close_code";

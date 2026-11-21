@@ -190,9 +190,14 @@ where
             write_step_round_action(&mut digest, step, *round, *action);
             cause.update_occurrence_digest(&mut digest);
         }
-        Occurrence::StepQuiesced { step, action } => {
+        Occurrence::StepQuiesced {
+            step,
+            action,
+            launched,
+        } => {
             digest.write_tag(10);
             write_step_action(&mut digest, step, *action);
+            digest.write_tag(u8::from(*launched));
         }
         Occurrence::StopEntered { step, action } => {
             digest.write_tag(11);
@@ -351,7 +356,21 @@ where
     }
 
     pub(crate) fn step_quiesced(step: String, action: ActionId) -> Self {
-        Self::new(Occurrence::StepQuiesced { step, action })
+        Self::new(Occurrence::StepQuiesced {
+            step,
+            action,
+            launched: true,
+        })
+    }
+
+    /// A stopped start that never launched its command, agent or child run quiesced
+    /// (REQ-WFEXEC-69).
+    pub(crate) fn step_quiesced_unlaunched(step: String, action: ActionId) -> Self {
+        Self::new(Occurrence::StepQuiesced {
+            step,
+            action,
+            launched: false,
+        })
     }
 
     pub(crate) fn stop_entered(step: String, action: ActionId) -> Self {
@@ -454,7 +473,15 @@ impl<Provisional, Cause, Output> DriverOccurrence<Provisional, Cause, Output> {
                 action,
                 cause,
             },
-            Occurrence::StepQuiesced { step, action } => Occurrence::StepQuiesced { step, action },
+            Occurrence::StepQuiesced {
+                step,
+                action,
+                launched,
+            } => Occurrence::StepQuiesced {
+                step,
+                action,
+                launched,
+            },
             Occurrence::StopEntered { step, action } => Occurrence::StopEntered { step, action },
             Occurrence::CancellationOperationRequested {
                 operation: _,

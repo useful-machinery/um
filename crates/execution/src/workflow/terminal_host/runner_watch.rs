@@ -29,7 +29,7 @@ use self::interaction::{RunnerWatchInteraction, RunnerWatchSurface};
 pub use self::view::{
     RunnerWatchAssignment, RunnerWatchAssignmentAnswer, RunnerWatchAssignmentDetail,
     RunnerWatchAssignmentQuery, RunnerWatchChildRun, RunnerWatchConnection, RunnerWatchCounts,
-    RunnerWatchEvent, RunnerWatchHeldAssignment, RunnerWatchLease, RunnerWatchLog,
+    RunnerWatchDisk, RunnerWatchEvent, RunnerWatchHeldAssignment, RunnerWatchLease, RunnerWatchLog,
     RunnerWatchLogRecord, RunnerWatchLogSource, RunnerWatchLogStream, RunnerWatchLogin,
     RunnerWatchMark, RunnerWatchOutcome, RunnerWatchOverview, RunnerWatchRecent, RunnerWatchRun,
     RunnerWatchRunElement, RunnerWatchRunOutput, RunnerWatchRunStep, RunnerWatchRunWork,

@@ -174,6 +174,7 @@ impl RunnerHome {
             runner_state_path: self.state_path(),
             control_socket_path: self.control_socket_path(),
             work_root: self.work_root(),
+            minimum_free_disk_bytes: None,
         };
         let bytes = json_document(&document)
             .map_err(io::Error::from)

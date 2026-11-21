@@ -11,6 +11,7 @@
 
 mod claude_code;
 mod codex;
+mod disk_space;
 mod harness_installation;
 mod owned_tree;
 mod pi;
@@ -26,6 +27,11 @@ pub use codex::{
     CODEX_APP_SERVER_V1_QUALIFICATION_VERSION, CODEX_APP_SERVER_V1_SUPPORTED_RANGE,
     CodexIncompatibility, CodexInstallationFailure, CodexProbe, ValidatedCodexInstallation,
     discover_and_validate_codex_installation,
+};
+pub use disk_space::{
+    DEFAULT_MINIMUM_FREE_DISK_BYTES, DiskSpace, MAXIMUM_MINIMUM_FREE_DISK_BYTES,
+    RUNNER_DISK_GATE_ENVIRONMENT, RunnerDiskGate, RunnerDiskGateError, RunnerDiskStartGate,
+    format_bytes, read_disk_space,
 };
 pub use owned_tree::{RemovalError, open_directory_at, open_regular_file_at, remove_open_tree_at};
 pub use pi::{
@@ -196,6 +202,7 @@ pub use workflow::runtime::{
     TransitionSequence, WorkflowState,
 };
 pub use workflow::runtime::{RecoveryRoundNumber, TargetExecutionNumber};
+pub use workflow::start_gate::{StartGateReading, StepStartGate};
 pub use workflow::step_runtime::spawn_isolated_command_launch;
 pub use workflow::step_runtime::{
     AgentExecution, RecoveryFailureKind, StepFailureCause, StepFailureKind, WorkflowExecutionStart,
@@ -210,11 +217,12 @@ pub use workflow::terminal_host::archived::{
 pub use workflow::terminal_host::runner_watch::{
     RunnerWatchAssignment, RunnerWatchAssignmentAnswer, RunnerWatchAssignmentDetail,
     RunnerWatchAssignmentQuery, RunnerWatchChildRun, RunnerWatchConnection, RunnerWatchCounts,
-    RunnerWatchEvent, RunnerWatchHeldAssignment, RunnerWatchHost, RunnerWatchLease, RunnerWatchLog,
-    RunnerWatchLogRecord, RunnerWatchLogSource, RunnerWatchLogStream, RunnerWatchLogin,
-    RunnerWatchMark, RunnerWatchOutcome, RunnerWatchOverview, RunnerWatchRecent, RunnerWatchRun,
-    RunnerWatchRunElement, RunnerWatchRunOutput, RunnerWatchRunStep, RunnerWatchRunWork,
-    RunnerWatchSource, RunnerWatchSourceError, RunnerWatchStep, RunnerWatchTitle, RunnerWatchWait,
+    RunnerWatchDisk, RunnerWatchEvent, RunnerWatchHeldAssignment, RunnerWatchHost,
+    RunnerWatchLease, RunnerWatchLog, RunnerWatchLogRecord, RunnerWatchLogSource,
+    RunnerWatchLogStream, RunnerWatchLogin, RunnerWatchMark, RunnerWatchOutcome,
+    RunnerWatchOverview, RunnerWatchRecent, RunnerWatchRun, RunnerWatchRunElement,
+    RunnerWatchRunOutput, RunnerWatchRunStep, RunnerWatchRunWork, RunnerWatchSource,
+    RunnerWatchSourceError, RunnerWatchStep, RunnerWatchTitle, RunnerWatchWait,
 };
 pub use workflow::terminal_host::{
     HostInteraction, TerminalBoundary, TerminalHostExit, TerminalInputEvent,

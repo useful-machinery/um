@@ -17,6 +17,7 @@ impl AssignmentManager {
             recorder,
             guard_processes,
             events: runner_events,
+            disk: disk_reading,
         } = dependencies;
         let (event_sender, events) = mpsc::unbounded_channel();
         let outbox = ObservationOutbox::new().with_events(Arc::clone(&runner_events));
@@ -51,6 +52,7 @@ impl AssignmentManager {
             recorder,
             runner_events,
             runner_id: config.credential().runner_id().to_owned(),
+            disk_reading,
             run_events: BTreeMap::new(),
             offer_facts: BTreeMap::new(),
             recent_assignments: Ring::new(RECENT_ASSIGNMENTS),
@@ -293,6 +295,24 @@ impl AssignmentManager {
         if let Err(decline) = self.validate_admission_prerequisites(&offer) {
             let response = rejected(&offer, decline);
             return self.retain_decision(offer, response);
+        }
+        // Last, while the disk is low, an offer the runner would otherwise hold is declined
+        // unless it continues an earlier attempt; no run is opened for it, as for a working
+        // runner's decline (REQ-RUNNERENROLL-154, INV-RUNNER-50).
+        if offer.continuation.is_none()
+            && self
+                .disk_reading
+                .published()
+                .is_some_and(|reading| reading.low)
+        {
+            let declined = LoggedEvent::DiskLowOfferDeclined {
+                run_id: offer.run_id.clone(),
+                assignment_id: offer.assignment_id.clone(),
+            };
+            let response = rejected(&offer, disk_space_low());
+            self.retain_decision(offer, response)?;
+            self.runner_events.record(declined);
+            return Ok(());
         }
 
         let root_offer = offer.clone();

@@ -1,5 +1,6 @@
 use super::interaction::RunnerWatchSurface;
 use super::*;
+use crate::format_bytes;
 
 mod assignment;
 
@@ -263,19 +264,58 @@ fn status_line(
 }
 
 fn health_lines(overview: &RunnerWatchOverview, width: usize, color: bool) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        fact_line(
-            Vec::new(),
+    let low_disk = overview.disk.filter(|disk| disk.low);
+    // A disk that is not low is one more fact of the identity line; a low one is its own line.
+    let disk = overview
+        .disk
+        .filter(|disk| !disk.low)
+        .map_or_else(Fact::absent, |disk| {
+            let available = format!("disk {} free", format_bytes(disk.available_bytes));
+            Fact::forms(
+                vec![
+                    format!("{available} of {}", format_bytes(disk.total_bytes)),
+                    available,
+                ],
+                1,
+            )
+        });
+    let mut lines = vec![fact_line(
+        Vec::new(),
+        vec![
+            Fact::id("", &overview.runner_id, ALWAYS).tone(Tone::Primary),
+            Fact::new(format!("v{}", visible_text(&overview.version)), 2),
+            Fact::new(format!("up {}", short_duration(overview.uptime)), 1),
+            disk,
+            Fact::id("boot ", &overview.boot_id, 3),
+        ],
+        "  ",
+        width,
+        color,
+    )];
+    if let Some(disk) = low_disk {
+        lines.push(fact_line(
+            vec![Span::styled("✗ ", tone_style(color, Tone::Failure))],
             vec![
-                Fact::id("", &overview.runner_id, ALWAYS).tone(Tone::Primary),
-                Fact::new(format!("v{}", visible_text(&overview.version)), 2),
-                Fact::new(format!("up {}", short_duration(overview.uptime)), 1),
-                Fact::id("boot ", &overview.boot_id, 3),
+                Fact::new("disk low".to_owned(), ALWAYS).tone(Tone::Failure),
+                Fact::new(
+                    format!(
+                        "{} free of {}",
+                        format_bytes(disk.available_bytes),
+                        format_bytes(disk.total_bytes)
+                    ),
+                    3,
+                ),
+                Fact::new(
+                    format!("minimum {}", format_bytes(disk.minimum_free_bytes)),
+                    2,
+                ),
             ],
-            "  ",
+            " · ",
             width,
             color,
-        ),
+        ));
+    }
+    lines.extend([
         connection_line(overview, width, color),
         fact_line(
             Vec::new(),
@@ -294,7 +334,7 @@ fn health_lines(overview: &RunnerWatchOverview, width: usize, color: bool) -> Ve
             width,
             color,
         ),
-    ];
+    ]);
     lines.extend(login_lines(&overview.logins, width, color));
     if let Some(left) = overview.stop_time_left {
         lines.push(fact_line(

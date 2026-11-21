@@ -978,6 +978,7 @@ fn deterministic_connection_loop_dependencies(
         boot_id,
         source_broker: None,
         agent_login_setup: None,
+        disk: None,
     }
 }
 

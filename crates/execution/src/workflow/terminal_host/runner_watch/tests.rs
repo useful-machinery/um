@@ -9,6 +9,7 @@ use time::format_description::well_known::Rfc3339;
 
 use super::assignment::OpenAssignment;
 use super::run_steps::{phase_boundary, step_state_kind};
+use super::view::RunnerWatchDisk;
 use super::widgets::{
     IN_FLIGHT_LABEL, LAST_KNOWN_LABEL, RESTARTED_LABEL, mark_glyph, render_runner_watch, short_id,
 };
@@ -313,6 +314,74 @@ async fn an_operation_runs_off_the_draw_loop_and_its_outcome_stays_shown() {
         .send(ScriptedInput::Event(TerminalInputEvent::Quit))
         .unwrap();
     assert_eq!(host.wait().await.unwrap(), ArchivedTerminalHostExit::Quit);
+}
+
+// REQ-RUNNERENROLL-140, REQ-LOCALRUN-6: the disk reading sits on the identity line, and
+// while the disk is low a warning with the minimum takes the line under it instead, told
+// by its mark and words rather than by color.
+#[test]
+fn the_disk_reading_and_its_low_warning_are_drawn_without_color() {
+    const GIB: u64 = 1 << 30;
+    let wide = Rect::new(0, 0, 120, 30);
+    let draw = |disk: Option<RunnerWatchDisk>, area: Rect| {
+        let mut screen = RunnerWatchScreen::new(overview(BOOT_A), observed_at(0));
+        screen.overview.disk = disk;
+        let mut interaction = RunnerWatchInteraction::new(area);
+        let buffer = render_screen(&screen, &mut interaction, area, false);
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .all(|cell| cell.fg == ratatui::style::Color::Reset
+                    && cell.bg == ratatui::style::Color::Reset),
+            "a cell carries a color"
+        );
+        let rows = buffer_rows(&buffer);
+        let identity = rows
+            .iter()
+            .position(|row| row.contains("v0.83.0"))
+            .unwrap_or_else(|| panic!("missing the identity line: {rows:#?}"));
+        (rows, identity)
+    };
+    let reading = |available_bytes: u64, low: bool| RunnerWatchDisk {
+        available_bytes,
+        total_bytes: 423_054_278_656,
+        minimum_free_bytes: 5 * GIB,
+        low,
+    };
+
+    // The narrowest row keeps the reading's shorter form.
+    for (area, shown) in [
+        (MINIMUM, "disk 120 GiB free"),
+        (wide, "disk 120 GiB free of 394 GiB"),
+    ] {
+        let (rows, identity) = draw(Some(reading(120 * GIB, false)), area);
+        assert!(rows[identity].contains(shown), "{rows:#?}");
+        assert!(
+            !rows.iter().any(|row| row.contains("disk low")),
+            "{rows:#?}"
+        );
+    }
+    for area in [MINIMUM, wide] {
+        let (rows, identity) = draw(Some(reading(6_186_599, true)), area);
+        assert!(!rows[identity].contains("disk"), "{rows:#?}");
+        let warning = &rows[identity + 1];
+        for fact in [
+            mark_glyph(RunnerWatchMark::Failure),
+            "disk low",
+            "5.9 MiB free of 394 GiB",
+            "minimum 5.0 GiB",
+        ] {
+            assert!(warning.contains(fact), "missing {fact:?}: {rows:#?}");
+        }
+
+        let (rows, identity) = draw(None, area);
+        assert!(!rows[identity].contains("disk"), "{rows:#?}");
+        assert!(
+            !rows.iter().any(|row| row.contains("disk low")),
+            "{rows:#?}"
+        );
+    }
 }
 
 // REQ-RUNNERENROLL-142
@@ -1797,6 +1866,7 @@ fn overview(boot_id: &str) -> RunnerWatchOverview {
         boot_id: boot_id.to_owned(),
         version: "0.83.0".to_owned(),
         uptime: Duration::from_secs(3 * 3_600 + 12 * 60),
+        disk: None,
         stop_time_left: None,
         connection: RunnerWatchConnection {
             mark: RunnerWatchMark::Active,

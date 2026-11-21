@@ -28,6 +28,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use useful_execution::{
     CancellationPolicy, CancellationSource, CaptureCancellation, ResolvedInput, ResolvedInputs,
+    RunnerDiskGate,
 };
 use useful_runner_protocol::{
     AssignmentDecline, ExecutionSpecInvalidReason, ExecutionSpecV1RunnerProjection, RunControl,
@@ -79,6 +80,9 @@ pub(super) struct TreeRunDependencies {
     command_bound: Duration,
     deliveries: Inbox<TriggerDelivery>,
     controls: Inbox<RunControl>,
+    /// The disk and minimum each `useful` command holds its run's steps by
+    /// (REQ-RUNNERENROLL-155); none when the service runs no disk monitor or its minimum is 0.
+    disk_gate: Option<RunnerDiskGate>,
 }
 
 impl TreeRunDependencies {
@@ -91,7 +95,15 @@ impl TreeRunDependencies {
             command_bound: command::SHORT_COMMAND_BOUND,
             deliveries: Inbox::default(),
             controls: Inbox::default(),
+            disk_gate: None,
         }
+    }
+
+    /// Gives each `useful` command `gate` in `RUNNER_DISK_GATE_ENVIRONMENT`, so the run holds
+    /// its next step while the disk `gate` names is low (REQ-RUNNERENROLL-155).
+    pub(super) fn with_disk_gate(mut self, gate: RunnerDiskGate) -> Self {
+        self.disk_gate = Some(gate);
+        self
     }
 
     /// Queues `delivery` for the tree run of `assignment_id`, which applies it once
@@ -477,6 +489,10 @@ pub(super) fn prepare(
         log: RunLog::new(layout.log.clone()),
         sleeper: Arc::clone(&preparation.sleeper),
         bound: dependencies.command_bound,
+        disk_gate: dependencies
+            .disk_gate
+            .as_ref()
+            .map(RunnerDiskGate::environment_value),
     };
     let fenced = || {
         AssignmentDecline::RunnerUnable(RunnerUnableReason::SourceServiceUnavailable)
@@ -625,6 +641,10 @@ pub(super) fn adopt(
         log: RunLog::new(layout.log),
         sleeper: Arc::clone(&adoption.sleeper),
         bound: dependencies.command_bound,
+        disk_gate: dependencies
+            .disk_gate
+            .as_ref()
+            .map(RunnerDiskGate::environment_value),
     };
     Ok(TreeRun::new(
         dependencies,

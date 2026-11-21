@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use clap::Args;
 
 use crate::exit_code::{ExitCode, OutcomeClass};
+use useful_execution::format_bytes;
 use useful_runner::RequestFailure;
 use useful_runner::{AssignmentCounts, Operation, Response, StatusSnapshot};
 
@@ -54,6 +55,22 @@ fn write_status(output: &mut impl Write, status: &StatusSnapshot) -> io::Result<
     )?;
     if let Some(log_path) = &status.log_path {
         writeln!(output, "log:            {log_path}")?;
+    }
+    if let Some(disk) = &status.disk {
+        writeln!(
+            output,
+            "disk:           {} free of {} at {}",
+            format_bytes(disk.available_bytes),
+            format_bytes(disk.total_bytes),
+            disk.path
+        )?;
+        if disk.low {
+            writeln!(
+                output,
+                "disk warning:   below the minimum of {}",
+                format_bytes(disk.minimum_free_bytes)
+            )?;
+        }
     }
     writeln!(
         output,
@@ -196,6 +213,7 @@ mod tests {
             boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             uptime_milliseconds: 273_600_000,
             log_path: None,
+            disk: None,
             connection_state: ConnectionState::Connected,
             last_connected_at: Some("2026-08-06T19:00:00Z".to_owned()),
             current_credential_id: Some("rrc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned()),
@@ -232,6 +250,7 @@ mod tests {
             boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             uptime_milliseconds: 10_000,
             log_path: Some("/var/lib/runner/logs/runner.log".to_owned()),
+            disk: None,
             connection_state: ConnectionState::Connecting,
             last_connected_at: None,
             current_credential_id: None,
@@ -257,5 +276,73 @@ mod tests {
             lines.iter().filter(|line| line.starts_with("log:")).count(),
             1
         );
+    }
+
+    /// The lines `write_status` prints for a snapshot whose `disk` member is `disk`, with
+    /// a log path, absent when `disk` is null.
+    fn status_lines_with_disk(disk: serde_json::Value) -> Vec<String> {
+        let mut status = serde_json::json!({
+            "processState": "running",
+            "bootId": "rbt_01k0z6r1w8f4jy2m7q9v3x5abc",
+            "uptimeMilliseconds": 10_000,
+            "logPath": "/var/lib/useful/runner/logs/runner.log",
+            "connectionState": "connected",
+            "assignmentCounts": {
+                "preparing": 0, "accepted": 0, "running": 0, "finishing": 0, "reporting": 0
+            }
+        });
+        if !disk.is_null() {
+            status["disk"] = disk;
+        }
+        let status: StatusSnapshot = serde_json::from_value(status).unwrap();
+        let mut output = Vec::new();
+        write_status(&mut output, &status).unwrap();
+        String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn disk_reading(available_bytes: u64, low: bool) -> serde_json::Value {
+        serde_json::json!({
+            "path": "/var/lib/useful/runner/work",
+            "availableBytes": available_bytes,
+            "totalBytes": 394_u64 << 30,
+            "minimumFreeBytes": 5_u64 << 30,
+            "low": low,
+            "readAt": "2026-11-19T14:00:30Z"
+        })
+    }
+
+    // REQ-RUNNERENROLL-42: the disk reading is shown directly after the log path, and a
+    // warning giving the minimum directly after it while the disk is low; a snapshot
+    // without a reading shows neither.
+    #[test]
+    fn renders_the_disk_reading_after_the_log_and_a_warning_while_it_is_low() {
+        let log = |lines: &[String]| {
+            lines
+                .iter()
+                .position(|line| line.starts_with("log:"))
+                .unwrap()
+        };
+        let disk_line = "disk:           120 GiB free of 394 GiB at /var/lib/useful/runner/work";
+
+        let ok = status_lines_with_disk(disk_reading(120 << 30, false));
+        assert_eq!(ok[log(&ok) + 1], disk_line);
+        assert!(!ok.iter().any(|line| line.starts_with("disk warning:")));
+
+        let low = status_lines_with_disk(disk_reading(6_186_599, true));
+        assert_eq!(
+            low[log(&low) + 1],
+            "disk:           5.9 MiB free of 394 GiB at /var/lib/useful/runner/work"
+        );
+        assert_eq!(
+            low[log(&low) + 2],
+            "disk warning:   below the minimum of 5.0 GiB"
+        );
+
+        let none = status_lines_with_disk(serde_json::Value::Null);
+        assert!(!none.iter().any(|line| line.starts_with("disk")));
     }
 }

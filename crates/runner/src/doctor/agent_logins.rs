@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use super::{CheckDescriptor, DoctorCheck, Outcome, Status};
 use crate::agent_login::readiness::{ReadinessDocument, readiness_path};
 use crate::control_protocol::{AgentLoginReadiness, AgentLoginState};
-use crate::enrollment::{RunnerHome, load_runner_state_path};
+use crate::enrollment::{RunnerHome, load_disk_space_settings, load_runner_state_path};
 use crate::telemetry::io_error_class;
 
 /// Where a doctor check that needs the runner operator configuration finds it
@@ -31,6 +31,30 @@ impl OperatorConfigSource {
             },
         }
     }
+
+    /// The work root and the minimum of free space kept on its disk
+    /// (REQ-RUNNERENROLL-152), read without taking the state lock or reading
+    /// the state. Creates nothing.
+    pub(super) fn disk_space_settings(&self) -> Result<(PathBuf, u64), ConfigUnavailable> {
+        let path = match self {
+            Self::File(path) => path.clone(),
+            Self::Home(home) => match home.existing_configuration() {
+                Ok(Some(path)) => path,
+                Ok(None) => return Err(ConfigUnavailable::Absent),
+                Err(_) => return Err(ConfigUnavailable::Invalid),
+            },
+        };
+        load_disk_space_settings(&path).map_err(|_| ConfigUnavailable::Invalid)
+    }
+}
+
+/// Why a check found no operator configuration to read.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ConfigUnavailable {
+    /// The runner home holds none.
+    Absent,
+    /// The configuration cannot be loaded.
+    Invalid,
 }
 
 /// `credentials.agent-logins` (REQ-RUNNERENROLL-86): reads the readiness the

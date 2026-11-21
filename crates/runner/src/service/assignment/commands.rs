@@ -402,6 +402,9 @@ impl AssignmentManager {
                 infrastructure_interruption: infrastructure_interruption_receiver,
             },
         );
+        // The engine of a single-workflow run holds its steps while the monitor's reading is
+        // low (REQ-RUNNERENROLL-155); without a monitor the reading is empty and holds none.
+        let job = job.with_start_gate(Arc::new(self.disk_reading.clone()));
         Ok(Some(match view {
             Some(view) => job.feeding(view),
             None => job,

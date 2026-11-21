@@ -2169,7 +2169,7 @@ fn runner_doctor_lists_registered_checks_without_running_git() {
     assert!(output.status.success());
     assert_eq!(
         output.stdout,
-        b"environment.command.git\nexecution.harness.pi-json-v1\nexecution.harness.claude-code-stream-json-v1\nexecution.harness.codex-app-server-v1\ncredentials.agent-logins\n"
+        b"environment.command.git\nexecution.harness.pi-json-v1\nexecution.harness.claude-code-stream-json-v1\nexecution.harness.codex-app-server-v1\ncredentials.agent-logins\nenvironment.disk-space\n"
     );
     assert!(output.stderr.is_empty());
 }
@@ -2401,6 +2401,67 @@ fn runner_doctor_agent_logins_check_reads_the_recorded_readiness() {
     assert!(passed.status.success());
     // The check never reads the runner state, so its credential cannot reach the report.
     assert!(!String::from_utf8_lossy(&passed.stdout).contains("AAAAAAAAAAAAAAAA"));
+}
+
+/// Writes the runner configuration `write_runner_config` writes, naming `minimum` as its
+/// `minimumFreeDiskBytes`.
+fn write_runner_config_with_minimum(directory: &tempfile::TempDir, minimum: u64) -> String {
+    let config_path = write_runner_config(
+        directory,
+        "https://not-a-websocket.example.test/v1/runner/connect",
+    );
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&fs::read(&config_path).expect("read runner config"))
+            .expect("decode runner config");
+    config["minimumFreeDiskBytes"] = minimum.into();
+    fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("encode runner config"),
+    )
+    .expect("write runner config");
+    config_path
+}
+
+// REQ-RUNNERENROLL-153
+#[test]
+fn runner_doctor_disk_space_check_judges_the_work_roots_disk() {
+    let check = ["runner", "doctor", "--check", "environment.disk-space"];
+
+    let roomy = private_credential_directory();
+    let config_path = write_runner_config_with_minimum(&roomy, 0);
+    let with_config = [check.as_slice(), &["--config", &config_path]].concat();
+    let passed = run(&with_config);
+    assert!(passed.status.success(), "{passed:?}");
+    assert!(passed.stderr.is_empty());
+
+    let json = run(&[with_config.as_slice(), &["--json"]].concat());
+    assert!(json.status.success(), "{json:?}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&json.stdout).expect("runner doctor report should be JSON");
+    let result = &report["checks"][0];
+    assert_eq!(result["id"], "environment.disk-space");
+    assert_eq!(result["status"], "pass");
+    assert_eq!(result["code"], "ok");
+    let size = |key: &str| {
+        result["details"][key]
+            .as_str()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or_else(|| panic!("{key} in {result}"))
+    };
+    assert!(size("available_bytes") <= size("total_bytes"), "{result}");
+    assert_eq!(size("minimum_free_bytes"), 0);
+    assert_eq!(
+        report["summary"],
+        serde_json::json!({"passed": 1, "failed": 0})
+    );
+
+    let cramped = private_credential_directory();
+    let config_path = write_runner_config_with_minimum(&cramped, 9_007_199_254_740_991);
+    let failed = run(&[check.as_slice(), &["--config", &config_path]].concat());
+    assert_eq!(failed.status.code(), Some(1), "{failed:?}");
+    let stdout = String::from_utf8_lossy(&failed.stdout);
+    assert!(stdout.contains("code: disk_space_low"), "{stdout}");
+    assert!(failed.stderr.is_empty());
 }
 
 #[test]

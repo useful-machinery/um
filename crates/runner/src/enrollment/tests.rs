@@ -147,6 +147,66 @@ fn operator_config_written_bytes_match_schema_in_both_deployment_modes() {
     }
 }
 
+// REQ-RUNNERENROLL-14: `minimumFreeDiskBytes` is optional, an integer from 0 to 2^53 - 1;
+// the work root and the minimum load together, the minimum 5 GiB where none is named, and
+// anything else in the member is refused by the loader and the schema alike.
+#[test]
+fn operator_config_takes_an_optional_minimum_of_free_disk_space_within_its_bounds() {
+    let temporary = tempfile::tempdir().expect("create config fixture");
+    let config_path = temporary.path().join("runner.json");
+    let document = |minimum: Option<serde_json::Value>| {
+        let mut document = serde_json::json!({
+            "schemaVersion": 1,
+            "deploymentMode": "production",
+            "runnerStatePath": "/var/lib/useful/runner-state.json",
+            "controlSocketPath": "/run/useful/runner.sock",
+            "workRoot": "/var/lib/useful/work"
+        });
+        if let Some(minimum) = minimum {
+            document["minimumFreeDiskBytes"] = minimum;
+        }
+        document
+    };
+    let write = |document: &serde_json::Value| {
+        let bytes = serde_json::to_vec(document).expect("encode config");
+        fs::write(&config_path, &bytes).expect("write config");
+        bytes
+    };
+    for (minimum, expected) in [
+        (Some(serde_json::json!(0)), 0),
+        (Some(serde_json::json!(1)), 1),
+        (
+            Some(serde_json::json!(9_007_199_254_740_991_u64)),
+            9_007_199_254_740_991,
+        ),
+        (None, 5_368_709_120),
+    ] {
+        let bytes = write(&document(minimum));
+        assert_json_matches_schema("runner operator config", OPERATOR_CONFIG_SCHEMA, &bytes);
+        assert_eq!(
+            load_disk_space_settings(&config_path).expect("load disk space settings"),
+            (PathBuf::from("/var/lib/useful/work"), expected)
+        );
+    }
+    for refused in [
+        serde_json::json!(9_007_199_254_740_992_u64),
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!("5"),
+    ] {
+        let document = document(Some(refused.clone()));
+        write(&document);
+        assert!(
+            matches!(
+                load_disk_space_settings(&config_path),
+                Err(EnrollmentError::InvalidConfig)
+            ),
+            "{refused}"
+        );
+        assert_schema_rejects("runner operator config", OPERATOR_CONFIG_SCHEMA, &document);
+    }
+}
+
 #[test]
 fn activation_artifact_accepts_a_plain_relative_destination() {
     assert_eq!(

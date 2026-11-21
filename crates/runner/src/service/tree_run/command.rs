@@ -42,7 +42,7 @@ use serde_json::Value;
 use useful_execution::{
     CONTROL_ANSWER, CONTROL_APPROVE, CONTROL_HAND_BACK, CONTROL_LIFT, CONTROL_RETRY,
     CancellationReason, CancellationSource, CaptureCancellation, ControlEvent,
-    LocalRunDirectoryError, WITHDRAWN_OUTCOME, wait_identity,
+    LocalRunDirectoryError, RUNNER_DISK_GATE_ENVIRONMENT, WITHDRAWN_OUTCOME, wait_identity,
 };
 use useful_runner_protocol::{
     RunControlAction, RunControlAnswer, RunControlOutcome, TriggerDelivery, TriggerDeliveryAction,
@@ -109,6 +109,9 @@ pub(in crate::service) struct UsefulCommand {
     pub(in crate::service) log: RunLog,
     pub(in crate::service) sleeper: Arc<dyn Sleeper>,
     pub(in crate::service) bound: Duration,
+    /// The `RUNNER_DISK_GATE_ENVIRONMENT` value each command is given; with none the variable
+    /// is removed from what the environment offers (REQ-RUNNERENROLL-155).
+    pub(in crate::service) disk_gate: Option<OsString>,
 }
 
 impl UsefulCommand {
@@ -139,7 +142,14 @@ impl UsefulCommand {
         command
             .args(arguments)
             .env_clear()
-            .envs(environment.variables())
+            .envs(environment.variables());
+        // The daemon's environment is offered whole, so a gate it happens to carry is
+        // removed unless the service gives one (REQ-RUNNERENROLL-155).
+        match &self.disk_gate {
+            Some(gate) => command.env(RUNNER_DISK_GATE_ENVIRONMENT, gate),
+            None => command.env_remove(RUNNER_DISK_GATE_ENVIRONMENT),
+        };
+        command
             .env("USEFUL_HOME", &self.home)
             .stdin(Stdio::null())
             .stdout(stdout)

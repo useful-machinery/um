@@ -4,20 +4,6 @@ use std::os::unix::net::UnixListener;
 
 use super::runner_status::write_status_config;
 
-/// The control socket request `useful runner watch` sends for an overview.
-fn overview_request() -> Vec<u8> {
-    fixture("valid/overview-request.json")
-}
-
-fn fixture(path: &str) -> Vec<u8> {
-    fs::read(
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests/fixtures/runner-control/v1")
-            .join(path),
-    )
-    .unwrap()
-}
-
 // REQ-RUNNERENROLL-139: without a terminal the command reads no configuration's socket,
 // asks the runner nothing and names `useful runner status`.
 #[test]
@@ -60,6 +46,20 @@ mod terminal {
     const LEAVE_ALTERNATE_SCREEN: &str = "\u{1b}[?1049l";
     /// The boot ID of the serving process that answers after the fixture's went away.
     const SECOND_BOOT_ID: &str = "rbt_7nnnnnnnnnnnnnnnnnnnnnnnnn";
+
+    /// The control socket request `useful runner watch` sends for an overview.
+    fn overview_request() -> Vec<u8> {
+        fixture("valid/overview-request.json")
+    }
+
+    fn fixture(path: &str) -> Vec<u8> {
+        fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/runner-control/v1")
+                .join(path),
+        )
+        .unwrap()
+    }
 
     /// A serving runner's control socket that answers each connection by its request line
     /// and records each request line.

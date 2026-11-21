@@ -22,18 +22,19 @@ use useful_execution::{
     ColorChoice, PresentationConfig, PresentationMode, RequestedPresentationMode,
     RunnerWatchAssignment, RunnerWatchAssignmentAnswer, RunnerWatchAssignmentDetail,
     RunnerWatchAssignmentQuery, RunnerWatchChildRun, RunnerWatchConnection, RunnerWatchCounts,
-    RunnerWatchEvent, RunnerWatchHeldAssignment, RunnerWatchHost, RunnerWatchLease, RunnerWatchLog,
-    RunnerWatchLogRecord, RunnerWatchLogSource, RunnerWatchLogStream, RunnerWatchLogin,
-    RunnerWatchMark, RunnerWatchOutcome, RunnerWatchOverview, RunnerWatchRecent, RunnerWatchRun,
-    RunnerWatchRunElement, RunnerWatchRunOutput, RunnerWatchRunStep, RunnerWatchRunWork,
-    RunnerWatchSource, RunnerWatchSourceError, RunnerWatchStep, RunnerWatchTitle, RunnerWatchWait,
-    SystemObservationClock, TerminalCapabilities,
+    RunnerWatchDisk, RunnerWatchEvent, RunnerWatchHeldAssignment, RunnerWatchHost,
+    RunnerWatchLease, RunnerWatchLog, RunnerWatchLogRecord, RunnerWatchLogSource,
+    RunnerWatchLogStream, RunnerWatchLogin, RunnerWatchMark, RunnerWatchOutcome,
+    RunnerWatchOverview, RunnerWatchRecent, RunnerWatchRun, RunnerWatchRunElement,
+    RunnerWatchRunOutput, RunnerWatchRunStep, RunnerWatchRunWork, RunnerWatchSource,
+    RunnerWatchSourceError, RunnerWatchStep, RunnerWatchTitle, RunnerWatchWait,
+    SystemObservationClock, TerminalCapabilities, format_bytes,
 };
 use useful_runner::{
     AgentLoginSetupResult, AgentLoginState, AgentLoginUse, AssignmentAnswer, AssignmentDetail,
     AssignmentLog, AssignmentLogSource, AssignmentLogStream, AssignmentPhase, AssignmentQuery,
     AssignmentRun, AssignmentStep, ConnectionState, ControlError, LiveStepState, OpenWord,
-    Operation, Overview, OverviewAnswer, OverviewAssignment, OverviewEvent,
+    Operation, Overview, OverviewAnswer, OverviewAssignment, OverviewDisk, OverviewEvent,
     OverviewProviderReadiness, OverviewRecentAssignment, OverviewRunElement, OverviewRunningStep,
     OverviewWait, ProviderReadiness, RequestFailure, Response, RunResult, RunnerEventKind,
     StepPathPart,
@@ -466,6 +467,7 @@ fn control_refusal(error: ControlError) -> Vec<String> {
 fn view(overview: Overview) -> Option<RunnerWatchOverview> {
     let Overview {
         runner,
+        disk,
         connection,
         current_credential_id,
         pending_credential_id,
@@ -492,6 +494,7 @@ fn view(overview: Overview) -> Option<RunnerWatchOverview> {
         boot_id: runner.boot_id,
         version: runner.version,
         uptime: Duration::from_millis(runner.uptime_milliseconds),
+        disk: disk.as_ref().map(disk_view),
         stop_time_left: runner
             .stop_time_left_milliseconds
             .map(Duration::from_millis),
@@ -530,6 +533,16 @@ fn view(overview: Overview) -> Option<RunnerWatchOverview> {
         events: events.iter().map(event).collect::<Option<_>>()?,
         events_omitted,
     })
+}
+
+/// The disk reading's sizes and state; its path and time are the status command's to give.
+fn disk_view(disk: &OverviewDisk) -> RunnerWatchDisk {
+    RunnerWatchDisk {
+        available_bytes: disk.available_bytes,
+        total_bytes: disk.total_bytes,
+        minimum_free_bytes: disk.minimum_free_bytes,
+        low: disk.low,
+    }
 }
 
 fn connection_mark(state: &OpenWord<ConnectionState>) -> RunnerWatchMark {
@@ -772,6 +785,26 @@ fn event_text(entry: &OverviewEvent) -> (String, RunnerWatchMark) {
             "telemetry record dropped".to_owned(),
             RunnerWatchMark::Failure,
         ),
+        RunnerEventKind::DiskSpaceLow => {
+            let mut text = "disk low".to_owned();
+            if let Some(available) = entry.available_bytes {
+                text.push_str(&format!(", {} free", format_bytes(available)));
+            }
+            if let Some(minimum) = entry.minimum_free_bytes {
+                text.push_str(&format!(", minimum {}", format_bytes(minimum)));
+            }
+            (text, RunnerWatchMark::Failure)
+        }
+        RunnerEventKind::DiskSpaceRecovered => (
+            entry.available_bytes.map_or_else(
+                || "disk recovered".to_owned(),
+                |available| format!("disk recovered, {} free", format_bytes(available)),
+            ),
+            RunnerWatchMark::Success,
+        ),
+        RunnerEventKind::DiskLowOfferDeclined => {
+            (run("run declined, disk low"), RunnerWatchMark::Failure)
+        }
         RunnerEventKind::Stopping => ("stopping".to_owned(), RunnerWatchMark::Neutral),
     }
 }
@@ -1198,6 +1231,50 @@ mod tests {
         assert!(text_of(1, "run_01k0z6r1w8f4jy2m7q9v3x5abd"));
         assert!(text_of(1, "2 workspaces"));
         assert_eq!(view.events_omitted, 2);
+    }
+
+    // REQ-RUNNERENROLL-138: the disk's three events are drawn in words naming their sizes
+    // or their run, the turn to low and the declined offer as failures and the recovery as
+    // a success.
+    #[test]
+    fn the_disk_events_map_to_words_naming_their_sizes() {
+        let view = mapped(&fixture_named("overview-disk-events-response.json"));
+        let [recovered, declined, low] = view.events.as_slice() else {
+            panic!("expected three events: {:?}", view.events);
+        };
+        assert_eq!(declined.mark, RunnerWatchMark::Failure);
+        assert!(
+            declined.text.contains("run_01k0z6r1w8f4jy2m7q9v3x5abg"),
+            "{declined:?}"
+        );
+        assert_eq!(recovered.mark, RunnerWatchMark::Success);
+        assert!(
+            recovered.text.starts_with("disk recovered"),
+            "{recovered:?}"
+        );
+        assert!(recovered.text.contains("8.0 GiB"), "{recovered:?}");
+        assert_eq!(low.mark, RunnerWatchMark::Failure);
+        assert!(low.text.starts_with("disk low"), "{low:?}");
+        for size in ["1.0 GiB", "5.0 GiB"] {
+            assert!(low.text.contains(size), "{size}: {low:?}");
+        }
+    }
+
+    // REQ-RUNNERENROLL-140: the overview's disk reading maps with its sizes, minimum and low
+    // state, the member this release does not know left behind.
+    #[test]
+    fn the_disk_reading_maps_with_its_sizes_minimum_and_state() {
+        let view = mapped(&fixture_named("overview-disk-response.json"));
+        assert_eq!(
+            view.disk,
+            Some(RunnerWatchDisk {
+                available_bytes: 6_186_599,
+                total_bytes: 423_054_278_656,
+                minimum_free_bytes: 5_368_709_120,
+                low: true,
+            })
+        );
+        assert_eq!(mapped(&fixture_document()).disk, None);
     }
 
     // REQ-RUNNERENROLL-135: a phase, a result and an event kind this release does not know

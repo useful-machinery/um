@@ -70,6 +70,7 @@ use useful_execution::{
     DefinitionError, SubjectClaim, SubjectError, WITHDRAWN_OUTCOME, WorkflowHome, check_subject,
     chosen_outcome, failure_outcome, is_subject, read_definition,
 };
+use useful_execution::{RUNNER_DISK_GATE_ENVIRONMENT, RunnerDiskGate};
 
 mod cloud;
 
@@ -1694,9 +1695,20 @@ async fn execute_attempt_phases(
         .map_err(anyhow::Error::new)
         .context("load retained workflow values")?;
     let (run_id, attempt_id) = attempt.run()?.finalization_identity()?;
-    let execution_start =
+    // INV-ENGINE-46: a runner names the disk a tree run's attempts hold their steps by; a
+    // child attempt reads the same process environment.
+    let disk_gate = env::var_os(RUNNER_DISK_GATE_ENVIRONMENT)
+        .map(|value| {
+            RunnerDiskGate::from_environment_value(&value)
+                .map_err(|error| anyhow!("read {RUNNER_DISK_GATE_ENVIRONMENT}: {error}"))
+        })
+        .transpose()?;
+    let mut execution_start =
         WorkflowExecutionStart::seeded(attempt.run()?.process_guard_registry(), seed)
             .with_finalization_identity(run_id, attempt_id);
+    if let Some(gate) = disk_gate {
+        execution_start = execution_start.with_start_gate(Arc::new(gate.start_gate()));
+    }
     let commit_port =
         attempt
             .run()?

@@ -131,6 +131,13 @@ pub struct StatusSnapshot {
     /// REQ-TELEMETRY-52).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub log_path: Option<String>,
+    /// The serving process's newest reading of the work root's disk, present exactly when
+    /// its monitor has published one (REQ-RUNNERENROLL-42, REQ-RUNNERENROLL-152). A
+    /// `useful runner status` older than it refuses the answer of a process that has one,
+    /// the replaced-binary case chapter 11 documents (REQ-RUNNERENROLL-135). Boxed so the
+    /// reading does not grow every `Response` by its size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk: Option<Box<StatusDisk>>,
     pub connection_state: ConnectionState,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_connected_at: Option<String>,
@@ -154,6 +161,22 @@ pub struct StatusSnapshot {
     /// and absent from the answer of a serving process that predates it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub held_runs: Vec<HeldRun>,
+}
+
+/// A reading of the work root's disk as the serving process's monitor judged it
+/// (REQ-RUNNERENROLL-42, REQ-RUNNERENROLL-152). Closed like the snapshot that carries it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct StatusDisk {
+    /// The absolute path read, the work root.
+    pub path: String,
+    pub available_bytes: u64,
+    pub total_bytes: u64,
+    pub minimum_free_bytes: u64,
+    /// Whether `available_bytes` is below `minimum_free_bytes`.
+    pub low: bool,
+    /// When the read ended, RFC 3339.
+    pub read_at: String,
 }
 
 /// A provider in the runner's agent-login readiness.
@@ -833,15 +856,25 @@ fn valid_status(status: &StatusSnapshot) -> bool {
             .as_deref()
             .is_none_or(valid_timestamp)
         && status.agent_logins.as_ref().is_none_or(valid_readiness)
-        && status.log_path.as_deref().is_none_or(valid_log_path)
+        && status.log_path.as_deref().is_none_or(valid_host_path)
+        && status
+            .disk
+            .as_ref()
+            .is_none_or(|disk| valid_disk_reading(&disk.path, &disk.read_at))
 }
 
-/// The longest log path a status may carry, in characters.
-const MAXIMUM_LOG_PATH: usize = 4096;
+/// The longest host path an answer may carry, in characters.
+const MAXIMUM_HOST_PATH: usize = 4096;
 
-/// A status's log path: an absolute path of at most `MAXIMUM_LOG_PATH` characters.
-fn valid_log_path(path: &str) -> bool {
-    path.starts_with('/') && path.chars().count() <= MAXIMUM_LOG_PATH
+/// A host path an answer carries, the log's or the disk's: an absolute path of at most
+/// `MAXIMUM_HOST_PATH` characters.
+fn valid_host_path(path: &str) -> bool {
+    path.starts_with('/') && path.chars().count() <= MAXIMUM_HOST_PATH
+}
+
+/// A disk reading's path and time, as the status and the overview carry them.
+fn valid_disk_reading(path: &str, read_at: &str) -> bool {
+    valid_host_path(path) && valid_timestamp(read_at)
 }
 
 /// The most runs a status may list, the most assignments a runner holds.
@@ -1006,6 +1039,10 @@ pub enum LiveStepState {
 #[serde(rename_all = "camelCase")]
 pub struct Overview {
     pub runner: OverviewRunner,
+    /// The serving process's newest disk reading, absent while it has none
+    /// (REQ-RUNNERENROLL-133).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk: Option<OverviewDisk>,
     pub connection: OverviewConnection,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_credential_id: Option<String>,
@@ -1087,6 +1124,9 @@ pub enum RunnerEventKind {
     WorkspacesFound,
     ObservationRefused,
     TelemetryDropped,
+    DiskSpaceLow,
+    DiskSpaceRecovered,
+    DiskLowOfferDeclined,
     Stopping,
 }
 
@@ -1136,6 +1176,13 @@ pub struct OverviewEvent {
     pub assignment_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspaces: Option<u64>,
+    /// The space available on the work root's disk, of a `disk_space_low` or a
+    /// `disk_space_recovered`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub available_bytes: Option<u64>,
+    /// The minimum the disk fell below, of a `disk_space_low`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimum_free_bytes: Option<u64>,
 }
 
 const fn once() -> u64 {
@@ -1153,6 +1200,22 @@ pub struct OverviewRunner {
     /// The time left of the stop's bound, while the process is stopping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_time_left_milliseconds: Option<u64>,
+}
+
+/// The disk reading as the status snapshot gives it (REQ-RUNNERENROLL-133), open like
+/// every overview type (REQ-RUNNERENROLL-135).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverviewDisk {
+    /// The absolute path read, the work root.
+    pub path: String,
+    pub available_bytes: u64,
+    pub total_bytes: u64,
+    pub minimum_free_bytes: u64,
+    /// Whether `available_bytes` is below `minimum_free_bytes`.
+    pub low: bool,
+    /// When the read ended, RFC 3339.
+    pub read_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1415,6 +1478,10 @@ fn valid_overview(overview: &Overview) -> bool {
     let mut assignment_ids = BTreeSet::new();
     typed(&overview.runner.runner_id, "rnr_")
         && typed(&overview.runner.boot_id, "rbt_")
+        && overview
+            .disk
+            .as_ref()
+            .is_none_or(|disk| valid_disk_reading(&disk.path, &disk.read_at))
         && overview
             .connection
             .last_connected_at
@@ -1857,6 +1924,7 @@ mod tests {
             boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             uptime_milliseconds: 0,
             log_path: None,
+            disk: None,
             connection_state: ConnectionState::Connecting,
             last_connected_at: None,
             current_credential_id: None,
@@ -1978,6 +2046,96 @@ mod tests {
         };
         let encoded = encode_response(&Response::Status(empty)).unwrap();
         assert_eq!(decode_response(&encoded), Err(ProtocolFailure::Invalid));
+    }
+
+    /// The reading the disk fixtures state.
+    fn fixture_disk_reading() -> (String, u64, u64, u64, bool, String) {
+        (
+            "/var/lib/useful/runner/work".to_owned(),
+            6_186_599,
+            423_054_278_656,
+            5_368_709_120,
+            true,
+            "2026-11-19T14:00:30Z".to_owned(),
+        )
+    }
+
+    // REQ-RUNNERENROLL-42, REQ-RUNNERENROLL-135: the status snapshot's disk reading decodes
+    // and encodes back to its bytes; the snapshot stays closed inside the reading, which
+    // carries an absolute path, and a snapshot without one decodes with none.
+    #[test]
+    fn status_with_a_disk_reading_decodes_and_an_unknown_member_or_relative_path_is_refused() {
+        let cli_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let fixtures = cli_root.join("tests/fixtures/runner-control/v1");
+        let read = |path: &str| std::fs::read(fixtures.join(path)).unwrap();
+
+        let valid = read("valid/status-disk-low-response.json");
+        let Ok(Response::Status(status)) = decode_response(&valid) else {
+            panic!("the disk snapshot did not decode");
+        };
+        let disk = status
+            .disk
+            .clone()
+            .expect("the snapshot carries its reading");
+        assert_eq!(
+            (
+                disk.path,
+                disk.available_bytes,
+                disk.total_bytes,
+                disk.minimum_free_bytes,
+                disk.low,
+                disk.read_at,
+            ),
+            fixture_disk_reading()
+        );
+        assert_eq!(
+            encode_response(&Response::Status(status.clone())).unwrap(),
+            valid
+        );
+
+        for refused in [
+            "invalid/status-disk-unknown-member.json",
+            "invalid/status-disk-relative-path.json",
+        ] {
+            assert_eq!(
+                decode_response(&read(refused)),
+                Err(ProtocolFailure::Invalid),
+                "{refused}"
+            );
+        }
+        let mut unreadable_time = status;
+        if let Some(disk) = unreadable_time.disk.as_mut() {
+            disk.read_at = "yesterday".to_owned();
+        }
+        let encoded = encode_response(&Response::Status(unreadable_time)).unwrap();
+        assert_eq!(decode_response(&encoded), Err(ProtocolFailure::Invalid));
+
+        let Ok(Response::Status(idle)) = decode_response(&read("valid/status-idle-response.json"))
+        else {
+            panic!("the idle snapshot did not decode");
+        };
+        assert_eq!(idle.disk, None);
+    }
+
+    // REQ-RUNNERENROLL-133, REQ-RUNNERENROLL-135: the overview's disk reading decodes with
+    // what it states, a member of it this release does not know dropped.
+    #[test]
+    fn an_overview_disk_reading_decodes_and_drops_a_member_it_does_not_know() {
+        let overview = decoded_overview(&overview_fixture("valid/overview-disk-response.json"));
+        let disk = overview.disk.expect("the overview carries its reading");
+        assert_eq!(
+            (
+                disk.path,
+                disk.available_bytes,
+                disk.total_bytes,
+                disk.minimum_free_bytes,
+                disk.low,
+                disk.read_at,
+            ),
+            fixture_disk_reading()
+        );
+        let idle = decoded_overview(&overview_fixture("valid/overview-idle-response.json"));
+        assert_eq!(idle.disk, None);
     }
 
     fn readiness() -> AgentLoginReadiness {
@@ -2697,6 +2855,7 @@ mod tests {
             boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
             uptime_milliseconds: 10,
             log_path: None,
+            disk: None,
             connection_state: ConnectionState::Connecting,
             last_connected_at: None,
             current_credential_id: Some("rrc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned()),
@@ -2736,6 +2895,7 @@ mod tests {
                 process_state: OpenWord::Known(ProcessState::Stopping),
                 stop_time_left_milliseconds: Some(298_000),
             },
+            disk: None,
             connection: OverviewConnection {
                 state: OpenWord::Known(ConnectionState::BackingOff),
                 last_connected_at: Some("2026-11-19T14:02:00Z".to_owned()),
@@ -2900,6 +3060,8 @@ mod tests {
             run_id: None,
             assignment_id: None,
             workspaces: None,
+            available_bytes: None,
+            minimum_free_bytes: None,
         };
         vec![
             event(12, RunnerEventKind::Stopping, 1),
@@ -2990,6 +3152,59 @@ mod tests {
             )),
             Err(ControlError::InvalidRequest)
         );
+    }
+
+    // REQ-RUNNERENROLL-138: the disk's three events decode with their kinds and their
+    // facts, the space available and, of the turn to low, the minimum, and of the declined
+    // offer, its run and assignment, and encode back to their bytes.
+    #[test]
+    fn the_disk_events_decode_with_their_facts_and_encode_to_their_bytes() {
+        let bytes = overview_fixture("valid/overview-disk-events-response.json");
+        let overview = decoded_overview(&bytes);
+        let facts = overview
+            .events
+            .iter()
+            .map(|event| {
+                (
+                    event.kind.clone(),
+                    event.count,
+                    event.available_bytes,
+                    event.minimum_free_bytes,
+                    event.run_id.as_deref(),
+                    event.assignment_id.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            facts,
+            [
+                (
+                    OpenWord::Known(RunnerEventKind::DiskSpaceRecovered),
+                    1,
+                    Some(8_589_934_592),
+                    None,
+                    None,
+                    None
+                ),
+                (
+                    OpenWord::Known(RunnerEventKind::DiskLowOfferDeclined),
+                    1,
+                    None,
+                    None,
+                    Some("run_01k0z6r1w8f4jy2m7q9v3x5abg"),
+                    Some("asn_01k0z6r1w8f4jy2m7q9v3x5abh")
+                ),
+                (
+                    OpenWord::Known(RunnerEventKind::DiskSpaceLow),
+                    1,
+                    Some(1_073_741_824),
+                    Some(5_368_709_120),
+                    None,
+                    None
+                ),
+            ]
+        );
+        assert_eq!(encode_overview_response(&overview).unwrap(), bytes);
     }
 
     // REQ-RUNNERENROLL-135, REQ-RUNNERENROLL-137, REQ-RUNNERENROLL-138: a member this

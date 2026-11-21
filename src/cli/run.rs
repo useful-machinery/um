@@ -1756,6 +1756,13 @@ fn write_observation_human(
         if let Some(reason) = &decline.reason {
             writeln!(out, "  reason: {}", enum_text(reason)?)?;
         }
+        if let Some(cause) = decline
+            .diagnostic
+            .as_deref()
+            .and_then(|diagnostic| diagnostic.decline_cause.as_deref())
+        {
+            writeln!(out, "  cause: {}", visible_text(cause))?;
+        }
         writeln!(out, "  runner: {}", decline.runner_id)?;
         writeln!(out, "  declined at: {}", decline.declined_at)?;
     }
@@ -2429,7 +2436,7 @@ mod tests {
             "lastDecline": {"code": "runner_unable", "reason": "source_service_unavailable",
                 "runnerId": "runner-c", "declinedAt": "2026-08-03T11:59:00Z",
                 "diagnostic": {"stage": "decline-stage-sentinel",
-                    "declineCause": "decline-cause-sentinel",
+                    "declineCause": "source_repository_unavailable",
                     "transportError": "decline-transport-sentinel"}},
             "lastTransition": {"attemptId": "attempt-a", "eventSequence": 3,
                 "transitionSequence": 2, "recordedAt": "2026-08-03T11:00:00Z",
@@ -2452,12 +2459,91 @@ mod tests {
         ] {
             assert!(output.contains(identifier), "missing {identifier}");
         }
+        assert_eq!(
+            line_after(&output, "  reason: source_service_unavailable"),
+            Some("  cause: source_repository_unavailable"),
+            "decline cause belongs under its reason in {output}"
+        );
         assert!(
             !output.contains("sentinel"),
             "runner diagnostic rendered in {output}"
         );
         // The public projection is serialized by the run-show command; the human
         // rendering must keep placement separate from coordinator progress.
+    }
+
+    fn line_after<'a>(output: &'a str, line: &str) -> Option<&'a str> {
+        let mut lines = output.lines();
+        lines.find(|candidate| *candidate == line)?;
+        lines.next()
+    }
+
+    fn render_decline(decline: serde_json::Value) -> String {
+        let observation: RunObservation = serde_json::from_value(serde_json::json!({
+            "observedAt": "2026-08-03T12:00:00Z",
+            "placement": null,
+            "assignment": null,
+            "lastTransition": null,
+            "lastDecline": decline,
+        }))
+        .expect("valid run observation");
+        let mut output = Vec::new();
+        write_observation_human(&mut output, &observation).expect("render observation");
+        String::from_utf8(output).expect("human report is UTF-8")
+    }
+
+    // REQ-DIAG-29, REQ-DIAG-44
+    #[test]
+    fn run_show_prints_decline_cause_after_code_when_decline_has_no_reason() {
+        let output = render_decline(serde_json::json!({
+            "code": "capacity_unavailable", "runnerId": "runner-c",
+            "declinedAt": "2026-08-03T11:59:00Z",
+            "diagnostic": {"stage": "host_disk", "declineCause": "disk_space_low"}
+        }));
+        assert_eq!(
+            line_after(&output, "  code: capacity_unavailable"),
+            Some("  cause: disk_space_low"),
+            "decline cause belongs under its code in {output}"
+        );
+        assert!(!output.contains("host_disk"), "stage rendered in {output}");
+    }
+
+    // REQ-DIAG-29
+    #[test]
+    fn run_show_prints_no_decline_cause_when_diagnostic_names_none() {
+        for decline in [
+            serde_json::json!({"code": "runner_unable", "reason": "source_service_unavailable",
+                "runnerId": "runner-c", "declinedAt": "2026-08-03T11:59:00Z"}),
+            serde_json::json!({"code": "runner_unable", "reason": "source_service_unavailable",
+                "runnerId": "runner-c", "declinedAt": "2026-08-03T11:59:00Z",
+                "diagnostic": {"stage": "source_materialization"}}),
+        ] {
+            let output = render_decline(decline);
+            assert!(
+                output.contains("last placement decline:"),
+                "decline missing from {output}"
+            );
+            assert!(!output.contains("cause:"), "cause rendered in {output}");
+        }
+    }
+
+    // REQ-DIAG-29
+    #[test]
+    fn run_show_escapes_control_characters_in_decline_cause() {
+        let output = render_decline(serde_json::json!({
+            "code": "capacity_unavailable", "runnerId": "runner-c",
+            "declinedAt": "2026-08-03T11:59:00Z",
+            "diagnostic": {"declineCause": "disk\u{1b}[2Jlow"}
+        }));
+        assert!(
+            !output.contains('\u{1b}'),
+            "raw escape rendered in {output}"
+        );
+        assert_eq!(
+            line_after(&output, "  code: capacity_unavailable"),
+            Some("  cause: disk\\x1b[2Jlow"),
+            "cause not escaped in {output}"
+        );
     }
 
     struct ScriptedObservationApi {

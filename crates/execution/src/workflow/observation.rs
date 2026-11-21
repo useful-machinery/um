@@ -53,6 +53,16 @@ pub struct CommandOutputClosedObservation {
     pub(crate) sequence: SourceSequence,
 }
 
+/// The driver held a start of `step` at its start gate because the disk is low
+/// (INV-ENGINE-46): sent once for that start, before it waits.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartHeldObservation {
+    pub(crate) step: String,
+    pub(crate) invocation: ActionId,
+    pub(crate) available_bytes: u64,
+    pub(crate) minimum_free_bytes: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ObservedStepTransition {
     Recovery {
@@ -137,6 +147,7 @@ pub enum ExecutionObservation<Deadline> {
     CommandOutput(CommandOutputObservation),
     CommandOutputClosed(CommandOutputClosedObservation),
     Agent(AgentObservationEnvelope),
+    StartHeld(StartHeldObservation),
 }
 
 pub trait ExecutionObserver<Deadline>: Clone + Send + Sync + 'static {

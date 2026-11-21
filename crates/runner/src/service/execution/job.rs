@@ -25,6 +25,7 @@ impl ExecutionJob {
             workspace_release_reported: AtomicBool::new(false),
             run_event,
             view: None,
+            start_gate: Arc::new(super::super::disk::DiskReadingHandle::new()),
         }
     }
 
@@ -35,6 +36,12 @@ impl ExecutionJob {
             view: Some(view),
             ..self
         }
+    }
+
+    /// The job, its single-workflow run's engine consulting `start_gate` before each command
+    /// or agent step (REQ-RUNNERENROLL-155, INV-ENGINE-46).
+    pub(in crate::service) fn with_start_gate(self, start_gate: Arc<dyn StepStartGate>) -> Self {
+        Self { start_gate, ..self }
     }
 
     #[cfg(test)]

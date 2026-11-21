@@ -8836,3 +8836,145 @@ fn admission_refuses_wait_targets_and_workflow_steps_outside_a_tree() {
     );
     assert!(!destination.exists());
 }
+
+/// The largest minimum the runner's disk gate may name; no disk has that much free.
+const UNREACHABLE_MINIMUM_FREE_BYTES: u64 = 9_007_199_254_740_991;
+
+/// The scope of each `held` record in a progress stream whose detail begins `disk space low`
+/// and gives the unreachable minimum as `format_bytes` writes it (REQ-LOCALRUN-222).
+fn held_disk_scopes(stream: &str) -> Vec<String> {
+    let minimum = useful_execution::format_bytes(UNREACHABLE_MINIMUM_FREE_BYTES);
+    stream
+        .lines()
+        .filter_map(|line| {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            (fields.get(2) == Some(&"held")).then(|| {
+                assert_eq!(
+                    fields.get(3..6),
+                    Some(&["disk", "space", "low:"][..]),
+                    "{line}"
+                );
+                assert!(line.contains(&minimum), "{line}");
+                fields[1].to_owned()
+            })
+        })
+        .collect()
+}
+
+/// Spawns `command` with the runner's disk gate naming `disk` and the unreachable minimum,
+/// its standard error in `log`; waits until the stream holds a `held` record, checks that it
+/// is the only one and names `scope`, then interrupts the command and returns its output.
+fn interrupt_held_start(mut command: Command, disk: &Path, log: &Path, scope: &str) -> Output {
+    let child = command
+        .env(
+            "USEFUL_RUNNER_DISK_GATE",
+            format!("{UNREACHABLE_MINIMUM_FREE_BYTES}:{}", disk.display()),
+        )
+        .stdout(Stdio::piped())
+        .stderr(File::create(log).unwrap())
+        .spawn()
+        .unwrap();
+    let held = poll_until(
+        "the held record",
+        || held_disk_scopes(&fs::read_to_string(log).unwrap()),
+        |held| !held.is_empty(),
+    );
+    assert_eq!(held, [scope]);
+    kill_process(
+        Pid::from_raw(i32::try_from(child.id()).unwrap()).unwrap(),
+        Signal::INT,
+    )
+    .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stream = fs::read_to_string(log).unwrap();
+    assert_eq!(output.status.code(), Some(130), "{stream}");
+    assert_eq!(held_disk_scopes(&stream), [scope], "{stream}");
+    output
+}
+
+// INV-ENGINE-46, REQ-LOCALRUN-222: with the runner's variable naming a disk below its minimum,
+// `useful workflow run create` holds its command step, writes one `held` record for it and
+// never runs the command; SIGINT ends it with 130 as for any starting step.
+#[test]
+fn the_runner_disk_gate_holds_a_command_step_until_interrupted() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: [touch, marker]\n",
+    );
+    let destination = bundle.result("held");
+    let mut args = bundle.args(&destination);
+    args.insert(args.len() - 1, "--json".to_owned());
+
+    let output = interrupt_held_start(
+        isolated_command(&args),
+        bundle.initial_cwd(),
+        &bundle.initial_cwd().join("stderr.log"),
+        "work",
+    );
+
+    let terminal: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&terminal), "{terminal}");
+    assert!(!bundle.execution_root().join("marker").exists());
+}
+
+// INV-ENGINE-46, REQ-LOCALRUN-222, REQ-LOCALRUN-200: a `workflow` step is not held, and its
+// child's command step is, under the scope `<step>.<child step>`.
+#[test]
+fn the_runner_disk_gate_holds_a_child_step_under_its_position_path() {
+    let bundle = TreeBundle::new(
+        "schemaVersion: 1\noutcomes: [landed, failed]\nsteps:\n  design:\n    kind: workflow\n    workflow: design.yaml\n    on:\n      planned: exit.landed\n      failed: exit.failed\n",
+    );
+    bundle.write_source(
+        "design.yaml",
+        "schemaVersion: 1\noutcomes: [planned, failed]\noutcome: { from: outputs.work.verdict, onFailure: failed }\nsteps:\n  work:\n    kind: cmd\n    command: { argv: [touch, marker] }\n    outputs:\n      verdict: { kind: text, from: path, path: verdict.txt }\n",
+    );
+    let destination = bundle.result("held-child");
+
+    interrupt_held_start(
+        isolated_command(&bundle.args(&destination)),
+        bundle.temporary.path(),
+        &bundle.temporary.path().join("stderr.log"),
+        "design.work",
+    );
+
+    assert!(!bundle.execution_root().join("marker").exists());
+}
+
+// INV-ENGINE-46: with minimum 0 the gate never holds, the run succeeds and the variable never
+// reaches the step's environment; a value the attempt cannot read fails it before any step.
+#[test]
+fn the_runner_disk_gate_at_zero_holds_nothing_and_a_malformed_one_starts_nothing() {
+    let bundle = RunBundle::new(
+        "schemaVersion: 1\nsteps:\n  work:\n    kind: cmd\n    command:\n      argv: [sh, -c, 'env > environment.txt']\n",
+    );
+    let recorded = bundle.execution_root().join("environment.txt");
+    let run_with = |name: &str, value: String| {
+        let destination = bundle.result(name);
+        let mut args = bundle.args(&destination);
+        args.insert(args.len() - 1, "--json".to_owned());
+        isolated_command(&args)
+            .env("USEFUL_RUNNER_DISK_GATE", value)
+            .output()
+            .unwrap()
+    };
+
+    let malformed = run_with("malformed", "five:/".to_owned());
+    assert!(!malformed.status.success(), "{malformed:?}");
+    assert!(
+        String::from_utf8_lossy(&malformed.stderr).contains("USEFUL_RUNNER_DISK_GATE"),
+        "{malformed:?}"
+    );
+    assert!(!recorded.exists());
+
+    let output = run_with("open", format!("0:{}", bundle.initial_cwd().display()));
+    let terminal = succeeded(&output);
+    assert_eq!(terminal["result"]["steps"][0]["state"], "succeeded");
+    assert!(held_disk_scopes(&String::from_utf8(output.stderr).unwrap()).is_empty());
+    let environment = fs::read_to_string(&recorded).unwrap();
+    assert!(environment.lines().any(|line| line.starts_with("PATH=")));
+    assert!(
+        !environment
+            .lines()
+            .any(|line| line.starts_with("USEFUL_RUNNER_DISK_GATE=")),
+        "{environment}"
+    );
+}

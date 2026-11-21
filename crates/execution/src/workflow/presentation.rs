@@ -25,7 +25,8 @@ use super::local_run::{
     CarryMiss, LocalRetryRejection, RetryIneligibilityReason, TreeCopyMismatch,
 };
 use super::observation::{
-    ExecutionObservation, ExecutionObserver, ObservedStepTransition, TransitionObservation,
+    ExecutionObservation, ExecutionObserver, ObservedStepTransition, StartHeldObservation,
+    TransitionObservation,
 };
 use super::presentation_feed::{
     AcceptedRecordOrder, AgentPresentationHarness, DisplayDeadline, NormalizedAgentObservation,
@@ -51,6 +52,7 @@ use super::tree::{TreeDiagnostic, TreeLocation};
 use super::validated::{Scheduling, ValidatedStep};
 use super::wait::position_path;
 use crate::AgentHarnessInstallationFailure;
+use crate::format_bytes;
 use crate::harness_installation::UntestedHarnessAdvisory;
 
 const RUN_COMMAND: &str = "useful workflow run create";
@@ -1823,36 +1825,51 @@ struct ChildStepScope {
     step_starts: BTreeMap<String, Instant>,
 }
 
+/// What a child run forwards into its root's stream for one of its steps.
+enum ChildStepRecord<Deadline> {
+    Transition(Box<TransitionObservation<Deadline>>),
+    StartHeld(StartHeldObservation),
+}
+
 impl ChildStepScope {
     fn render<StandardOutput: Write, StandardError: Write, Deadline>(
         &mut self,
         state: &mut PresentationState<StandardOutput, StandardError>,
         position: &[serde_json::Value],
         observed_at: ObservationTime,
-        transition: TransitionObservation<Deadline>,
+        record: ChildStepRecord<Deadline>,
     ) -> Result<(), PresentationFailure> {
-        let TransitionEvent::Step {
-            step,
-            failure_policy,
-            to,
-            ..
-        } = transition.event
-        else {
-            return Ok(());
+        let (step, records) = match record {
+            ChildStepRecord::Transition(transition) => {
+                let TransitionEvent::Step {
+                    step,
+                    failure_policy,
+                    to,
+                    ..
+                } = transition.event
+                else {
+                    return Ok(());
+                };
+                let records = StepRecords {
+                    workflow: &self.workflow,
+                    definition: &self.definition,
+                    step_starts: &mut self.step_starts,
+                    outputs: false,
+                }
+                .transition(
+                    observed_at.monotonic,
+                    &step,
+                    failure_policy,
+                    to,
+                    transition.step,
+                );
+                (step, records)
+            }
+            ChildStepRecord::StartHeld(held) => {
+                let records = start_held_records(&held);
+                (held.step, records)
+            }
         };
-        let records = StepRecords {
-            workflow: &self.workflow,
-            definition: &self.definition,
-            step_starts: &mut self.step_starts,
-            outputs: false,
-        }
-        .transition(
-            observed_at.monotonic,
-            &step,
-            failure_policy,
-            to,
-            transition.step,
-        );
         let mut position = position.to_vec();
         position.push(serde_json::Value::String(step));
         state.write_step_records(observed_at.utc, &position_path(&position), records)?;
@@ -1872,20 +1889,24 @@ where
         &self,
         observation: ExecutionObservation<Deadline>,
     ) -> impl Future<Output = ()> + Send {
-        let forwarded = match (observation, &self.steps) {
-            (ExecutionObservation::Transition(transition), Some(steps))
+        let record = match observation {
+            ExecutionObservation::Transition(transition)
                 if matches!(transition.event, TransitionEvent::Step { .. }) =>
             {
-                let (steps, position) = (Arc::clone(steps), Arc::clone(&self.position));
-                Some(self.parent.enqueue_render(move |state, observed_at| {
-                    steps
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .render(state, &position, observed_at, *transition)
-                }))
+                Some(ChildStepRecord::Transition(transition))
             }
+            ExecutionObservation::StartHeld(held) => Some(ChildStepRecord::StartHeld(held)),
             _ => None,
         };
+        let forwarded = record.zip(self.steps.as_ref()).map(|(record, steps)| {
+            let (steps, position) = (Arc::clone(steps), Arc::clone(&self.position));
+            self.parent.enqueue_render(move |state, observed_at| {
+                steps
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .render(state, &position, observed_at, record)
+            })
+        });
         async move {
             if let Some(forwarded) = forwarded {
                 forwarded.await;
@@ -2061,6 +2082,9 @@ where
             }
             PresentationRecordKind::AgentObservation(observation) => {
                 self.render_agent_observation(record.observed_at, observation)
+            }
+            PresentationRecordKind::StartHeld(held) => {
+                self.write_step_records(record.observed_at, &held.step, start_held_records(&held))
             }
         }
     }
@@ -2750,6 +2774,19 @@ struct SummaryRow {
 
 /// One state record of a step: its token, detail and role.
 type StepRecord = (&'static str, String, TokenRole);
+
+/// The one record of a start held at the start gate (REQ-LOCALRUN-222).
+fn start_held_records(held: &StartHeldObservation) -> Vec<StepRecord> {
+    vec![(
+        "held",
+        format!(
+            "disk space low: {} free, minimum {}",
+            format_bytes(held.available_bytes),
+            format_bytes(held.minimum_free_bytes)
+        ),
+        TokenRole::Blocked,
+    )]
+}
 
 /// The state records of one workflow's steps and finalizers, rendered against that
 /// workflow's definitions and the starts observed for its steps: the root's own, or a

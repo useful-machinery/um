@@ -490,7 +490,8 @@ fn observed_stream(
             ExecutionObservation::Transition(_)
             | ExecutionObservation::CommandOutput(_)
             | ExecutionObservation::CommandOutputClosed(_)
-            | ExecutionObservation::Agent(_) => None,
+            | ExecutionObservation::Agent(_)
+            | ExecutionObservation::StartHeld(_) => None,
         })
         .collect::<Vec<_>>();
     assert!(!observations.is_empty());
@@ -515,7 +516,8 @@ fn observed_stream(
             ExecutionObservation::Transition(_)
             | ExecutionObservation::CommandOutput(_)
             | ExecutionObservation::CommandOutputClosed(_)
-            | ExecutionObservation::Agent(_) => None,
+            | ExecutionObservation::Agent(_)
+            | ExecutionObservation::StartHeld(_) => None,
         })
         .collect::<Vec<_>>();
     assert_eq!(closed.len(), 1);

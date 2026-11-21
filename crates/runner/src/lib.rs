@@ -34,10 +34,10 @@ pub use control_protocol::{
     AssignmentRun, AssignmentStep, AssignmentWorkflow, ConnectionFailure, ConnectionState,
     ControlError, CredentialSource, HeldRun, HeldRunState, LeaseHealth, LiveStepState, OpenWord,
     Operation, Overview, OverviewAgentLogins, OverviewAnswer, OverviewAssignment,
-    OverviewConnection, OverviewCounts, OverviewEvent, OverviewLease, OverviewProviderReadiness,
-    OverviewRecentAssignment, OverviewRunElement, OverviewRunner, OverviewRunningStep,
-    OverviewWait, ProcessState, ProtocolFailure, ProviderReadiness, Response, RunResult,
-    RunnerEventKind, StatusSnapshot, StepPathPart,
+    OverviewConnection, OverviewCounts, OverviewDisk, OverviewEvent, OverviewLease,
+    OverviewProviderReadiness, OverviewRecentAssignment, OverviewRunElement, OverviewRunner,
+    OverviewRunningStep, OverviewWait, ProcessState, ProtocolFailure, ProviderReadiness, Response,
+    RunResult, RunnerEventKind, StatusDisk, StatusSnapshot, StepPathPart,
 };
 pub use doctor::{
     CheckDescriptor, CheckResult, CredentialKind, CredentialOrigin, CredentialRequirement,

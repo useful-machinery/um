@@ -8,6 +8,7 @@ mod control;
 mod conversation;
 #[cfg(test)]
 mod determinism_spike;
+mod disk;
 mod execution;
 mod history;
 mod lease_clock;
@@ -443,6 +444,8 @@ struct ConnectionLoopDependencies {
     /// Agent-login setup, for a runner with protected state to record its
     /// readiness beside.
     agent_login_setup: Option<SetupDependencies>,
+    /// The disk monitor's reader and sleeper; a loop without them starts no monitor.
+    disk: Option<disk::DiskMonitorDependencies>,
 }
 
 #[derive(Debug)]
@@ -597,6 +600,10 @@ async fn run_until_cancelled(
             Arc::clone(&recorder),
         )
     });
+    let disk = Some(disk::DiskMonitorDependencies {
+        reader: Arc::new(disk::SystemDiskReader),
+        sleeper: Arc::clone(&sleeper),
+    });
     Box::pin(run_connection_loop(
         ConnectionLoopDependencies {
             config,
@@ -607,6 +614,7 @@ async fn run_until_cancelled(
             boot_id,
             source_broker: None,
             agent_login_setup,
+            disk,
         },
         &WebSocketConnector,
         Backoff::new(),
@@ -636,6 +644,7 @@ fn fixture_loop_dependencies(
         boot_id,
         source_broker,
         agent_login_setup: None,
+        disk: None,
     })
 }
 
@@ -801,17 +810,38 @@ async fn connection_loop_with_work_root(
         boot_id,
         source_broker,
         agent_login_setup,
+        disk,
     } = dependencies;
-    let live_status = Arc::new(
-        LiveStatus::new(
-            boot_id.clone(),
-            config.credential().credential_id().to_owned(),
-            config
-                .startup_pending()
-                .map(|pending| pending.credential_id.clone()),
-        )
-        .with_log_path(recorder.log_path()),
-    );
+    // The monitor publishes its reading of the work root's disk in this handle, which the
+    // control socket's answers and the offer rule copy from (INV-RUNNER-49, INV-RUNNER-50);
+    // a service without a monitor has none, its answers carry no reading and its offer rule
+    // never finds the disk low.
+    let disk_reading = disk.as_ref().map(|_| disk::DiskReadingHandle::new());
+    let mut live_status = LiveStatus::new(
+        boot_id.clone(),
+        config.credential().credential_id().to_owned(),
+        config
+            .startup_pending()
+            .map(|pending| pending.credential_id.clone()),
+    )
+    .with_log_path(recorder.log_path());
+    if let Some(reading) = &disk_reading {
+        live_status = live_status.with_disk(reading.clone());
+    }
+    let live_status = Arc::new(live_status);
+    // The monitor reads the work root's disk from here until the loop returns.
+    let _disk_monitor = disk
+        .zip(disk_reading.clone())
+        .map(|(dependencies, reading)| {
+            disk::DiskMonitor::start(
+                dependencies,
+                reading,
+                config.assignment().work_root().to_owned(),
+                config.minimum_free_disk_bytes(),
+                Arc::clone(live_status.events()),
+                Arc::clone(&recorder),
+            )
+        });
     recorder.set_dropped_record_observer(Arc::<history::EventLog>::clone(live_status.events()));
     let assignment_dependencies = AssignmentDependencies::production(
         &config,
@@ -822,6 +852,26 @@ async fn connection_loop_with_work_root(
         source_broker,
     )?
     .with_events(Arc::clone(live_status.events()));
+    // The offer rule declines new runs while the monitor's reading is low (INV-RUNNER-50),
+    // and a running run holds its next step while it is (REQ-RUNNERENROLL-155): a
+    // single-workflow run on the monitor's reading, a tree run's `useful` commands on the
+    // same disk and minimum, which they read themselves and are given only above 0.
+    let assignment_dependencies = match disk_reading {
+        Some(reading) => {
+            // The configuration already refuses what `RunnerDiskGate::new` refuses: its work
+            // root is canonical and its minimum at most the largest allowed.
+            let tree_gate = match config.minimum_free_disk_bytes() {
+                0 => None,
+                minimum => useful_execution::RunnerDiskGate::new(
+                    config.assignment().work_root().to_owned(),
+                    minimum,
+                )
+                .ok(),
+            };
+            assignment_dependencies.with_disk(reading, tree_gate)
+        }
+        None => assignment_dependencies,
+    };
     let assignment_manager = Arc::new(Mutex::new(AssignmentManager::new(
         &config,
         lease_clock,
@@ -2307,6 +2357,7 @@ mod tests {
             boot_id: boot_id.clone(),
             source_broker: None,
             agent_login_setup: None,
+            disk: None,
         };
         let remover = Arc::new(FailingBootRemover {
             calls: AtomicUsize::new(0),
@@ -5540,6 +5591,7 @@ mod tests {
                         state.path(),
                         recorder,
                     )),
+                    disk: None,
                 };
                 let work_root =
                     WorkRootLease::acquire_for_test(config.assignment().work_root(), &boot_id)

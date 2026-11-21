@@ -4,13 +4,21 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use super::*;
+use crate::service::assignment::AssignmentCancel;
+use crate::service::assignment::test_support::{
+    accepted_roots, align_fixture_capacity, prepare_offered, queued_assignment_reports,
+    start_offered, wait_for_reports,
+};
 use crate::service::lease_clock::{LeaseTimerRelease, controlled_lease_clock};
+use crate::service::source::test_support::fixture_source_broker;
 use crate::service::test_support::{
-    controlled_sleeper, fixture_run_view, sleep_request, step_execution_transition, with_watchdog,
+    controlled_sleeper, fixture_run_view, require_internal_worker_executable, run_fixture_git,
+    sleep_request, step_execution_transition, tree_fixture, with_watchdog,
 };
 use useful_execution::{
     CommitFailure, CommitFailureClass, ExecutionSettlement, ObservedExecutions,
-    RecoveryFailureKind, SettledExecution, StartedExecution, StepFailureKind,
+    RecoveryFailureKind, SettledExecution, StartGateReading, StartedExecution, StepFailureKind,
+    StepStartGate,
 };
 use useful_runner_protocol::{MAXIMUM_ORDINARY_FRAME_BYTES, RunnerEnvelope, RunnerFrame};
 
@@ -1887,4 +1895,117 @@ async fn the_pairs_second_observer_sees_a_transition_after_the_runners_counted_i
 
     assert_eq!(observer.last_sequence(), 6);
     assert_eq!(*second.seen.lock().unwrap(), [1, 2, 3, 4, 5, 6]);
+}
+
+/// A start gate finding the disk low at every read, telling the test of each read.
+struct LowDiskGate {
+    reads: tokio::sync::mpsc::UnboundedSender<()>,
+}
+
+impl StepStartGate for LowDiskGate {
+    fn read(&self) -> StartGateReading {
+        let _ = self.reads.send(());
+        StartGateReading::DiskLow {
+            available_bytes: 1024 * 1024 * 1024,
+            minimum_free_bytes: 5 * 1024 * 1024 * 1024,
+        }
+    }
+}
+
+/// The tree fixture's manager offered a single-workflow run of `workflow` instead: the
+/// fixture repository commits it as `workflow.yaml` and the offer names that commit and
+/// carries the capacity it resolves to.
+fn single_workflow_fixture(workflow: &str) -> tree_fixture::Fixture {
+    require_internal_worker_executable();
+    let mut fixture = tree_fixture::fixture_sourced(
+        tree_fixture::TREE_DIGEST,
+        "exited",
+        "null",
+        &[],
+        None,
+        |dependencies| dependencies,
+        fixture_source_broker,
+        tree_fixture::TREE_FILES,
+    );
+    std::fs::write(fixture.source.join("workflow.yaml"), workflow).unwrap();
+    run_fixture_git(&fixture.source, &["add", "workflow.yaml"]);
+    run_fixture_git(&fixture.source, &["commit", "--quiet", "-m", "workflow"]);
+    let commit = run_fixture_git(&fixture.source, &["rev-parse", "HEAD"]);
+    let spec = &mut fixture.offer.execution_spec;
+    spec.workflow_tree = None;
+    spec.workflow_definition_source.workflow_path = "workflow.yaml".to_owned();
+    spec.workflow_definition_source
+        .commit_oid
+        .clone_from(&commit);
+    spec.primary_workspace_source.commit_oid = commit;
+    let resolved = useful_execution::resolve(&fixture.source, Path::new("workflow.yaml")).unwrap();
+    align_fixture_capacity(spec, &resolved);
+    fixture
+}
+
+// REQ-RUNNERENROLL-155: the engine of a single-workflow assignment consults the gate its job
+// carries; while the gate finds the disk low the first step stays `starting` with its command
+// not run, and cancelling the assignment ends it without the step ever having started.
+#[tokio::test]
+async fn a_single_workflow_runs_first_step_waits_at_a_low_disk_gate_until_cancelled() {
+    let mut fixture = single_workflow_fixture(
+        "schemaVersion: 1\nsteps:\n  task:\n    kind: cmd\n    command:\n      argv: [touch, marker]\n",
+    );
+    assert_eq!(
+        prepare_offered(&mut fixture.manager, &fixture.offer).await,
+        None
+    );
+    let marker = accepted_roots(&fixture.manager).0.join("marker");
+    let (reads, mut read) = tokio::sync::mpsc::unbounded_channel();
+    start_offered(&mut fixture.manager, &fixture.offer)
+        .with_start_gate(Arc::new(LowDiskGate { reads }))
+        .spawn();
+
+    with_watchdog(read.recv())
+        .await
+        .expect("the gate was not read")
+        .expect("the gate was dropped unread");
+    assert!(!marker.exists(), "the held step's command ran");
+    fixture
+        .manager
+        .handle_cancel(AssignmentCancel {
+            effect_id: "eff_01k0z6r1w8f4jy2m7q9v3x5abm".to_owned(),
+            assignment_id: fixture.offer.assignment_id.clone(),
+            run_id: fixture.offer.run_id.clone(),
+            attempt_id: fixture.offer.attempt_id.clone(),
+            request_id: "cmd_01k0z6r1w8f4jy2m7q9v3x5abm".to_owned(),
+            mode: useful_runner_protocol::CancellationMode::Graceful,
+        })
+        .unwrap();
+    let run_cancelled = |reports: &[ExecutionReport]| {
+        reports.iter().any(|report| {
+            matches!(
+                report,
+                ExecutionReport::Transition { workflow_event, .. }
+                    if workflow_event["eventType"] == "workflow_state_changed"
+                        && workflow_event["to"]["state"] == "cancelled"
+            )
+        })
+    };
+    wait_for_reports(&mut fixture.manager, run_cancelled).await;
+
+    let reports = queued_assignment_reports(&mut fixture.manager, &fixture.offer.assignment_id);
+    let task: Vec<_> = reports
+        .iter()
+        .filter_map(|report| match report {
+            ExecutionReport::Transition { workflow_event, .. }
+                if workflow_event["eventType"] == "step_state_changed"
+                    && workflow_event["stepId"] == "task" =>
+            {
+                workflow_event["to"].as_str()
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        task,
+        ["starting", "cancelling", "cancelled"],
+        "{reports:#?}"
+    );
+    assert!(!marker.exists(), "the held step's command ran");
 }

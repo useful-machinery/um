@@ -554,6 +554,7 @@ async fn cancellation_during_a_stalled_launch_quiesces_before_the_controlled_dea
             Occurrence::StepQuiesced {
                 step: "task".to_owned(),
                 action: cancel_action,
+                launched: false,
             }
         );
         assert_eq!(control_clock.active_waiters(), 0);
@@ -627,6 +628,7 @@ async fn cancelled_stalled_launch_cleans_worker_fixture() {
             Occurrence::StepQuiesced {
                 step: "task".to_owned(),
                 action: cancel_action,
+                launched: false,
             }
         );
         assert!(rustix::process::test_kill_process(worker).is_err());
@@ -1247,7 +1249,8 @@ steps:
         boundaries.release();
         let mut quiesced = BTreeMap::new();
         for _ in 0..2 {
-            let Occurrence::StepQuiesced { step, action } = next_occurrence(&mut receiver).await
+            let Occurrence::StepQuiesced { step, action, .. } =
+                next_occurrence(&mut receiver).await
             else {
                 panic!("cancelled capture reported a lifecycle completion");
             };
@@ -1359,6 +1362,7 @@ steps:
             Occurrence::StepQuiesced {
                 step: "task".to_owned(),
                 action: force_abort.id,
+                launched: true,
             }
         );
         assert!(boundaries.reached.try_recv().is_err());
@@ -1801,6 +1805,7 @@ steps:
             Occurrence::StepQuiesced {
                 step: "task".to_owned(),
                 action: cancellation.id,
+                launched: true,
             }
         );
 
@@ -3552,6 +3557,7 @@ async fn input_view_cleanup_precedes_controlled_cancellation_quiescence() {
             Occurrence::StepQuiesced {
                 step: "task".to_owned(),
                 action: cancel_action,
+                launched: true,
             }
         );
         assert!(!parent_path.exists());
@@ -3701,6 +3707,7 @@ async fn cancellation_during_diagnostic_join_waits_for_readers() {
             Occurrence::StepQuiesced {
                 step: "task".to_owned(),
                 action: cancel_action,
+                launched: true,
             }
         );
         let diagnostic = diagnostics.get("task").unwrap();
@@ -3823,6 +3830,7 @@ async fn cancellation_before_launch_revokes_the_action_and_duplicate_delivery_is
             Occurrence::StepQuiesced {
                 step: "task".to_owned(),
                 action: cancel_action,
+                launched: false,
             }
         );
         assert_eq!(runtime.active_work_count(), 0);
@@ -3883,6 +3891,7 @@ async fn cancellation_before_launch_returns_interrupts_the_released_group_and_re
             Occurrence::StepQuiesced {
                 step: "task".to_owned(),
                 action: cancel_action,
+                launched: true,
             }
         );
 
@@ -3941,6 +3950,7 @@ async fn sixty_second_local_grace_allows_clean_exit_after_thirty_seconds() {
             Occurrence::StepQuiesced {
                 step: "task".to_owned(),
                 action: cancel_action,
+                launched: true,
             }
         );
 
@@ -3995,6 +4005,7 @@ async fn admitted_deadline_forces_the_stubborn_process_group_without_wall_clock_
             Occurrence::StepQuiesced {
                 step: "task".to_owned(),
                 action: cancel_action,
+                launched: true,
             }
         );
 
@@ -4062,6 +4073,7 @@ async fn force_abort_of_gracefully_cancelling_command_reports_the_force_action()
             Occurrence::StepQuiesced {
                 step: "task".to_owned(),
                 action: force_action,
+                launched: true,
             }
         );
 
@@ -4122,6 +4134,7 @@ async fn natural_exit_before_cancel_delivery_has_no_late_lifecycle_or_cleanup_wo
             Occurrence::StepQuiesced {
                 step: "task".to_owned(),
                 action: cancel_action,
+                launched: true,
             }
         );
 
@@ -4183,6 +4196,7 @@ async fn cancellation_after_the_owned_child_exits_still_terminates_its_descendan
             Occurrence::StepQuiesced {
                 step: "task".to_owned(),
                 action: cancel_action,
+                launched: true,
             }
         );
 
@@ -6734,6 +6748,7 @@ async fn a_force_abort_after_cancellation_reaches_the_running_child() {
             Occurrence::StepQuiesced {
                 step: "design".to_owned(),
                 action: force_abort.id,
+                launched: true,
             }
         );
         assert_eq!(driver.active_work_count(), 0);
@@ -6816,6 +6831,309 @@ async fn runner_shutdown_revocation_reaches_the_running_child() {
             Some(CancellationReason::RunnerShutdown)
         );
         assert_eq!(driver.active_work_count(), 0);
+    })
+    .await;
+}
+
+/// A start gate answering its queued readings in order, the last for every later read, and
+/// sending each answer as it reads.
+struct QueuedStartGate {
+    readings: std::sync::Mutex<std::collections::VecDeque<StartGateReading>>,
+    reads: mpsc::UnboundedSender<StartGateReading>,
+}
+
+impl StepStartGate for QueuedStartGate {
+    fn read(&self) -> StartGateReading {
+        let mut readings = self.readings.lock().unwrap();
+        let reading = if readings.len() > 1 {
+            readings.pop_front().unwrap()
+        } else {
+            *readings.front().unwrap()
+        };
+        let _ = self.reads.send(reading);
+        reading
+    }
+}
+
+fn queued_start_gate(
+    readings: Vec<StartGateReading>,
+) -> (
+    Arc<dyn StepStartGate>,
+    mpsc::UnboundedReceiver<StartGateReading>,
+) {
+    let (reads, read) = mpsc::unbounded_channel();
+    (
+        Arc::new(QueuedStartGate {
+            readings: std::sync::Mutex::new(readings.into()),
+            reads,
+        }),
+        read,
+    )
+}
+
+const DISK_LOW: StartGateReading = StartGateReading::DiskLow {
+    available_bytes: 3 * 1024 * 1024 * 1024,
+    minimum_free_bytes: 5 * 1024 * 1024 * 1024,
+};
+
+/// Records the held starts the driver reports.
+#[derive(Clone, Default)]
+struct HeldStartRecorder(Arc<std::sync::Mutex<Vec<StartHeldObservation>>>);
+
+impl HeldStartRecorder {
+    fn held(&self) -> Vec<StartHeldObservation> {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+impl ExecutionObserver<TestInstant> for HeldStartRecorder {
+    fn observe(
+        &self,
+        observation: ExecutionObservation<TestInstant>,
+    ) -> impl Future<Output = ()> + Send {
+        if let ExecutionObservation::StartHeld(held) = observation {
+            self.0.lock().unwrap().push(held);
+        }
+        std::future::ready(())
+    }
+}
+
+/// A one-step workflow whose `task` creates `marker` in the execution root.
+fn admit_marker_fixture(temporary: &Path) -> (AdmittedWorkflow, PathBuf) {
+    let execution_root = temporary.join("execution");
+    fs::create_dir(&execution_root).unwrap();
+    let argv = ["touch", "marker"];
+    let source = workflow_source(&[("task", None, argv.as_slice())]);
+    let environment =
+        EnvironmentSnapshot::new([(OsString::from("PATH"), std::env::var_os("PATH").unwrap())]);
+    let admitted = admit_fixture(temporary, &execution_root, &source, environment, 1);
+    (admitted, execution_root.join("marker"))
+}
+
+// INV-ENGINE-46: a command step waits at the start gate, still `starting` and unprepared, is
+// reported held once for its start, reads the gate again each 30 seconds of the runtime's
+// clock, and starts once the gate is open.
+#[tokio::test]
+async fn a_low_disk_holds_a_command_step_before_it_is_prepared_until_the_gate_opens() {
+    with_watchdog(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let (admitted, marker) = admit_marker_fixture(temporary.path());
+        let now = TestInstant(Duration::from_secs(7));
+        let (clock, mut clock_control) = ControlledClock::new(now);
+        let (gate, mut reads) = queued_start_gate(vec![DISK_LOW, DISK_LOW, StartGateReading::Open]);
+        let observer = HeldStartRecorder::default();
+        let (commit_sender, mut commit_receiver) = mpsc::unbounded_channel();
+        let artifacts = test_artifacts(&admitted);
+        let diagnostics = StepDiagnosticLog::default();
+        let execution = execute_workflow_observed(
+            admitted,
+            &artifacts.staging,
+            &artifacts.inputs,
+            &diagnostics,
+            clock,
+            RecordingCommitPort {
+                commits: commit_sender,
+            },
+            observer.clone(),
+            AgentExecution::disabled(),
+            WorkflowExecutionStart::initial(ProcessGuardRegistry::default()).with_start_gate(gate),
+        );
+        let held = async {
+            assert_eq!(reads.recv().await, Some(DISK_LOW));
+            assert_eq!(clock_control.next_deadline().await, now + START_GATE_REREAD);
+            let mut commits = Vec::new();
+            while let Ok(commit) = commit_receiver.try_recv() {
+                commits.push(commit);
+            }
+            let task = &commits.last().unwrap().state.steps["task"];
+            assert_eq!(task.state, StepState::Starting);
+            assert!(!marker.exists());
+            assert_eq!(
+                observer.held(),
+                vec![StartHeldObservation {
+                    step: "task".to_owned(),
+                    invocation: task.current_action.unwrap(),
+                    available_bytes: 3 * 1024 * 1024 * 1024,
+                    minimum_free_bytes: 5 * 1024 * 1024 * 1024,
+                }]
+            );
+
+            clock_control.release();
+            assert_eq!(reads.recv().await, Some(DISK_LOW));
+            assert_eq!(reads.recv().await, Some(StartGateReading::Open));
+        };
+
+        let (result, ()) = tokio::join!(execution, held);
+        let result = result.unwrap();
+        assert_eq!(result.state.workflow, WorkflowState::Succeeded);
+        assert!(marker.exists());
+        assert_eq!(observer.held().len(), 1);
+    })
+    .await;
+}
+
+// INV-ENGINE-46: a held step's wake ends it as any unlaunched start ends, with nothing
+// launched.
+#[tokio::test]
+async fn a_held_step_cancelled_at_the_start_gate_quiesces_unlaunched() {
+    with_watchdog(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let (admitted, marker) = admit_marker_fixture(temporary.path());
+        let (start, cancel) =
+            running_cancellation_actions(&admitted, TestInstant(Duration::from_secs(19)));
+        let cancel_action = cancel.id;
+        let now = TestInstant(Duration::ZERO);
+        let (clock, mut clock_control) = ControlledClock::new(now);
+        let (gate, mut reads) = queued_start_gate(vec![DISK_LOW]);
+        let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
+        let artifacts = test_artifacts(&admitted);
+        let mut runtime = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            clock,
+        )
+        .with_start_gate(Some(gate));
+
+        runtime.release(start).await;
+        assert_eq!(reads.recv().await, Some(DISK_LOW));
+        assert_eq!(clock_control.next_deadline().await, now + START_GATE_REREAD);
+        runtime.release(cancel).await;
+
+        assert_eq!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::StepQuiesced {
+                step: "task".to_owned(),
+                action: cancel_action,
+                launched: false,
+            }
+        );
+        assert_eq!(runtime.active_work_count(), 0);
+        assert_eq!(clock_control.active_waiters(), 0);
+        assert!(receiver.try_recv().is_none());
+        assert!(!marker.exists());
+    })
+    .await;
+}
+
+const RECOVERED_TASK_WORKFLOW: &str = r#"schemaVersion: 1
+steps:
+  task:
+    kind: cmd
+    recovery:
+      retries: 1
+      handler:
+        kind: cmd
+        command:
+          argv:
+            - /bin/sh
+            - -c
+            - printf '%s' '{"schemaVersion":1,"decision":"recheck","summary":"repaired","reason":"recheck"}' > "$USEFUL_RECOVERY_RESULT"
+    command:
+      argv: ["/bin/false"]
+"#;
+
+// INV-ENGINE-46: the gate stands before a command or agent step of the workflow's own steps
+// alone; a `workflow` step, a finalizer and a recovery handler start without reading it.
+#[tokio::test]
+async fn the_start_gate_holds_no_workflow_step_finalizer_or_recovery_handler() {
+    with_watchdog(async {
+        let fixture = admit_child_parent(&format!(
+            "{CHILD_PARENT_WORKFLOW}finalizers:\n  release:\n    kind: cmd\n    command:\n      argv: [\"/bin/sh\", \"-c\", \": > finalized\"]\n"
+        ));
+        let finalized = fixture._temporary.path().join("root/finalized");
+        let (gate, mut reads) = queued_start_gate(vec![DISK_LOW]);
+        let (dispatcher, _requests) = scripted_child(exited("planned"), true);
+        let artifacts = test_artifacts(&fixture.admitted);
+        let (commits, _committed) = mpsc::unbounded_channel();
+        let result = execute_workflow_observed_with_children(
+            fixture.admitted.clone(),
+            &artifacts.staging,
+            &artifacts.inputs,
+            &StepDiagnosticLog::default(),
+            TestClock,
+            RecordingCommitPort { commits },
+            NoopExecutionObserver,
+            AgentExecution::disabled(),
+            ChildRuns::Enabled {
+                dispatcher,
+                controls: ControlContext::default(),
+            },
+            WorkflowExecutionStart::initial(ProcessGuardRegistry::default())
+                .with_start_gate(Arc::clone(&gate)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.state.workflow, WorkflowState::Succeeded);
+        assert!(finalized.exists());
+
+        let temporary = tempfile::tempdir().unwrap();
+        let execution_root = temporary.path().join("execution");
+        fs::create_dir(&execution_root).unwrap();
+        let admitted = admit_fixture(
+            temporary.path(),
+            &execution_root,
+            RECOVERED_TASK_WORKFLOW,
+            EnvironmentSnapshot::default(),
+            1,
+        );
+        let initialized = runtime::initialize::<
+            ProvisionalStepOutputs,
+            StepFailureCause,
+            CapturedValue,
+            TestInstant,
+        >(&admitted, None);
+        let start = start_actions(&admitted)["task"];
+        let started = runtime::reduce::<
+            ProvisionalStepOutputs,
+            StepFailureCause,
+            CapturedValue,
+            TestInstant,
+        >(
+            &initialized.state,
+            Occurrence::StepStarted {
+                step: "task".to_owned(),
+                action: start,
+            },
+        );
+        let failed = runtime::reduce(
+            &started.state,
+            Occurrence::StepExecutionFailed {
+                step: "task".to_owned(),
+                action: start,
+                cause: StepFailureCause::Execution(StepExecutionFailure::Command(
+                    CommandExecutionFailure::UnsuccessfulExit { code: Some(1) },
+                )),
+            },
+        );
+        let handler = failed
+            .actions
+            .into_iter()
+            .find(|requested| matches!(requested.action, Action::StartRecoveryHandler { .. }))
+            .unwrap();
+        let handler_action = handler.id;
+        let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(4).unwrap());
+        let artifacts = test_artifacts(&admitted);
+        let mut runtime = StepRuntime::new(
+            admitted,
+            artifacts.staging.clone(),
+            artifacts.inputs.clone(),
+            sender,
+            TestClock,
+        )
+        .with_start_gate(Some(gate));
+        runtime.release(handler).await;
+
+        assert!(matches!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::RecoveryHandlerStarted { action, .. } if action == handler_action
+        ));
+        assert!(matches!(
+            next_occurrence(&mut receiver).await,
+            Occurrence::RecoveryHandlerCompleted { action, .. } if action == handler_action
+        ));
+        assert!(reads.try_recv().is_err());
     })
     .await;
 }

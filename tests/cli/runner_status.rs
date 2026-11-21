@@ -66,15 +66,22 @@ pub(super) struct ServeStatusFixture {
 }
 
 impl ServeStatusFixture {
+    /// A runner that keeps no minimum of free space, so the host's disk never declines an
+    /// offer it is sent (REQ-RUNNERENROLL-154).
     pub(super) fn new(endpoint: &str) -> Self {
-        Self::new_inner(endpoint, false)
+        Self::new_inner(endpoint, false, 0)
     }
 
     fn with_pending(endpoint: &str) -> Self {
-        Self::new_inner(endpoint, true)
+        Self::new_inner(endpoint, true, 0)
     }
 
-    fn new_inner(endpoint: &str, pending: bool) -> Self {
+    /// A runner whose configuration keeps `minimum_free_disk_bytes` free on its work root.
+    fn with_minimum_free_disk_bytes(endpoint: &str, minimum_free_disk_bytes: u64) -> Self {
+        Self::new_inner(endpoint, false, minimum_free_disk_bytes)
+    }
+
+    fn new_inner(endpoint: &str, pending: bool, minimum_free_disk_bytes: u64) -> Self {
         let root = private_credential_directory();
         let runtime = tempfile::tempdir_in("/tmp").unwrap();
         fs::set_permissions(runtime.path(), Permissions::from_mode(0o700)).unwrap();
@@ -113,7 +120,8 @@ impl ServeStatusFixture {
                 "deploymentMode": "development",
                 "runnerStatePath": state_path,
                 "controlSocketPath": runtime.path().join("runner.sock"),
-                "workRoot": work
+                "workRoot": work,
+                "minimumFreeDiskBytes": minimum_free_disk_bytes
             }))
             .unwrap(),
         )
@@ -129,6 +137,11 @@ impl ServeStatusFixture {
     /// readiness document.
     pub(super) fn state_directory(&self) -> std::path::PathBuf {
         self.root.path().join("state")
+    }
+
+    /// The runner's `workRoot`.
+    fn work_root(&self) -> std::path::PathBuf {
+        self.root.path().join("work")
     }
 }
 
@@ -575,6 +588,136 @@ fn pending_handshake_preserves_contiguous_current_boot_sequences() {
         pending_hello_sequence > latest_current_sequence,
         "pending hello sequence {pending_hello_sequence} regressed behind current sequence {latest_current_sequence}"
     );
+}
+
+/// Whether `directory` holds, at any depth, an entry named `name`.
+fn holds_entry_named(directory: &std::path::Path, name: &str) -> bool {
+    fs::read_dir(directory).unwrap().any(|entry| {
+        let entry = entry.unwrap();
+        entry.file_name() == name
+            || (entry.file_type().unwrap().is_dir() && holds_entry_named(&entry.path(), name))
+    })
+}
+
+// REQ-RUNNERENROLL-154, REQ-DIAG-44: a runner whose disk is below its minimum declines the
+// offer of a new run `capacity_unavailable` with the stage `host_disk` and the cause
+// `disk_space_low`, before it prepares anything for it.
+#[test]
+fn a_runner_on_a_low_disk_declines_an_offer_before_preparing_it() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("ws://{}/v1/runner/connect", listener.local_addr().unwrap());
+    let fixture =
+        ServeStatusFixture::with_minimum_free_disk_bytes(&endpoint, 9_007_199_254_740_991);
+    let offer: serde_json::Value = serde_json::from_slice(
+        &fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runner-protocol/v1/valid/cloud-assignment-offer.json"
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let assignment_id = offer["payload"]["assignmentId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (offer_now, offer_asked) = tokio::sync::oneshot::channel::<()>();
+    let (answer_sent, answer_received) = mpsc::sync_channel(1);
+    let server = thread::spawn(move || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async move {
+                let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+                let mut socket =
+                    accept_runner_socket(accept_runner_connection(&listener).await).await;
+                let mut offer_asked = offer_asked;
+                let mut welcomed = false;
+                let mut offered = false;
+                loop {
+                    // The offer follows the welcome and the opening's acknowledgement: the
+                    // runner refuses an offer that reaches it before its handshake ends.
+                    let frame = tokio::select! {
+                        frame = socket.next() => frame,
+                        asked = &mut offer_asked, if welcomed && !offered => {
+                            asked.unwrap();
+                            offered = true;
+                            socket
+                                .send(Message::Text(offer.to_string().into()))
+                                .await
+                                .unwrap();
+                            continue;
+                        }
+                    };
+                    let Some(Ok(Message::Text(frame))) = frame else {
+                        panic!("the runner closed its connection before answering the offer");
+                    };
+                    let frame: serde_json::Value = serde_json::from_str(&frame).unwrap();
+                    let hello = frame["type"] == "hello";
+                    if hello {
+                        socket.send(cloud_welcome()).await.unwrap();
+                    }
+                    if let (Some(message_id), Some(sequence)) =
+                        (frame["messageId"].as_str(), frame["sequence"].as_u64())
+                    {
+                        socket
+                            .send(cloud_observation_ack(message_id, sequence))
+                            .await
+                            .unwrap();
+                    }
+                    welcomed |= hello;
+                    // The runner's first answer to the offer ends the exchange.
+                    if matches!(
+                        frame["type"].as_str(),
+                        Some(
+                            "assignment_rejected" | "assignment_preparing" | "assignment_accepted"
+                        )
+                    ) {
+                        answer_sent.send(frame).unwrap();
+                        return;
+                    }
+                }
+            });
+    });
+    let mut serve = Command::new(env!("CARGO_BIN_EXE_useful"))
+        .args(["runner", "serve", "--config", &fixture.config])
+        .env("OTEL_SDK_DISABLED", "true")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+
+    poll_until(
+        "a disk warning in the status",
+        || {
+            if let Some(status) = serve.try_wait().unwrap() {
+                panic!("Runner Serve exited {status} before its status warned of its disk");
+            }
+            String::from_utf8(run(&["runner", "status", "--config", &fixture.config]).stdout)
+                .unwrap()
+        },
+        |stdout| stdout.lines().any(|line| line.starts_with("disk warning:")),
+    );
+    offer_now.send(()).unwrap();
+    let answer = answer_received.recv();
+    serve.kill().unwrap();
+    serve.wait().unwrap();
+    let rejection = answer.expect("the runner answered the offer");
+    server.join().unwrap();
+
+    // The exchange ends at the runner's first answer to the offer, so no
+    // `assignment_preparing` or `assignment_accepted` preceded the rejection.
+    assert_eq!(rejection["type"], "assignment_rejected", "{rejection}");
+    assert_eq!(rejection["payload"]["assignmentId"], assignment_id.as_str());
+    assert_eq!(
+        rejection["payload"]["decline"],
+        serde_json::json!({
+            "type": "capacity_unavailable",
+            "diagnostic": {"stage": "host_disk", "declineCause": "disk_space_low"}
+        })
+    );
+    assert!(!holds_entry_named(&fixture.work_root(), &assignment_id));
 }
 
 fn run_status_with_response(response: &'static [u8]) -> Output {

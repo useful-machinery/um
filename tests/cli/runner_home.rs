@@ -114,6 +114,12 @@ impl ServeHome {
     /// A `development` configuration of the home's own layout, which the
     /// loopback fakes need, naming `state` as its state.
     fn write_development_config(&self, state: &Path) {
+        self.write_development_config_with_minimum(state, None);
+    }
+
+    /// `write_development_config`'s configuration, naming `minimum` as its
+    /// `minimumFreeDiskBytes` when one is given.
+    fn write_development_config_with_minimum(&self, state: &Path, minimum: Option<u64>) {
         for directory in [
             self.useful_home(),
             self.runner(),
@@ -123,18 +129,17 @@ impl ServeHome {
             fs::set_permissions(&directory, Permissions::from_mode(0o700)).unwrap();
         }
         let config = self.runner().join("config.json");
-        fs::write(
-            &config,
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "schemaVersion": 1,
-                "deploymentMode": "development",
-                "runnerStatePath": state,
-                "controlSocketPath": self.runner().join("control.sock"),
-                "workRoot": self.runner().join("work")
-            }))
-            .unwrap(),
-        )
-        .unwrap();
+        let mut document = serde_json::json!({
+            "schemaVersion": 1,
+            "deploymentMode": "development",
+            "runnerStatePath": state,
+            "controlSocketPath": self.runner().join("control.sock"),
+            "workRoot": self.runner().join("work")
+        });
+        if let Some(minimum) = minimum {
+            document["minimumFreeDiskBytes"] = minimum.into();
+        }
+        fs::write(&config, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
         fs::set_permissions(&config, Permissions::from_mode(0o600)).unwrap();
     }
 
@@ -292,6 +297,18 @@ fn serve_without_a_configuration_connects_with_the_homes_enrolled_state() {
     assert_eq!(fs::read(home.state()).unwrap(), state);
 }
 
+/// The records of `log`'s complete lines: a line still being written is not
+/// one.
+fn complete_records(log: &[u8]) -> impl Iterator<Item = serde_json::Value> + '_ {
+    let complete = log
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(&[][..], |end| &log[..end]);
+    complete
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+}
+
 /// Waits, once `witness` has seen `serve` connect, until the home's log holds
 /// past its first `written` bytes a complete record of the connection's,
 /// one whose `event.name` starts `runner.gateway_`.
@@ -308,14 +325,7 @@ fn wait_for_logged_connection(
         "a logged connection record",
         || {
             let bytes = fs::read(home.log()).unwrap_or_default();
-            let added = bytes.get(written..).unwrap_or_default();
-            let complete = added
-                .iter()
-                .rposition(|byte| *byte == b'\n')
-                .map_or(&[][..], |end| &added[..end]);
-            complete
-                .split(|byte| *byte == b'\n')
-                .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
+            complete_records(bytes.get(written..).unwrap_or_default())
                 .filter_map(|record| record["event.name"].as_str().map(str::to_owned))
                 .find(|name| name.starts_with("runner.gateway_"))
         },
@@ -357,6 +367,46 @@ fn serve_appends_its_records_to_the_homes_log_whatever_happens_to_standard_error
     assert_eq!(boots.len(), 2, "{boots:?}");
 }
 
+/// Waits for the home's log to hold a complete record named `name`, answering
+/// the first; panics once `serve` has exited.
+fn wait_for_logged_record(
+    home: &ServeHome,
+    serve: &mut ServeProcess,
+    name: &str,
+) -> serde_json::Value {
+    poll_until(
+        &format!("a logged {name} record"),
+        || {
+            if let Some(status) = serve.exited() {
+                panic!("Runner Serve exited {status} before writing {name}");
+            }
+            let bytes = fs::read(home.log()).unwrap_or_default();
+            complete_records(&bytes).find(|record| record["event.name"] == name)
+        },
+        Option::is_some,
+    )
+    .unwrap()
+}
+
+// REQ-TELEMETRY-55, REQ-RUNNERENROLL-14: a runner whose configuration names a minimum no
+// disk reaches writes the `low` record of its first reading, with that minimum, as it
+// starts.
+#[test]
+fn serve_records_its_disk_low_against_the_configured_minimum_as_it_starts() {
+    const MINIMUM: u64 = 9_007_199_254_740_991;
+    let witness = ConnectionWitness::new();
+    let home = ServeHome::new();
+    home.write_development_config_with_minimum(&home.state(), Some(MINIMUM));
+    home.write_enrolled_state(&witness.url);
+
+    let mut serve = home.serve(&[]);
+    let record = wait_for_logged_record(&home, &mut serve, "runner.disk_space");
+    serve.stop();
+
+    assert_eq!(record["um.disk.state"], "low", "{record}");
+    assert_eq!(record["um.disk.minimum_free_bytes"], MINIMUM, "{record}");
+}
+
 // REQ-RUNNERENROLL-42, REQ-TELEMETRY-52
 #[test]
 fn status_shows_the_log_the_serving_runner_writes() {
@@ -380,6 +430,62 @@ fn status_shows_the_log_the_serving_runner_writes() {
         .unwrap_or_else(|| panic!("no log line: {stdout}"));
     assert_eq!(Path::new(log.trim_start()), home.log());
     assert!(home.log().is_file());
+}
+
+/// Asks `useful runner status` of `home` until it prints a `disk:` line, answering its
+/// standard output's lines; panics once `serve` has exited.
+fn wait_for_status_disk(home: &ServeHome, serve: &mut ServeProcess) -> Vec<String> {
+    poll_until(
+        "a disk reading in the status",
+        || {
+            if let Some(status) = serve.exited() {
+                panic!("Runner Serve exited {status} before its status gave a disk reading");
+            }
+            let output = home.run(&["runner", "status"]);
+            let stdout = String::from_utf8(output.stdout).unwrap();
+            let reading =
+                output.status.success() && stdout.lines().any(|line| line.starts_with("disk:"));
+            (reading, stdout)
+        },
+        |(reading, _)| *reading,
+    )
+    .1
+    .lines()
+    .map(str::to_owned)
+    .collect()
+}
+
+// REQ-RUNNERENROLL-42: the status of a runner whose configuration names a minimum no disk
+// reaches gives the reading of its work root and, directly after it, the low warning.
+#[test]
+fn status_shows_the_work_roots_disk_and_a_warning_while_it_is_low() {
+    let witness = ConnectionWitness::new();
+    let home = ServeHome::new();
+    home.write_development_config_with_minimum(&home.state(), Some(9_007_199_254_740_991));
+    home.write_enrolled_state(&witness.url);
+
+    let mut serve = home.serve(&[]);
+    let lines = wait_for_status_disk(&home, &mut serve);
+    serve.stop();
+
+    let disk = lines
+        .iter()
+        .position(|line| line.starts_with("disk:"))
+        .unwrap();
+    let (_, path) = lines[disk]
+        .rsplit_once(" at ")
+        .unwrap_or_else(|| panic!("the disk line names no path: {lines:?}"));
+    assert_eq!(
+        Path::new(path),
+        fs::canonicalize(home.runner().join("work")).unwrap(),
+        "{lines:?}"
+    );
+    assert!(
+        lines
+            .get(disk + 1)
+            .is_some_and(|line| line.starts_with("disk warning:")),
+        "{lines:?}"
+    );
 }
 
 // REQ-RUNNERENROLL-97

@@ -59,6 +59,8 @@ pub struct Config {
     control_socket_path: Option<PathBuf>,
     log_directory: Option<PathBuf>,
     assignment: AssignmentConfig,
+    /// The free space kept on the work root's disk (REQ-RUNNERENROLL-152).
+    minimum_free_disk_bytes: u64,
     repository_url_policy: RepositoryUrlPolicy,
     pi_installation: Option<ValidatedPiInstallation>,
     claude_code_installation: Option<ValidatedClaudeCodeInstallation>,
@@ -174,6 +176,7 @@ impl Config {
             .map(|directory| directory.join(LOG_DIRECTORY));
         config.state_access = Some(enrolled.state_access);
         config.control_socket_path = Some(enrolled.control_socket_path);
+        config.minimum_free_disk_bytes = enrolled.minimum_free_disk_bytes;
         Ok(config)
     }
 
@@ -205,6 +208,7 @@ impl Config {
             control_socket_path: None,
             log_directory: None,
             assignment,
+            minimum_free_disk_bytes: useful_execution::DEFAULT_MINIMUM_FREE_DISK_BYTES,
             repository_url_policy,
             pi_installation: None,
             claude_code_installation: None,
@@ -253,6 +257,12 @@ impl Config {
 
     pub(crate) fn assignment(&self) -> &AssignmentConfig {
         &self.assignment
+    }
+
+    /// The free space the serving runner keeps on its work root's disk: the operator
+    /// configuration's `minimumFreeDiskBytes`, or the default (REQ-RUNNERENROLL-152).
+    pub(crate) fn minimum_free_disk_bytes(&self) -> u64 {
+        self.minimum_free_disk_bytes
     }
 
     pub(super) fn repository_url_policy(&self) -> RepositoryUrlPolicy {

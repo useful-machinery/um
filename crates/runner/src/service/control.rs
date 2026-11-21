@@ -20,6 +20,7 @@ use useful_execution::{
 };
 
 use super::assignment::{AssignmentManager, AssignmentOverview, AssignmentRead};
+use super::disk::DiskReadingHandle;
 use super::execution::AssignmentRunView;
 use super::history::{EventLog, LoggedEvent};
 use super::tree_run::published_path;
@@ -37,10 +38,11 @@ use crate::control_protocol::{
     AssignmentLogSource, AssignmentLogStream, AssignmentOutput, AssignmentQuery, AssignmentRun,
     AssignmentStep, AssignmentWorkflow, ConnectionFailure, ConnectionState, ControlError,
     ControlRequest, LOG_WINDOW_BYTES, OVERVIEW_RESPONSE_LIMIT, Operation, Overview,
-    OverviewAssignment, OverviewConnection, OverviewRunElement, OverviewRunner, OverviewWait,
-    ProcessState, ProtocolFailure, Response, StatusSnapshot, SyncedAgentLogins,
-    WRITTEN_ASSIGNMENT_STEPS, WRITTEN_CHILD_RUNS, decode_request, encode_assignment_not_held,
-    encode_assignment_response, encode_overview_response, encode_response,
+    OverviewAssignment, OverviewConnection, OverviewDisk, OverviewRunElement, OverviewRunner,
+    OverviewWait, ProcessState, ProtocolFailure, Response, StatusDisk, StatusSnapshot,
+    SyncedAgentLogins, WRITTEN_ASSIGNMENT_STEPS, WRITTEN_CHILD_RUNS, decode_request,
+    encode_assignment_not_held, encode_assignment_response, encode_overview_response,
+    encode_response,
 };
 
 const RUNTIME_DIRECTORY_MODE: u32 = 0o700;
@@ -280,6 +282,8 @@ pub(super) struct LiveStatus {
     boot_id: String,
     started_at: Instant,
     log_path: Option<String>,
+    /// The disk monitor's published reading; none for a service that starts no monitor.
+    disk: Option<DiskReadingHandle>,
     state: Mutex<LiveStatusState>,
     connected: tokio::sync::Notify,
     /// The runner's own events, recorded once the state's lock is released.
@@ -296,6 +300,7 @@ impl LiveStatus {
             boot_id,
             started_at: useful_support::monotonic_now(),
             log_path: None,
+            disk: None,
             state: Mutex::new(LiveStatusState {
                 process_state: ProcessState::Running,
                 connection_state: ConnectionState::Connecting,
@@ -324,6 +329,34 @@ impl LiveStatus {
                 .map(str::to_owned),
             ..self
         }
+    }
+
+    /// The status of a process whose disk monitor publishes in `disk`: the snapshot and
+    /// the overview give the reading it holds, copied before the status's own lock is
+    /// taken (REQ-RUNNERENROLL-42, REQ-RUNNERENROLL-133, INV-RUNNER-49).
+    pub(super) fn with_disk(self, disk: DiskReadingHandle) -> Self {
+        Self {
+            disk: Some(disk),
+            ..self
+        }
+    }
+
+    /// The disk monitor's newest published reading, with its path as text and its time
+    /// as RFC 3339; none before the first, without a monitor, or when its time cannot be
+    /// written.
+    fn disk_reading(&self) -> Option<StatusDisk> {
+        let reading = self.disk.as_ref()?.published()?;
+        Some(StatusDisk {
+            path: reading.path.to_string_lossy().into_owned(),
+            available_bytes: reading.available_bytes,
+            total_bytes: reading.total_bytes,
+            minimum_free_bytes: reading.minimum_free_bytes,
+            low: reading.low,
+            read_at: reading
+                .read_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok()?,
+        })
     }
 
     /// The log of the runner's own events (REQ-RUNNERENROLL-138).
@@ -449,6 +482,7 @@ impl LiveStatus {
         assignment_counts: crate::control_protocol::AssignmentCounts,
         held_runs: Vec<crate::control_protocol::HeldRun>,
     ) -> StatusSnapshot {
+        let disk = self.disk_reading();
         let state = self.lock();
         let uptime_milliseconds = self.uptime_milliseconds();
         StatusSnapshot {
@@ -456,6 +490,7 @@ impl LiveStatus {
             boot_id: self.boot_id.clone(),
             uptime_milliseconds,
             log_path: self.log_path.clone(),
+            disk: disk.map(Box::new),
             connection_state: state.connection_state,
             last_connected_at: state.last_connected_at.clone(),
             current_credential_id: state.current_credential_id.clone(),
@@ -476,6 +511,7 @@ impl LiveStatus {
         assignments: AssignmentOverview,
     ) -> Overview {
         let events = self.events.newest_first();
+        let disk = self.disk_reading();
         let state = self.lock();
         let now = useful_support::monotonic_now();
         let backing_off = state.connection_state == ConnectionState::BackingOff;
@@ -493,6 +529,7 @@ impl LiveStatus {
                     )
                 }),
             },
+            disk: disk.map(overview_disk),
             connection: OverviewConnection {
                 state: state.connection_state.into(),
                 last_connected_at: state.last_connected_at.clone(),
@@ -521,6 +558,18 @@ impl LiveStatus {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// The overview's form of the snapshot's disk reading, the same members.
+fn overview_disk(disk: StatusDisk) -> OverviewDisk {
+    OverviewDisk {
+        path: disk.path,
+        available_bytes: disk.available_bytes,
+        total_bytes: disk.total_bytes,
+        minimum_free_bytes: disk.minimum_free_bytes,
+        low: disk.low,
+        read_at: disk.read_at,
     }
 }
 
@@ -3096,5 +3145,75 @@ mod tests {
         );
         assert_eq!(overview.recent_assignments, recent);
         assert_eq!(overview.recent_assignments_omitted, 0);
+    }
+
+    // REQ-RUNNERENROLL-133, INV-RUNNER-49: the snapshot and the overview give the reading
+    // the monitor's handle holds, and neither gives one while the handle holds none or the
+    // status was handed no handle.
+    #[test]
+    fn the_status_answers_give_the_published_disk_reading_and_none_without_one() {
+        let answers = |status: &LiveStatus| {
+            let snapshot = status.snapshot(AssignmentCounts::default(), Vec::new());
+            let overview = status.overview(
+                "rnr_01k0z6r1w8f4jy2m7q9v3x5abd".to_owned(),
+                crate::telemetry::TEST_SERVICE_VERSION.to_owned(),
+                AssignmentOverview {
+                    counts: OverviewCounts::default(),
+                    assignments: Vec::new(),
+                    assignments_omitted: 0,
+                    unacknowledged_reports: 0,
+                    recent_assignments: Vec::new(),
+                },
+            );
+            (snapshot.disk, overview.disk)
+        };
+        let status = || {
+            LiveStatus::new(
+                "rbt_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                "rrc_01k0z6r1w8f4jy2m7q9v3x5abc".to_owned(),
+                None,
+            )
+        };
+
+        let reading = super::super::disk::DiskReading {
+            path: PathBuf::from("/var/lib/useful/runner/work"),
+            available_bytes: 6_186_599,
+            total_bytes: 423_054_278_656,
+            minimum_free_bytes: 5_368_709_120,
+            low: true,
+            read_at: time::OffsetDateTime::parse(
+                "2026-11-19T14:00:30Z",
+                &time::format_description::well_known::Rfc3339,
+            )
+            .unwrap(),
+        };
+        let held = status().with_disk(super::super::disk::DiskReadingHandle::holding(reading));
+        let (snapshot, overview) = answers(&held);
+        assert_eq!(
+            snapshot.as_deref(),
+            Some(&crate::control_protocol::StatusDisk {
+                path: "/var/lib/useful/runner/work".to_owned(),
+                available_bytes: 6_186_599,
+                total_bytes: 423_054_278_656,
+                minimum_free_bytes: 5_368_709_120,
+                low: true,
+                read_at: "2026-11-19T14:00:30Z".to_owned(),
+            })
+        );
+        assert_eq!(
+            overview,
+            Some(crate::control_protocol::OverviewDisk {
+                path: "/var/lib/useful/runner/work".to_owned(),
+                available_bytes: 6_186_599,
+                total_bytes: 423_054_278_656,
+                minimum_free_bytes: 5_368_709_120,
+                low: true,
+                read_at: "2026-11-19T14:00:30Z".to_owned(),
+            })
+        );
+
+        let empty = status().with_disk(super::super::disk::DiskReadingHandle::new());
+        assert_eq!(answers(&empty), (None, None));
+        assert_eq!(answers(&status()), (None, None));
     }
 }

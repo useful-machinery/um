@@ -28,6 +28,7 @@ use crate::service::assignment::test_support::{
     observation_retained, reporting_assignment, take_held_assignment,
 };
 use crate::service::config::{AssignmentConfig, Config, RepositoryUrlPolicy};
+use crate::service::disk::{DiskReading, DiskReadingHandle};
 use crate::service::lease_clock::{
     ControlledLeaseClock, LeaseTimerRelease, controlled_lease_clock,
 };
@@ -5582,6 +5583,204 @@ async fn an_offer_past_the_held_assignment_bound_is_declined_and_each_held_one_r
             offered.assignment_id
         );
     }
+}
+
+const DISK_GIB: u64 = 1 << 30;
+
+/// A reading of the work root's disk with `available_bytes` left against a 5 GiB minimum.
+fn disk_reading(available_bytes: u64) -> DiskReading {
+    let minimum_free_bytes = 5 * DISK_GIB;
+    DiskReading {
+        path: PathBuf::from("/work"),
+        available_bytes,
+        total_bytes: 100 * DISK_GIB,
+        minimum_free_bytes,
+        low: available_bytes < minimum_free_bytes,
+        read_at: time::OffsetDateTime::UNIX_EPOCH,
+    }
+}
+
+/// A manager whose disk monitor has published a low reading: 1 GiB left of a 5 GiB minimum.
+fn manager_fixture_on_low_disk() -> (tempfile::TempDir, AssignmentManager) {
+    let (temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
+    manager.disk_reading = DiskReadingHandle::holding(disk_reading(DISK_GIB));
+    (temporary, manager)
+}
+
+/// The declines the manager answered `assignment_id` with, pending in its outbox.
+fn pending_declines(
+    manager: &mut AssignmentManager,
+    assignment_id: &str,
+) -> Vec<AssignmentDecline> {
+    manager
+        .pending_observations(&BTreeSet::new(), MAXIMUM_SERVICE_OBSERVATIONS)
+        .into_iter()
+        .filter_map(|pending| match pending.observation {
+            AssignmentObservation::Decision(AssignmentDecision::Rejected {
+                assignment_id: rejected,
+                decline,
+                ..
+            }) if rejected == assignment_id => Some(decline),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Each listed `disk_low_offer_declined`, newest first, as its run, assignment and count.
+fn listed_disk_declines(manager: &AssignmentManager) -> Vec<(Option<String>, Option<String>, u64)> {
+    manager
+        .runner_events
+        .newest_first()
+        .into_iter()
+        .filter(|event| event.kind == OpenWord::Known(RunnerEventKind::DiskLowOfferDeclined))
+        .map(|event| (event.run_id, event.assignment_id, event.count))
+        .collect()
+}
+
+fn disk_space_low_decline() -> AssignmentDecline {
+    AssignmentDecline::CapacityUnavailable.diagnosed("host_disk", "disk_space_low")
+}
+
+/// Installs `offered` as a running assignment whose loop last reported a wait when
+/// `waiting`, and work otherwise.
+fn install_held_disk_fixture(
+    manager: &mut AssignmentManager,
+    offered: &AssignmentOffer,
+    waiting: bool,
+) {
+    install_running_renewal_fixture(manager, offered.clone());
+    let activity = RunActivity::new();
+    activity.reported(waiting);
+    manager
+        .running_mut(&offered.assignment_id)
+        .expect("installed assignment runs")
+        .activity = Some(activity);
+}
+
+// REQ-RUNNERENROLL-154, REQ-DIAG-44, INV-RUNNER-50: while the published reading is low, an
+// offer of a new run is declined `capacity_unavailable` with the stage `host_disk` and the
+// cause `disk_space_low`, leaving nothing held, kept or prepared, and listed once as
+// `disk_low_offer_declined`; the same offer again changes nothing, and once a reading that
+// is not low is published the next offer is held.
+#[tokio::test]
+async fn a_new_offer_on_a_low_disk_is_declined_and_held_again_once_the_disk_recovers() {
+    let (_temporary, mut manager) = manager_fixture_on_low_disk();
+    let declined = offer("dd");
+
+    manager.handle_offer(declined.clone()).unwrap();
+
+    assert_eq!(
+        pending_declines(&mut manager, &declined.assignment_id),
+        [disk_space_low_decline()]
+    );
+    assert!(!manager.held.contains_key(&declined.assignment_id));
+    assert!(!manager.run_events.contains_key(&declined.assignment_id));
+    assert!(!manager.offer_facts.contains_key(&declined.assignment_id));
+    assert!(
+        !manager
+            .work_root
+            .boot_path()
+            .join(&declined.assignment_id)
+            .exists()
+    );
+    let listed = vec![(
+        Some(declined.run_id.clone()),
+        Some(declined.assignment_id.clone()),
+        1,
+    )];
+    assert_eq!(listed_disk_declines(&manager), listed);
+
+    manager.handle_offer(declined.clone()).unwrap();
+    assert_eq!(
+        pending_declines(&mut manager, &declined.assignment_id),
+        [disk_space_low_decline()]
+    );
+    assert_eq!(listed_disk_declines(&manager), listed);
+
+    manager.disk_reading.publish(disk_reading(8 * DISK_GIB));
+    let events = manager.runner_events.newest_first().len();
+    let taken = offer("de");
+    manager.handle_offer(taken.clone()).unwrap();
+    assert!(matches!(
+        manager.held.get(&taken.assignment_id),
+        Some(HeldAssignment::Preparing(_))
+    ));
+    assert!(pending_declines(&mut manager, &taken.assignment_id).is_empty());
+    assert_eq!(manager.runner_events.newest_first().len(), events);
+}
+
+// REQ-RUNNERENROLL-154, INV-RUNNER-50: an offer that continues an earlier attempt is held
+// while the disk is low, and no disk decline is listed.
+#[tokio::test]
+async fn a_continuation_offer_on_a_low_disk_is_held() {
+    let (_temporary, mut manager) = manager_fixture_on_low_disk();
+    let mut continued = offer("df");
+    continued.continuation = Some(Box::new(ContinuationOffer {
+        prior_assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5aaa".to_owned(),
+        prior_attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5aaa".to_owned(),
+        required_runner_boot_id: "rbt_01k0z6r1w8f4jy2m7q9v3x5aaa".to_owned(),
+        execution_root: "/retained/workspace".to_owned(),
+        definition_source: continued.execution_spec.workflow_definition_source.clone(),
+        effective_capacity: continued.execution_spec.capacity.clone(),
+        prior_manifest_digest: continued
+            .execution_spec
+            .workflow_definition_source
+            .workflow_source_closure_digest
+            .clone(),
+        request: serde_json::json!({"fromSteps":["build"]}),
+        reexecuted_steps: vec!["build".to_owned()],
+        inherited_steps: Vec::new(),
+        prior_settlement_snapshot: None,
+    }));
+
+    manager.handle_offer(continued.clone()).unwrap();
+
+    assert!(matches!(
+        manager.held.get(&continued.assignment_id),
+        Some(HeldAssignment::Preparing(_))
+    ));
+    assert!(pending_declines(&mut manager, &continued.assignment_id).is_empty());
+    assert!(listed_disk_declines(&manager).is_empty());
+}
+
+// REQ-RUNNERENROLL-154, REQ-DIAG-44, INV-RUNNER-50: beside a held assignment that waits, an
+// offer on a low disk is declined with the disk's diagnostic and the held assignment still
+// renews; beside one that works, the offer is declined plain `capacity_unavailable`, the
+// earlier rule, and no disk decline is listed.
+#[tokio::test]
+async fn a_low_disk_declines_an_offer_beside_a_waiting_run_which_still_renews() {
+    let (_temporary, mut manager) = manager_fixture_on_low_disk();
+    let waiting = offer("dg");
+    install_held_disk_fixture(&mut manager, &waiting, true);
+    let declined = offer("dh");
+
+    manager.handle_offer(declined.clone()).unwrap();
+
+    assert_eq!(
+        pending_declines(&mut manager, &declined.assignment_id),
+        [disk_space_low_decline()]
+    );
+    assert!(!manager.held.contains_key(&declined.assignment_id));
+    assert_eq!(
+        manager
+            .handle_renewal(renewal_for(&waiting))
+            .unwrap()
+            .disposition,
+        RenewalDisposition::Applied
+    );
+
+    let (_temporary, mut manager) = manager_fixture_on_low_disk();
+    let working = offer("dj");
+    install_held_disk_fixture(&mut manager, &working, false);
+    let declined = offer("dk");
+
+    manager.handle_offer(declined.clone()).unwrap();
+
+    assert_eq!(
+        pending_declines(&mut manager, &declined.assignment_id),
+        [AssignmentDecline::CapacityUnavailable]
+    );
+    assert!(listed_disk_declines(&manager).is_empty());
 }
 
 // REQ-RUNNERENROLL-80: a held run whose loop last reported a wait is counted `waiting`

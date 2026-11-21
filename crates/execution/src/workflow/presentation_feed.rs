@@ -10,7 +10,7 @@ use super::claude_code::ClaudeCodeEffort;
 use super::document::{FailurePolicy, Output};
 use super::observation::{
     CommandOutputClosedObservation, CommandOutputObservation, CommandOutputSource,
-    ExecutionObservation, SourceSequence, TransitionObservation,
+    ExecutionObservation, SourceSequence, StartHeldObservation, TransitionObservation,
 };
 use super::pi::Thinking;
 use super::resolution::ResolvedWorkflow;
@@ -302,6 +302,8 @@ pub(crate) enum PresentationRecordKind {
     Transition(Box<PresentationTransition>),
     ChildOutput(NormalizedChildOutput),
     AgentObservation(NormalizedAgentObservation),
+    /// A step held at its start gate (REQ-LOCALRUN-222).
+    StartHeld(StartHeldObservation),
 }
 
 pub(crate) type PresentationTransition = TransitionObservation<OffsetDateTime>;
@@ -394,6 +396,9 @@ impl WorkflowPresentationFeed {
             }
             ExecutionObservation::Agent(observation) => {
                 self.accept_agent_observation(observed_at, observation)
+            }
+            ExecutionObservation::StartHeld(held) => {
+                vec![self.record(observed_at, PresentationRecordKind::StartHeld(held))]
             }
         }
     }

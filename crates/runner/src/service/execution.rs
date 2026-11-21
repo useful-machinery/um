@@ -48,7 +48,7 @@ use useful_execution::{
     RecoveryInvocationDiagnosticV1, RecoveryInvocationRoleV1, RecoveryInvocationStateV1,
     RecoveryInvocationUsageV1, RecoveryInvocationV1, RunOutcome, SchedulingGate, StartedExecution,
     StepDiagnostic, StepDiagnosticLog, StepFailureCause, StepFailureKind, StepRecoveryState,
-    StepState, StepStateKind, SystemProcessIdentityInspector, TargetExecutionNumber,
+    StepStartGate, StepState, StepStateKind, SystemProcessIdentityInspector, TargetExecutionNumber,
     TransitionEvent, TransitionObservation, ValidatedRecoveryHandler, ValidatedStep,
     WorkflowExecutionResult, WorkflowExecutionStart, WorkflowNodeRole, WorkflowRunCancellation,
     WorkflowRunFinalization, WorkflowRunFinalizationCancellation, WorkflowRunId, WorkflowRunResult,
@@ -277,6 +277,10 @@ pub(super) struct ExecutionJob {
     run_event: RunEvent,
     /// The view of a single-workflow run the manager also holds; none for a tree run.
     view: Option<AssignmentRunView>,
+    /// The start gate a single-workflow run's engine consults before each command or agent
+    /// step (REQ-RUNNERENROLL-155): the disk monitor's published reading, or an empty
+    /// reading, which never holds a step, when the service runs no monitor.
+    start_gate: Arc<dyn StepStartGate>,
 }
 
 struct RunnerResultFailure {
