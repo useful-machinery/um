@@ -12,7 +12,8 @@ use std::time::Duration;
 use anyhow::Context;
 use clap::{Args, Subcommand, ValueEnum};
 
-use crate::exit_code::ExitCode;
+use crate::exit_code::{ExitCode, OutcomeClass};
+use useful_execution::{ArchivedTerminalHostExit, PresentationFailure};
 
 pub(super) const ABOUT: &str = "Work with local workflow definitions and runs";
 const NAME: &str = "workflow";
@@ -288,22 +289,25 @@ pub(super) fn write_embedded_asset(
     Ok(ExitCode::Success)
 }
 
-// Read-only commands use a current-thread runtime so signal exit can abandon a blocked
-// filesystem worker without delaying process shutdown.
+// Read-only commands and the viewers use a current-thread runtime so signal exit can abandon
+// a blocked filesystem or socket worker without delaying process shutdown. `family` and
+// `leaf` name the command, `workflow view` or `runner watch`.
 pub(super) fn execute_with_abandonable_runtime(
+    family: &'static str,
     leaf: &'static str,
     execution: impl Future<Output = super::CommandResult>,
 ) -> super::CommandResult {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .with_context(|| format!("start workflow {leaf} runtime"))?;
+        .with_context(|| format!("start {family} {leaf} runtime"))?;
     let result = runtime.block_on(execution);
     runtime.shutdown_timeout(Duration::ZERO);
     result
 }
 
 pub(super) fn observe_workflow_signals(
+    family: &'static str,
     leaf: &'static str,
 ) -> anyhow::Result<(tokio::signal::unix::Signal, tokio::signal::unix::Signal)> {
     (|| -> io::Result<_> {
@@ -311,7 +315,47 @@ pub(super) fn observe_workflow_signals(
         let terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         Ok((interrupt, terminate))
     })()
-    .with_context(|| format!("install workflow {leaf} signal observation"))
+    .with_context(|| format!("install {family} {leaf} signal observation"))
+}
+
+/// The ending a viewer's first SIGINT or SIGTERM requests.
+pub(super) async fn first_view_signal(
+    interrupt: &mut tokio::signal::unix::Signal,
+    terminate: &mut tokio::signal::unix::Signal,
+) -> ArchivedTerminalHostExit {
+    tokio::select! {
+        biased;
+        _ = interrupt.recv() => ArchivedTerminalHostExit::Interrupted,
+        _ = terminate.recv() => ArchivedTerminalHostExit::Terminated,
+    }
+}
+
+/// A viewer's exit status for its ending: 0 for `q`, 130 and 143 for an interrupt and a
+/// termination (REQ-LOCALRUN-70).
+pub(super) fn viewer_exit_code(exit: ArchivedTerminalHostExit) -> ExitCode {
+    match exit {
+        ArchivedTerminalHostExit::Quit => OutcomeClass::Success,
+        ArchivedTerminalHostExit::Interrupted => OutcomeClass::Interrupted,
+        ArchivedTerminalHostExit::Terminated => OutcomeClass::Terminated,
+    }
+    .exit_code()
+}
+
+/// The diagnostic of a viewer whose terminal failed (REQ-LOCALRUN-72); `command` names
+/// the viewer, `workflow view` or `runner watch`.
+pub(super) fn terminal_failure(command: &str, failure: &PresentationFailure) -> anyhow::Error {
+    if failure.panic_message.is_some() {
+        return anyhow::anyhow!("{failure}");
+    }
+    failure.error_kind.map_or_else(
+        || anyhow::anyhow!("{command} terminal failure: {:?}", failure.operation),
+        |kind| {
+            anyhow::anyhow!(
+                "{command} terminal failure: {:?} ({kind:?})",
+                failure.operation
+            )
+        },
+    )
 }
 
 impl Command {

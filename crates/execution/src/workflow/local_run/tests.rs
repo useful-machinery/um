@@ -831,16 +831,25 @@ async fn execute_to_a_stop_wait(
     fixture: &AdmittedFixture,
     run: &InitialLocalRun,
 ) -> crate::workflow::runtime::EnteredWait {
-    let artifacts =
-        ArtifactStaging::create(fixture.admitted.execution(), run.private_directory()).unwrap();
-    let inputs = crate::workflow::input::InputStaging::create(
-        fixture.admitted.execution(),
-        run.private_directory(),
-    )
-    .unwrap();
+    match execute_with_stops(fixture.admitted.clone(), run).await {
+        crate::workflow::runtime::RunOutcome::Waiting { wait } => wait,
+        other => panic!("the attempt did not end on the stop wait: {other:?}"),
+    }
+}
+
+/// Executes `run`'s attempt of `admitted` with a stop in force before every `workflow`
+/// step: a workflow without one runs to its end.
+async fn execute_with_stops(
+    admitted: AdmittedWorkflow,
+    run: &InitialLocalRun,
+) -> crate::workflow::runtime::RunOutcome {
+    let artifacts = ArtifactStaging::create(admitted.execution(), run.private_directory()).unwrap();
+    let inputs =
+        crate::workflow::input::InputStaging::create(admitted.execution(), run.private_directory())
+            .unwrap();
     let diagnostics = crate::workflow::diagnostic::StepDiagnosticLog::default();
     let result = crate::workflow::execution::execute_workflow_with_children(
-        fixture.admitted.clone(),
+        admitted,
         &artifacts,
         &inputs,
         &diagnostics,
@@ -862,10 +871,7 @@ async fn execute_to_a_stop_wait(
     )
     .await
     .unwrap();
-    match result.outcome {
-        crate::workflow::runtime::RunOutcome::Waiting { wait } => wait,
-        other => panic!("the attempt did not end on the stop wait: {other:?}"),
-    }
+    result.outcome
 }
 
 // REQ-WFEXEC-61, INV-ENGINE-20
@@ -3608,14 +3614,11 @@ fn lock_holder_process_fixture() {
     drop(pending);
 }
 
-// REQ-LOCALRUN-175
-#[tokio::test]
-async fn lock_holder_names_the_process_that_holds_the_run_lock() {
-    let fixture = edge_tree_fixture();
-    let (run_path, _, _writable) = waiting_tree_run(&fixture, "locked").await;
-    assert_eq!(lock_holder(&run_path), Ok(None));
-
-    // A process's own `fcntl` lock never blocks its own query, so another process holds it.
+/// Spawns `lock_holder_process_fixture` for the run at `run_path` and waits until it holds
+/// the run lock; closing the child's standard input releases it. A process's own `fcntl`
+/// lock never blocks its own query, and closing any descriptor of `run.lock` in the holding
+/// process releases it, so another process holds it.
+fn spawn_lock_holder(run_path: &Path) -> (std::process::Child, rustix::process::Pid) {
     let ready = run_path.with_extension("held");
     let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -3624,7 +3627,7 @@ async fn lock_holder_names_the_process_that_holds_the_run_lock() {
             "--ignored",
             "--test-threads=1",
         ])
-        .env(LOCK_HOLDER_RUN, &run_path)
+        .env(LOCK_HOLDER_RUN, run_path)
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -3639,12 +3642,527 @@ async fn lock_holder_names_the_process_that_holds_the_run_lock() {
         assert!(useful_support::elapsed(started) < Duration::from_secs(10));
         useful_support::sleep(Duration::from_millis(10));
     }
-    let holder_pid = rustix::process::Pid::from_raw(i32::try_from(holder.id()).unwrap());
-    assert_eq!(lock_holder(&run_path), Ok(holder_pid));
+    let holder_pid = rustix::process::Pid::from_raw(i32::try_from(holder.id()).unwrap()).unwrap();
+    (holder, holder_pid)
+}
+
+// REQ-LOCALRUN-175
+#[tokio::test]
+async fn lock_holder_names_the_process_that_holds_the_run_lock() {
+    let fixture = edge_tree_fixture();
+    let (run_path, _, _writable) = waiting_tree_run(&fixture, "locked").await;
+    assert_eq!(lock_holder(&run_path), Ok(None));
+
+    let (mut holder, holder_pid) = spawn_lock_holder(&run_path);
+    assert_eq!(lock_holder(&run_path), Ok(Some(holder_pid)));
 
     drop(holder.stdin.take());
     assert!(holder.wait().unwrap().success());
     assert_eq!(lock_holder(&run_path), Ok(None));
+}
+
+// A workflow that declares a `workflow` step is edge-scheduled and holds no `cmd` step
+// (REQ-WFFORMAT-93), so the view's steps are read from two runs: this dataflow one for
+// `cmd` steps and `edge_tree_fixture`'s for a `workflow` step and its child runs.
+const VIEW_STEPS_WORKFLOW: &str = "schemaVersion: 1\nprograms: [bin]\nsteps:\n  plan:\n    kind: cmd\n    cwd: tools\n    command: {argv: [\"plan\"]}\n    recovery: {retries: 1}\n    outputs:\n      plan: {kind: text, from: path, path: tools/plan.txt}\n  build:\n    kind: cmd\n    dependsOn: [plan]\n    cwd: tools\n    command: {argv: [\"plan\"]}\n  review:\n    kind: cmd\n    dependsOn: [build]\n    cwd: tools\n    command: {argv: [\"plan\"]}\n";
+/// Fails its first run in a directory, retaining output on both streams, and then prints 40
+/// lines and writes `plan.txt`.
+const VIEW_PLAN_PROGRAM: &str = "#!/bin/sh\nif [ ! -e tried ]; then\n  : > tried\n  echo first try\n  echo failing >&2\n  exit 1\nfi\ni=0\nwhile [ \"$i\" -lt 40 ]; do echo \"plan line $i\"; i=$((i + 1)); done\necho planned > plan.txt\n";
+const VIEW_STARTED: &str = "2026-11-19T14:02:05Z";
+
+fn view_steps_fixture() -> AdmittedFixture {
+    let fixture = AdmittedFixture::from_tree(
+        VIEW_STEPS_WORKFLOW,
+        &[("bin/plan", VIEW_PLAN_PROGRAM, 0o755)],
+    );
+    fs::create_dir(fixture.execution_root.join("tools")).unwrap();
+    fixture
+}
+
+/// A tree run of `VIEW_STEPS_WORKFLOW` whose steps ran for real, `plan` failing once and
+/// recovering, both of its invocations retaining output, and settling with its output
+/// committed; then staged as a run in flight: `build` `running` since `VIEW_STARTED` and
+/// `review` `pending`. Answers the run's state as staged.
+async fn running_steps_run(
+    fixture: &AdmittedFixture,
+    name: &str,
+) -> (PathBuf, LocalRunStateV1, WritableTreeCopyOnDrop) {
+    let run_path = fixture.run_path(name);
+    let writable = WritableTreeCopyOnDrop(run_path.clone());
+    let record = tree_record(fixture, None);
+    let run =
+        InitialLocalRun::create_with_record(&run_path, &fixture.admitted, Some(&record)).unwrap();
+    // The commands find the tree's programs through the run's copy (REQ-WFEXEC-53).
+    let admitted = fixture
+        .admitted
+        .clone()
+        .with_tree_copy(&run.tree_copy_directory())
+        .unwrap();
+    assert_eq!(
+        execute_with_stops(admitted, &run).await,
+        crate::workflow::runtime::RunOutcome::Succeeded
+    );
+    stage_running(&run, |step| match step.id.as_str() {
+        "build" => {
+            step.state = AttemptStepStateV1::Running;
+            step.started_at = Some(VIEW_STARTED.to_owned());
+        }
+        "review" => {
+            step.state = AttemptStepStateV1::Pending;
+            step.started_at = None;
+        }
+        _ => {}
+    });
+    let state = read_state(run.root_handle()).unwrap();
+    // The run's own lock is released before any read of it in this process.
+    drop(run);
+    (run_path, state, writable)
+}
+
+/// Stages `run`'s settled attempt as one in flight, each step as `stage` leaves it; a step
+/// it leaves unsettled keeps no detail or output.
+fn stage_running(run: &InitialLocalRun, stage: impl Fn(&mut AttemptStepV1)) {
+    run.state
+        .update(|state| {
+            let attempt = current_attempt_mut(state)?;
+            attempt.state = AttemptStateV1::Running;
+            attempt.settled_at = None;
+            attempt.settlement_snapshot = None;
+            attempt.result = AttemptResultV1::NotPublished {
+                reason: ResultAbsentReasonV1::AttemptNonterminal,
+            };
+            for step in &mut attempt.progress.steps {
+                stage(step);
+                if step.state == AttemptStepStateV1::Pending || step.state.is_in_flight() {
+                    step.detail = None;
+                    step.outputs = Some(Vec::new());
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// A tree run of `edge_tree_fixture` whose attempt reached the stop before `design`, then
+/// staged in flight: `design` `running` since `VIEW_STARTED` with `children` child runs,
+/// and `build` `pending`.
+async fn running_workflow_step_run(
+    fixture: &AdmittedFixture,
+    name: &str,
+    children: usize,
+) -> (PathBuf, Vec<WritableTreeCopyOnDrop>) {
+    let run_path = fixture.run_path(name);
+    let mut writable = vec![WritableTreeCopyOnDrop(run_path.clone())];
+    let record = tree_record(fixture, None);
+    let run =
+        InitialLocalRun::create_with_record(&run_path, &fixture.admitted, Some(&record)).unwrap();
+    execute_to_a_stop_wait(fixture, &run).await;
+    stage_running(&run, |step| {
+        if step.id == "design" {
+            step.state = AttemptStepStateV1::Running;
+            step.started_at = Some(VIEW_STARTED.to_owned());
+        } else {
+            step.state = AttemptStepStateV1::Pending;
+        }
+    });
+    let parent_copy = run.tree_copy_directory();
+    for _ in 0..children {
+        let admitted = fixture.admit_child(&parent_copy, "design.yaml");
+        let child_record = WorkflowRunRecord::child_of(&record, "design", "design.yaml", None);
+        let child = create_child(&run, "design", None, &admitted, &child_record).unwrap();
+        writable.push(WritableTreeCopyOnDrop(child.run_directory().to_owned()));
+    }
+    drop(run);
+    (run_path, writable)
+}
+
+fn view_request(now: OffsetDateTime) -> RunViewRequest {
+    RunViewRequest {
+        path: Vec::new(),
+        step: None,
+        now,
+        maximum_steps: 1024,
+        maximum_child_runs: 64,
+        maximum_output_bytes: 262_144,
+    }
+}
+
+/// A listed step's ID, role, kind, state, failure policy and dependencies.
+type ViewStepSummary<'a> = (&'a str, &'a str, &'a str, &'a str, &'a str, Vec<String>);
+
+fn view_step_summary(view: &RunView) -> Vec<ViewStepSummary<'_>> {
+    view.steps
+        .iter()
+        .map(|step| {
+            (
+                step.id.as_str(),
+                step.role.as_str(),
+                step.work.kind(),
+                step.state.as_str(),
+                step.failure_policy.as_str(),
+                step.needs.clone(),
+            )
+        })
+        .collect()
+}
+
+fn view_timestamp(value: &str) -> OffsetDateTime {
+    crate::workflow::schema_common::parse_canonical_utc_timestamp(value).unwrap()
+}
+
+// REQ-RUNNERENROLL-144
+#[tokio::test]
+async fn run_view_reads_a_running_tree_runs_steps_and_child_runs() {
+    let now = view_timestamp(VIEW_STARTED) + Duration::from_secs(61);
+
+    let fixture = view_steps_fixture();
+    let (run_path, state, _writable) = running_steps_run(&fixture, "view").await;
+    let attempt = state.attempts.last().unwrap();
+    let plan = &attempt.progress.steps[0];
+    let [failed, recovered] = attempt.progress.invocations.as_slice() else {
+        panic!(
+            "plan should have two invocations: {:?}",
+            attempt.progress.invocations
+        );
+    };
+
+    let view = read_run_view(&run_path, &view_request(now)).unwrap();
+    assert_eq!(
+        (
+            view.workflow_path.as_str(),
+            view.state.as_str(),
+            view.attempts,
+            view.outcome.as_deref(),
+            view.attempt_number,
+            view.attempt_state.as_str(),
+            &view.wait,
+            view.steps_omitted,
+            &view.output,
+        ),
+        (
+            "workflow.yaml",
+            "running",
+            1,
+            None,
+            1,
+            "running",
+            &None,
+            0,
+            &RunViewStepOutput::NotGiven,
+        )
+    );
+    let needs = |step: &str| vec![step.to_owned()];
+    assert_eq!(
+        view_step_summary(&view),
+        [
+            ("plan", "step", "cmd", "succeeded", "required", vec![]),
+            ("build", "step", "cmd", "running", "required", needs("plan")),
+            (
+                "review",
+                "step",
+                "cmd",
+                "pending",
+                "required",
+                needs("build")
+            ),
+        ]
+    );
+    let [plan_view, build, review] = view.steps.as_slice() else {
+        panic!("the view should list three steps");
+    };
+    assert_eq!(
+        plan_view.work,
+        RunViewWork::Command {
+            argv: vec!["plan".to_owned()],
+            cwd: Some("tools".to_owned()),
+        }
+    );
+    assert_eq!(
+        plan_view.outputs,
+        [RunViewOutput {
+            name: "plan".to_owned(),
+            kind: "text".to_owned(),
+            committed: true,
+        }]
+    );
+    assert_eq!(plan_view.started_at, plan.started_at);
+    // The time to the last finish among the step's invocations.
+    let finished = [failed, recovered]
+        .map(|invocation| view_timestamp(invocation.finished_at.as_deref().unwrap()))
+        .into_iter()
+        .max()
+        .unwrap();
+    let started = view_timestamp(plan.started_at.as_deref().unwrap());
+    assert_eq!(
+        plan_view.duration,
+        Some(Duration::try_from(finished - started).unwrap())
+    );
+    assert_eq!(
+        (build.started_at.as_deref(), build.duration),
+        (Some(VIEW_STARTED), Some(Duration::from_secs(61)))
+    );
+    assert_eq!((&review.started_at, review.duration), (&None, None));
+
+    // A step bound keeps the first steps and counts the rest.
+    let bounded = RunViewRequest {
+        maximum_steps: 2,
+        ..view_request(now)
+    };
+    let view = read_run_view(&run_path, &bounded).unwrap();
+    assert_eq!(
+        (
+            view.steps
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<Vec<_>>(),
+            view.steps_omitted
+        ),
+        (vec!["plan", "build"], 1)
+    );
+
+    // A `workflow` step in flight with its child run.
+    let fixture = edge_tree_fixture();
+    let (run_path, _writable) = running_workflow_step_run(&fixture, "view-children", 1).await;
+    let view = read_run_view(&run_path, &view_request(now)).unwrap();
+    let [design, build] = view.steps.as_slice() else {
+        panic!("the view should list two steps: {:?}", view.steps);
+    };
+    assert_eq!(
+        (
+            design.state.as_str(),
+            design.started_at.as_deref(),
+            design.duration
+        ),
+        ("running", Some(VIEW_STARTED), Some(Duration::from_secs(61)))
+    );
+    assert_eq!(
+        design.work,
+        RunViewWork::Workflow {
+            file: "design.yaml".to_owned(),
+            child_runs: vec![RunViewChildRun {
+                ordinal: 1,
+                item: None,
+                state: "running".to_owned(),
+                outcome: None,
+            }],
+            child_runs_omitted: 0,
+        }
+    );
+    assert_eq!(
+        (build.state.as_str(), &build.started_at, build.duration),
+        ("pending", &None, None)
+    );
+
+    // The child run's own steps.
+    let child = RunViewRequest {
+        path: vec![RunViewPathElement {
+            step: "design".to_owned(),
+            item: None,
+            ordinal: 1,
+        }],
+        ..view_request(now)
+    };
+    let child_view = read_run_view(&run_path, &child).unwrap();
+    assert_eq!(
+        (
+            child_view.workflow_path.as_str(),
+            view_step_summary(&child_view)
+        ),
+        (
+            "design.yaml",
+            vec![("work", "step", "cmd", "pending", "required", vec![])]
+        )
+    );
+    for missing in [("design", 2), ("build", 1)] {
+        let request = RunViewRequest {
+            path: vec![RunViewPathElement {
+                step: missing.0.to_owned(),
+                item: None,
+                ordinal: missing.1,
+            }],
+            ..view_request(now)
+        };
+        assert!(
+            matches!(
+                read_run_view(&run_path, &request),
+                Err(RunViewError::ChildRunMissing { depth: 0 })
+            ),
+            "{missing:?}"
+        );
+    }
+}
+
+// REQ-RUNNERENROLL-144
+#[tokio::test]
+async fn run_view_keeps_a_workflow_steps_last_child_runs_and_counts_the_earlier() {
+    let fixture = edge_tree_fixture();
+    let (run_path, _writable) = running_workflow_step_run(&fixture, "children", 2).await;
+    let request = RunViewRequest {
+        maximum_child_runs: 1,
+        ..view_request(useful_support::utc_now())
+    };
+    let view = read_run_view(&run_path, &request).unwrap();
+    let RunViewWork::Workflow {
+        child_runs,
+        child_runs_omitted,
+        ..
+    } = &view.steps[0].work
+    else {
+        panic!("design should be a workflow step: {:?}", view.steps);
+    };
+    assert_eq!(
+        (
+            child_runs
+                .iter()
+                .map(|child| child.ordinal)
+                .collect::<Vec<_>>(),
+            *child_runs_omitted
+        ),
+        (vec![2], 1)
+    );
+}
+
+// REQ-RUNNERENROLL-144
+#[tokio::test]
+async fn run_view_reads_a_run_another_process_holds_locked() {
+    let fixture = edge_tree_fixture();
+    let (run_path, wait, _writable) = waiting_tree_run(&fixture, "view-locked").await;
+    let (mut holder, holder_pid) = spawn_lock_holder(&run_path);
+
+    let view = read_run_view(&run_path, &view_request(useful_support::utc_now())).unwrap();
+    assert_eq!(
+        (
+            view.state.as_str(),
+            view.steps
+                .iter()
+                .map(|step| (step.id.as_str(), step.state.as_str()))
+                .collect::<Vec<_>>(),
+            view.wait,
+        ),
+        (
+            "waiting",
+            vec![("design", "not_run"), ("build", "not_run")],
+            Some(RunViewWait {
+                kind: "stop".to_owned(),
+                since: wait.since.clone(),
+                step: wait.step.clone(),
+            }),
+        )
+    );
+    // The read took no lock and released none.
+    assert_eq!(lock_holder(&run_path), Ok(Some(holder_pid)));
+
+    drop(holder.stdin.take());
+    assert!(holder.wait().unwrap().success());
+}
+
+/// The view's output of the step `step` of the run at `run_path` with output windows of
+/// `window` bytes.
+fn view_output(run_path: &Path, step: &str, window: u64) -> RunViewStepOutput {
+    let request = RunViewRequest {
+        step: Some(step.to_owned()),
+        maximum_output_bytes: window,
+        ..view_request(useful_support::utc_now())
+    };
+    read_run_view(run_path, &request).unwrap().output
+}
+
+// REQ-RUNNERENROLL-145
+#[tokio::test]
+async fn run_view_gives_a_settled_steps_newest_retained_output() {
+    let fixture = view_steps_fixture();
+    let (run_path, state, _writable) = running_steps_run(&fixture, "output").await;
+    let [failed, recovered] = state.attempts[0].progress.invocations.as_slice() else {
+        panic!("plan should have two invocations");
+    };
+    assert!(
+        [failed, recovered]
+            .iter()
+            .all(|invocation| invocation.diagnostics.len() == 2),
+        "both invocations should retain output: {failed:?} {recovered:?}"
+    );
+    let [stdout, stderr] = recovered.diagnostics.as_slice() else {
+        panic!("the invocation should retain two streams");
+    };
+    let retained = fs::read(run_path.join(&stdout.reference)).unwrap();
+    assert!(retained.len() > 100, "{}", retained.len());
+    assert_eq!(fs::read(run_path.join(&stderr.reference)).unwrap(), b"");
+
+    // The pending step, the running step and a step the run does not have give none.
+    for step in ["review", "build", "absent"] {
+        assert_eq!(
+            view_output(&run_path, step, 100),
+            RunViewStepOutput::NotGiven,
+            "{step}"
+        );
+    }
+    // The newer invocation that retained output is given, the earlier counted.
+    assert_eq!(
+        view_output(&run_path, "plan", 100),
+        RunViewStepOutput::Retained(RunViewRetainedOutput {
+            invocation_id: recovered.invocation_id,
+            stdout: RunViewStream {
+                retained_bytes: stdout.retained_bytes,
+                discarded_bytes: stdout.discarded_bytes,
+                window: retained[retained.len() - 100..].to_vec(),
+                omitted_bytes: u64::try_from(retained.len() - 100).unwrap(),
+            },
+            stderr: RunViewStream::default(),
+            earlier_invocations_omitted: 1,
+        })
+    );
+
+    // A settled step no invocation of which retained output.
+    let edge = edge_tree_fixture();
+    let (waiting_path, _, _waiting_writable) = waiting_tree_run(&edge, "settled-none").await;
+    assert_eq!(
+        view_output(&waiting_path, "design", 100),
+        RunViewStepOutput::SettledWithNone
+    );
+}
+
+// REQ-RUNNERENROLL-145
+#[test]
+fn read_run_file_tail_reads_only_the_end_of_a_file_beneath_the_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    fs::create_dir(root.join("nested")).unwrap();
+    fs::write(root.join("nested/short"), b"short").unwrap();
+    let long = (0..=255_u8).cycle().take(1000).collect::<Vec<_>>();
+    fs::write(root.join("nested/long"), &long).unwrap();
+    symlink(root.join("nested/long"), root.join("nested/link")).unwrap();
+
+    assert_eq!(
+        read_run_file_tail(root, "nested/short", 64).unwrap(),
+        FileTail {
+            bytes: b"short".to_vec(),
+            omitted_bytes: 0,
+        }
+    );
+    assert_eq!(
+        read_run_file_tail(root, "nested/long", 64).unwrap(),
+        FileTail {
+            bytes: long[1000 - 64..].to_vec(),
+            omitted_bytes: 1000 - 64,
+        }
+    );
+    assert!(matches!(
+        read_run_file_tail(root, "nested/link", 64),
+        Err(LocalRunDirectoryError::File {
+            operation: "open",
+            ..
+        })
+    ));
+    for name in ["nested/../nested/short", "../short", "/nested/short"] {
+        assert!(
+            matches!(
+                read_run_file_tail(root, name, 64),
+                Err(LocalRunDirectoryError::StateFile { operation: "resolve", ref source, .. })
+                    if matches!(**source, LocalRunDirectoryError::InvalidPath)
+            ),
+            "{name}"
+        );
+    }
 }
 
 // REQ-LOCALRUN-175

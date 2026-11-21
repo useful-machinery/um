@@ -12,7 +12,12 @@ pub(super) fn render_archived(
     clamp_step_selection(&mut interaction.selected, view.steps.len());
     frame.render_widget(Clear, area);
     if !operational_area(area) {
-        render_archived_too_small(frame, area, color);
+        render_viewer_too_small(
+            frame,
+            area,
+            " Useful Machinery archived workflow attempt ",
+            color,
+        );
         return;
     }
 
@@ -57,7 +62,7 @@ pub(super) fn render_archived(
         render_help_overlay_groups(
             frame,
             sections[0],
-            archived_help_groups(interaction.surface),
+            viewer_help_groups(interaction.surface, OutputHelpMode::Archived),
             color,
         );
     }
@@ -134,28 +139,6 @@ pub(super) fn render_archived_summary(
         })
         .collect::<Vec<_>>();
     frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-pub(super) fn render_archived_too_small(frame: &mut Frame<'_>, area: Rect, color: bool) {
-    frame.render_widget(
-        Paragraph::new(vec![
-            Line::from(Span::styled(
-                "Terminal too small",
-                tone_style(color, Tone::Failure),
-            )),
-            Line::from(format!(
-                "Resize to at least {MINIMUM_WIDTH}x{MINIMUM_HEIGHT}."
-            )),
-            Line::from("Press q to quit or Ctrl-C to interrupt the viewer."),
-        ])
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(separator_style(color))
-                .title(" Useful Machinery archived workflow attempt "),
-        ),
-        area,
-    );
 }
 
 pub(super) fn render_archived_output_preview(
@@ -299,25 +282,20 @@ pub(super) fn archived_stream_tone(stream: &ArchivedStreamView) -> Tone {
     }
 }
 
-pub(super) struct ArchivedOutputRow {
-    pub(super) text: String,
-    pub(super) tone: Tone,
-}
-
-pub(super) fn output_document(output: &ArchivedCommandOutputView) -> Vec<ArchivedOutputRow> {
+pub(super) fn output_document(output: &ArchivedCommandOutputView) -> Vec<OutputRow> {
     let ArchivedCommandOutputView::Present { stdout, stderr } = output else {
-        return vec![ArchivedOutputRow {
+        return vec![OutputRow {
             text: "No durable command-stream prefixes exist for this step.".to_owned(),
             tone: Tone::Muted,
         }];
     };
-    let mut rows = vec![ArchivedOutputRow {
+    let mut rows = vec![OutputRow {
         text: "Stdout is shown before stderr for layout only; cross-stream order is unavailable."
             .to_owned(),
         tone: Tone::Blocked,
     }];
     append_stream_document(&mut rows, stdout);
-    rows.push(ArchivedOutputRow {
+    rows.push(OutputRow {
         text: String::new(),
         tone: Tone::Muted,
     });
@@ -325,28 +303,25 @@ pub(super) fn output_document(output: &ArchivedCommandOutputView) -> Vec<Archive
     rows
 }
 
-pub(super) fn append_stream_document(
-    rows: &mut Vec<ArchivedOutputRow>,
-    stream: &ArchivedStreamView,
-) {
-    rows.push(ArchivedOutputRow {
+pub(super) fn append_stream_document(rows: &mut Vec<OutputRow>, stream: &ArchivedStreamView) {
+    rows.push(OutputRow {
         text: match stream.source {
             ArchivedStreamSource::StandardOutput => "RETAINED STDOUT PREFIX".to_owned(),
             ArchivedStreamSource::StandardError => "RETAINED STDERR PREFIX".to_owned(),
         },
         tone: Tone::Primary,
     });
-    rows.push(ArchivedOutputRow {
+    rows.push(OutputRow {
         text: archived_stream_summary(stream, false),
         tone: archived_stream_tone(stream),
     });
     if stream.records.is_empty() {
-        rows.push(ArchivedOutputRow {
+        rows.push(OutputRow {
             text: "empty retained prefix".to_owned(),
             tone: Tone::Muted,
         });
     } else {
-        rows.extend(stream.records.iter().map(|record| ArchivedOutputRow {
+        rows.extend(stream.records.iter().map(|record| OutputRow {
             text: format!(
                 "{}{}",
                 if record.continuation { "↪ " } else { "" },
@@ -356,7 +331,7 @@ pub(super) fn append_stream_document(
         }));
     }
     if stream.unterminated {
-        rows.push(ArchivedOutputRow {
+        rows.push(OutputRow {
             text: "⟂ retained-prefix boundary (final fragment has no line ending)".to_owned(),
             tone: Tone::Muted,
         });
@@ -367,62 +342,27 @@ pub(super) fn archived_output_dimensions(
     area: Rect,
     step: &ArchivedTerminalStepView,
 ) -> (usize, usize) {
-    let body =
-        archived_output_block(Borders::TOP, false).inner(selected_lower_panel_area(area, step));
-    let rows = archived_output_areas(body)[1];
-    (usize::from(rows.width), usize::from(rows.height))
+    output_document_dimensions(selected_lower_panel_area(area, step), 0)
 }
 
 pub(super) fn render_archived_full_output(
     frame: &mut Frame<'_>,
     area: Rect,
     step: Option<&ArchivedTerminalStepView>,
-    interaction: &ArchivedOutputInteraction,
+    viewport: &OutputViewport<usize>,
     color: bool,
 ) {
-    let block = archived_output_block(Borders::TOP, color);
-    let content = block.inner(area);
-    frame.render_widget(block, area);
-    let sections = archived_output_areas(content);
-    let title = step.map_or_else(
-        || "RETAINED OUTPUT".to_owned(),
-        |step| format!("RETAINED OUTPUT · {}", step.id),
-    );
-    frame.render_widget(
-        Paragraph::new(Span::styled(
-            ellipsize(&title, usize::from(sections[0].width)),
-            tone_style(color, Tone::Muted),
-        )),
-        sections[0],
-    );
     let Some(step) = step else {
-        frame.render_widget(Paragraph::new("No workflow steps."), sections[1]);
+        let rows = [OutputRow {
+            text: "No workflow steps.".to_owned(),
+            tone: Tone::Neutral,
+        }];
+        let heading = DocumentHeading::titled("RETAINED OUTPUT".to_owned());
+        render_output_document(frame, area, heading, &rows, viewport, color);
         return;
     };
-    let lines = step
-        .document
-        .iter()
-        .skip(interaction.top)
-        .take(usize::from(sections[1].height))
-        .map(|row| Line::from(Span::styled(row.text.clone(), tone_style(color, row.tone))))
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        Paragraph::new(lines).scroll((
-            0,
-            u16::try_from(interaction.horizontal_offset).unwrap_or(u16::MAX),
-        )),
-        sections[1],
-    );
-}
-
-pub(super) fn archived_output_block(borders: Borders, color: bool) -> Block<'static> {
-    section_block(borders, color).padding(Padding::horizontal(INSPECTOR_PANEL_PADDING))
-}
-
-pub(super) fn archived_output_areas(area: Rect) -> [Rect; 2] {
-    let rows =
-        Layout::vertical([Constraint::Length(LOG_HEADER_HEIGHT), Constraint::Min(0)]).split(area);
-    [rows[0], rows[1]]
+    let heading = DocumentHeading::titled(format!("RETAINED OUTPUT · {}", step.id));
+    render_output_document(frame, area, heading, &step.document, viewport, color);
 }
 
 pub(super) fn render_archived_footer(
@@ -432,38 +372,11 @@ pub(super) fn render_archived_footer(
     label: &'static str,
     options: &[&[HelpCommand]],
 ) {
-    let options = options
-        .iter()
-        .map(|commands| {
-            let mut commands = commands
-                .iter()
-                .copied()
-                .filter(|command| command.keys != "F")
-                .collect::<Vec<_>>();
-            commands.push(help("q", "quit"));
-            commands.push(help("?", "help"));
-            commands
-        })
-        .collect::<Vec<_>>();
-    let reserved_width = u16::try_from(display_width(label).saturating_add(4)).unwrap_or(u16::MAX);
-    let commands = fitting_footer(options, area.width.saturating_sub(reserved_width));
-    render_footer_text(frame, area, label, commands, color);
-}
-
-pub(super) fn archived_help_groups(surface: HostSurface) -> Vec<HelpGroup> {
-    let mut groups = surface_help_groups(surface, OutputHelpMode::Archived);
-    groups.push(HelpGroup {
-        title: "VIEWER",
-        commands: vec![
-            HelpCommand {
-                keys: "q",
-                description: "quit",
-            },
-            HelpCommand {
-                keys: "^C",
-                description: "interrupt",
-            },
-        ],
-    });
-    groups
+    render_fitting_footer(
+        frame,
+        area,
+        label,
+        viewer_footer_options(options, false),
+        color,
+    );
 }

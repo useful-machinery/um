@@ -43,6 +43,8 @@ pub enum TerminalInputEvent {
     Quit,
     Cancel,
     Resize,
+    /// A character, unmodified or shifted, that no binding above takes.
+    Character(char),
     Other,
 }
 
@@ -96,6 +98,7 @@ pub(super) fn terminal_input_event(event: Event) -> TerminalInputEvent {
                 KeyCode::Enter => TerminalInputEvent::Enter,
                 KeyCode::Esc => TerminalInputEvent::Escape,
                 KeyCode::Char('q') => TerminalInputEvent::Quit,
+                KeyCode::Char(character) => TerminalInputEvent::Character(character),
                 _ => TerminalInputEvent::Other,
             }
         }

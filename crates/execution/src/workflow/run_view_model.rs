@@ -13,12 +13,11 @@ use super::evidence::FailedChild;
 use super::observation::{
     CommandOutputSource, ExecutionObservation, ExecutionObserver, ObservedStepTransition,
 };
-#[cfg(test)]
-use super::presentation_feed::MAX_NORMALIZED_CHILD_RECORD_BYTES;
 use super::presentation_feed::{
     AcceptedRecordOrder, AgentPresentationObservationKind, DisplayDeadline,
-    NormalizedAgentObservation, NormalizedChildOutput, PresentationRecord, PresentationRecordKind,
-    PresentationTransition, WorkflowPresentationFeed, WorkflowPresentationStep,
+    MAX_NORMALIZED_CHILD_RECORD_BYTES, NormalizedAgentObservation, NormalizedChildOutput,
+    PresentationRecord, PresentationRecordKind, PresentationTransition, WorkflowPresentationFeed,
+    WorkflowPresentationStep,
 };
 use super::publication::{
     LocalPublicationError, LocalPublicationFailureKind, LocalPublicationPhase,
@@ -29,12 +28,38 @@ use super::run_timing::{
     ObservationClock, ObservationTime, RunTimingObservation, RunTimingSnapshot,
 };
 use super::runtime::{
-    RunOutcome, SchedulingGate, StepState, StepStateKind, TransitionEvent, WorkflowState,
+    ExecutionSeed, InheritedDisposition, RunOutcome, SchedulingGate, StepState, StepStateKind,
+    TransitionEvent, WorkflowState,
 };
 use super::validated::WorkflowNodeRole;
 
 const MAXIMUM_LOG_RECORDS_PER_STEP: usize = 4_096;
 const RUN_LOG_RECORD_BUDGET: usize = 262_144;
+
+/// The bounds on what a model keeps of its steps' output: each step keeps at most
+/// `step_records` records of at most `step_bytes` payload bytes, and the run at most
+/// `run_records` and `run_bytes` over its steps and finalizers (REQ-LOCALRUN-38,
+/// REQ-LOCALRUN-39, REQ-RUNNERENROLL-147).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RunLogBudget {
+    pub step_bytes: usize,
+    pub run_bytes: usize,
+    pub step_records: usize,
+    pub run_records: usize,
+}
+
+impl RunLogBudget {
+    /// The budget of `useful workflow run`'s interface.
+    fn base() -> Self {
+        Self {
+            step_bytes: usize::try_from(super::MAXIMUM_RETAINED_BYTES_PER_STREAM)
+                .unwrap_or(usize::MAX),
+            run_bytes: usize::try_from(super::RUN_LOG_BYTE_BUDGET).unwrap_or(usize::MAX),
+            step_records: MAXIMUM_LOG_RECORDS_PER_STEP,
+            run_records: RUN_LOG_RECORD_BUDGET,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct StepLogCapacity {
@@ -53,12 +78,25 @@ impl StepLogCapacity {
         )
     }
 
-    fn for_step_count(step_count: usize) -> Self {
+    /// A step's capacity under the base budget.
+    pub(crate) fn for_step_count(step_count: usize) -> Self {
+        Self::for_budget(RunLogBudget::base(), step_count)
+    }
+
+    /// A step's share of `budget` among `step_count` steps: the smaller of the step bound and
+    /// the run bound over the step count, for records and for bytes, and never under one
+    /// record.
+    fn for_budget(budget: RunLogBudget, step_count: usize) -> Self {
         let step_count = step_count.max(1);
         Self {
-            maximum_records: MAXIMUM_LOG_RECORDS_PER_STEP.min(RUN_LOG_RECORD_BUDGET / step_count),
-            maximum_bytes: usize::try_from(super::maximum_retained_bytes_per_stream(step_count))
-                .unwrap_or(usize::MAX),
+            maximum_records: budget
+                .step_records
+                .min(budget.run_records / step_count)
+                .max(1),
+            maximum_bytes: budget
+                .step_bytes
+                .min(budget.run_bytes / step_count)
+                .max(MAX_NORMALIZED_CHILD_RECORD_BYTES),
         }
     }
 
@@ -75,6 +113,43 @@ impl StepLogCapacity {
 pub(crate) enum WorkflowRunLogSource {
     Command(CommandOutputSource),
     Agent(AgentPresentationObservationKind),
+}
+
+const AGENT_OBSERVATION_KINDS: [AgentPresentationObservationKind; 10] = [
+    AgentPresentationObservationKind::Assistant,
+    AgentPresentationObservationKind::Reasoning,
+    AgentPresentationObservationKind::ToolCall,
+    AgentPresentationObservationKind::ToolResult,
+    AgentPresentationObservationKind::Diagnostic,
+    AgentPresentationObservationKind::Usage,
+    AgentPresentationObservationKind::Model,
+    AgentPresentationObservationKind::Lifecycle,
+    AgentPresentationObservationKind::ValueRejected,
+    AgentPresentationObservationKind::HarnessEvent,
+];
+
+impl WorkflowRunLogSource {
+    /// The source's word: `stdout` or `stderr` for a command's record and the kind's word for
+    /// an agent's (REQ-RUNNERENROLL-145).
+    pub(crate) const fn word(self) -> &'static str {
+        match self {
+            Self::Command(CommandOutputSource::StandardOutput) => "stdout",
+            Self::Command(CommandOutputSource::StandardError) => "stderr",
+            Self::Agent(kind) => kind.as_str(),
+        }
+    }
+
+    /// The source `word` spells, `None` for a word that spells none.
+    pub(crate) fn from_word(word: &str) -> Option<Self> {
+        match word {
+            "stdout" => Some(Self::Command(CommandOutputSource::StandardOutput)),
+            "stderr" => Some(Self::Command(CommandOutputSource::StandardError)),
+            _ => AGENT_OBSERVATION_KINDS
+                .into_iter()
+                .find(|kind| kind.as_str() == word)
+                .map(Self::Agent),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -250,10 +325,25 @@ where
         timing: RunTimingObservation,
         clock: Clock,
     ) -> Self {
-        let log_capacity = StepLogCapacity::for_step_count(
-            workflow.definition.presentation_order.len()
-                + workflow.definition.finalizer_presentation_order.len(),
-        );
+        let log_capacity = StepLogCapacity::for_step_count(node_count(workflow));
+        Self::with_log_capacity(
+            workflow,
+            maximum_parallel_steps,
+            timing,
+            clock,
+            log_capacity,
+        )
+    }
+
+    /// A model whose steps keep their output within `budget` (REQ-RUNNERENROLL-147).
+    pub fn with_log_budget(
+        workflow: &ResolvedWorkflow,
+        maximum_parallel_steps: usize,
+        timing: RunTimingObservation,
+        clock: Clock,
+        budget: RunLogBudget,
+    ) -> Self {
+        let log_capacity = StepLogCapacity::for_budget(budget, node_count(workflow));
         Self::with_log_capacity(
             workflow,
             maximum_parallel_steps,
@@ -343,6 +433,74 @@ where
     fn snapshot_with_logs(&self, selected_step: Option<usize>) -> WorkflowRunViewSnapshot {
         let now = self.clock.sample();
         let state = lock_state(&self.inner);
+        self.snapshot_of(&state, now, selected_step)
+    }
+
+    /// A snapshot holding the records of the step `step` names alone, and that step's index:
+    /// the step is resolved and the snapshot taken in one hold of the lock. With no step
+    /// named, or one the model does not have, the snapshot holds no step's records.
+    pub(crate) fn snapshot_for_step(
+        &self,
+        step: Option<&str>,
+    ) -> (WorkflowRunViewSnapshot, Option<usize>) {
+        let now = self.clock.sample();
+        let state = lock_state(&self.inner);
+        let index = step.and_then(|id| state.step_indexes.get(id).copied());
+        let selected = index.unwrap_or(state.steps.len());
+        (self.snapshot_of(&state, now, Some(selected)), index)
+    }
+
+    /// The IDs and states of the first `maximum` steps in flight in presentation order, and
+    /// the number of the others, copied in one hold of the lock (REQ-RUNNERENROLL-134).
+    pub(crate) fn steps_in_flight(&self, maximum: usize) -> (Vec<(String, StepStateKind)>, usize) {
+        let state = lock_state(&self.inner);
+        let mut steps = Vec::new();
+        let mut omitted = 0_usize;
+        for step in state.steps.iter().filter(|step| is_in_flight(step.state)) {
+            if steps.len() < maximum {
+                steps.push((step.id.clone(), step.state));
+            } else {
+                omitted = omitted.saturating_add(1);
+            }
+        }
+        (steps, omitted)
+    }
+
+    /// Shows the model the steps `seed` inherits, which a seeded engine start settles with no
+    /// transition: each is `inherited` with the seed's detail and outputs.
+    pub fn observe_seed<Output>(&self, seed: &ExecutionSeed<Output>) {
+        self.observe_inherited(|id| {
+            seed.inherited_step(id).map(|step| InheritedStepFacts {
+                detail: &step.detail,
+                disposition: step.disposition,
+                outputs: step.outputs.keys().map(String::as_str).collect(),
+            })
+        });
+    }
+
+    /// Settles each step of the model `inherited` answers facts for as `inherited`.
+    pub(crate) fn observe_inherited<'seed>(
+        &self,
+        inherited: impl Fn(&str) -> Option<InheritedStepFacts<'seed>>,
+    ) {
+        self.update(|state| {
+            let mut changed = false;
+            for step in &mut state.steps {
+                if let Some(facts) = inherited(&step.id) {
+                    step.inherit(&facts);
+                    changed = true;
+                }
+            }
+            changed
+        });
+    }
+
+    fn snapshot_of(
+        &self,
+        state: &WorkflowRunViewState,
+        now: ObservationTime,
+        selected_step: Option<usize>,
+    ) -> WorkflowRunViewSnapshot {
         let timing = self.timing.snapshot();
         let workflow_timing = state.terminal_timing.as_ref().map_or_else(
             || observed_run_elapsed(&timing, now),
@@ -523,6 +681,14 @@ where
         }
         ready(())
     }
+}
+
+/// What the model needs of a step a continued attempt inherits: the seed's detail, its
+/// disposition and the outputs it holds.
+pub(crate) struct InheritedStepFacts<'seed> {
+    pub(crate) detail: &'seed super::evidence::InheritedDetail,
+    pub(crate) disposition: InheritedDisposition,
+    pub(crate) outputs: Vec<&'seed str>,
 }
 
 struct WorkflowRunViewState {
@@ -821,20 +987,7 @@ impl WorkflowRunStepViewState {
                 disposition,
                 outputs,
                 ..
-            } => match disposition {
-                super::runtime::InheritedDisposition::Succeeded => {
-                    for (name, output_disposition) in &mut self.outputs {
-                        *output_disposition = if outputs.contains_key(name) {
-                            WorkflowRunOutputDisposition::Committed
-                        } else {
-                            WorkflowRunOutputDisposition::Pending
-                        };
-                    }
-                }
-                super::runtime::InheritedDisposition::Skipped => {
-                    self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Skipped);
-                }
-            },
+            } => self.inherit_outputs(*disposition, |name| outputs.contains_key(name)),
             StepState::Failed { .. } => {
                 self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Failed);
             }
@@ -858,6 +1011,33 @@ impl WorkflowRunStepViewState {
             | StepState::Cancelling { .. } => {}
         }
         self.terminal_timing = terminal.timing.clone();
+    }
+
+    fn inherit(&mut self, facts: &InheritedStepFacts<'_>) {
+        self.state = StepStateKind::Inherited;
+        self.fact = None;
+        self.inherited = Some(facts.detail.clone());
+        self.failed_child = None;
+        self.inherit_outputs(facts.disposition, |name| facts.outputs.contains(&name));
+    }
+
+    /// An inherited step's outputs: the ones it holds committed and the others pending when
+    /// it inherited a success, and every one unavailable when it inherited a skip.
+    fn inherit_outputs(&mut self, disposition: InheritedDisposition, holds: impl Fn(&str) -> bool) {
+        match disposition {
+            InheritedDisposition::Succeeded => {
+                for (name, output_disposition) in &mut self.outputs {
+                    *output_disposition = if holds(name) {
+                        WorkflowRunOutputDisposition::Committed
+                    } else {
+                        WorkflowRunOutputDisposition::Pending
+                    };
+                }
+            }
+            InheritedDisposition::Skipped => {
+                self.make_outputs_unavailable(WorkflowRunOutputUnavailableReason::Skipped);
+            }
+        }
     }
 
     fn make_outputs_unavailable(&mut self, reason: WorkflowRunOutputUnavailableReason) {
@@ -1012,6 +1192,24 @@ impl StepLogRing {
     }
 }
 
+/// The steps and finalizers of `workflow`, among which the run's log budget is shared.
+fn node_count(workflow: &ResolvedWorkflow) -> usize {
+    workflow.definition.presentation_order.len()
+        + workflow.definition.finalizer_presentation_order.len()
+}
+
+/// Whether a step in `state` has started and not settled (REQ-RUNNERENROLL-134).
+const fn is_in_flight(state: StepStateKind) -> bool {
+    matches!(
+        state,
+        StepStateKind::Starting
+            | StepStateKind::Running
+            | StepStateKind::CapturingOutputs
+            | StepStateKind::Recovering
+            | StepStateKind::Cancelling
+    )
+}
+
 fn validate_terminal_result(
     state: &WorkflowRunViewState,
     run: &WorkflowRunResult,
@@ -1061,14 +1259,14 @@ fn terminal_step_is_valid(
             }
         },
         StepState::Inherited {
-            disposition: super::runtime::InheritedDisposition::Succeeded,
+            disposition: InheritedDisposition::Succeeded,
             outputs,
             ..
         } => outputs
             .keys()
             .all(|output| view.outputs.contains_key(output)),
         StepState::Inherited {
-            disposition: super::runtime::InheritedDisposition::Skipped,
+            disposition: InheritedDisposition::Skipped,
             ..
         }
         | StepState::Failed { .. }

@@ -23,19 +23,7 @@ impl ArchivedTerminalBoundary for ScriptedTerminalBoundary {
         interaction: &mut ArchivedHostInteraction,
         _color: bool,
     ) -> io::Result<()> {
-        self.draw_count = self.draw_count.saturating_add(1);
-        self.record(BoundaryAction::Draw(interaction.terminal_area));
-        if self.failures.panic_at == Some(self.draw_count) {
-            std::panic::panic_any("injected archived widget panic");
-        }
-        if self.failures.draw_at == Some(self.draw_count) {
-            Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "injected draw failure",
-            ))
-        } else {
-            Ok(())
-        }
+        self.scripted_draw(interaction.terminal_area, "injected archived widget panic")
     }
 }
 

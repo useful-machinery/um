@@ -4,12 +4,12 @@ use std::path::Path;
 use anyhow::{Context, anyhow};
 use clap::Args;
 
-use crate::exit_code::{ExitCode, OutcomeClass};
+use super::super::{first_view_signal, terminal_failure, viewer_exit_code};
+use crate::exit_code::ExitCode;
 use useful_execution::{
-    ArchivedAttemptLoadError, ArchivedTerminalHostExit, ArchivedViewOutput,
-    ArchivedWorkflowTerminalHost, PresentationConfig, PresentationFailure, PresentationMode,
-    TerminalCapabilities, ineligibility_code, load_local_archived_attempt, normalize_terminal_path,
-    operational_error_code,
+    ArchivedAttemptLoadError, ArchivedViewOutput, ArchivedWorkflowTerminalHost, PresentationConfig,
+    PresentationMode, TerminalCapabilities, ineligibility_code, load_local_archived_attempt,
+    normalize_terminal_path, operational_error_code,
 };
 
 pub(super) const ABOUT: &str = "View a published local workflow attempt";
@@ -44,11 +44,11 @@ pub(super) struct Command {
 
 impl Command {
     pub(super) fn execute(self) -> super::super::super::CommandResult {
-        super::execute_with_abandonable_runtime("view", self.execute_async())
+        super::execute_with_abandonable_runtime("workflow", "view", self.execute_async())
     }
 
     async fn execute_async(self) -> super::super::super::CommandResult {
-        let (mut interrupt, mut terminate) = super::observe_workflow_signals("view")?;
+        let (mut interrupt, mut terminate) = super::observe_workflow_signals("workflow", "view")?;
 
         let config = viewer_config(&self.presentation, TerminalCapabilities::detect());
         let mode = config.mode();
@@ -132,7 +132,7 @@ impl Command {
         };
         match result {
             Ok(exit) => Ok(viewer_exit_code(exit)),
-            Err(failure) => Err(terminal_failure(&failure).into()),
+            Err(failure) => Err(terminal_failure("workflow view", &failure).into()),
         }
     }
 }
@@ -153,26 +153,6 @@ fn viewer_config(
     capabilities: TerminalCapabilities,
 ) -> PresentationConfig {
     super::create::presentation_config_with(presentation, false, capabilities)
-}
-
-async fn first_view_signal(
-    interrupt: &mut tokio::signal::unix::Signal,
-    terminate: &mut tokio::signal::unix::Signal,
-) -> ArchivedTerminalHostExit {
-    tokio::select! {
-        biased;
-        _ = interrupt.recv() => ArchivedTerminalHostExit::Interrupted,
-        _ = terminate.recv() => ArchivedTerminalHostExit::Terminated,
-    }
-}
-
-fn viewer_exit_code(exit: ArchivedTerminalHostExit) -> ExitCode {
-    match exit {
-        ArchivedTerminalHostExit::Quit => OutcomeClass::Success,
-        ArchivedTerminalHostExit::Interrupted => OutcomeClass::Interrupted,
-        ArchivedTerminalHostExit::Terminated => OutcomeClass::Terminated,
-    }
-    .exit_code()
 }
 
 /// Runs `write` off the runtime so SIGINT or SIGTERM still ends a view whose output blocks.
@@ -215,21 +195,6 @@ fn load_error(requested: &Path, error: ArchivedAttemptLoadError) -> anyhow::Erro
                 error.attempt_number
             )),
     }
-}
-
-fn terminal_failure(failure: &PresentationFailure) -> anyhow::Error {
-    if failure.panic_message.is_some() {
-        return anyhow!("{failure}");
-    }
-    failure.error_kind.map_or_else(
-        || anyhow!("workflow view terminal failure: {:?}", failure.operation),
-        |kind| {
-            anyhow!(
-                "workflow view terminal failure: {:?} ({kind:?})",
-                failure.operation
-            )
-        },
-    )
 }
 
 #[cfg(test)]

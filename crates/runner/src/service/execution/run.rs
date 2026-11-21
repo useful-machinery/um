@@ -4,6 +4,7 @@ impl ExecutionJob {
     pub(super) async fn run_workflow(
         &mut self,
         mut admitted: AdmittedWorkflow,
+        view: AssignmentRunView,
         assignment_id: &str,
         attempt_id: &str,
         run_id: &str,
@@ -150,6 +151,7 @@ impl ExecutionJob {
             return completion;
         }
         self.run_event.enter(RunPhase::Execution);
+        view.mark_execution_started();
 
         let started_at = RunnerExecutionClock.now();
         let diagnostics = StepDiagnosticLog::default();
@@ -169,6 +171,9 @@ impl ExecutionJob {
             },
             self.run_event.clone(),
         );
+        // The engine and the agent dispatcher feed the run's view only after the runner's
+        // observer (INV-RUNNER-47); the runner's observer alone answers for the run.
+        let viewed = ObserverThenView::new(observer.clone(), view.clone());
         let process_guard_registry = self
             .accepted
             .process_guards
@@ -265,6 +270,7 @@ impl ExecutionJob {
                     }
                 };
                 admitted = rebound;
+                view.observe_seed(&seed);
                 WorkflowExecutionStart::seeded(process_guard_registry, seed)
             }
             None => WorkflowExecutionStart::initial(process_guard_registry),
@@ -297,7 +303,7 @@ impl ExecutionJob {
                 diagnostics.clone(),
                 maximum_log_bytes,
                 RunnerExecutionClock,
-                observer.clone(),
+                viewed.clone(),
                 &self.accepted.execution_version,
             );
             let dispatcher = match dispatcher {
@@ -338,7 +344,7 @@ impl ExecutionJob {
                         agents,
                         RunnerExecutionClock,
                         cloud_commit,
-                        observer.clone(),
+                        viewed.clone(),
                         start,
                     )),
                     &cancellation,
@@ -369,7 +375,7 @@ impl ExecutionJob {
                         AgentExecution::disabled(),
                         RunnerExecutionClock,
                         cloud_commit,
-                        observer.clone(),
+                        viewed.clone(),
                         start,
                     )),
                     &cancellation,

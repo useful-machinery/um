@@ -6,7 +6,9 @@
 //! the engine's `child_run_directories` finds them, so the runner and the engine tell a
 //! child run from an element by the same `run.json`. The records are read as untyped
 //! JSON, tolerant of members this reader does not know, and a record, step or child
-//! number outside the wire's grammar is skipped rather than reported.
+//! number outside the wire's grammar is skipped rather than reported. The steps running
+//! now, which an overview lists (REQ-RUNNERENROLL-134), are reduced from one scan's
+//! observations by `running_now`.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -16,6 +18,10 @@ use std::time::SystemTime;
 use serde_json::Value;
 use useful_runner_protocol::{TreeStepObservation, TreeStepRunElement, TreeStepState};
 use useful_support::is_identifier;
+
+use crate::control_protocol::{
+    LiveStepState, MAXIMUM_RUNNING_STEPS, OpenWord, OverviewRunElement, OverviewRunningStep,
+};
 
 /// The deepest child run reported: the wire's `run` holds at most 16 levels.
 const MAXIMUM_DEPTH: usize = 16;
@@ -182,4 +188,97 @@ fn parse(bytes: &[u8]) -> RunSteps {
         }
     }
     steps
+}
+
+/// One level of a run path: the `workflow` step, its fan-out element and the child ordinal.
+type Level<'a> = (&'a str, Option<u64>, u64);
+
+fn levels(run: &[TreeStepRunElement]) -> Vec<Level<'_>> {
+    run.iter()
+        .map(|element| (element.step.as_str(), element.item, element.ordinal))
+        .collect()
+}
+
+/// The steps running now among `observations`, as `StepReader::scan` yields them
+/// (REQ-RUNNERENROLL-134): the steps in a live state of each run's newest attempt, in runs
+/// whose every level is the newest child run of its `workflow` step and fan-out element, for
+/// an attempt or a child run that a killed process left behind keeps its steps live. A
+/// `workflow` step is left out when a step listed in a child run beneath it names it in its
+/// path, so the leaf is kept. At most 16 in scan order, with the number left out.
+pub(super) fn running_now(observations: &[TreeStepObservation]) -> (Vec<OverviewRunningStep>, u64) {
+    let mut newest_attempt = HashMap::<Vec<Level<'_>>, u64>::new();
+    let mut newest_child = HashMap::<(Vec<Level<'_>>, &str, Option<u64>), u64>::new();
+    for observation in observations {
+        let attempt = newest_attempt.entry(levels(&observation.run)).or_default();
+        *attempt = (*attempt).max(observation.run_attempt);
+        for (depth, element) in observation.run.iter().enumerate() {
+            let parent = levels(&observation.run[..depth]);
+            let ordinal = newest_child
+                .entry((parent, element.step.as_str(), element.item))
+                .or_default();
+            *ordinal = (*ordinal).max(element.ordinal);
+        }
+    }
+    let current = |observation: &TreeStepObservation| {
+        newest_attempt.get(&levels(&observation.run)) == Some(&observation.run_attempt)
+            && observation.run.iter().enumerate().all(|(depth, element)| {
+                let parent = levels(&observation.run[..depth]);
+                newest_child.get(&(parent, element.step.as_str(), element.item))
+                    == Some(&element.ordinal)
+            })
+    };
+    let live = observations
+        .iter()
+        .filter_map(|observation| Some((observation, live_state(observation.state)?)))
+        .filter(|(observation, _)| current(observation))
+        .collect::<Vec<_>>();
+    // Each `workflow` step, by its run's path, that a live step beneath it names.
+    let occupied =
+        live.iter()
+            .flat_map(|(observation, _)| {
+                observation.run.iter().enumerate().map(|(depth, element)| {
+                    (levels(&observation.run[..depth]), element.step.as_str())
+                })
+            })
+            .collect::<HashSet<_>>();
+    let mut listed = live.iter().filter(|(observation, _)| {
+        !occupied.contains(&(levels(&observation.run), observation.step.as_str()))
+    });
+    let steps = listed
+        .by_ref()
+        .take(MAXIMUM_RUNNING_STEPS)
+        .map(|(observation, state)| OverviewRunningStep {
+            run: observation
+                .run
+                .iter()
+                .map(|element| OverviewRunElement {
+                    step: element.step.clone(),
+                    item: element.item,
+                    ordinal: element.ordinal,
+                })
+                .collect(),
+            run_attempt: observation.run_attempt,
+            step: observation.step.clone(),
+            state: OpenWord::Known(*state),
+        })
+        .collect();
+    (steps, u64::try_from(listed.count()).unwrap_or(u64::MAX))
+}
+
+/// The live state a step in `state` is in, or `None` for one that is not running now.
+fn live_state(state: TreeStepState) -> Option<LiveStepState> {
+    match state {
+        TreeStepState::Starting => Some(LiveStepState::Starting),
+        TreeStepState::Running => Some(LiveStepState::Running),
+        TreeStepState::CapturingOutputs => Some(LiveStepState::CapturingOutputs),
+        TreeStepState::Cancelling => Some(LiveStepState::Cancelling),
+        TreeStepState::Pending
+        | TreeStepState::Succeeded
+        | TreeStepState::Inherited
+        | TreeStepState::Failed
+        | TreeStepState::Blocked
+        | TreeStepState::Skipped
+        | TreeStepState::NotRun
+        | TreeStepState::Cancelled => None,
+    }
 }

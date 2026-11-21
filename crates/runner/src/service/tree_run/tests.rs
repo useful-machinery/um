@@ -12,9 +12,15 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use url::Url;
 
+use super::activity::{RunPaths, RunRead};
 use super::records::conclude;
 use super::resume_loop::ResumeIntervals;
 use super::{TransportResult, TreeConclusion, TreeRunDependencies};
+use crate::control_protocol::{
+    AssignmentPhase, HeldRunState, LiveStepState, OpenWord, OverviewRecentAssignment,
+    OverviewRunElement, OverviewRunningStep, OverviewWait, RunResult, RunnerEventKind,
+    StepPathPart,
+};
 use crate::service::assignment::test_support::{
     GITLAB_CANONICAL_URL, GitLabGrantBroker, accepted_roots, assert_no_runner_git_wiring,
     cleanup_failed, control_lease_clock, ended_assignment_reports, enqueue_transitions,
@@ -286,6 +292,32 @@ async fn published_tree_runs_once_and_reports_the_chosen_outcome() {
     );
 }
 
+/// The fixture's assignment as the overview lists it once its terminal report is
+/// acknowledged and its workspace released, the one recent assignment.
+async fn recent_entry(fixture: &mut Fixture) -> OverviewRecentAssignment {
+    settled_observations(&mut fixture.manager).await;
+    let recent = fixture.manager.overview_assignments().recent_assignments;
+    let [entry] = <[_; 1]>::try_from(recent)
+        .unwrap_or_else(|recent| panic!("one recent assignment: {recent:#?}"));
+    assert_eq!(entry.assignment_id, fixture.offer.assignment_id);
+    assert_eq!(entry.run_id, fixture.offer.run_id);
+    entry
+}
+
+// REQ-RUNNERENROLL-137: a tree run that exited with an outcome is listed as recent with its
+// result and that outcome.
+#[tokio::test]
+async fn a_finished_tree_run_is_listed_as_recent_with_its_chosen_outcome() {
+    let mut fixture = fixture(TREE_DIGEST, "exited", "\"planned\"");
+    execute(&mut fixture).await;
+
+    let entry = recent_entry(&mut fixture).await;
+    assert_eq!(entry.result, OpenWord::Known(RunResult::Succeeded));
+    assert_eq!(entry.chosen_outcome.as_deref(), Some("planned"));
+    assert_eq!(entry.failure_code, None);
+    assert_eq!(entry.interruption_cause, None);
+}
+
 /// The values that follow each `--source-revision` on the fixture's `create`, in order.
 fn source_revision_arguments(log: &Path) -> Vec<String> {
     let create = logged_lines(log, "create.args");
@@ -419,6 +451,28 @@ async fn failed_run_choosing_its_on_failure_outcome_finishes_failed() {
     let failed: Value = serde_json::from_str(BUILD_FAILED).unwrap();
     assert_eq!(outcome["primaryIssue"], failed["primaryIssue"]);
     assert_eq!(chosen_outcome(&reports).as_deref(), Some("blocked"));
+}
+
+// REQ-RUNNERENROLL-137: a failed tree run is listed as recent with the failure code its
+// reported outcome gives.
+#[tokio::test]
+async fn a_failed_tree_run_is_listed_as_recent_with_its_failure_code() {
+    let mut fixture = fixture_with(
+        TREE_DIGEST,
+        "exited",
+        "\"blocked\"",
+        &[("TREE_TEST_RESULT", BUILD_FAILED)],
+    );
+    let reports = execute(&mut fixture).await;
+    let Some(ExecutionReport::TreeFinished { outcome, .. }) = reports.last() else {
+        panic!("expected a tree finish: {reports:#?}");
+    };
+    let code = outcome["primaryIssue"]["detail"]["code"].as_str().unwrap();
+
+    let entry = recent_entry(&mut fixture).await;
+    assert_eq!(entry.result, OpenWord::Known(RunResult::Failed));
+    assert_eq!(entry.failure_code.as_deref(), Some(code));
+    assert_eq!(entry.chosen_outcome.as_deref(), Some("blocked"));
 }
 
 // REQ-RUNNERENROLL-99: a created run whose last command's document carries no settled
@@ -1095,6 +1149,208 @@ async fn the_evaluation_of_a_held_wait_in_flight_holds_off_an_install() {
     fs::remove_file(fixture.log.join("gate")).unwrap();
     let reports = finished_reports(&mut fixture.manager).await;
     assert_eq!(terminal_count(&reports), 1);
+}
+
+/// The activity of the fixture's one tree run, which waits.
+fn waiting_activity(fixture: &mut Fixture) -> Arc<super::RunActivity> {
+    match fixture.manager.held_runs() {
+        super::HeldRuns::Waiting(activities) if activities.len() == 1 => Arc::clone(&activities[0]),
+        _ => panic!("the fixture's run does not wait alone"),
+    }
+}
+
+/// The fixture's run directory, under the `useful` home its `create` ran with.
+fn fixture_run_directory(log: &Path) -> PathBuf {
+    logged_lines(log, "create.env")
+        .into_iter()
+        .find_map(|line| line.strip_prefix("USEFUL_HOME=").map(PathBuf::from))
+        .unwrap()
+        .join("workflows/def_01k0z6r1w8f4jy2m7q9v3x5loc/runs/run_01k0z6r1w8f4jy2m7q9v3x5loc")
+}
+
+/// A position or wait step part: a step ID.
+fn named(step: &str) -> StepPathPart {
+    StepPathPart::Name(step.to_owned())
+}
+
+/// A step running now as the overview lists it, under the child run path `run` of
+/// `(step, item, ordinal)` levels.
+fn running_step(
+    run: &[(&str, Option<u64>, u64)],
+    attempt: u64,
+    step: &str,
+    state: LiveStepState,
+) -> OverviewRunningStep {
+    OverviewRunningStep {
+        run: run
+            .iter()
+            .map(|(step, item, ordinal)| OverviewRunElement {
+                step: (*step).to_owned(),
+                item: *item,
+                ordinal: *ordinal,
+            })
+            .collect(),
+        run_attempt: attempt,
+        step: step.to_owned(),
+        state: OpenWord::Known(state),
+    }
+}
+
+// REQ-RUNNERENROLL-134, INV-RUNNER-15: once the run waits, its activity holds the loop's
+// read of the record and its wait, a fan-out element of the position as its number, and the
+// read changes nothing the activity answers.
+#[tokio::test]
+async fn a_waiting_runs_activity_holds_the_loops_read_of_its_records() {
+    let position = json!(["outer", { "item": 2 }, "ask"]).to_string();
+    let mut fixture = control_wait_fixture("answer", &[("TREE_TEST_POSITION", position.as_str())]);
+    start(&mut fixture).await;
+    wait_for_waiting(&mut fixture).await;
+
+    let activity = waiting_activity(&mut fixture);
+    let nested = vec![named("outer"), StepPathPart::Number(2), named("ask")];
+    assert_eq!(
+        activity.last_read(),
+        Some(RunRead {
+            position: nested.clone(),
+            // The fixture's `run.json` names no subject.
+            subject: None,
+            wait: Some(OverviewWait {
+                kind: "answer".to_owned(),
+                since: Some("2026-07-23T00:00:05Z".to_owned()),
+                step: nested,
+            }),
+            running_steps: Vec::new(),
+            running_steps_omitted: 0,
+        })
+    );
+    assert!(activity.is_waiting());
+}
+
+// REQ-RUNNERENROLL-134, REQ-LOCALRUN-175: while the evaluation of a held wait is in flight,
+// the loop's read beside it reaches the run's activity: the subject the run's record names
+// and the step running now. Once the loop has ended the read holds no wait and no step, as
+// the run has no process.
+#[tokio::test]
+async fn the_read_beside_a_command_in_flight_lists_the_steps_running_now() {
+    let mut fixture = fixture_with(
+        TREE_DIGEST,
+        "waiting",
+        "null",
+        &[
+            ("TREE_TEST_WAIT_KIND", "external"),
+            ("TREE_TEST_WAIT_SOURCE", "github"),
+            ("TREE_TEST_RESUMES", "gated continue"),
+        ],
+    );
+    // The first `resume` is held until the test removes the gate; the second lands the run.
+    fs::write(fixture.log.join("gate"), b"").unwrap();
+    fs::write(fixture.log.join("proceed"), b"").unwrap();
+    stage_state(
+        &fixture.log,
+        "create",
+        "",
+        &[(1, vec![step("merge", "running"), step("finish", "pending")])],
+    );
+    start(&mut fixture).await;
+    wait_for_waiting(&mut fixture).await;
+    let activity = waiting_activity(&mut fixture);
+    let log = fixture.log.clone();
+    let read = crate::service::test_support::with_watchdog(async {
+        while resumes(&log) == 0 {
+            crate::service::Sleeper::sleep(
+                &crate::service::TokioSleeper,
+                Duration::from_millis(10),
+            )
+            .await;
+        }
+        // The record names the run's subject, replaced whole as the runtime writes it.
+        let run = fixture_run_directory(&log);
+        fs::write(
+            run.join("run.json.next"),
+            b"{\"state\":\"waiting\",\"outcome\":null,\"attempts\":1,\"position\":[\"merge\"],\"subject\":\"AUTO-751\"}\n",
+        )
+        .unwrap();
+        fs::rename(run.join("run.json.next"), run.join("run.json")).unwrap();
+        loop {
+            if let Some(read) = activity.last_read()
+                && read.subject.is_some()
+            {
+                return read;
+            }
+            crate::service::Sleeper::sleep(
+                &crate::service::TokioSleeper,
+                Duration::from_millis(10),
+            )
+            .await;
+        }
+    })
+    .await
+    .expect("the read beside the held wait's evaluation did not reach the activity");
+
+    // The gate still holds the first `resume`.
+    assert_eq!(resumes(&fixture.log), 1);
+    assert_eq!(
+        read,
+        RunRead {
+            position: vec![named("merge")],
+            subject: Some("AUTO-751".to_owned()),
+            wait: Some(OverviewWait {
+                kind: "external".to_owned(),
+                since: Some("2026-07-23T00:00:05Z".to_owned()),
+                step: vec![named("merge")],
+            }),
+            running_steps: vec![running_step(&[], 1, "merge", LiveStepState::Running)],
+            running_steps_omitted: 0,
+        }
+    );
+
+    fs::remove_file(fixture.log.join("gate")).unwrap();
+    let reports = finished_reports(&mut fixture.manager).await;
+    assert_eq!(terminal_count(&reports), 1);
+    let ended = activity.last_read().unwrap();
+    assert_eq!((ended.wait, ended.running_steps), (None, Vec::new()));
+}
+
+/// The fixture's run log: `tree-run.log` in the private directory whose home its `create`
+/// ran with.
+fn fixture_run_log(log: &Path) -> PathBuf {
+    logged_lines(log, "create.env")
+        .into_iter()
+        .find_map(|line| line.strip_prefix("USEFUL_HOME=").map(PathBuf::from))
+        .unwrap()
+        .with_file_name("tree-run.log")
+}
+
+// REQ-RUNNERENROLL-144: a running tree run publishes where its log is before its loop's first
+// command returns, and no run directory; once the run waits, its activity, and the manager's
+// read of the assignment, answer the run directory its `create` made and the `tree-run.log`
+// under the assignment's private directory.
+#[tokio::test]
+async fn a_running_tree_run_publishes_its_log_and_then_its_run_directory() {
+    let mut fixture = control_wait_fixture("answer", &[]);
+    start(&mut fixture).await;
+    let assignment_id = fixture.offer.assignment_id.clone();
+    // The run's job is spawned on this thread and not yet polled, so its loop's first command
+    // has not returned.
+    let before = fixture.manager.read_assignment(&assignment_id).unwrap();
+    assert_eq!(before.paths.directory, None);
+    assert!(!fixture.log.join("create.env").exists());
+
+    wait_for_waiting(&mut fixture).await;
+    let published = RunPaths {
+        directory: Some(fixture_run_directory(&fixture.log)),
+        log: Some(fixture_run_log(&fixture.log)),
+    };
+    assert_eq!(before.paths.log, published.log);
+    assert_eq!(waiting_activity(&mut fixture).paths(), published);
+    assert_eq!(
+        fixture
+            .manager
+            .read_assignment(&assignment_id)
+            .unwrap()
+            .paths,
+        published
+    );
 }
 
 // REQ-WORKSPACE-18, REQ-GRANT-87, REQ-GRANT-86: a tree run's runtime admits its steps
@@ -2221,6 +2477,110 @@ async fn an_offer_is_taken_while_the_held_run_waits_and_each_run_ends_alone() {
     assert_eq!(chosen_outcome(&second_reports).as_deref(), Some("landed"));
 }
 
+// REQ-RUNNERENROLL-134: the manager holding a waiting tree run and a second run working gives
+// an entry for each, with the wait the first run's loop read and the step running now the
+// second's read beside its command.
+#[tokio::test]
+async fn the_overview_gives_the_wait_and_the_running_step_each_runs_loop_read() {
+    let mut fixture = fixture_with(
+        TREE_DIGEST,
+        "waiting",
+        "null",
+        &[
+            ("TREE_TEST_WAIT_KIND", "external"),
+            ("TREE_TEST_WAIT_SOURCE", "github"),
+        ],
+    );
+    let first = fixture.offer.clone();
+    let second = other_offer(&first, '6');
+    let first_log = per_run_log(&fixture, &first);
+    let second_log = per_run_log(&fixture, &second);
+    // The first run's `resume` holds its wait until the test answers `continue`; the second
+    // run's `create` holds a running record of its running `merge` step until the test
+    // removes `running`, and the run then waits once and lands.
+    fs::write(first_log.join("proceed"), b"").unwrap();
+    for (name, contents) in [("running", ""), ("answer", "continue"), ("proceed", "")] {
+        fs::write(second_log.join(name), contents).unwrap();
+    }
+    stage_state(
+        &second_log,
+        "create",
+        "",
+        &[(1, vec![step("merge", "running")])],
+    );
+    start(&mut fixture).await;
+    wait_for_assignment_reports(&mut fixture.manager, &first.assignment_id, |reports| {
+        reported_state(reports, "waiting")
+    })
+    .await;
+    assert_eq!(start_other(&mut fixture, &second, '6').await, None);
+
+    let manager = &mut fixture.manager;
+    let overview = crate::service::test_support::with_watchdog(async {
+        loop {
+            let overview = manager.overview_assignments();
+            if overview.assignments.iter().any(|entry| {
+                entry.assignment_id == second.assignment_id && !entry.running_steps.is_empty()
+            }) {
+                return overview;
+            }
+            crate::service::Sleeper::sleep(
+                &crate::service::TokioSleeper,
+                Duration::from_millis(10),
+            )
+            .await;
+        }
+    })
+    .await
+    .expect("the second run's read beside its command did not reach the overview");
+
+    let merge = vec![named("merge")];
+    let read: Vec<_> = overview
+        .assignments
+        .into_iter()
+        .map(|entry| {
+            (
+                entry.assignment_id,
+                entry.phase,
+                entry.activity,
+                entry.position,
+                entry.wait,
+                entry.running_steps,
+            )
+        })
+        .collect();
+    assert_eq!(
+        read,
+        [
+            (
+                second.assignment_id.clone(),
+                OpenWord::Known(AssignmentPhase::Running),
+                Some(OpenWord::Known(HeldRunState::Working)),
+                Some(merge.clone()),
+                None,
+                vec![running_step(&[], 1, "merge", LiveStepState::Running)],
+            ),
+            (
+                first.assignment_id.clone(),
+                OpenWord::Known(AssignmentPhase::Waiting),
+                Some(OpenWord::Known(HeldRunState::Waiting)),
+                Some(merge.clone()),
+                Some(OverviewWait {
+                    kind: "external".to_owned(),
+                    since: Some("2026-07-23T00:00:05Z".to_owned()),
+                    step: merge,
+                }),
+                Vec::new(),
+            ),
+        ]
+    );
+
+    fs::write(first_log.join("answer"), "continue").unwrap();
+    finished_assignment_reports(&mut fixture.manager, &first.assignment_id).await;
+    fs::remove_file(second_log.join("running")).unwrap();
+    finished_assignment_reports(&mut fixture.manager, &second.assignment_id).await;
+}
+
 // REQ-RUNNERENROLL-64, REQ-RUNNERENROLL-132: an offer that reaches the runner while the run
 // it holds works is declined `capacity_unavailable`, and the held run goes on to its end.
 #[tokio::test]
@@ -3187,11 +3547,17 @@ async fn cancellation_during_a_wait_cancels_the_run() {
     assert_eq!(chosen_outcome(&reports).as_deref(), Some("canceled"));
 }
 
-// REQ-RUNNERENROLL-91, REQ-RUNNERENROLL-99
-#[tokio::test]
-async fn lease_loss_kills_the_process_and_reports_no_outcome() {
-    let mut fixture = fixture(TREE_DIGEST, "cancellable", "null");
-    start(&mut fixture).await;
+/// Starts the fixture's run, releases it for a lost grant of time once it runs, and returns
+/// its reports, the terminal one acknowledged.
+async fn lose_lease(fixture: &mut Fixture) -> Vec<ExecutionReport> {
+    release_for_lease_loss(fixture).await;
+    finished_reports(&mut fixture.manager).await
+}
+
+/// Starts the fixture's run and, once it runs, releases it as Cloud does when its grant of
+/// time has lapsed.
+async fn release_for_lease_loss(fixture: &mut Fixture) {
+    start(fixture).await;
     wait_for_reports(&mut fixture.manager, |reports| {
         progress(reports)
             .iter()
@@ -3208,7 +3574,13 @@ async fn lease_loss_kills_the_process_and_reports_no_outcome() {
             reason: "execution_lease_expired".to_owned(),
         })
         .unwrap();
-    let reports = finished_reports(&mut fixture.manager).await;
+}
+
+// REQ-RUNNERENROLL-91, REQ-RUNNERENROLL-99
+#[tokio::test]
+async fn lease_loss_kills_the_process_and_reports_no_outcome() {
+    let mut fixture = fixture(TREE_DIGEST, "cancellable", "null");
+    let reports = lose_lease(&mut fixture).await;
 
     assert!(!fixture.log.join("cancel.args").exists());
     // The killed process never ended its record.
@@ -3223,6 +3595,66 @@ async fn lease_loss_kills_the_process_and_reports_no_outcome() {
         ),
         "{reports:#?}"
     );
+}
+
+/// An event's kind, its count, and the run and assignment it names.
+type LoggedRun = (
+    OpenWord<RunnerEventKind>,
+    u64,
+    Option<String>,
+    Option<String>,
+);
+
+/// The kinds, counts and run and assignment IDs of the events `manager` logged, the newest
+/// first.
+fn logged_runs(manager: &AssignmentManager) -> Vec<LoggedRun> {
+    manager
+        .runner_events
+        .newest_first()
+        .into_iter()
+        .map(|event| (event.kind, event.count, event.run_id, event.assignment_id))
+        .collect()
+}
+
+// REQ-RUNNERENROLL-138: a run interrupted for a lost grant of time logs a `lease_lost` with
+// its run and assignment once the runner settles it, before Cloud acknowledges its report.
+#[tokio::test]
+async fn a_run_interrupted_for_lease_loss_logs_lease_lost_before_its_report_is_acknowledged() {
+    let mut fixture = fixture(TREE_DIGEST, "cancellable", "null");
+    release_for_lease_loss(&mut fixture).await;
+    let reports =
+        ended_assignment_reports(&mut fixture.manager, &fixture.offer.assignment_id).await;
+    assert!(
+        matches!(reports.last(), Some(ExecutionReport::Interrupted { reason, .. })
+            if reason == "execution_lease_expired"),
+        "{reports:#?}"
+    );
+
+    assert_eq!(
+        logged_runs(&fixture.manager),
+        [(
+            OpenWord::Known(RunnerEventKind::LeaseLost),
+            1,
+            Some(fixture.offer.run_id.clone()),
+            Some(fixture.offer.assignment_id.clone()),
+        )]
+    );
+}
+
+// REQ-RUNNERENROLL-137: a run interrupted for a lost grant of time is listed as recent with
+// that cause and no chosen outcome.
+#[tokio::test]
+async fn a_run_interrupted_for_lease_loss_is_listed_as_recent_with_its_cause() {
+    let mut fixture = fixture(TREE_DIGEST, "cancellable", "null");
+    lose_lease(&mut fixture).await;
+
+    let entry = recent_entry(&mut fixture).await;
+    assert_eq!(entry.result, OpenWord::Known(RunResult::Interrupted));
+    assert_eq!(
+        entry.interruption_cause.as_deref(),
+        Some("execution_lease_expired")
+    );
+    assert_eq!(entry.chosen_outcome, None);
 }
 
 /// The `run.json` of the run `create` made in the run-scoped home.
@@ -3899,6 +4331,7 @@ fn exited(outcome: &str) -> super::records::TreeRecord {
         outcome: Some(outcome.to_owned()),
         attempts: 1,
         position: Vec::new(),
+        subject: None,
         mirror: Vec::new(),
         earlier_writes: 0,
         exports: Vec::new(),
@@ -4092,6 +4525,7 @@ fn exited_records_conclude_from_the_engine_result_not_the_chosen_outcome() {
             outcome: None,
             attempts: 1,
             position: vec![json!("merge")],
+            subject: None,
             mirror: Vec::new(),
             earlier_writes: 0,
             exports: Vec::new(),
@@ -5677,6 +6111,35 @@ async fn adopted_exited_run_is_reported_as_it_reads_without_a_command() {
     assert_eq!(files(&adopted.home), home);
 }
 
+// REQ-RUNNERENROLL-144: an adopted run publishes its own assignment's log from the adoption,
+// and once its loop locates the run, the run directory under the earlier attempt's home;
+// both stay as they are once the loop has ended.
+#[tokio::test]
+async fn an_adopted_run_publishes_the_earlier_homes_run_directory_and_its_own_log() {
+    let adopted = adopted(record("exited", Some("landed"), 1, json!([])), None);
+    write_attempt(&adopted.run, "succeeded", published_result(), json!([]));
+    let run = adopt_run(&adopted, &[], "").unwrap();
+    let log = adopted.private.join("tree-run.log");
+    assert_eq!(
+        run.activity().paths(),
+        RunPaths {
+            directory: None,
+            log: Some(log.clone()),
+        }
+    );
+
+    let end = run.drive(&|_| true).await.unwrap();
+    succeeded_with(&end, "landed");
+    assert!(adopted.run.starts_with(&adopted.first));
+    assert_eq!(
+        run.activity().paths(),
+        RunPaths {
+            directory: Some(adopted.run.clone()),
+            log: Some(log),
+        }
+    );
+}
+
 // REQ-RUNNERENROLL-89
 #[tokio::test]
 async fn adopted_failed_record_reports_the_failure_its_attempt_recorded() {
@@ -6044,6 +6507,188 @@ fn state_record_that_could_not_be_read_is_reported_once_it_can() {
         .map(|observation| (observation.step, observation.state.as_str()))
         .collect::<Vec<_>>();
     assert_eq!(steps, [("build".to_owned(), "running")]);
+}
+
+// REQ-RUNNERENROLL-134: the steps running now are the live steps of each run's newest
+// attempt and of each `workflow` step's newest child run, in the order the step reader scans
+// them; a `workflow` step a listed step beneath it names is left out, and past sixteen the
+// rest are counted.
+#[test]
+fn the_steps_running_now_are_the_live_leaves_of_the_newest_attempts_and_child_runs() {
+    let temporary = tempfile::tempdir().unwrap();
+    let log = temporary.path();
+    stage_state(
+        log,
+        "tree",
+        "",
+        &[
+            (
+                1,
+                vec![step("build", "running"), step("abandoned", "running")],
+            ),
+            (
+                2,
+                vec![
+                    step("build", "running"),
+                    step("design", "running"),
+                    step("package", "capturing_outputs"),
+                    step("deploy", "starting"),
+                    step("lint", "succeeded"),
+                    step("merge", "pending"),
+                ],
+            ),
+        ],
+    );
+    // The child run of `build` an earlier attempt left behind, with one of its own.
+    stage_child_run(
+        log,
+        "tree",
+        "children/build/000001",
+        &[(1, vec![step("implement", "running")])],
+    );
+    stage_child_run(
+        log,
+        "tree",
+        "children/build/000001/children/implement/000001",
+        &[(1, vec![step("read", "running")])],
+    );
+    stage_child_run(
+        log,
+        "tree",
+        "children/build/000002",
+        &[(
+            1,
+            vec![
+                step("implement", "running"),
+                step("teardown", "cancelling"),
+                step("review", "pending"),
+            ],
+        )],
+    );
+    // No step of `design`'s child run is running, so `design` itself is listed.
+    stage_child_run(
+        log,
+        "tree",
+        "children/design/000001",
+        &[(1, vec![step("plan", "succeeded")])],
+    );
+
+    let observations = super::steps::StepReader::default().scan(&log.join("stages/tree"));
+    let building = [("build", None, 2)];
+    assert_eq!(
+        super::steps::running_now(&observations),
+        (
+            vec![
+                running_step(&[], 2, "design", LiveStepState::Running),
+                running_step(&[], 2, "package", LiveStepState::CapturingOutputs),
+                running_step(&[], 2, "deploy", LiveStepState::Starting),
+                running_step(&building, 1, "implement", LiveStepState::Running),
+                running_step(&building, 1, "teardown", LiveStepState::Cancelling),
+            ],
+            0
+        )
+    );
+
+    let many = (1..=20)
+        .map(|n| step(&format!("s{n}"), "running"))
+        .collect();
+    stage_state(log, "many", "", &[(1, many)]);
+    let observations = super::steps::StepReader::default().scan(&log.join("stages/many"));
+    assert_eq!(
+        super::steps::running_now(&observations),
+        (
+            (1..=16)
+                .map(|n| running_step(&[], 1, &format!("s{n}"), LiveStepState::Running))
+                .collect(),
+            4
+        )
+    );
+}
+
+// REQ-RUNNERENROLL-134, REQ-LOCALRUN-175: a step of the run can replace its records, so the
+// read publishes a subject only when it is a string, a position or a wait's step only of at
+// most sixteen step IDs and element numbers and a `since` only in RFC 3339; anything else is
+// published as none or empty, the record still read.
+#[test]
+fn the_published_read_bounds_what_a_step_of_the_run_can_write() {
+    let temporary = tempfile::tempdir().unwrap();
+    let run = temporary.path();
+    let write = |name: &str, value: Value| {
+        fs::write(run.join(name), serde_json::to_vec(&value).unwrap()).unwrap();
+    };
+    let read = || {
+        let record = super::records::read_record(run).unwrap();
+        let wait = super::records::read_wait(run);
+        super::records::published_read(&record, wait.as_ref(), &[])
+    };
+    let waiting = |position: Value, subject: Value| {
+        json!({
+            "state": "waiting",
+            "outcome": null,
+            "attempts": 1,
+            "position": position,
+            "subject": subject,
+        })
+    };
+    let wait = |since: &str, step: Value| json!({ "kind": "answer", "since": since, "step": step, "rule": { "source": "um" } });
+
+    let path = json!(["outer", 3, { "item": 2 }, "ask"]);
+    write("run.json", waiting(path.clone(), json!("AUTO-751")));
+    write("wait.json", wait("2026-07-23T00:00:05Z", path));
+    let parts = vec![
+        named("outer"),
+        StepPathPart::Number(3),
+        StepPathPart::Number(2),
+        named("ask"),
+    ];
+    assert_eq!(
+        read(),
+        RunRead {
+            position: parts.clone(),
+            subject: Some("AUTO-751".to_owned()),
+            wait: Some(OverviewWait {
+                kind: "answer".to_owned(),
+                since: Some("2026-07-23T00:00:05Z".to_owned()),
+                step: parts,
+            }),
+            running_steps: Vec::new(),
+            running_steps_omitted: 0,
+        }
+    );
+
+    let sixteen = Value::Array(vec![json!("a"); 16]);
+    for (position, subject, step) in [
+        (json!(vec![json!("a"); 17]), json!(7), json!(["a", -1])),
+        (
+            json!(["a", null]),
+            json!(null),
+            json!(["a", { "item": 1, "x": 1 }]),
+        ),
+        (
+            json!(["a", 1.5]),
+            json!(["AUTO-751"]),
+            json!([{ "other": 1 }]),
+        ),
+    ] {
+        write("run.json", waiting(position, subject));
+        write("wait.json", wait("2026-07-23 00:00:05", step));
+        assert_eq!(
+            read(),
+            RunRead {
+                position: Vec::new(),
+                subject: None,
+                wait: Some(OverviewWait {
+                    kind: "answer".to_owned(),
+                    since: None,
+                    step: Vec::new(),
+                }),
+                running_steps: Vec::new(),
+                running_steps_omitted: 0,
+            }
+        );
+    }
+    write("run.json", waiting(sixteen, json!(null)));
+    assert_eq!(read().position, vec![named("a"); 16]);
 }
 
 // REQ-RUNNERENROLL-88: a `state.json` that a step replaced with a symbolic link is not
@@ -6827,6 +7472,32 @@ fn created_run(workspace: &Path, first: &AssignmentOffer) -> PathBuf {
         .join(ADOPTED_DEFINITION)
         .join("runs")
         .join(ADOPTED_RUN)
+}
+
+// REQ-RUNNERENROLL-138: the manager logs a `run_continued` with the run and assignment of
+// an offer it accepts as a continuation, and none for a first attempt.
+#[tokio::test]
+async fn an_accepted_continuation_logs_run_continued_and_a_first_attempt_none() {
+    let mut fixture = failed_fixture(&[]);
+    let workspace = retained_first_attempt(&mut fixture).await;
+    assert_eq!(logged_runs(&fixture.manager), []);
+    let first = fixture.offer.clone();
+    fs::remove_dir_all(&fixture.source).unwrap();
+    fs::write(fixture.log.join("answer"), "continue").unwrap();
+    fs::write(fixture.log.join("proceed"), b"").unwrap();
+    let next = continuation_of(&first, BOOT, &workspace, &["build"], "cn1");
+
+    execute_continued(&mut fixture, &next).await;
+
+    assert_eq!(
+        logged_runs(&fixture.manager),
+        [(
+            OpenWord::Known(RunnerEventKind::RunContinued),
+            1,
+            Some(next.run_id.clone()),
+            Some(next.assignment_id.clone()),
+        )]
+    );
 }
 
 // REQ-RUNNERENROLL-89, REQ-CONTINUE-83

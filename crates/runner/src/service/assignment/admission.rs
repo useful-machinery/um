@@ -16,9 +16,10 @@ impl AssignmentManager {
             execution_version,
             recorder,
             guard_processes,
+            events: runner_events,
         } = dependencies;
         let (event_sender, events) = mpsc::unbounded_channel();
-        let outbox = ObservationOutbox::new();
+        let outbox = ObservationOutbox::new().with_events(Arc::clone(&runner_events));
         let allow_insecure_artifact_uploads =
             config.endpoint().scheme() == "ws" && crate::is_loopback(config.endpoint());
         let artifact_delivery = ArtifactDeliveryBroker::new(
@@ -48,8 +49,11 @@ impl AssignmentManager {
             input_broker,
             tree_run,
             recorder,
+            runner_events,
             runner_id: config.credential().runner_id().to_owned(),
             run_events: BTreeMap::new(),
+            offer_facts: BTreeMap::new(),
+            recent_assignments: Ring::new(RECENT_ASSIGNMENTS),
             lease_policy: None,
             held: BTreeMap::new(),
             reporting: BTreeMap::new(),
@@ -270,6 +274,7 @@ impl AssignmentManager {
         let assignment_id = offer.assignment_id.clone();
         self.run_events
             .insert(offer.assignment_id.clone(), run_event.clone());
+        self.keep_offer_facts(&offer);
         self.hold(HeldAssignment::Preparing(Box::new(PreparingAssignment {
             offer,
             cancellation: CaptureCancellation::default(),

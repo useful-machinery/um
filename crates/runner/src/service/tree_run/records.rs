@@ -16,6 +16,8 @@
 use std::path::Path;
 
 use serde_json::{Map, Value, json};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use useful_execution::{
     CancellationReason, FailingNodeState, LocalRunDirectoryError, MirrorAction, MirrorHook,
     MirrorSkipReason, MirrorWrite, MirrorWriteOutcome, WaitQuestions, WorkflowNodeRole,
@@ -24,8 +26,12 @@ use useful_execution::{
 use useful_runner_protocol::{
     TreeExit, TreeExport, TreeProgressFailedChild, TreeProgressFailedChildRole,
     TreeProgressFailedChildState, TreeProgressWaitQuestion, TreeProgressWaitQuestions,
+    TreeStepObservation,
 };
 use useful_support::is_diagnostic_slug;
+
+use super::activity::RunRead;
+use crate::control_protocol::{OverviewWait, StepPathPart};
 
 /// The most mirror results one finish carries, the protocol's bound.
 const MAXIMUM_MIRROR_RESULTS: usize = 1024;
@@ -40,14 +46,16 @@ pub(super) fn read_json(run_directory: &Path, name: &str) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
-/// What `run.json` reads: its state, outcome, attempt count and position, and the run's
-/// mirror writes once the resume loop has ended on it.
+/// What `run.json` reads: its state, outcome, attempt count, position and subject, and the
+/// run's mirror writes once the resume loop has ended on it.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(in crate::service) struct TreeRecord {
     pub(in crate::service) state: RecordState,
     pub(in crate::service) outcome: Option<String>,
     pub(in crate::service) attempts: u64,
     pub(in crate::service) position: Vec<Value>,
+    /// The run's subject (REQ-LOCALRUN-175), a string or null; any other value reads as none.
+    pub(in crate::service) subject: Option<String>,
     /// The run's `mirror/` writes in order (REQ-LOCALRUN-193), every attempt's, read only
     /// for the record the loop ends on; empty while the loop observes the record.
     pub(in crate::service) mirror: Vec<MirrorWrite>,
@@ -98,10 +106,60 @@ pub(in crate::service) fn read_record(run_directory: &Path) -> Option<TreeRecord
             .as_u64()
             .filter(|attempts| *attempts >= 1)?,
         position: record["position"].as_array()?.clone(),
+        subject: record["subject"].as_str().map(str::to_owned),
         mirror: Vec::new(),
         earlier_writes: 0,
         exports: Vec::new(),
     })
+}
+
+/// The most parts of a position or a wait's step an overview publishes.
+const MAXIMUM_PUBLISHED_PATH: usize = 16;
+
+/// The loop's read of `record`, `wait` and the step observations `steps` as an overview
+/// publishes it (REQ-RUNNERENROLL-134). A step of the run can replace its records and the
+/// read is copied at each record interval, so a position or a wait's step is published
+/// only when it is a path `published_path` admits, and otherwise as empty, and a wait's
+/// `since` only when it is RFC 3339.
+pub(in crate::service) fn published_read(
+    record: &TreeRecord,
+    wait: Option<&TreeWait>,
+    steps: &[TreeStepObservation],
+) -> RunRead {
+    let (running_steps, running_steps_omitted) = super::steps::running_now(steps);
+    RunRead {
+        position: published_path(&record.position),
+        subject: record.subject.clone(),
+        wait: wait.map(|wait| OverviewWait {
+            kind: wait.kind.clone(),
+            since: OffsetDateTime::parse(&wait.since, &Rfc3339)
+                .is_ok()
+                .then(|| wait.since.clone()),
+            step: published_path(&wait.step),
+        }),
+        running_steps,
+        running_steps_omitted,
+    }
+}
+
+/// `path` as an overview or an assignment answer publishes it: at most 16 parts, each a
+/// string, a non-negative integer or the engine's fan-out element `{"item": n}` as its
+/// number (REQ-WFDEF-4); empty for any other path.
+pub(in crate::service) fn published_path(path: &[Value]) -> Vec<StepPathPart> {
+    if path.len() > MAXIMUM_PUBLISHED_PATH {
+        return Vec::new();
+    }
+    path.iter()
+        .map(|part| match part {
+            Value::String(name) => Some(StepPathPart::Name(name.clone())),
+            Value::Number(number) => number.as_u64().map(StepPathPart::Number),
+            Value::Object(element) if element.len() == 1 => {
+                element.get("item")?.as_u64().map(StepPathPart::Number)
+            }
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
 }
 
 /// The class of a failure to read a run's `mirror/`, which the run event records beside the

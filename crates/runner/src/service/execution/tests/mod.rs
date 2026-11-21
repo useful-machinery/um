@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use super::*;
 use crate::service::lease_clock::{LeaseTimerRelease, controlled_lease_clock};
-use crate::service::test_support::{controlled_sleeper, sleep_request, with_watchdog};
+use crate::service::test_support::{
+    controlled_sleeper, fixture_run_view, sleep_request, step_execution_transition, with_watchdog,
+};
 use useful_execution::{
     CommitFailure, CommitFailureClass, ExecutionSettlement, ObservedExecutions,
     RecoveryFailureKind, SettledExecution, StartedExecution, StepFailureKind,
@@ -1286,30 +1288,6 @@ fn settled_execution(
     })
 }
 
-// One step transition at `sequence` whose wire projection is `observed` and
-// whose physical executions are `settled` and `started`.
-fn step_execution_transition(
-    sequence: u64,
-    (step, role): (&str, WorkflowNodeRole),
-    (from, to): (StepStateKind, StepStateKind),
-    observed: Option<ObservedStepTransition>,
-    settled: Option<SettledExecution>,
-    started: Option<StartedExecution>,
-) -> TransitionObservation<RunnerExecutionInstant> {
-    TransitionObservation {
-        event: TransitionEvent::Step {
-            sequence: TransitionSequence(sequence),
-            step: step.to_owned(),
-            role,
-            failure_policy: FailurePolicy::Required,
-            from,
-            to,
-        },
-        step: observed,
-        executions: ObservedExecutions { settled, started },
-    }
-}
-
 fn recovery_progress(
     active: (u64, ActiveStepInvocation),
     settled: (u64, ActiveStepInvocation),
@@ -1329,7 +1307,7 @@ fn recovery_progress(
 }
 
 async fn observe_all(
-    observer: &RunnerExecutionObserver,
+    observer: &impl ExecutionObserver<RunnerExecutionInstant>,
     transitions: &[TransitionObservation<RunnerExecutionInstant>],
 ) {
     for transition in transitions {
@@ -1722,4 +1700,102 @@ async fn step_executions_without_a_recorder_leave_the_transition_stream_unchange
     let events = enqueued_workflow_events(&outbox);
     assert_eq!(events.len(), 6);
     assert_eq!(events, enqueued_workflow_events(&recorded_outbox));
+}
+
+/// A workflow of the step `implement` and the finalizer `wrap` that
+/// `finalizer_and_recovered_step` moves.
+const IMPLEMENT_AND_WRAP: &str = "schemaVersion: 1\nsteps:\n  implement:\n    kind: cmd\n    command:\n      argv: [\"true\"]\nfinalizers:\n  wrap:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+
+// The attributes of the `runner.step_execution` records, which carry no time or span.
+fn step_execution_attributes_written(
+    capture: &crate::telemetry::TestCapture,
+) -> Vec<BTreeMap<String, Value>> {
+    step_execution_records(capture)
+        .into_iter()
+        .map(|record| {
+            record
+                .into_iter()
+                .filter(|(key, _)| is_step_execution_attribute(key))
+                .collect()
+        })
+        .collect()
+}
+
+// INV-RUNNER-47: the transitions fed to the runner's observer through the pair over a run's
+// view queue exactly the workflow events, and write exactly the step execution records, that
+// they do fed to the runner's observer alone; and the view sees them.
+#[tokio::test]
+async fn a_viewed_runs_observer_queues_and_records_what_it_does_alone() {
+    let transitions = finalizer_and_recovered_step();
+    let (alone_event, alone_capture) = step_execution_run_event();
+    let alone_outbox = ObservationOutbox::new();
+    let alone = step_execution_observer(alone_event, alone_outbox.clone());
+    observe_all(&alone, &transitions).await;
+
+    let (run_event, capture) = step_execution_run_event();
+    let outbox = ObservationOutbox::new();
+    let observer = step_execution_observer(run_event, outbox.clone());
+    let view = fixture_run_view(IMPLEMENT_AND_WRAP);
+    observe_all(
+        &ObserverThenView::new(observer.clone(), view.clone()),
+        &transitions,
+    )
+    .await;
+
+    assert_eq!(observer.fault(), None);
+    assert_eq!(observer.last_sequence(), 6);
+    let events = enqueued_workflow_events(&outbox);
+    assert_eq!(events.len(), 6);
+    assert_eq!(events, enqueued_workflow_events(&alone_outbox));
+    let records = step_execution_attributes_written(&capture);
+    assert_eq!(records.len(), 4);
+    assert_eq!(records, step_execution_attributes_written(&alone_capture));
+
+    let run = view.run(&useful_execution::LiveRunViewRequest {
+        step: None,
+        maximum_steps: 8,
+        maximum_output_bytes: 0,
+    });
+    let states: Vec<_> = run
+        .steps
+        .iter()
+        .map(|step| (step.id.as_str(), step.state.as_str()))
+        .collect();
+    assert_eq!(states, [("implement", "succeeded"), ("wrap", "succeeded")]);
+}
+
+/// A second observer that records, as it is called, the runner observer's last sequence.
+#[derive(Clone)]
+struct CountedSequences {
+    runner: RunnerExecutionObserver,
+    seen: Arc<Mutex<Vec<u64>>>,
+}
+
+impl ExecutionObserver<RunnerExecutionInstant> for CountedSequences {
+    fn observe(
+        &self,
+        _observation: ExecutionObservation<RunnerExecutionInstant>,
+    ) -> impl Future<Output = ()> + Send {
+        self.seen.lock().unwrap().push(self.runner.last_sequence());
+        std::future::ready(())
+    }
+}
+
+// INV-RUNNER-47: the pair calls its second observer with each transition only after the
+// runner's observer has counted it.
+#[tokio::test]
+async fn the_pairs_second_observer_sees_a_transition_after_the_runners_counted_it() {
+    let observer = step_execution_observer(RunEvent::default(), ObservationOutbox::new());
+    let second = CountedSequences {
+        runner: observer.clone(),
+        seen: Arc::default(),
+    };
+    observe_all(
+        &ObserverThenView::new(observer.clone(), second.clone()),
+        &finalizer_and_recovered_step(),
+    )
+    .await;
+
+    assert_eq!(observer.last_sequence(), 6);
+    assert_eq!(*second.seen.lock().unwrap(), [1, 2, 3, 4, 5, 6]);
 }

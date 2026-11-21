@@ -72,10 +72,7 @@ pub(super) fn render_projected_steps<Step: StepProjection>(
         let mut spans = vec![
             Span::styled(marker, selection_marker_style(color)),
             Span::styled(graph_row.before_node.clone(), connector_style),
-            Span::styled(
-                step_state_glyph(step),
-                step_state_style(step.state(), color),
-            ),
+            Span::styled(step_mark(step), step_state_style(step.state(), color)),
             Span::styled(graph_row.after_node.clone(), connector_style),
             Span::raw(" "),
             Span::styled(id, step_identity_style(step.state(), color)),
@@ -83,7 +80,7 @@ pub(super) fn render_projected_steps<Step: StepProjection>(
         if columns.kind {
             spans.push(Span::raw("  "));
             spans.push(Span::styled(
-                padded_text(step_kind(step.definition()), columns.kind_width),
+                padded_text(&visible_text(step.kind()), columns.kind_width),
                 tone_style(color, Tone::Muted),
             ));
         }
@@ -155,7 +152,7 @@ impl StepColumns {
             .unwrap_or(0);
         let kind_width = steps
             .iter()
-            .map(|step| display_width(step_kind(step.definition())))
+            .map(|step| display_width(&visible_text(step.kind())))
             .fold(MINIMUM_KIND_COLUMN_WIDTH, usize::max);
         let duration_width = steps
             .iter()

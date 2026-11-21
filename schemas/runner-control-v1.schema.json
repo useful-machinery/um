@@ -2,14 +2,18 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://docs.usefulmachinery.com/schemas/runner-control-v1.schema.json",
   "title": "Useful Machinery Runner Local Control Protocol V1",
-  "description": "One closed request or response JSON object. The wire protocol appends exactly one LF and limits requests to 4096 bytes and responses to 65536 bytes, including that LF.",
+  "description": "One request or response JSON object. The wire protocol appends exactly one LF and limits requests to 4096 bytes, the overview and assignment answers to 1048576 bytes and every other response to 65536 bytes, including that LF. Every request is closed, and only the assignment request carries more than schemaVersion and operation: its assignmentId and, optionally, run and step. Every answer but the overview and the assignment is closed; those two are open at every level.",
   "oneOf": [
     { "$ref": "#/$defs/statusRequest" },
     { "$ref": "#/$defs/reloadRequest" },
     { "$ref": "#/$defs/syncAgentLoginsRequest" },
+    { "$ref": "#/$defs/overviewRequest" },
+    { "$ref": "#/$defs/assignmentRequest" },
     { "$ref": "#/$defs/statusResponse" },
     { "$ref": "#/$defs/reloadedResponse" },
     { "$ref": "#/$defs/agentLoginsSyncedResponse" },
+    { "$ref": "#/$defs/overviewResponse" },
+    { "$ref": "#/$defs/assignmentResponse" },
     { "$ref": "#/$defs/errorResponse" }
   ],
   "$defs": {
@@ -40,6 +44,43 @@
         "operation": { "const": "sync_agent_logins" }
       }
     },
+    "overviewRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "operation"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "operation": { "const": "overview" }
+      }
+    },
+    "assignmentRequest": {
+      "description": "Asks for one assignment the runner holds: its overview entry, the run directory of its run or of the child run run names, and the output of the step step names or else the end of the run log.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "operation", "assignmentId"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "operation": { "const": "assignment" },
+        "assignmentId": { "type": "string", "pattern": "^asn_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "run": {
+          "description": "The child run's path from the root, one element a level; absent for the root.",
+          "type": "array",
+          "maxItems": 16,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["step", "ordinal"],
+            "properties": {
+              "step": { "$ref": "#/$defs/stepIdentifier" },
+              "item": { "type": "integer", "minimum": 0, "maximum": 2147483647 },
+              "ordinal": { "type": "integer", "minimum": 0, "maximum": 2147483647 }
+            }
+          }
+        },
+        "step": { "$ref": "#/$defs/stepIdentifier" }
+      }
+    },
+    "stepIdentifier": { "type": "string", "pattern": "^[a-z][A-Za-z0-9]{0,63}$" },
     "assignmentCounts": {
       "type": "object",
       "additionalProperties": false,
@@ -251,6 +292,473 @@
         "cause": { "enum": ["program_unavailable", "start_failed", "timed_out", "harness_error"] }
       }
     },
+    "overviewResponse": {
+      "description": "What the serving process is doing, from what it holds in memory. Open at every level: a reader ignores a member it does not know and keeps a vocabulary word it does not know as received.",
+      "type": "object",
+      "required": ["schemaVersion", "outcome", "overview"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "outcome": { "const": "overview" },
+        "overview": { "$ref": "#/$defs/overview" }
+      }
+    },
+    "overview": {
+      "type": "object",
+      "required": ["runner", "connection", "assignmentCounts", "unacknowledgedReports", "assignments"],
+      "properties": {
+        "runner": { "$ref": "#/$defs/overviewRunner" },
+        "connection": { "$ref": "#/$defs/overviewConnection" },
+        "currentCredentialId": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "pendingCredentialId": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "agentLogins": {
+          "description": "Each provider's readiness with the members status gives; an entry a reader cannot read as its own is kept as its provider and state.",
+          "type": "object",
+          "required": ["updatedAt", "providers"],
+          "properties": {
+            "updatedAt": { "type": "string", "format": "date-time" },
+            "providers": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["provider", "state"],
+                "properties": {
+                  "provider": { "type": "string" },
+                  "state": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "assignmentCounts": { "$ref": "#/$defs/overviewCounts" },
+        "unacknowledgedReports": {
+          "description": "The runner's reports Cloud has not yet acknowledged.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "assignments": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/overviewAssignment" }
+        },
+        "assignmentsOmitted": {
+          "description": "The entries left out past the bound; absent when zero.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "recentAssignments": {
+          "description": "The assignments that ended in this serving process and that the runner holds no longer, newest first; absent when there is none.",
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/overviewRecentAssignment" }
+        },
+        "recentAssignmentsOmitted": {
+          "description": "The recent assignments left out past the bound; absent when zero.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "events": {
+          "description": "The runner's own events, newest first; absent when there is none.",
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/overviewEvent" }
+        },
+        "eventsOmitted": {
+          "description": "The events left out past the bound; absent when zero.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "overviewRunner": {
+      "type": "object",
+      "required": ["runnerId", "bootId", "version", "uptimeMilliseconds", "processState"],
+      "properties": {
+        "runnerId": { "type": "string", "pattern": "^rnr_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "bootId": { "type": "string", "pattern": "^rbt_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "version": { "type": "string" },
+        "uptimeMilliseconds": { "type": "integer", "minimum": 0 },
+        "processState": { "description": "As status gives it: running or stopping.", "type": "string" },
+        "stopTimeLeftMilliseconds": {
+          "description": "The time left of the stop's bound; absent unless the process is stopping.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "overviewConnection": {
+      "type": "object",
+      "required": ["state"],
+      "properties": {
+        "state": {
+          "description": "As status gives it: connecting, connected, backing_off, authentication_failed, protocol_failed or stopping.",
+          "type": "string"
+        },
+        "lastConnectedAt": { "type": "string", "format": "date-time" },
+        "lastFailure": {
+          "description": "As status gives it: network, rate_limited, cloud_unavailable, authentication or protocol.",
+          "type": "string"
+        },
+        "attemptsSinceConnected": {
+          "description": "The failed attempts since the last connection; absent unless backing off.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "nextAttemptInMilliseconds": {
+          "description": "The time until the next attempt; absent unless backing off.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "overviewCounts": {
+      "type": "object",
+      "properties": {
+        "preparing": { "type": "integer", "minimum": 0 },
+        "accepted": { "type": "integer", "minimum": 0 },
+        "running": { "type": "integer", "minimum": 0 },
+        "waiting": { "type": "integer", "minimum": 0 },
+        "finishing": { "type": "integer", "minimum": 0 },
+        "reporting": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "overviewAssignment": {
+      "type": "object",
+      "required": [
+        "assignmentId",
+        "runId",
+        "attemptNumber",
+        "workflowPath",
+        "phase",
+        "heldMilliseconds",
+        "continuesEarlierAttempt"
+      ],
+      "properties": {
+        "assignmentId": { "type": "string", "pattern": "^asn_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "runId": { "type": "string", "pattern": "^run_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "attemptNumber": { "type": "integer", "minimum": 0 },
+        "workflowPath": { "type": "string" },
+        "phase": {
+          "description": "One of preparing, accepted, running, waiting, finishing or reporting.",
+          "type": "string"
+        },
+        "activity": {
+          "description": "working or waiting, as status lists the held run; absent on an ended entry.",
+          "type": "string"
+        },
+        "heldMilliseconds": { "type": "integer", "minimum": 0 },
+        "continuesEarlierAttempt": { "type": "boolean" },
+        "lease": {
+          "description": "The time Cloud granted the running assignment; absent before the start and after the end.",
+          "type": "object",
+          "required": ["health", "timeLeftMilliseconds"],
+          "properties": {
+            "health": { "description": "One of ok, renewing, expiring or revoked.", "type": "string" },
+            "timeLeftMilliseconds": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "subject": { "type": "string" },
+        "runUrl": { "type": "string" },
+        "position": { "$ref": "#/$defs/overviewStepPath" },
+        "wait": { "$ref": "#/$defs/overviewWait" },
+        "runningSteps": {
+          "description": "The steps running now; absent when there is none.",
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/overviewRunningStep" }
+        },
+        "runningStepsOmitted": {
+          "description": "The running steps left out past the bound; absent when zero.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "overviewRecentAssignment": {
+      "type": "object",
+      "required": ["assignmentId", "runId", "workflowPath", "result", "endedAt", "heldMilliseconds"],
+      "properties": {
+        "assignmentId": { "type": "string", "pattern": "^asn_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "runId": { "type": "string", "pattern": "^run_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "workflowPath": { "type": "string" },
+        "subject": { "type": "string" },
+        "result": {
+          "description": "One of succeeded, failed, cancelled, interrupted, aborted, rejected or fenced.",
+          "type": "string"
+        },
+        "chosenOutcome": {
+          "description": "The root's chosen outcome, when a tree run exited with one.",
+          "type": "string"
+        },
+        "failureCode": { "type": "string" },
+        "interruptionCause": { "type": "string" },
+        "endedAt": {
+          "description": "When the run ended, or when the runner gave the offer up if it never ran.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "heldMilliseconds": {
+          "description": "How long the runner had held the assignment when it ended.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "overviewEvent": {
+      "description": "One of the runner's own events: the facts of every kind are optional members of the one shape.",
+      "type": "object",
+      "required": ["at", "kind"],
+      "properties": {
+        "at": { "type": "string", "format": "date-time" },
+        "kind": {
+          "description": "One of connected, connection_failed, credential_reloaded, credential_reload_failed, agent_logins_set_up, lease_lost, run_continued, workspaces_found, observation_refused, telemetry_dropped or stopping.",
+          "type": "string"
+        },
+        "count": {
+          "description": "How many times in a row the event happened; absent reads as 1.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "failure": {
+          "description": "As connection.lastFailure gives it: network, rate_limited, cloud_unavailable, authentication or protocol.",
+          "type": "string"
+        },
+        "nextAttemptInMilliseconds": {
+          "description": "The delay before the next attempt, when another attempt follows.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "credentialId": { "type": "string", "pattern": "^rrc_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "error": {
+          "description": "One of the closed control errors: invalid_request, unsupported_version, runner_busy, no_pending_credential, pending_registration_mismatch, pending_authentication_failed, pending_protocol_failed, pending_connection_failed or state_update_failed.",
+          "type": "string"
+        },
+        "setupCause": { "description": "One of schedule, sync or admission.", "type": "string" },
+        "setupResult": { "description": "One of finished, runner_busy or failed.", "type": "string" },
+        "runId": { "type": "string", "pattern": "^run_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "assignmentId": { "type": "string", "pattern": "^asn_[0-7][0-9a-hjkmnp-tv-z]{25}$" },
+        "workspaces": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "overviewWait": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "description": "The engine's word for the wait; not a closed set.", "type": "string" },
+        "since": { "type": "string", "format": "date-time" },
+        "step": { "$ref": "#/$defs/overviewStepPath" }
+      }
+    },
+    "overviewRunElement": {
+      "type": "object",
+      "required": ["step", "ordinal"],
+      "properties": {
+        "step": { "type": "string" },
+        "item": { "type": "integer", "minimum": 0 },
+        "ordinal": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "overviewStepPath": {
+      "type": "array",
+      "items": {
+        "oneOf": [{ "type": "string" }, { "type": "integer", "minimum": 0 }]
+      }
+    },
+    "overviewRunningStep": {
+      "type": "object",
+      "required": ["run", "runAttempt", "step", "state"],
+      "properties": {
+        "run": { "type": "array", "items": { "$ref": "#/$defs/overviewRunElement" } },
+        "runAttempt": { "type": "integer", "minimum": 0 },
+        "step": { "type": "string" },
+        "state": {
+          "description": "One of starting, running, capturing_outputs, recovering or cancelling.",
+          "type": "string"
+        }
+      }
+    },
+    "assignmentResponse": {
+      "description": "One assignment the runner holds, its run as the run directory says and the output of a step or the end of the run log. Open at every level: a reader ignores a member it does not know, and every vocabulary is a plain string as the engine wrote it.",
+      "type": "object",
+      "required": ["schemaVersion", "outcome", "assignment"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "outcome": { "const": "assignment" },
+        "assignment": { "$ref": "#/$defs/assignment" }
+      }
+    },
+    "assignment": {
+      "type": "object",
+      "required": ["entry"],
+      "properties": {
+        "entry": { "$ref": "#/$defs/overviewAssignment" },
+        "run": { "$ref": "#/$defs/assignmentRun" },
+        "log": { "$ref": "#/$defs/assignmentLog" }
+      }
+    },
+    "assignmentRun": {
+      "description": "The run read, present while the assignment runs or waits and its run directory read whole.",
+      "type": "object",
+      "required": ["workflowPath", "state", "attempts", "attemptNumber", "attemptState", "steps"],
+      "properties": {
+        "path": {
+          "description": "The child run asked for; absent for the root.",
+          "type": "array",
+          "maxItems": 16,
+          "items": { "$ref": "#/$defs/overviewRunElement" }
+        },
+        "workflowPath": { "type": "string" },
+        "state": { "description": "The run record's state, such as running, waiting or exited.", "type": "string" },
+        "attempts": { "type": "integer", "minimum": 0 },
+        "outcome": { "description": "The run record's outcome, once it has one.", "type": "string" },
+        "attemptNumber": { "type": "integer", "minimum": 0 },
+        "attemptState": { "description": "The newest attempt's state.", "type": "string" },
+        "wait": { "$ref": "#/$defs/overviewWait" },
+        "steps": {
+          "description": "The newest attempt's steps then finalizers in presentation order.",
+          "type": "array",
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/assignmentStep" }
+        },
+        "stepsOmitted": {
+          "description": "The steps left out past the bound; absent when zero.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "assignmentStep": {
+      "type": "object",
+      "required": ["id", "role", "kind", "state", "failurePolicy"],
+      "properties": {
+        "id": { "type": "string" },
+        "role": { "description": "step or finalizer.", "type": "string" },
+        "kind": { "description": "The workflow format's word: cmd, agent or workflow.", "type": "string" },
+        "needs": { "description": "The direct dependencies; absent when none.", "type": "array", "items": { "type": "string" } },
+        "state": { "description": "The engine's word for the step's state.", "type": "string" },
+        "failurePolicy": { "type": "string" },
+        "startedAt": { "type": "string" },
+        "durationMilliseconds": { "type": "integer", "minimum": 0 },
+        "command": {
+          "description": "What a cmd step runs, as the workflow declares it.",
+          "type": "object",
+          "required": ["argv"],
+          "properties": {
+            "argv": { "type": "array", "items": { "type": "string" } },
+            "cwd": { "type": "string" }
+          }
+        },
+        "agent": {
+          "description": "What an agent step runs, as the workflow declares it.",
+          "type": "object",
+          "required": ["profile", "harness"],
+          "properties": {
+            "profile": { "type": "string" },
+            "harness": { "type": "string" },
+            "model": { "type": "string" },
+            "effort": { "type": "string" }
+          }
+        },
+        "workflow": {
+          "description": "What a workflow step runs, as the workflow declares it.",
+          "type": "object",
+          "required": ["file"],
+          "properties": { "file": { "type": "string" } }
+        },
+        "outputs": {
+          "description": "Each declared output and whether the attempt committed it; absent when none is declared.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "kind", "committed"],
+            "properties": {
+              "name": { "type": "string" },
+              "kind": { "type": "string" },
+              "committed": { "type": "boolean" }
+            }
+          }
+        },
+        "childRuns": {
+          "description": "A workflow step's child runs in the engine's order, the last of them; absent when none.",
+          "type": "array",
+          "maxItems": 256,
+          "items": {
+            "type": "object",
+            "required": ["ordinal", "state"],
+            "properties": {
+              "ordinal": { "type": "integer", "minimum": 0 },
+              "item": { "type": "integer", "minimum": 0 },
+              "state": { "type": "string" },
+              "outcome": { "type": "string" }
+            }
+          }
+        },
+        "childRunsOmitted": {
+          "description": "The earlier child runs left out; absent when zero.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "assignmentLog": {
+      "description": "The output of a settled step's newest invocation that retained any (source step), the end of the assignment's run log (source run_log), or a single-workflow assignment's named step's newest records (source step_records).",
+      "type": "object",
+      "required": ["source"],
+      "properties": {
+        "source": { "description": "step, run_log or step_records; not a closed set.", "type": "string" },
+        "step": { "type": "string" },
+        "invocationId": { "type": "integer", "minimum": 0 },
+        "stdout": { "$ref": "#/$defs/assignmentLogStream" },
+        "stderr": { "$ref": "#/$defs/assignmentLogStream" },
+        "earlierInvocationsOmitted": {
+          "description": "The step's earlier invocations that retained output; absent when zero.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "text": { "description": "The end of the run log.", "type": "string" },
+        "omittedBytes": {
+          "description": "The run log's bytes before the text; for step_records, the older records' bytes.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "records": {
+          "description": "The step's newest whole records in the order observed; absent when empty.",
+          "type": "array",
+          "maxItems": 16384,
+          "items": { "$ref": "#/$defs/assignmentLogRecord" }
+        },
+        "omittedRecords": {
+          "description": "The step's older records left out; absent when zero.",
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "assignmentLogRecord": {
+      "description": "One record of a step's output. Open: a reader ignores a member it does not know.",
+      "type": "object",
+      "required": ["source", "text"],
+      "properties": {
+        "source": {
+          "description": "stdout or stderr for a command's record, the engine's word for an agent's; not a closed set.",
+          "type": "string"
+        },
+        "text": { "description": "The record made visible.", "type": "string" },
+        "continuation": {
+          "description": "A piece the output was split into; absent when false.",
+          "type": "boolean"
+        }
+      }
+    },
+    "assignmentLogStream": {
+      "type": "object",
+      "required": ["retainedBytes", "discardedBytes", "omittedBytes", "text"],
+      "properties": {
+        "retainedBytes": { "type": "integer", "minimum": 0 },
+        "discardedBytes": { "type": "integer", "minimum": 0 },
+        "omittedBytes": { "description": "The retained bytes before the text.", "type": "integer", "minimum": 0 },
+        "text": { "type": "string" }
+      }
+    },
     "errorResponse": {
       "type": "object",
       "additionalProperties": false,
@@ -268,7 +776,8 @@
             "pending_authentication_failed",
             "pending_protocol_failed",
             "pending_connection_failed",
-            "state_update_failed"
+            "state_update_failed",
+            "assignment_not_held"
           ]
         }
       }

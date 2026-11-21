@@ -65,12 +65,15 @@ use useful_execution::{
 
 mod job;
 mod lease_supervision;
+mod live_view;
 mod observer;
 mod process_guards;
 mod projection;
 mod run;
 
 use lease_supervision::*;
+pub(super) use live_view::AssignmentRunView;
+use live_view::ObserverThenView;
 use observer::*;
 #[cfg(test)]
 use process_guards::GuardProcessControl;
@@ -272,6 +275,8 @@ pub(super) struct ExecutionJob {
     infrastructure_interruption: tokio::sync::watch::Receiver<Option<InfrastructureInterruption>>,
     workspace_release_reported: AtomicBool,
     run_event: RunEvent,
+    /// The view of a single-workflow run the manager also holds; none for a tree run.
+    view: Option<AssignmentRunView>,
 }
 
 struct RunnerResultFailure {
@@ -594,6 +599,19 @@ impl CoordinatorClock for RunnerExecutionClock {
     )]
     fn wait_until(&self, deadline: Self::Instant) -> impl Future<Output = ()> + Send {
         tokio::time::sleep_until(tokio::time::Instant::from_std(deadline.monotonic))
+    }
+}
+
+impl useful_execution::ObservationClock for RunnerExecutionClock {
+    fn sample(&self) -> useful_execution::ObservationTime {
+        let RunnerExecutionInstant { monotonic, utc } = Self.now();
+        useful_execution::ObservationTime { utc, monotonic }
+    }
+}
+
+impl useful_execution::DisplayDeadline for RunnerExecutionInstant {
+    fn deadline_utc(&self) -> OffsetDateTime {
+        self.utc
     }
 }
 

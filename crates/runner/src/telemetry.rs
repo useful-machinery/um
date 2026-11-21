@@ -3,7 +3,7 @@ use std::fmt;
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Instant;
 
@@ -191,6 +191,40 @@ pub(crate) trait EventWriter: Send + Sync {
     fn write(&self, event: &Map<String, Value>) -> io::Result<()>;
 }
 
+/// Told of each runner record the telemetry writer drops (REQ-TELEMETRY-14). It is told
+/// outside every lock this module holds and must write no telemetry.
+pub(crate) trait DroppedRecordObserver: Send + Sync {
+    /// One more record was dropped.
+    fn record_dropped(&self);
+}
+
+// Drops is what the event source and the writer thread share of the records
+// they drop: the count the next completed main record reports, and the
+// observer the serving loop may set once.
+#[derive(Default)]
+struct Drops {
+    pending: AtomicU64,
+    observer: OnceLock<Arc<dyn DroppedRecordObserver>>,
+}
+
+impl Drops {
+    // dropped counts one dropped record and puts back `carried`, the count the
+    // lost record was reporting, which is not dropped again: the observer is
+    // told of the one record only.
+    fn dropped(&self, carried: u64) {
+        self.pending
+            .fetch_add(carried.saturating_add(1), Ordering::AcqRel);
+        if let Some(observer) = self.observer.get() {
+            observer.record_dropped();
+        }
+    }
+
+    // take answers the pending count and leaves none.
+    fn take(&self) -> u64 {
+        self.pending.swap(0, Ordering::AcqRel)
+    }
+}
+
 struct QueuedRecord {
     bytes: Vec<u8>,
     represented_dropped_count: u64,
@@ -207,7 +241,7 @@ struct QueuedWriter {
 }
 
 impl QueuedWriter {
-    fn stderr(dropped_count: Arc<AtomicU64>) -> Self {
+    fn stderr(drops: Arc<Drops>) -> Self {
         let (sender, receiver) = sync_channel::<QueueMessage>(EVENT_QUEUE_CAPACITY);
         let worker = thread::Builder::new()
             .name("useful-runner-events".to_owned())
@@ -217,10 +251,7 @@ impl QueuedWriter {
                     match message {
                         QueueMessage::Record(record) => {
                             if stderr.write_record(&record.bytes).is_err() {
-                                dropped_count.fetch_add(
-                                    record.represented_dropped_count.saturating_add(1),
-                                    Ordering::AcqRel,
-                                );
+                                drops.dropped(record.represented_dropped_count);
                             }
                         }
                         QueueMessage::Flush(completed) => {
@@ -350,7 +381,7 @@ pub(crate) struct Recorder {
 struct EventSource {
     tracer: SdkTracer,
     writer: Arc<dyn EventWriter>,
-    dropped_count: Arc<AtomicU64>,
+    drops: Arc<Drops>,
     service_version: Arc<str>,
     service_instance_id: Arc<str>,
 }
@@ -363,8 +394,8 @@ impl fmt::Debug for Recorder {
 
 impl Recorder {
     pub(crate) fn stderr(service_instance_id: &str, service_version: &str) -> Arc<Self> {
-        let dropped_count = Arc::new(AtomicU64::new(0));
-        let queued_writer = Arc::new(QueuedWriter::stderr(Arc::clone(&dropped_count)));
+        let drops = Arc::new(Drops::default());
+        let queued_writer = Arc::new(QueuedWriter::stderr(Arc::clone(&drops)));
         let writer: Arc<dyn EventWriter> = queued_writer.clone();
         let mut provider = SdkTracerProvider::builder();
         if let Some(processor) = otlp::configured_processor(Arc::clone(&writer)) {
@@ -375,13 +406,19 @@ impl Recorder {
         let _ = queued_writer.flush();
         let resource = runner_resource(service_version, service_instance_id);
         let provider = provider.with_resource(resource).build();
-        Arc::new(Self::with_dropped_count(
+        Arc::new(Self::with_drops(
             provider,
             writer,
             service_version,
             service_instance_id,
-            dropped_count,
+            drops,
         ))
+    }
+
+    /// Sets the observer told of each record dropped from now on. Only the first observer
+    /// set is kept; a later one is ignored.
+    pub(crate) fn set_dropped_record_observer(&self, observer: Arc<dyn DroppedRecordObserver>) {
+        let _ = self.source.drops.observer.set(observer);
     }
 
     pub(crate) fn service_version(&self) -> &str {
@@ -399,21 +436,21 @@ impl Recorder {
         service_version: &str,
         service_instance_id: &str,
     ) -> Self {
-        Self::with_dropped_count(
+        Self::with_drops(
             provider,
             writer,
             service_version,
             service_instance_id,
-            Arc::new(AtomicU64::new(0)),
+            Arc::new(Drops::default()),
         )
     }
 
-    fn with_dropped_count(
+    fn with_drops(
         provider: SdkTracerProvider,
         writer: Arc<dyn EventWriter>,
         service_version: &str,
         service_instance_id: &str,
-        dropped_count: Arc<AtomicU64>,
+        drops: Arc<Drops>,
     ) -> Self {
         let tracer = provider.tracer("um-runner");
         Self {
@@ -421,7 +458,7 @@ impl Recorder {
             source: EventSource {
                 tracer,
                 writer,
-                dropped_count,
+                drops,
                 service_version: Arc::from(service_version),
                 service_instance_id: Arc::from(service_instance_id),
             },
@@ -457,7 +494,7 @@ impl Recorder {
         }
         fields.insert(EVENT_NAME.to_owned(), Value::String(name.to_owned()));
         if self.source.writer.write(&fields).is_err() {
-            self.source.dropped_count.fetch_add(1, Ordering::AcqRel);
+            self.source.drops.dropped(0);
         }
     }
 }
@@ -619,7 +656,7 @@ impl Event {
                 .fields
                 .insert(DURATION_MS.to_owned(), Value::Number(duration_ms.into()));
             let span = self.inner.context.span();
-            let prior_dropped_count = self.inner.source.dropped_count.swap(0, Ordering::AcqRel);
+            let prior_dropped_count = self.inner.source.drops.take();
             if prior_dropped_count > 0 {
                 let count = integer(prior_dropped_count);
                 state
@@ -653,10 +690,7 @@ impl Event {
         };
 
         if self.inner.source.writer.write(&event).is_err() {
-            self.inner
-                .source
-                .dropped_count
-                .fetch_add(prior_dropped_count.saturating_add(1), Ordering::AcqRel);
+            self.inner.source.drops.dropped(prior_dropped_count);
         }
     }
 }
@@ -811,7 +845,7 @@ pub(crate) fn test_recorder(service_instance_id: &str) -> (Arc<Recorder>, TestCa
 mod tests {
     use std::io::{self, Write};
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::mpsc::sync_channel;
     use std::thread;
 
@@ -820,8 +854,8 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        DROPPED_COUNT, EventWriter, FramedWriter, Outcome, QueuedWriter, Recorder,
-        TEST_SERVICE_VERSION, TestCapture, test_recorder,
+        DROPPED_COUNT, DroppedRecordObserver, EventWriter, FramedWriter, Outcome, QueuedWriter,
+        Recorder, TEST_SERVICE_VERSION, TestCapture, test_recorder,
     };
 
     // REQ-TELEMETRY-2
@@ -1020,6 +1054,86 @@ mod tests {
         let events = captured.events();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0][DROPPED_COUNT], 1);
+    }
+
+    // REQ-TELEMETRY-14, REQ-RUNNERENROLL-138: the observer is told of each record the
+    // writer refuses, once, never of the count a refused record carried; the pending count
+    // and the record that reports it are what they are without one.
+    #[test]
+    fn each_refused_record_tells_the_observer_once_and_the_count_is_unchanged() {
+        #[derive(Debug, Default)]
+        struct RefusingWriter {
+            refusing: AtomicBool,
+            captured: TestCapture,
+        }
+
+        impl EventWriter for RefusingWriter {
+            fn write(&self, event: &serde_json::Map<String, Value>) -> std::io::Result<()> {
+                if self.refusing.load(Ordering::Acquire) {
+                    return Err(std::io::Error::other("synthetic writer refusal"));
+                }
+                self.captured.write(event)
+            }
+        }
+
+        #[derive(Debug, Default)]
+        struct CountingObserver {
+            told: AtomicU64,
+        }
+
+        impl DroppedRecordObserver for CountingObserver {
+            fn record_dropped(&self) {
+                self.told.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+
+        // Three refused records, one taken, two refused, one refused that carries their
+        // count, one taken: the dropped counts the taken records carry.
+        let reported = |recorder: &Recorder, writer: &RefusingWriter| {
+            writer.refusing.store(true, Ordering::Release);
+            recorder.record("runner.dropped_diagnostic", []);
+            recorder
+                .start("runner.dropped", [])
+                .finish(Outcome::Failure);
+            recorder
+                .start("runner.dropped", [])
+                .finish(Outcome::Success);
+            writer.refusing.store(false, Ordering::Release);
+            recorder
+                .start("runner.recovered", [])
+                .finish(Outcome::Success);
+            writer.refusing.store(true, Ordering::Release);
+            recorder.record("runner.dropped_diagnostic", []);
+            recorder.record("runner.dropped_diagnostic", []);
+            recorder
+                .start("runner.dropped_carrying", [])
+                .finish(Outcome::Success);
+            writer.refusing.store(false, Ordering::Release);
+            recorder
+                .start("runner.recovered", [])
+                .finish(Outcome::Success);
+            writer
+                .captured
+                .events()
+                .iter()
+                .map(|event| event[DROPPED_COUNT].clone())
+                .collect::<Vec<_>>()
+        };
+        let recorder_with = |writer: &Arc<RefusingWriter>| {
+            let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+            Recorder::new(provider, writer.clone(), "0.2.0-test", "rbt_fixture")
+        };
+
+        let observer = Arc::new(CountingObserver::default());
+        let observed_writer = Arc::new(RefusingWriter::default());
+        let observed = recorder_with(&observed_writer);
+        observed.set_dropped_record_observer(observer.clone());
+        assert_eq!(reported(&observed, &observed_writer), [3, 3]);
+        assert_eq!(observer.told.load(Ordering::Acquire), 6);
+
+        let unobserved_writer = Arc::new(RefusingWriter::default());
+        let unobserved = recorder_with(&unobserved_writer);
+        assert_eq!(reported(&unobserved, &unobserved_writer), [3, 3]);
     }
 
     // REQ-TELEMETRY-14

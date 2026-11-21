@@ -20,6 +20,10 @@ use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::http::{HeaderMap, HeaderValue, header};
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 use tokio_tungstenite::{WebSocketStream, accept_hdr_async};
+use useful_execution::{
+    FailurePolicy, ObservedExecutions, ObservedStepTransition, SettledExecution, StartedExecution,
+    StepStateKind, TransitionEvent, TransitionObservation, TransitionSequence, WorkflowNodeRole,
+};
 use useful_test_support::watchdog::{FIXTURE_WAIT_BASE, WatchdogExpired, host_scaled_timeout};
 
 use crate::agent_login::ServiceEnvironment;
@@ -36,6 +40,7 @@ use crate::control_protocol::{AgentLoginCheckCause, AgentLoginProvider};
 use crate::credential::Credential;
 use crate::service::config::{AssignmentConfig, Config, ConfigError, RepositoryUrlPolicy};
 use crate::service::connection::{ConnectionError, FrameSource, run_established_shared};
+use crate::service::execution::{AssignmentRunView, RunnerExecutionInstant};
 pub(crate) use crate::service::lease_clock::fixture_lease_clock;
 use crate::service::{
     ConnectionAttempt, ConnectionFuture, Connector, Shutdown, ShutdownFuture, Sleeper,
@@ -1586,6 +1591,41 @@ pub(crate) fn fake_agent_login_setup_serving(
         &state_directory.join("runner-state.json"),
         recorder,
     )
+}
+
+/// The view of the workflow `source` holds, resolved from a file as a run's is, with every
+/// step `pending` and at most four run at once.
+pub(crate) fn fixture_run_view(source: &str) -> AssignmentRunView {
+    let directory = tempfile::tempdir().expect("create workflow fixture directory");
+    let path = directory.path().join("build.yaml");
+    std::fs::write(&path, source).expect("write workflow fixture");
+    let workflow = useful_execution::resolve_workflow_file(directory.path(), &path)
+        .expect("resolve workflow fixture");
+    AssignmentRunView::new(&workflow, 4)
+}
+
+/// One step transition at `sequence` whose wire projection is `observed` and whose physical
+/// executions are `settled` and `started`.
+pub(crate) fn step_execution_transition(
+    sequence: u64,
+    (step, role): (&str, WorkflowNodeRole),
+    (from, to): (StepStateKind, StepStateKind),
+    observed: Option<ObservedStepTransition>,
+    settled: Option<SettledExecution>,
+    started: Option<StartedExecution>,
+) -> TransitionObservation<RunnerExecutionInstant> {
+    TransitionObservation {
+        event: TransitionEvent::Step {
+            sequence: TransitionSequence(sequence),
+            step: step.to_owned(),
+            role,
+            failure_policy: FailurePolicy::Required,
+            from,
+            to,
+        },
+        step: observed,
+        executions: ObservedExecutions { settled, started },
+    }
 }
 
 #[cfg(test)]

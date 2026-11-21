@@ -82,8 +82,8 @@ use super::command::{self, CommandExit, UsefulCommand};
 use super::exports::{EXPORT_READER_LOST, read_exports};
 use super::records::{
     ClassifiedEnd, EngineResult, MIRROR_READER_LOST, RecordState, RefusedCommand, TreeConclusion,
-    TreeRecord, TreeWait, conclude, conclude_classified, mirror_read_failure, read_record,
-    read_recorded_result, read_wait,
+    TreeRecord, TreeWait, conclude, conclude_classified, mirror_read_failure, published_read,
+    read_record, read_recorded_result, read_wait,
 };
 use super::steps::{self, StepKey, StepReader};
 use super::{PendingStop, TreeRun, TreeStart};
@@ -329,7 +329,8 @@ impl Progress<'_> {
     /// (REQ-RUNNERENROLL-88): its observations and those after it stay unreported, under
     /// the same sequence, for the next read to offer again. Once a report that carries the
     /// root as news is queued, the run's activity reads waiting exactly when it carries a
-    /// wait.
+    /// wait. Every read, reported or not, is first kept as the run activity's last read
+    /// (REQ-RUNNERENROLL-134), which changes no report.
     fn observe(
         &mut self,
         run: &TreeRun,
@@ -337,6 +338,8 @@ impl Progress<'_> {
         wait: Option<&TreeWait>,
         steps: Vec<TreeStepObservation>,
     ) -> Result<(), DriveFailure> {
+        run.activity()
+            .record_read(published_read(record, wait, &steps));
         let observed = match (record.state, wait) {
             (RecordState::Waiting, None) => return Ok(()),
             (RecordState::Exited, _) => None,
@@ -516,7 +519,7 @@ async fn drive_to_end(driver: &mut Driver<'_>) -> Result<TreeEnd, DriveFailure> 
                     ..TreeEnd::after(None, exit)
                 });
             }
-            driver.directory = match exit
+            let directory = match exit
                 .document
                 .as_ref()
                 .and_then(|document| document["runDirectory"].as_str())
@@ -524,6 +527,7 @@ async fn drive_to_end(driver: &mut Driver<'_>) -> Result<TreeEnd, DriveFailure> 
                 Some(reported) => Some(PathBuf::from(reported)),
                 None => locate(&run.runs).await,
             };
+            driver.set_directory(directory);
             if let Some(directory) = driver.directory.clone()
                 && exit.cancellation.is_none()
             {
@@ -532,7 +536,8 @@ async fn drive_to_end(driver: &mut Driver<'_>) -> Result<TreeEnd, DriveFailure> 
             exit
         }
         TreeStart::Adopt(steps) => {
-            driver.directory = locate(&run.runs).await;
+            let directory = locate(&run.runs).await;
+            driver.set_directory(directory);
             let ended = match driver.directory.clone() {
                 Some(directory) => {
                     // The writes the run already holds are earlier attempts', counted before
@@ -705,6 +710,13 @@ async fn drive_to_end(driver: &mut Driver<'_>) -> Result<TreeEnd, DriveFailure> 
 }
 
 impl Driver<'_> {
+    /// Keeps `directory` as the run's directory, and publishes it in the run's activity as
+    /// where the run's directory is (REQ-RUNNERENROLL-144), which decides nothing.
+    fn set_directory(&mut self, directory: Option<PathBuf>) {
+        self.run.activity().publish_directory(directory.clone());
+        self.directory = directory;
+    }
+
     /// Supervises one `useful` command, reading the record at the record interval while it
     /// runs so a new attempt, stage or step state is reported as it starts, and applying
     /// each delivery, and each control that names no wait, that arrives once the run
@@ -752,7 +764,8 @@ impl Driver<'_> {
                 () = run.controls.arrived(), if applying.is_terminated() => {}
                 () = run.sleeper.sleep(run.intervals.record) => {
                     if self.directory.is_none() {
-                        self.directory = locate(&run.runs).await;
+                        let directory = locate(&run.runs).await;
+                        self.set_directory(directory);
                     }
                     if let Some(directory) = self.directory.clone()
                         && let Some(observed) = self.observe(directory).await

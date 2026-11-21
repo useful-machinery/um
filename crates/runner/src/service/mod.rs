@@ -9,6 +9,7 @@ mod conversation;
 #[cfg(test)]
 mod determinism_spike;
 mod execution;
+mod history;
 mod lease_clock;
 mod run_inputs;
 mod source;
@@ -53,7 +54,7 @@ use connection::{
 };
 use control::{
     AdmissionAgentLogins, ControlContext, ControlServer, ControlServerError, ControlTimeouts,
-    LiveStatus, ReloadRequest,
+    LiveStatus, RUN_READ_PLACES, ReloadRequest,
 };
 use lease_clock::{LeaseClock, LeaseClockError};
 use useful_execution::MAXIMUM_CANCELLATION_GRACE;
@@ -609,6 +610,29 @@ async fn run_until_cancelled(
     .await
 }
 
+/// The loop's dependencies for a test of the whole service: no agent-login setup.
+#[cfg(test)]
+fn fixture_loop_dependencies(
+    config: Config,
+    frame_source: Arc<dyn FrameSource>,
+    sleeper: Arc<dyn Sleeper>,
+    recorder: Arc<Recorder>,
+    source_broker: Option<Arc<dyn source::SourceCredentialBroker>>,
+) -> Result<ConnectionLoopDependencies, ServiceError> {
+    let boot_id = frame_source.public_id("rbt_");
+    let lease_clock = LeaseClock::system().map_err(ServiceError::LeaseClock)?;
+    Ok(ConnectionLoopDependencies {
+        config,
+        frame_source,
+        sleeper,
+        recorder,
+        lease_clock,
+        boot_id,
+        source_broker,
+        agent_login_setup: None,
+    })
+}
+
 #[cfg(test)]
 async fn run_until_cancelled_with_dependencies(
     config: Config,
@@ -619,19 +643,8 @@ async fn run_until_cancelled_with_dependencies(
     mut shutdown: Box<dyn Shutdown>,
     join_key: JoinKeyMode,
 ) -> Result<ServiceEnd, ServiceError> {
-    let boot_id = frame_source.public_id("rbt_");
-    let lease_clock = LeaseClock::system().map_err(ServiceError::LeaseClock)?;
     run_connection_loop_with_filesystem(
-        ConnectionLoopDependencies {
-            config,
-            frame_source,
-            sleeper,
-            recorder,
-            lease_clock,
-            boot_id,
-            source_broker,
-            agent_login_setup: None,
-        },
+        fixture_loop_dependencies(config, frame_source, sleeper, recorder, source_broker)?,
         &WebSocketConnector,
         Backoff::new(),
         shutdown.as_mut(),
@@ -783,19 +796,6 @@ async fn connection_loop_with_work_root(
         source_broker,
         agent_login_setup,
     } = dependencies;
-    let assignment_dependencies = AssignmentDependencies::production(
-        &config,
-        &boot_id,
-        Arc::clone(&sleeper),
-        Arc::clone(&work_root),
-        Arc::clone(&recorder),
-        source_broker,
-    )?;
-    let assignment_manager = Arc::new(Mutex::new(AssignmentManager::new(
-        &config,
-        lease_clock,
-        assignment_dependencies,
-    )));
     let live_status = Arc::new(LiveStatus::new(
         boot_id.clone(),
         config.credential().credential_id().to_owned(),
@@ -803,6 +803,29 @@ async fn connection_loop_with_work_root(
             .startup_pending()
             .map(|pending| pending.credential_id.clone()),
     ));
+    recorder.set_dropped_record_observer(Arc::<history::EventLog>::clone(live_status.events()));
+    let assignment_dependencies = AssignmentDependencies::production(
+        &config,
+        &boot_id,
+        Arc::clone(&sleeper),
+        Arc::clone(&work_root),
+        Arc::clone(&recorder),
+        source_broker,
+    )?
+    .with_events(Arc::clone(live_status.events()));
+    let assignment_manager = Arc::new(Mutex::new(AssignmentManager::new(
+        &config,
+        lease_clock,
+        assignment_dependencies,
+    )));
+    let found = work_root.startup_retained().len();
+    if found != 0 {
+        live_status
+            .events()
+            .record(history::LoggedEvent::WorkspacesFound {
+                workspaces: u64::try_from(found).unwrap_or(u64::MAX),
+            });
+    }
     let reload_dependencies = ReloadDependencies {
         boot_id: boot_id.clone(),
         frame_source: Arc::clone(&frame_source),
@@ -839,9 +862,12 @@ async fn connection_loop_with_work_root(
                 ControlContext {
                     status: Arc::clone(&live_status),
                     assignments: Arc::clone(&assignment_manager),
+                    run_reads: Arc::new(tokio::sync::Semaphore::new(RUN_READ_PLACES)),
                     reloads: reload_sender,
                     agent_logins: agent_login_setup.clone(),
                     timeouts: ControlTimeouts::production(),
+                    runner_id: config.credential().runner_id().to_owned(),
+                    version: recorder.service_version().to_owned(),
                 },
             )
         })
@@ -1286,8 +1312,8 @@ async fn connection_loop_with_work_root(
             backoff.reset();
             join_key.handshake_completed();
         }
-        live_status.backing_off(connection_failure(cause));
         let delay = backoff.next_delay();
+        live_status.backing_off(connection_failure(cause), delay);
         let outcome = if cause.is_timeout() {
             Outcome::Timeout
         } else {
@@ -1568,7 +1594,7 @@ impl ReloadDependencies {
             .as_ref()
             .map(promoted_credential_id)
             .map_err(|error| *error);
-        respond_to_reload(&mut request, response);
+        respond_to_reload(&self.live_status, &mut request, response);
         result.ok()
     }
 
@@ -1591,6 +1617,7 @@ impl ReloadDependencies {
                 () = self.live_status.wait_until_connected() => {}
                 result = &mut *connection => {
                     respond_to_reload(
+                        &self.live_status,
                         &mut request,
                         Err(ControlError::PendingConnectionFailed),
                     );
@@ -1598,6 +1625,7 @@ impl ReloadDependencies {
                 }
                 _ = shutdown.wait() => {
                     respond_to_reload(
+                        &self.live_status,
                         &mut request,
                         Err(ControlError::PendingConnectionFailed),
                     );
@@ -1618,7 +1646,11 @@ impl ReloadDependencies {
                     prior_result = Some(result);
                 }
                 _ = shutdown.wait() => {
-                    respond_to_reload(&mut request, Err(ControlError::PendingConnectionFailed));
+                    respond_to_reload(
+                        &self.live_status,
+                        &mut request,
+                        Err(ControlError::PendingConnectionFailed),
+                    );
                     return ConnectedReloadResult::Shutdown;
                 }
             }
@@ -1626,7 +1658,7 @@ impl ReloadDependencies {
         let prepared = match prepared {
             Ok(prepared) => prepared,
             Err(error) => {
-                respond_to_reload(&mut request, Err(error));
+                respond_to_reload(&self.live_status, &mut request, Err(error));
                 return prior_result.map_or(
                     ConnectedReloadResult::Continue,
                     ConnectedReloadResult::Finished,
@@ -1635,14 +1667,18 @@ impl ReloadDependencies {
         };
         match self.commit_candidate(prepared).await {
             Ok(promoted) => {
-                respond_to_reload(&mut request, Ok(promoted_credential_id(&promoted)));
+                respond_to_reload(
+                    &self.live_status,
+                    &mut request,
+                    Ok(promoted_credential_id(&promoted)),
+                );
                 ConnectedReloadResult::Promoted(Box::new(promoted))
             }
             Err(error) => {
                 let recovery = self
                     .prepare_connection(config.clone(), sequence, attempt.saturating_add(1))
                     .await;
-                respond_to_reload(&mut request, Err(error));
+                respond_to_reload(&self.live_status, &mut request, Err(error));
                 match recovery {
                     Ok(recovered) => ConnectedReloadResult::Promoted(Box::new(recovered)),
                     Err(_) => prior_result.map_or(
@@ -1829,7 +1865,18 @@ fn promoted_credential_id(promoted: &PromotedAttempt) -> String {
     promoted.config.credential().credential_id().to_owned()
 }
 
-fn respond_to_reload(request: &mut Option<ReloadRequest>, result: Result<String, ControlError>) {
+/// Answers the waiting `request`, if any, with `result`; a failed reload is one of the
+/// runner's events whether or not a request waits (REQ-RUNNERENROLL-138).
+fn respond_to_reload(
+    status: &LiveStatus,
+    request: &mut Option<ReloadRequest>,
+    result: Result<String, ControlError>,
+) {
+    if let Err(error) = result {
+        status
+            .events()
+            .record(history::LoggedEvent::CredentialReloadFailed { error });
+    }
     if let Some(request) = request.take() {
         let _ = request.response.send(result);
     }
@@ -4849,6 +4896,190 @@ mod tests {
 
         // No controlled sleep is released: neither the backoff nor the shutdown
         // deadline can elapse, so a return here is an exit that waited on nothing.
+        with_watchdog(service)
+            .await
+            .expect("runner kept running past a stop signal received in reconnect backoff")
+            .expect("runner service task failed")
+            .expect("runner service returned an error");
+        server.abort();
+    }
+
+    // REQ-RUNNERENROLL-133: while the service backs off from a refused session, the control
+    // socket's overview gives the attempt, the time to the next and who is serving, and
+    // `status` still answers its snapshot.
+    #[tokio::test]
+    async fn the_overview_of_a_service_in_reconnect_backoff_gives_its_attempts() {
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
+        let server = tokio::spawn(async move {
+            // Every session ends before welcome, so the runner never connects.
+            loop {
+                let mut socket = accept_fixture_socket(&listener).await;
+                expect_opening_hello(&mut socket).await;
+                socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::Error,
+                        reason: "store_failure".into(),
+                    })))
+                    .await
+                    .expect("send pre-welcome close");
+                while let Some(Ok(_)) = socket.next().await {}
+            }
+        });
+
+        let (sleeper, mut sleep_requests) = controlled_sleeper();
+        let (service, _capture, shutdown_trigger) =
+            spawn_configured_service(fixture.config.clone(), sleeper);
+        let (delay, _held_backoff) = backoff_request(&mut sleep_requests).await;
+        let overview_socket = socket_path.clone();
+        let answer = tokio::task::spawn_blocking(move || {
+            crate::control_client::request_overview(&overview_socket)
+        })
+        .await
+        .unwrap()
+        .unwrap();
+        let crate::control_protocol::OverviewAnswer::Overview(overview) = answer else {
+            panic!("the serving process refused the overview: {answer:?}");
+        };
+        assert_eq!(
+            overview.connection.state,
+            crate::control_protocol::OpenWord::Known(ConnectionState::BackingOff)
+        );
+        assert_eq!(overview.connection.attempts_since_connected, Some(1));
+        let next = overview
+            .connection
+            .next_attempt_in_milliseconds
+            .expect("a backing-off service gives the time to its next attempt");
+        assert!(next <= u64::try_from(delay.as_millis()).unwrap(), "{next}");
+        assert_eq!(
+            overview.runner.runner_id,
+            fixture.config.credential().runner_id()
+        );
+        assert_eq!(
+            overview.runner.version,
+            crate::telemetry::TEST_SERVICE_VERSION
+        );
+        assert!(matches!(
+            request_control(socket_path, Operation::Status).await,
+            Response::Status(_)
+        ));
+
+        shutdown_trigger.notify_one();
+        with_watchdog(service)
+            .await
+            .expect("runner kept running past a stop signal received in reconnect backoff")
+            .expect("runner service task failed")
+            .expect("runner service returned an error");
+        server.abort();
+    }
+
+    // REQ-RUNNERENROLL-138: a service backing off from refused sessions lists its failed
+    // attempts as one event, and a reload that fails is answered as before and listed.
+    #[tokio::test]
+    async fn the_overview_of_a_service_in_reconnect_backoff_lists_its_events() {
+        use crate::control_protocol::{OpenWord, OverviewAnswer, RunnerEventKind};
+
+        let (listener, endpoint) = fixture_listener().await;
+        let fixture = RotationFixture::without_pending(&endpoint);
+        let socket_path = fixture.config.control_socket_path().unwrap().to_owned();
+        let server = tokio::spawn(async move {
+            // Every session ends before welcome, so the runner never connects.
+            loop {
+                let mut socket = accept_fixture_socket(&listener).await;
+                expect_opening_hello(&mut socket).await;
+                socket
+                    .send(Message::Close(Some(CloseFrame {
+                        code: CloseCode::Error,
+                        reason: "store_failure".into(),
+                    })))
+                    .await
+                    .expect("send pre-welcome close");
+                while let Some(Ok(_)) = socket.next().await {}
+            }
+        });
+        let events = || {
+            let socket_path = socket_path.clone();
+            async move {
+                let answer = tokio::task::spawn_blocking(move || {
+                    crate::control_client::request_overview(&socket_path)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+                let OverviewAnswer::Overview(overview) = answer else {
+                    panic!("the serving process refused the overview: {answer:?}");
+                };
+                (overview.events, overview.connection.last_failure)
+            }
+        };
+
+        let (sleeper, mut sleep_requests) = controlled_sleeper();
+        let (recorder, _capture) = test_recorder("rbt_00000000000000000000000001");
+        let dependencies = super::fixture_loop_dependencies(
+            fixture.config.clone(),
+            deterministic_frame_source(),
+            sleeper,
+            recorder,
+            Some(unavailable_source_broker()),
+        )
+        .unwrap();
+        let (mut shutdown, shutdown_trigger) = controlled_shutdown();
+        // A fixed unit keeps every delay under the second `backoff_request` waits for.
+        let service = tokio::spawn(async move {
+            super::run_connection_loop_with_filesystem(
+                dependencies,
+                &super::WebSocketConnector,
+                super::Backoff::with_fixed_unit(0.1),
+                shutdown.as_mut(),
+                super::workspace::WorkspaceFilesystem::testing(),
+                JoinKeyMode::None,
+            )
+            .await
+        });
+        for _ in 0..2 {
+            let (_delay, held_backoff) = backoff_request(&mut sleep_requests).await;
+            held_backoff.release();
+        }
+        let (delay, _held_backoff) = backoff_request(&mut sleep_requests).await;
+        let (listed, last_failure) = events().await;
+        let [failed] = listed.as_slice() else {
+            panic!("the three failed attempts are one event: {listed:?}");
+        };
+        assert_eq!(
+            failed.kind,
+            OpenWord::Known(RunnerEventKind::ConnectionFailed)
+        );
+        assert_eq!(failed.count, 3);
+        assert_eq!(failed.failure, last_failure);
+        assert_eq!(
+            failed.next_attempt_in_milliseconds,
+            Some(u64::try_from(delay.as_millis()).unwrap())
+        );
+
+        assert_eq!(
+            request_control(socket_path.clone(), Operation::ReloadCredential).await,
+            Response::Error(ControlError::NoPendingCredential)
+        );
+        let (listed, _) = events().await;
+        let reload_failed = listed
+            .iter()
+            .position(|event| {
+                event.kind == OpenWord::Known(RunnerEventKind::CredentialReloadFailed)
+            })
+            .unwrap_or_else(|| panic!("the failed reload is listed: {listed:?}"));
+        assert_eq!(
+            listed[reload_failed].error,
+            Some(OpenWord::Known(ControlError::NoPendingCredential))
+        );
+        assert!(
+            listed[..reload_failed]
+                .iter()
+                .all(|event| event.kind == OpenWord::Known(RunnerEventKind::ConnectionFailed)),
+            "{listed:?}"
+        );
+
+        shutdown_trigger.notify_one();
         with_watchdog(service)
             .await
             .expect("runner kept running past a stop signal received in reconnect backoff")

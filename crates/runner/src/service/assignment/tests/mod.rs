@@ -15,12 +15,16 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
 
 use super::*;
-use crate::control_protocol::{HeldRun, HeldRunState};
+use crate::control_protocol::{
+    AssignmentPhase, HeldRun, HeldRunState, LeaseHealth, LiveStepState, OpenWord,
+    OverviewAssignment, OverviewCounts, OverviewLease, OverviewRunningStep, OverviewWait,
+    RunResult, RunnerEventKind, StepPathPart,
+};
 use crate::credential::test_credential;
 use crate::service::assignment::test_support::{
     active_step_count, align_fixture_capacity, held_assignment, hold_assignment,
-    install_running_renewal_fixture, install_running_renewal_fixture_beside, observation_retained,
-    reporting_assignment, take_held_assignment,
+    install_run_activity, install_running_renewal_fixture, install_running_renewal_fixture_beside,
+    observation_retained, reporting_assignment, take_held_assignment,
 };
 use crate::service::config::{AssignmentConfig, Config, RepositoryUrlPolicy};
 use crate::service::lease_clock::{
@@ -35,6 +39,7 @@ use crate::service::test_support::{
     holding_step_workflow, process_exists, require_internal_worker_executable, run_fixture_git,
     with_watchdog,
 };
+use crate::service::tree_run::{RunPaths, RunRead};
 use crate::service::workspace::{
     CleanupCancellation, CleanupSleeper, OwnedTree, TreeRemover, WorkRootHook, WorkspaceFilesystem,
 };
@@ -1529,7 +1534,22 @@ async fn controlled_running_fixture() -> (
     AssignmentOffer,
     PathBuf,
 ) {
-    let workflow = "schemaVersion: 1\nsteps:\n  wait:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"sleep 60\"]\n";
+    controlled_running_fixture_of(
+        "schemaVersion: 1\nsteps:\n  wait:\n    kind: cmd\n    command:\n      argv: [\"sh\", \"-c\", \"sleep 60\"]\n",
+    )
+    .await
+}
+
+/// `workflow` started, its lease timers controlled, beside a sentinel in its workspace.
+async fn controlled_running_fixture_of(
+    workflow: &str,
+) -> (
+    tempfile::TempDir,
+    AssignmentManager,
+    tokio::sync::mpsc::UnboundedReceiver<(Duration, LeaseTimerRelease)>,
+    AssignmentOffer,
+    PathBuf,
+) {
     let (temporary, mut manager) = manager_fixture(workflow);
     let (lease_clock, _control, lease_waits) = controlled_lease_clock();
     manager.lease_clock = lease_clock;
@@ -5550,6 +5570,601 @@ async fn status_counts_a_waiting_run_beside_a_preparing_one_and_lists_both() {
     );
 }
 
+/// Lets `duration` pass on the manager's controlled sleeper.
+async fn pass_held_time(
+    sleeper: &dyn Sleeper,
+    sleeps: &mut tokio::sync::mpsc::UnboundedReceiver<(
+        Duration,
+        crate::service::test_support::SleepRelease,
+    )>,
+    duration: Duration,
+) {
+    let release = async {
+        let (requested, release) = sleeps.recv().await.expect("the sleeper stays open");
+        assert_eq!(requested, duration);
+        release.release();
+    };
+    tokio::join!(sleeper.sleep(duration), release);
+}
+
+/// The execution spec and continuation of the offer in the runner-protocol fixture `name`.
+fn protocol_fixture_offer(
+    name: &str,
+) -> (
+    ExecutionSpecV1RunnerProjection,
+    Option<Box<ContinuationOffer>>,
+) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/runner-protocol/v1/valid")
+        .join(name);
+    let CloudFrame::AssignmentOffer {
+        execution_spec,
+        continuation,
+        ..
+    } = decode_cloud_frame(&fs::read(path).unwrap()).unwrap()
+    else {
+        panic!("expected an assignment offer");
+    };
+    (*execution_spec, continuation)
+}
+
+/// A loop's read of a run at `step` naming `subject`: waiting on an external condition
+/// there, or running `step` with two more steps left out.
+fn loop_read(subject: &str, step: &str, waiting: bool) -> RunRead {
+    let position = vec![StepPathPart::Name(step.to_owned())];
+    RunRead {
+        position: position.clone(),
+        subject: Some(subject.to_owned()),
+        wait: waiting.then(|| OverviewWait {
+            kind: "external".to_owned(),
+            since: Some("2026-07-23T00:00:05Z".to_owned()),
+            step: position,
+        }),
+        running_steps: if waiting {
+            Vec::new()
+        } else {
+            vec![OverviewRunningStep {
+                run: Vec::new(),
+                run_attempt: 1,
+                step: step.to_owned(),
+                state: LiveStepState::Running.into(),
+            }]
+        },
+        running_steps_omitted: if waiting { 0 } else { 2 },
+    }
+}
+
+/// Gives the installed run of `offered` an activity holding `read`, waiting exactly when
+/// the read holds a wait.
+fn give_loop_read(manager: &mut AssignmentManager, offered: &AssignmentOffer, read: RunRead) {
+    let activity = RunActivity::new();
+    activity.reported(read.wait.is_some());
+    activity.record_read(read);
+    install_run_activity(manager, &offered.assignment_id, activity);
+}
+
+/// The time the fixture's clock has left before `offered`'s run would begin cancelling.
+fn fixture_time_left(manager: &AssignmentManager, offered: &AssignmentOffer) -> Duration {
+    let cancellation_start = manager
+        .running(&offered.assignment_id)
+        .expect("installed assignment runs")
+        .authority_updates
+        .borrow()
+        .cancellation_start;
+    cancellation_start
+        .checked_duration_since(manager.lease_clock.now().unwrap())
+        .unwrap_or_default()
+}
+
+fn milliseconds(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap()
+}
+
+/// The overview entry of `offered`'s assignment.
+fn overview_entry(
+    overview: &super::overview::AssignmentOverview,
+    offered: &AssignmentOffer,
+) -> OverviewAssignment {
+    overview
+        .assignments
+        .iter()
+        .find(|entry| entry.assignment_id == offered.assignment_id)
+        .cloned()
+        .expect("the overview lists the assignment")
+}
+
+/// Ends the installed run of `offered` with its terminal report queued, and lets its final
+/// grace pass with the report unacknowledged, so the manager holds it no longer but still
+/// reports it; answers the report's observation.
+fn end_and_keep_reporting(manager: &mut AssignmentManager, offered: &AssignmentOffer) -> u64 {
+    let identity = AssignmentIdentity::from_offer(offered);
+    let report = enqueue_finished(manager, &identity);
+    let deadline = manager
+        .lease_clock
+        .now()
+        .unwrap()
+        .checked_add(Duration::from_secs(5))
+        .unwrap();
+    for event in [
+        ManagerEvent::Finished {
+            assignment_id: offered.assignment_id.clone(),
+            final_observation_id: Some(report),
+            final_delivery_deadline: Some(deadline),
+            lease_clock_failed: false,
+            fenced: false,
+            retained_root: None,
+            quiescence: ProcessQuiescence::Proven,
+            quiescence_failure: None,
+            workspace_disposition: WorkspaceDisposition::Remove,
+        },
+        ManagerEvent::FinalGraceElapsed {
+            assignment_id: offered.assignment_id.clone(),
+            final_observation_id: report,
+            continue_reporting: true,
+        },
+    ] {
+        manager.event_sender.send(event).unwrap();
+        manager.drain_events();
+    }
+    assert_eq!(reporting_assignment(manager), Some(&identity));
+    report
+}
+
+// REQ-RUNNERENROLL-134: the overview gives one entry per assignment the manager holds, in one
+// read that changes nothing: the working ones and then the waiting ones as `status` lists
+// them, then the ended ones, each with what its offer said, the time since the runner took
+// it and, for a run, the time Cloud granted it and what its loop last read; the entries'
+// phases tally to the read's counts.
+#[tokio::test]
+async fn the_overview_gives_one_entry_per_assignment_in_the_order_status_lists_them() {
+    let (_temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
+    let (sleeper, mut sleeps) = controlled_sleeper();
+    manager.sleeper = Arc::clone(&sleeper);
+    // The waiting run has the lowest ID, so the order is the phases' and not the IDs'.
+    let mut waiting = offer("ba");
+    waiting.attempt_number = 2;
+    waiting.continuation =
+        protocol_fixture_offer("cloud-assignment-offer-tree-continuation.json").1;
+    let ended = offer("bb");
+    let preparing = offer("bc");
+    let mut working = offer("bd");
+    let (mut tree_spec, _) = protocol_fixture_offer("cloud-assignment-offer-workflow-tree.json");
+    let tree = tree_spec.workflow_tree.as_mut().unwrap();
+    tree.workflow_path = ".useful/engineering/workflow.yaml".to_owned();
+    let run_url = tree.run_url.clone().unwrap();
+    working.execution_spec.workflow_tree = tree_spec.workflow_tree;
+
+    let timing = install_running_renewal_fixture(&mut manager, waiting.clone());
+    give_loop_read(&mut manager, &waiting, loop_read("AUTO-751", "merge", true));
+    // A run that waited ends and reports beside the others.
+    install_running_renewal_fixture_beside(&mut manager, ended.clone(), &timing);
+    give_loop_read(&mut manager, &ended, loop_read("AUTO-700", "review", true));
+    let report = end_and_keep_reporting(&mut manager, &ended);
+
+    pass_held_time(sleeper.as_ref(), &mut sleeps, Duration::from_secs(2)).await;
+    manager.handle_offer(preparing.clone()).unwrap();
+    // The root preparation worker reports `Preparing` on its own thread; wait for that
+    // report so every read below sees the same outbox and the same preparing assignment.
+    wait_for_offer_preparation(&mut manager).await;
+    assert!(manager.preparing(&preparing.assignment_id).is_some());
+    install_running_renewal_fixture_beside(&mut manager, working.clone(), &timing);
+    give_loop_read(
+        &mut manager,
+        &working,
+        loop_read("AUTO-752", "build", false),
+    );
+    for (offered, suffix) in [(&waiting, "ra"), (&working, "rb")] {
+        let renewal = AssignmentRenewal {
+            effect_id: format!("eff_01k0z6r1w8f4jy2m7q9v3x5a{suffix}"),
+            ..renewal_for(offered)
+        };
+        assert_eq!(
+            manager.handle_renewal(renewal).unwrap().disposition,
+            RenewalDisposition::Applied
+        );
+    }
+    pass_held_time(sleeper.as_ref(), &mut sleeps, Duration::from_secs(3)).await;
+
+    let status = manager.status_assignments();
+    let overview = manager.overview_assignments();
+    assert_eq!(manager.status_assignments(), status);
+
+    let granted = Some(OverviewLease {
+        health: LeaseHealth::Ok.into(),
+        time_left_milliseconds: milliseconds(timing.cancellation_headroom().unwrap()),
+    });
+    let entry =
+        |offered: &AssignmentOffer, phase: AssignmentPhase, held_seconds: u64| OverviewAssignment {
+            assignment_id: offered.assignment_id.clone(),
+            run_id: offered.run_id.clone(),
+            attempt_number: offered.attempt_number,
+            workflow_path: "workflows/build.yaml".to_owned(),
+            phase: phase.into(),
+            activity: None,
+            held_milliseconds: held_seconds * 1000,
+            continues_earlier_attempt: false,
+            lease: None,
+            subject: None,
+            run_url: None,
+            position: None,
+            wait: None,
+            running_steps: Vec::new(),
+            running_steps_omitted: 0,
+        };
+    let working_read = loop_read("AUTO-752", "build", false);
+    let waiting_read = loop_read("AUTO-751", "merge", true);
+    assert_eq!(
+        overview.assignments,
+        [
+            OverviewAssignment {
+                activity: Some(HeldRunState::Working.into()),
+                ..entry(&preparing, AssignmentPhase::Preparing, 3)
+            },
+            OverviewAssignment {
+                workflow_path: ".useful/engineering/workflow.yaml".to_owned(),
+                activity: Some(HeldRunState::Working.into()),
+                lease: granted.clone(),
+                subject: working_read.subject,
+                run_url: Some(run_url),
+                position: Some(working_read.position),
+                running_steps: working_read.running_steps,
+                running_steps_omitted: 2,
+                ..entry(&working, AssignmentPhase::Running, 3)
+            },
+            OverviewAssignment {
+                activity: Some(HeldRunState::Waiting.into()),
+                continues_earlier_attempt: true,
+                lease: granted,
+                subject: waiting_read.subject,
+                position: Some(waiting_read.position),
+                wait: waiting_read.wait,
+                ..entry(&waiting, AssignmentPhase::Waiting, 5)
+            },
+            // The ended run keeps the subject its loop last read.
+            OverviewAssignment {
+                subject: Some("AUTO-700".to_owned()),
+                ..entry(&ended, AssignmentPhase::Reporting, 5)
+            },
+        ]
+    );
+    assert_eq!(overview.assignments_omitted, 0);
+    let mut tally = OverviewCounts::default();
+    for entry in &overview.assignments {
+        let count = match &entry.phase {
+            OpenWord::Known(AssignmentPhase::Preparing) => &mut tally.preparing,
+            OpenWord::Known(AssignmentPhase::Accepted) => &mut tally.accepted,
+            OpenWord::Known(AssignmentPhase::Running) => &mut tally.running,
+            OpenWord::Known(AssignmentPhase::Waiting) => &mut tally.waiting,
+            OpenWord::Known(AssignmentPhase::Finishing) => &mut tally.finishing,
+            OpenWord::Known(AssignmentPhase::Reporting) => &mut tally.reporting,
+            OpenWord::Unknown(word) => panic!("an unknown phase {word}"),
+        };
+        *count += 1;
+    }
+    assert_eq!(overview.counts, tally);
+    let listed: Vec<_> = overview
+        .assignments
+        .iter()
+        .filter_map(|entry| {
+            let state = match entry.activity.as_ref()? {
+                OpenWord::Known(state) => *state,
+                OpenWord::Unknown(word) => panic!("an unknown activity {word}"),
+            };
+            Some(HeldRun {
+                run_id: entry.run_id.clone(),
+                state,
+            })
+        })
+        .collect();
+    assert_eq!(listed, status.1);
+
+    // The time held grows with the manager's clock.
+    pass_held_time(sleeper.as_ref(), &mut sleeps, Duration::from_secs(1)).await;
+    let later = manager.overview_assignments();
+    assert_eq!(
+        later
+            .assignments
+            .iter()
+            .map(|entry| entry.held_milliseconds)
+            .collect::<Vec<_>>(),
+        [4000, 4000, 6000, 6000]
+    );
+
+    // The renewal falls due, the cancellation begins, and a renewal then revokes the grant.
+    let renewal_request = manager
+        .running(&waiting.assignment_id)
+        .unwrap()
+        .authority_updates
+        .borrow()
+        .renewal_request;
+    timing.advance(
+        renewal_request
+            .checked_duration_since(manager.lease_clock.now().unwrap())
+            .unwrap(),
+    );
+    let renewing = Some(OverviewLease {
+        health: LeaseHealth::Renewing.into(),
+        time_left_milliseconds: milliseconds(fixture_time_left(&manager, &waiting)),
+    });
+    let overview = manager.overview_assignments();
+    assert_eq!(overview_entry(&overview, &waiting).lease, renewing);
+    assert_eq!(overview_entry(&overview, &working).lease, renewing);
+    timing.advance(fixture_time_left(&manager, &waiting));
+    let overview = manager.overview_assignments();
+    let expiring = Some(OverviewLease {
+        health: LeaseHealth::Expiring.into(),
+        time_left_milliseconds: 0,
+    });
+    assert_eq!(overview_entry(&overview, &waiting).lease, expiring);
+    timing.advance(Duration::from_secs(1));
+    let late = AssignmentRenewal {
+        effect_id: "eff_01k0z6r1w8f4jy2m7q9v3x5arc".to_owned(),
+        lease: ExecutionLeaseGrant { sequence: 3 },
+        ..renewal_for(&waiting)
+    };
+    assert_eq!(
+        manager.handle_renewal(late).unwrap().disposition,
+        RenewalDisposition::CancellationStarted
+    );
+    let overview = manager.overview_assignments();
+    assert_eq!(
+        overview_entry(&overview, &waiting).lease,
+        Some(OverviewLease {
+            health: LeaseHealth::Revoked.into(),
+            time_left_milliseconds: 0,
+        })
+    );
+    assert_eq!(overview_entry(&overview, &working).lease, expiring);
+    // An ended entry has no lease and no activity.
+    assert_eq!(overview_entry(&overview, &ended).lease, None);
+
+    // Once Cloud acknowledges the ended run's last report, its entry and its report are gone.
+    manager.acknowledge_observation(report);
+    let acknowledged = manager.overview_assignments();
+    assert_eq!(
+        acknowledged.unacknowledged_reports,
+        overview.unacknowledged_reports - 1
+    );
+    assert!(
+        acknowledged
+            .assignments
+            .iter()
+            .all(|entry| entry.assignment_id != ended.assignment_id)
+    );
+    assert!(!manager.offer_facts.contains_key(&ended.assignment_id));
+    assert_eq!(acknowledged.counts.total(), Some(3));
+}
+
+// REQ-RUNNERENROLL-144, REQ-RUNNERENROLL-134: the manager's read of one assignment gives the
+// entry the overview lists for it, from the same kind of read, with where a running tree
+// run's directory and log are as its activity published them, and no path for an
+// assignment being prepared or one that ended and still reports; it gives nothing for an
+// assignment the manager neither holds nor reports, and changes nothing `status` reads.
+#[tokio::test]
+async fn the_read_of_one_assignment_gives_its_overview_entry_and_a_running_runs_paths() {
+    let (temporary, mut manager) = manager_fixture("schemaVersion: 1\nsteps: {}\n");
+    let (sleeper, mut sleeps) = controlled_sleeper();
+    manager.sleeper = Arc::clone(&sleeper);
+    let running = offer("ba");
+    let ended = offer("bb");
+    let preparing = offer("bc");
+
+    let timing = install_running_renewal_fixture(&mut manager, running.clone());
+    let private = temporary.path().join("ba/private");
+    let paths = RunPaths {
+        directory: Some(private.join(
+            "home/workflows/def_01k0z6r1w8f4jy2m7q9v3x5loc/runs/run_01k0z6r1w8f4jy2m7q9v3x5loc",
+        )),
+        log: Some(private.join("tree-run.log")),
+    };
+    let activity = RunActivity::new();
+    activity.record_read(loop_read("AUTO-752", "build", false));
+    activity.publish_log(paths.log.clone().unwrap());
+    activity.publish_directory(paths.directory.clone());
+    // The run waits while the runner takes the second offer, and works again once it is being
+    // prepared (INV-RUNNER-40).
+    activity.reported(true);
+    install_run_activity(&mut manager, &running.assignment_id, Arc::clone(&activity));
+    install_running_renewal_fixture_beside(&mut manager, ended.clone(), &timing);
+    give_loop_read(&mut manager, &ended, loop_read("AUTO-700", "review", true));
+    end_and_keep_reporting(&mut manager, &ended);
+    pass_held_time(sleeper.as_ref(), &mut sleeps, Duration::from_secs(2)).await;
+    manager.handle_offer(preparing.clone()).unwrap();
+    wait_for_offer_preparation(&mut manager).await;
+    assert!(manager.preparing(&preparing.assignment_id).is_some());
+    activity.reported(false);
+
+    let status = manager.status_assignments();
+    let overview = manager.overview_assignments();
+    let mut read = |offered: &AssignmentOffer| {
+        let read = manager
+            .read_assignment(&offered.assignment_id)
+            .expect("the manager holds or reports the assignment");
+        assert_eq!(read.now, sleeper.utc_now());
+        (read.entry, read.paths)
+    };
+    let running_entry = overview_entry(&overview, &running);
+    assert_eq!(running_entry.phase, AssignmentPhase::Running.into());
+    assert_eq!(read(&running), (running_entry, paths));
+    for offered in [&preparing, &ended] {
+        assert_eq!(
+            read(offered),
+            (overview_entry(&overview, offered), RunPaths::default())
+        );
+    }
+    assert!(
+        manager
+            .read_assignment(&offer("bd").assignment_id)
+            .is_none()
+    );
+    assert_eq!(manager.status_assignments(), status);
+}
+
+// REQ-RUNNERENROLL-134: an offer driven to its acknowledged end is listed exactly while the
+// counts count it, and the manager keeps nothing of what it said once it has ended.
+#[tokio::test]
+async fn an_assignment_is_listed_from_its_offer_to_its_acknowledged_end_and_then_forgotten() {
+    let workflow =
+        "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+    let (_temporary, mut manager) = manager_fixture(workflow);
+    let mut offered = offer("bg");
+    align_offer_with_source_fixture(&manager, &mut offered);
+    let listed = |manager: &mut AssignmentManager| {
+        let overview = manager.overview_assignments();
+        assert_eq!(
+            u64::try_from(overview.assignments.len()).ok(),
+            overview.counts.total()
+        );
+        overview
+            .assignments
+            .into_iter()
+            .map(|entry| (entry.assignment_id, entry.phase))
+            .collect::<Vec<_>>()
+    };
+    let only = |phase: AssignmentPhase| vec![(offered.assignment_id.clone(), phase.into())];
+    assert_eq!(listed(&mut manager), []);
+
+    manager.handle_offer(offered.clone()).unwrap();
+    assert_eq!(listed(&mut manager), only(AssignmentPhase::Preparing));
+    prepare_current(&mut manager, &offered).await;
+    assert_eq!(listed(&mut manager), only(AssignmentPhase::Accepted));
+    spawn_execution(&mut manager, &offered);
+    assert_eq!(listed(&mut manager).len(), 1);
+    with_watchdog(wait_for_terminal(&mut manager))
+        .await
+        .unwrap();
+    assert_eq!(listed(&mut manager).len(), 1);
+    wait_for_execution_finalization(&mut manager).await;
+    assert_eq!(listed(&mut manager).len(), 1);
+    let terminal_id = manager
+        .pending_observations(&BTreeSet::new(), 100)
+        .into_iter()
+        .find(|entry| entry.observation.is_terminal())
+        .expect("terminal observation")
+        .id;
+    manager.acknowledge_observation(terminal_id);
+    assert!(listed(&mut manager).len() <= 1);
+    settle_cleanup(&mut manager).await;
+
+    assert_eq!(listed(&mut manager), []);
+    assert!(manager.offer_facts.is_empty());
+}
+
+// REQ-RUNNERENROLL-137: an assignment is listed as recent once the runner holds it no longer,
+// never beside its own entry, with how its run ended, when, and how long it was held then;
+// an offer given up before it ran is listed with the result its record ended with, and the
+// later of two is listed first.
+#[tokio::test]
+async fn an_ended_assignment_is_listed_as_recent_once_it_is_held_no_longer() {
+    let workflow =
+        "schemaVersion: 1\nsteps:\n  check:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n";
+    let (_temporary, mut manager) = manager_fixture(workflow);
+    let mut offered = offer("bg");
+    align_offer_with_source_fixture(&manager, &mut offered);
+    let recent = |manager: &mut AssignmentManager| {
+        let overview = manager.overview_assignments();
+        for ended in &overview.recent_assignments {
+            assert!(
+                overview
+                    .assignments
+                    .iter()
+                    .all(|entry| entry.assignment_id != ended.assignment_id),
+                "{} is listed as held and as recent",
+                ended.assignment_id
+            );
+        }
+        overview.recent_assignments
+    };
+    assert_eq!(recent(&mut manager), []);
+
+    manager.handle_offer(offered.clone()).unwrap();
+    assert_eq!(recent(&mut manager), []);
+    prepare_current(&mut manager, &offered).await;
+    assert_eq!(recent(&mut manager), []);
+    spawn_execution(&mut manager, &offered);
+    assert_eq!(recent(&mut manager), []);
+    with_watchdog(wait_for_terminal(&mut manager))
+        .await
+        .unwrap();
+    assert_eq!(recent(&mut manager), []);
+    wait_for_execution_finalization(&mut manager).await;
+    assert_eq!(recent(&mut manager), []);
+    let terminal_id = manager
+        .pending_observations(&BTreeSet::new(), 100)
+        .into_iter()
+        .find(|entry| entry.observation.is_terminal())
+        .expect("terminal observation")
+        .id;
+    manager.acknowledge_observation(terminal_id);
+    recent(&mut manager);
+    settle_cleanup(&mut manager).await;
+
+    let succeeded = recent(&mut manager);
+    let [entry] = succeeded.as_slice() else {
+        panic!("one recent assignment: {succeeded:#?}");
+    };
+    assert_eq!(entry.assignment_id, offered.assignment_id);
+    assert_eq!(entry.run_id, offered.run_id);
+    assert_eq!(
+        entry.workflow_path,
+        offered
+            .execution_spec
+            .workflow_definition_source
+            .workflow_path
+    );
+    assert_eq!(entry.result, OpenWord::Known(RunResult::Succeeded));
+    assert_eq!(entry.failure_code, None);
+    assert!(
+        time::OffsetDateTime::parse(
+            &entry.ended_at,
+            &time::format_description::well_known::Rfc3339
+        )
+        .is_ok(),
+        "{}",
+        entry.ended_at
+    );
+
+    // Given up before it ran: Cloud's preparation had expired when it came.
+    let mut given_up = offer("bh");
+    align_offer_with_source_fixture(&manager, &mut given_up);
+    manager.handle_offer(given_up.clone()).unwrap();
+    let preparation_id = wait_for_offer_preparation(&mut manager).await.id;
+    manager.acknowledge_observation(preparation_id);
+    let expired = AssignmentPrepare {
+        preparation_expires_at: manager
+            .sleeper
+            .utc_now()
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap(),
+        ..prepare_for(&manager, &given_up)
+    };
+    manager.handle_prepare(expired).unwrap();
+    settle_cleanup(&mut manager).await;
+    let listed = recent(&mut manager);
+    assert_eq!(
+        listed
+            .iter()
+            .map(|entry| (entry.assignment_id.as_str(), entry.result.clone()))
+            .collect::<Vec<_>>(),
+        [
+            (
+                given_up.assignment_id.as_str(),
+                OpenWord::Known(RunResult::Aborted)
+            ),
+            (
+                offered.assignment_id.as_str(),
+                OpenWord::Known(RunResult::Succeeded)
+            ),
+        ]
+    );
+
+    // An ended assignment's time held stays what it was when it ended.
+    let (sleeper, mut sleeps) = controlled_sleeper();
+    manager.sleeper = Arc::clone(&sleeper);
+    pass_held_time(sleeper.as_ref(), &mut sleeps, Duration::from_secs(2)).await;
+    assert_eq!(recent(&mut manager), listed);
+}
+
 // INV-LIFECYCLE-5
 #[tokio::test]
 async fn causal_acceptance_basis() {
@@ -6308,6 +6923,145 @@ async fn exact_next_renewal_replaces_the_running_authority() {
     );
 }
 
+/// Returns once the read of `assignment_id` gives a view holding the step `step` running with
+/// two records, since its output can be observed before its start. The view publishes no event a test
+/// can await: the fixture sleeper spaces the reads.
+async fn wait_until_step_printed(manager: &mut AssignmentManager, assignment_id: &str, step: &str) {
+    let sleeper = fixture_sleeper();
+    with_watchdog(async {
+        loop {
+            if let Some(read) = manager.read_assignment(assignment_id)
+                && read.view.as_ref().is_some_and(|view| {
+                    viewed_run(view, step)
+                        .steps
+                        .iter()
+                        .any(|viewed| viewed.id == step && viewed.state == "running")
+                        && step_records(view, step).len() >= 2
+                })
+            {
+                break;
+            }
+            sleeper.sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the step's output did not reach the run's view")
+}
+
+/// The run `view` holds, naming `step`.
+fn viewed_run(view: &AssignmentRunView, step: &str) -> useful_execution::RunView {
+    view.run(&useful_execution::LiveRunViewRequest {
+        step: Some(step.to_owned()),
+        maximum_steps: 8,
+        maximum_output_bytes: 262_144,
+    })
+}
+
+/// The records of `step` `view` holds, each as its source and its text.
+fn step_records(view: &AssignmentRunView, step: &str) -> Vec<(String, String)> {
+    match viewed_run(view, step).output {
+        useful_execution::RunViewStepOutput::Observed(observed) => observed
+            .records
+            .into_iter()
+            .map(|record| (record.source, record.text))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+// REQ-RUNNERENROLL-147: a running single-workflow assignment's read gives its step in flight
+// and a view whose live run names the step running with what it runs and holds the step's
+// output so far, each line under its source; the read changes no count; once the run has
+// settled the read gives no view; and the reports queued for the run are what they are
+// without a view.
+#[tokio::test]
+async fn a_single_workflow_assignments_read_gives_its_step_in_flight_and_output() {
+    let argv = ["sh", "-c", "echo said; echo warned >&2; sleep 60"];
+    let workflow = format!(
+        "schemaVersion: 1\nsteps:\n  speak:\n    kind: cmd\n    command:\n      argv: {}\n",
+        serde_json::to_string(&argv).unwrap()
+    );
+    let (_temporary, mut manager, mut lease_waits, offered, _workspace) =
+        controlled_running_fixture_of(&workflow).await;
+
+    wait_until_step_printed(&mut manager, &offered.assignment_id, "speak").await;
+    let before = manager.status_assignments();
+    let read = manager
+        .read_assignment(&offered.assignment_id)
+        .expect("the assignment is held");
+    assert_eq!(manager.status_assignments(), before);
+    assert_eq!(
+        read.entry.running_steps,
+        [OverviewRunningStep {
+            run: Vec::new(),
+            run_attempt: 1,
+            step: "speak".to_owned(),
+            state: OpenWord::Known(LiveStepState::Running),
+        }]
+    );
+    let view = read
+        .view
+        .expect("a running single-workflow assignment has a view");
+    let run = viewed_run(&view, "speak");
+    let [step] = run.steps.as_slice() else {
+        panic!("the run has one step: {run:?}");
+    };
+    assert_eq!(
+        (step.id.as_str(), step.state.as_str()),
+        ("speak", "running")
+    );
+    assert_eq!(
+        step.work,
+        useful_execution::RunViewWork::Command {
+            argv: argv.map(str::to_owned).to_vec(),
+            cwd: None,
+        }
+    );
+    let records = step_records(&view, "speak");
+    assert!(
+        records.contains(&("stdout".to_owned(), "said".to_owned())),
+        "{records:?}"
+    );
+    assert!(
+        records.contains(&("stderr".to_owned(), "warned".to_owned())),
+        "{records:?}"
+    );
+    drop(view);
+
+    lease_wait_request(&mut lease_waits, Duration::from_secs(329))
+        .await
+        .release();
+    lease_wait_request(&mut lease_waits, Duration::from_secs(30))
+        .await
+        .release();
+    let reports = with_watchdog(wait_for_terminal(&mut manager))
+        .await
+        .expect("the cancelled run did not settle");
+    wait_for_execution_finalization(&mut manager).await;
+    let settled = manager
+        .read_assignment(&offered.assignment_id)
+        .expect("the settled assignment is still held");
+    assert_eq!(settled.entry.assignment_id, offered.assignment_id);
+    assert!(settled.view.is_none());
+
+    assert!(
+        matches!(reports.first(), Some(ExecutionReport::Started)),
+        "unexpected reports: {reports:#?}"
+    );
+    let sequences: Vec<_> = reports
+        .iter()
+        .filter_map(|report| match report {
+            ExecutionReport::Transition {
+                execution_event_sequence,
+                ..
+            } => Some(*execution_event_sequence),
+            _ => None,
+        })
+        .collect();
+    assert!(!sequences.is_empty());
+    assert_eq!(sequences, (1..=sequences.len() as u64).collect::<Vec<_>>());
+}
+
 #[tokio::test]
 async fn executes_explicit_command_dag_and_reports_dense_transitions() {
     let fixture_argv = serde_json::to_string(&command_fixture_arguments()).unwrap();
@@ -6796,6 +7550,82 @@ fn steps_only_progress_leaves_outbox_capacity_for_the_run() {
         Err(OutboxFailure::Capacity)
     ));
     outbox.enqueue(progress(false)).unwrap();
+}
+
+/// The kinds and counts of the events `log` lists, the newest first.
+fn logged_kinds(log: &EventLog) -> Vec<(OpenWord<RunnerEventKind>, u64)> {
+    log.newest_first()
+        .into_iter()
+        .map(|event| (event.kind, event.count))
+        .collect()
+}
+
+// REQ-RUNNERENROLL-138: each enqueue the full outbox refuses is logged as an
+// `observation_refused`, repeats folded into its count, and refuses as before; an enqueue it
+// takes logs nothing.
+#[test]
+fn a_full_outbox_logs_each_refusal_as_observation_refused() {
+    let outbox = ObservationOutbox::new();
+    for _ in 0..(MAXIMUM_SERVICE_OBSERVATIONS - OBSERVATION_RESERVE_BASE) {
+        outbox
+            .enqueue(AssignmentObservation::Execution {
+                assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+                attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+                report: ExecutionReport::Started,
+            })
+            .unwrap();
+    }
+    assert_eq!(logged_kinds(&outbox.events), []);
+    let steps_only = || AssignmentObservation::Execution {
+        assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+        attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+        report: ExecutionReport::TreeProgress {
+            progress_sequence: 1,
+            progress: useful_runner_protocol::TreeRootProgress {
+                attempt: 1,
+                position: vec![json!("build")],
+                wait: None,
+                reported_at: "2026-07-23T00:00:05Z".into(),
+                steps: Vec::new(),
+            },
+            steps_only: true,
+        },
+    };
+    for count in 1..=2 {
+        assert_eq!(outbox.enqueue(steps_only()), Err(OutboxFailure::Capacity));
+        assert_eq!(
+            logged_kinds(&outbox.events),
+            [(OpenWord::Known(RunnerEventKind::ObservationRefused), count)]
+        );
+    }
+    outbox
+        .enqueue(AssignmentObservation::Execution {
+            assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+            attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+            report: ExecutionReport::Started,
+        })
+        .unwrap();
+    assert_eq!(
+        logged_kinds(&outbox.events),
+        [(OpenWord::Known(RunnerEventKind::ObservationRefused), 2)]
+    );
+}
+
+// REQ-RUNNERENROLL-138: a second terminal report for one assignment is refused as before,
+// and since the outbox is not full, nothing is logged.
+#[test]
+fn a_second_terminal_report_is_refused_without_logging_a_full_outbox() {
+    let outbox = ObservationOutbox::new();
+    let interrupted = AssignmentObservation::Execution {
+        assignment_id: "asn_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+        attempt_id: "atm_01k0z6r1w8f4jy2m7q9v3x5abc".into(),
+        report: ExecutionReport::AssignmentInterrupted {
+            reason: "execution_lease_expired".into(),
+        },
+    };
+    outbox.enqueue(interrupted.clone()).unwrap();
+    assert_eq!(outbox.enqueue(interrupted), Err(OutboxFailure::Capacity));
+    assert_eq!(logged_kinds(&outbox.events), []);
 }
 
 #[test]

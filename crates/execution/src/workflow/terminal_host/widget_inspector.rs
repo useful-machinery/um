@@ -20,7 +20,8 @@ pub(super) struct InspectorOutput {
     pub(super) marker: &'static str,
     pub(super) marker_tone: Tone,
     pub(super) name: String,
-    pub(super) kind: &'static str,
+    /// The output's kind word; a word as received is made visible first.
+    pub(super) kind: std::borrow::Cow<'static, str>,
     pub(super) detail: String,
     pub(super) disposition: Option<String>,
     pub(super) tone: Tone,
@@ -32,7 +33,7 @@ impl InspectorOutput {
             marker: "·",
             marker_tone: Tone::Muted,
             name,
-            kind,
+            kind: std::borrow::Cow::Borrowed(kind),
             detail,
             disposition: None,
             tone: Tone::Muted,
@@ -42,7 +43,7 @@ impl InspectorOutput {
 
 impl StepProjection for WorkflowRunStepView {
     fn header(&self) -> StepHeader<'_> {
-        StepHeader::new(
+        StepHeader::presented(
             &self.id,
             &self.definition,
             self.presented_state(),
@@ -275,17 +276,14 @@ pub(super) fn selected_step_title<Step: StepProjection>(
     color: bool,
     maximum_width: usize,
 ) -> Line<'static> {
-    let badge = format!(" {} ", step_kind(step.definition()));
+    let badge = format!(" {} ", visible_text(step.kind()));
     let fixed_width = 5_usize.saturating_add(display_width(&badge));
     let id = ellipsize(
         &visible_text(step.id()),
         maximum_width.saturating_sub(fixed_width),
     );
     Line::from(vec![
-        Span::styled(
-            step_state_glyph(step),
-            step_state_style(step.state(), color),
-        ),
+        Span::styled(step_mark(step), step_state_style(step.state(), color)),
         Span::raw("  "),
         Span::styled(
             id,
@@ -309,13 +307,16 @@ pub(super) fn selected_step_status_title<Step: StepProjection>(
     step: &Step,
     color: bool,
 ) -> Line<'static> {
-    let style = tone_style(color, step_state_tone(step.state()));
-    let mut spans = vec![Span::styled(step_state_label(step.state()), style)];
-    spans.push(Span::styled(
-        format!(
-            " · {}",
-            failure_policy_name(step.definition().failure_policy())
+    let (label, style) = match step.unknown_state() {
+        Some(word) => (visible_text(word), tone_style(color, Tone::Muted)),
+        None => (
+            step_state_label(step.state()).to_owned(),
+            tone_style(color, step_state_tone(step.state())),
         ),
+    };
+    let mut spans = vec![Span::styled(label, style)];
+    spans.push(Span::styled(
+        format!(" · {}", visible_text(step.failure_policy())),
         style,
     ));
     if let Some(timing) = step.timing() {
@@ -330,7 +331,12 @@ pub(super) fn inspector_detail_row_count<Step: StepProjection>(step: &Step) -> u
 }
 
 pub(super) fn inspector_fixed_field_count<Step: StepProjection>(step: &Step) -> usize {
-    let mut count = 3;
+    // What a step runs reserves two rows and its dependencies one; a kind this release
+    // does not know runs nothing the inspector can name.
+    let mut count = match step.work() {
+        StepWork::Unknown => 1,
+        StepWork::Command { .. } | StepWork::Agent { .. } | StepWork::Workflow { .. } => 3,
+    };
     if inspector_timing(step).is_some() {
         count += 1;
     }
@@ -362,7 +368,7 @@ pub(super) fn live_inspector_outputs(step: &WorkflowRunStepView) -> Vec<Inspecto
                 marker,
                 marker_tone,
                 name: visible_text(name),
-                kind,
+                kind: std::borrow::Cow::Borrowed(kind),
                 detail,
                 disposition: Some(disposition),
                 tone,
@@ -377,47 +383,33 @@ pub(super) fn inspector_fields<Step: StepProjection>(
     maximum_fields: usize,
 ) -> Vec<InspectorField> {
     let mut fields = Vec::with_capacity(maximum_fields);
-    let direct_dependencies = match step.definition() {
-        WorkflowPresentationStep::Command {
-            cwd,
-            direct_dependencies,
-            ..
-        } => {
+    match step.work() {
+        StepWork::Command { cwd } => {
             if let Some(command) = step.inspector_command() {
                 push_inspector_field(&mut fields, maximum_fields, || {
                     InspectorField::new("command", command, Tone::Neutral)
                 });
             }
             push_inspector_field(&mut fields, maximum_fields, || {
-                InspectorField::new("cwd", cwd.as_deref().unwrap_or("."), Tone::Neutral)
+                InspectorField::new("cwd", cwd.unwrap_or("."), Tone::Neutral)
             });
-            direct_dependencies
         }
-        WorkflowPresentationStep::Agent {
-            profile,
-            harness,
-            direct_dependencies,
-            ..
-        } => {
+        StepWork::Agent { profile, harness } => {
             push_inspector_field(&mut fields, maximum_fields, || {
                 InspectorField::new("profile", profile, Tone::Neutral)
             });
             push_inspector_field(&mut fields, maximum_fields, || {
                 InspectorField::new("harness", harness_description(harness), Tone::Neutral)
             });
-            direct_dependencies
         }
-        WorkflowPresentationStep::Workflow {
-            file,
-            direct_dependencies,
-            ..
-        } => {
+        StepWork::Workflow { file } => {
             push_inspector_field(&mut fields, maximum_fields, || {
                 InspectorField::new("workflow", file, Tone::Neutral)
             });
-            direct_dependencies
         }
-    };
+        StepWork::Unknown => {}
+    }
+    let direct_dependencies = step.direct_dependencies();
 
     let timing = inspector_timing(step);
     if let Some(timing) = timing {
@@ -445,25 +437,54 @@ pub(super) fn inspector_fields<Step: StepProjection>(
     fields
 }
 
-pub(super) fn harness_description(harness: &AgentPresentationHarness) -> String {
+pub(super) fn harness_description(harness: StepHarness<'_>) -> String {
     match harness {
-        AgentPresentationHarness::Pi { model, thinking } => {
+        StepHarness::Presented(AgentPresentationHarness::Pi { model, thinking }) => {
             let thinking = format!("{thinking:?}").to_ascii_lowercase();
-            format!("pi · {} · thinking={thinking}", visible_text(model))
+            harness_words("pi", Some(model), "thinking", Some(&thinking))
         }
-        AgentPresentationHarness::ClaudeCode { model, effort } => format!(
-            "claude code · {} · effort={}",
-            visible_text(model),
-            effort.as_str()
-        ),
-        AgentPresentationHarness::Codex { model, effort } => {
-            format!(
-                "codex · {} · effort={}",
-                visible_text(model),
-                visible_text(effort)
-            )
+        StepHarness::Presented(AgentPresentationHarness::ClaudeCode { model, effort }) => {
+            harness_words("claude code", Some(model), "effort", Some(effort.as_str()))
+        }
+        StepHarness::Presented(AgentPresentationHarness::Codex { model, effort }) => {
+            harness_words("codex", Some(model), "effort", Some(effort))
+        }
+        // A runner answers the workflow format's harness words; any other is drawn as
+        // received (REQ-RUNNERENROLL-135).
+        StepHarness::Words {
+            harness,
+            model,
+            effort,
+        } => {
+            let (name, effort_label) = match harness {
+                "pi" => ("pi", "thinking"),
+                "claude_code" => ("claude code", "effort"),
+                "codex" => ("codex", "effort"),
+                other => (other, "effort"),
+            };
+            harness_words(name, model, effort_label, effort)
         }
     }
+}
+
+fn harness_words(
+    name: &str,
+    model: Option<&str>,
+    effort_label: &str,
+    effort: Option<&str>,
+) -> String {
+    let mut description = visible_text(name);
+    if let Some(model) = model {
+        description.push_str(" · ");
+        description.push_str(&visible_text(model));
+    }
+    if let Some(effort) = effort {
+        description.push_str(" · ");
+        description.push_str(effort_label);
+        description.push('=');
+        description.push_str(&visible_text(effort));
+    }
+    description
 }
 
 pub(super) fn push_inspector_field(
@@ -478,14 +499,16 @@ pub(super) fn push_inspector_field(
 
 pub(super) fn inspector_timing<Step: StepProjection>(
     step: &Step,
-) -> Option<&crate::workflow::run_view_model::WorkflowRunElapsed> {
-    if matches!(
-        step.state(),
-        StepStateKind::Pending
-            | StepStateKind::Blocked
-            | StepStateKind::Skipped
-            | StepStateKind::NotRun
-    ) {
+) -> Option<crate::workflow::run_view_model::WorkflowRunElapsed> {
+    if step.unknown_state().is_some()
+        || matches!(
+            step.state(),
+            StepStateKind::Pending
+                | StepStateKind::Blocked
+                | StepStateKind::Skipped
+                | StepStateKind::NotRun
+        )
+    {
         None
     } else {
         step.timing()
@@ -777,7 +800,7 @@ pub(super) fn inspector_output_summary_line(
     )];
     let mut used_width = marker_width;
     if used_width < summary_width {
-        let kind_width = display_width(output.kind);
+        let kind_width = display_width(&output.kind);
         let remaining_width = summary_width - used_width;
         let name_width = if remaining_width > kind_width.saturating_add(2) {
             remaining_width.saturating_sub(kind_width.saturating_add(2))
@@ -789,7 +812,10 @@ pub(super) fn inspector_output_summary_line(
         spans.push(Span::styled(name, tone_style(color, Tone::Primary)));
         if summary_width.saturating_sub(used_width) > kind_width.saturating_add(1) {
             spans.push(Span::raw("  "));
-            spans.push(Span::styled(output.kind, tone_style(color, Tone::Muted)));
+            spans.push(Span::styled(
+                output.kind.clone(),
+                tone_style(color, Tone::Muted),
+            ));
             used_width = used_width.saturating_add(kind_width.saturating_add(2));
         }
     }

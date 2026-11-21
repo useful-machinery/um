@@ -183,6 +183,19 @@ pub(super) fn workflow_tone<Deadline>(workflow: &WorkflowState<Deadline>) -> Ton
     }
 }
 
+/// The mark of a step whose state word this release has no kind for (REQ-RUNNERENROLL-135).
+pub(super) const UNKNOWN_STATE_MARK: &str = "·";
+
+/// The symbol the graph and the inspector's title draw for a step: its state's, or the
+/// neutral mark for a state word this release does not know.
+pub(super) fn step_mark<Step: StepProjection>(step: &Step) -> &'static str {
+    if step.unknown_state().is_some() {
+        UNKNOWN_STATE_MARK
+    } else {
+        step_state_glyph(step)
+    }
+}
+
 pub(super) fn step_state_glyph<Step: StepProjection>(step: &Step) -> &'static str {
     match step.state() {
         StepStateKind::Pending => "○",

@@ -32,6 +32,9 @@ pub(super) struct ScriptedTerminalBoundary {
     actions: tokio::sync::mpsc::UnboundedSender<BoundaryAction>,
     pub(super) failures: BoundaryFailures,
     pub(super) draw_count: usize,
+    /// Receives the text of each frame a presentation that renders through a test backend
+    /// draws.
+    pub(super) frames: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 impl ScriptedTerminalBoundary {
@@ -54,6 +57,7 @@ impl ScriptedTerminalBoundary {
                 actions,
                 failures,
                 draw_count: 0,
+                frames: None,
             },
             input_sender,
             action_receiver,
@@ -62,6 +66,27 @@ impl ScriptedTerminalBoundary {
 
     pub(super) fn record(&self, action: BoundaryAction) {
         let _ = self.actions.send(action);
+    }
+
+    /// Counts and records a draw of `area`, then panics with `panic_message` or fails when
+    /// the injected failures say so.
+    pub(super) fn scripted_draw(
+        &mut self,
+        area: Rect,
+        panic_message: &'static str,
+    ) -> io::Result<()> {
+        self.draw_count = self.draw_count.saturating_add(1);
+        self.record(BoundaryAction::Draw(area));
+        if self.failures.panic_at == Some(self.draw_count) {
+            std::panic::panic_any(panic_message);
+        }
+        if self.failures.draw_at == Some(self.draw_count) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "injected draw failure",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -135,18 +160,7 @@ impl WorkflowTerminalBoundary for ScriptedTerminalBoundary {
         interaction: &mut HostInteraction,
         _color: bool,
     ) -> io::Result<()> {
-        self.draw_count = self.draw_count.saturating_add(1);
-        self.record(BoundaryAction::Draw(interaction.terminal_area));
-        if self.failures.panic_at == Some(self.draw_count) {
-            std::panic::panic_any("injected widget panic");
-        }
-        if self.failures.draw_at == Some(self.draw_count) {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "injected draw failure",
-            ));
-        }
-        Ok(())
+        self.scripted_draw(interaction.terminal_area, "injected widget panic")
     }
 }
 

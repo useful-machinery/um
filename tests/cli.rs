@@ -90,6 +90,8 @@ mod runner_home;
 mod runner_registration;
 #[path = "cli/runner_status.rs"]
 mod runner_status;
+#[path = "cli/runner_watch.rs"]
+mod runner_watch;
 #[path = "cli/service_principal.rs"]
 mod service_principal;
 #[path = "cli/workflow_continue.rs"]

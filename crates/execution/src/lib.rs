@@ -114,19 +114,24 @@ pub use workflow::local_run::retain_cloud_workflow_evidence;
 pub use workflow::local_run::{
     AttemptControls, CANCELED_OUTCOME, CarryMiss, ChildCommitFailure, ChildRun, ChildRunDirectory,
     ChildRunParent, ContinuationDefinitionMode, ControlsLock, DurableDeadline,
-    DurableInvocationStateV1, DurableInvocationV1, FailedAttemptRestart, InitialLocalRun,
-    ListedRun, LocalAttemptOwner, LocalAttemptOwnershipReleased, LocalContinuationOpen,
-    LocalRecoveryStatus, LocalRetryBeginError, LocalRetryEligibility, LocalRetryOpen,
-    LocalRetryRejection, LocalRunStatusSnapshot, LocalStatusError, LocalStatusResult,
-    MAXIMUM_DURABLE_RECORD_BYTES, PendingLocalContinuation, PublicationFailurePhaseV1, ResolvedBy,
-    RetryIneligibilityReason, RunListing, SUPERSEDED_OUTCOME, SuccessorCarry, TreeCopyMismatch,
-    WITHDRAWN_OUTCOME, WaitChild, WaitInspection, WaitProbe, acquire_local_continuation,
-    acquire_local_continuation_bridged, acquire_local_retry, attempt_controls, await_begin_gate,
-    await_child_start_gate, await_release_gate, await_run_lock_gate, await_settled_gate,
-    bind_cloud_continuation_context, child_run_directories, child_runs, inspect_wait, is_run_id,
-    latest_attempt_failed, latest_child_run, list_runs, load_cloud_continuation_seed, locate_run,
-    lock_holder, positioned_element, read_durable_record, read_local_run_status,
-    read_run_file_bounded, retain_cloud_continuation_evidence, wait_child,
+    DurableInvocationStateV1, DurableInvocationV1, FailedAttemptRestart, FileTail, InitialLocalRun,
+    ListedRun, LiveRunViewRequest, LiveRunningStep, LiveRunningSteps, LocalAttemptOwner,
+    LocalAttemptOwnershipReleased, LocalContinuationOpen, LocalRecoveryStatus,
+    LocalRetryBeginError, LocalRetryEligibility, LocalRetryOpen, LocalRetryRejection,
+    LocalRunStatusSnapshot, LocalStatusError, LocalStatusResult, MAXIMUM_DURABLE_RECORD_BYTES,
+    PendingLocalContinuation, PublicationFailurePhaseV1, ResolvedBy, RetryIneligibilityReason,
+    RunListing, RunView, RunViewChildRun, RunViewError, RunViewObservedOutput, RunViewOutput,
+    RunViewPathElement, RunViewRecord, RunViewRequest, RunViewRetainedOutput, RunViewStage,
+    RunViewStep, RunViewStepOutput, RunViewStream, RunViewWait, RunViewWork, SUPERSEDED_OUTCOME,
+    SuccessorCarry, TreeCopyMismatch, WITHDRAWN_OUTCOME, WaitChild, WaitInspection, WaitProbe,
+    acquire_local_continuation, acquire_local_continuation_bridged, acquire_local_retry,
+    attempt_controls, await_begin_gate, await_child_start_gate, await_release_gate,
+    await_run_lock_gate, await_settled_gate, bind_cloud_continuation_context,
+    child_run_directories, child_runs, inspect_wait, is_run_id, latest_attempt_failed,
+    latest_child_run, list_runs, live_run_view, live_running_steps, load_cloud_continuation_seed,
+    locate_run, lock_holder, positioned_element, read_durable_record, read_local_run_status,
+    read_run_file_bounded, read_run_file_tail, read_run_view, retain_cloud_continuation_evidence,
+    wait_child,
 };
 pub use workflow::login_check::{
     HarnessLoginCheck, HarnessLoginCheckCause, HarnessLoginCheckStage, check_claude_code_login,
@@ -180,7 +185,7 @@ pub use workflow::run_record::{RunParent, RunState, WorkflowRunRecord};
 pub use workflow::run_timing::ObservationTime;
 pub use workflow::run_timing::{ObservationClock, RunTimingObservation, RunTimingSnapshot};
 pub use workflow::run_view_model::{
-    WorkflowRunCleanupResult, WorkflowRunPublicationResult, WorkflowRunViewModel,
+    RunLogBudget, WorkflowRunCleanupResult, WorkflowRunPublicationResult, WorkflowRunViewModel,
 };
 pub use workflow::runtime::ExportValue;
 pub use workflow::runtime::{
@@ -201,6 +206,15 @@ pub use workflow::subject_index::{
 };
 pub use workflow::terminal_host::archived::{
     ArchivedTerminalHostExit, ArchivedWorkflowTerminalHost,
+};
+pub use workflow::terminal_host::runner_watch::{
+    RunnerWatchAssignment, RunnerWatchAssignmentAnswer, RunnerWatchAssignmentDetail,
+    RunnerWatchAssignmentQuery, RunnerWatchChildRun, RunnerWatchConnection, RunnerWatchCounts,
+    RunnerWatchEvent, RunnerWatchHeldAssignment, RunnerWatchHost, RunnerWatchLease, RunnerWatchLog,
+    RunnerWatchLogRecord, RunnerWatchLogSource, RunnerWatchLogStream, RunnerWatchLogin,
+    RunnerWatchMark, RunnerWatchOutcome, RunnerWatchOverview, RunnerWatchRecent, RunnerWatchRun,
+    RunnerWatchRunElement, RunnerWatchRunOutput, RunnerWatchRunStep, RunnerWatchRunWork,
+    RunnerWatchSource, RunnerWatchSourceError, RunnerWatchStep, RunnerWatchTitle, RunnerWatchWait,
 };
 pub use workflow::terminal_host::{
     HostInteraction, TerminalBoundary, TerminalHostExit, TerminalInputEvent,

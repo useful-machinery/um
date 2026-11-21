@@ -24,6 +24,16 @@ impl ExecutionJob {
             infrastructure_interruption: authority.infrastructure_interruption,
             workspace_release_reported: AtomicBool::new(false),
             run_event,
+            view: None,
+        }
+    }
+
+    /// The job, feeding `view`, which the manager also holds, as it runs a single-workflow
+    /// run (INV-RUNNER-47).
+    pub(in crate::service) fn feeding(self, view: AssignmentRunView) -> Self {
+        Self {
+            view: Some(view),
+            ..self
         }
     }
 
@@ -157,7 +167,16 @@ impl ExecutionJob {
         // both the enabled and disabled agent execution branches.
         let completion = match self.accepted.execution.clone() {
             AcceptedExecution::Engine(admitted) => {
-                Box::pin(self.run_workflow(*admitted, &assignment_id, &attempt_id, &run_id)).await
+                // The manager made the view when it started the assignment; a job given none
+                // feeds one no read reaches.
+                let view = self.view.clone().unwrap_or_else(|| {
+                    AssignmentRunView::new(
+                        admitted.workflow(),
+                        admitted.execution().limits().maximum_parallel_steps().get(),
+                    )
+                });
+                Box::pin(self.run_workflow(*admitted, view, &assignment_id, &attempt_id, &run_id))
+                    .await
             }
             AcceptedExecution::Tree(tree) => {
                 Box::pin(self.run_tree(&tree, &assignment_id, &attempt_id)).await
@@ -949,7 +968,10 @@ impl ExecutionJob {
 
     pub(super) fn describe_report(&self, report: &ExecutionReport) {
         match report {
-            ExecutionReport::TreeFinished { outcome, .. } => self.describe_outcome(outcome),
+            ExecutionReport::TreeFinished { outcome, exit, .. } => {
+                self.describe_outcome(outcome);
+                self.run_event.chosen_outcome(exit.chosen_outcome.clone());
+            }
             ExecutionReport::Finished {
                 outcome,
                 diagnostic,
@@ -975,10 +997,7 @@ impl ExecutionJob {
             ExecutionReport::Interrupted { reason, .. }
             | ExecutionReport::AssignmentInterrupted { reason } => {
                 self.run_event.result("interrupted");
-                self.run_event.set(KeyValue::new(
-                    telemetry::attribute::INTERRUPTION_CAUSE,
-                    reason.clone(),
-                ));
+                self.run_event.interruption_cause(reason);
             }
             ExecutionReport::Aborted { reason, .. } => {
                 self.run_event.result("aborted");
@@ -1000,29 +1019,22 @@ impl ExecutionJob {
             Some("succeeded") => self.run_event.result("succeeded"),
             Some("failed") => {
                 self.run_event.result("failed");
-                for (key, value) in [
-                    (
+                let detail = &outcome["primaryIssue"]["detail"];
+                if let Some(phase) = detail["phase"].as_str() {
+                    self.run_event.set(KeyValue::new(
                         telemetry::attribute::FAILURE_PHASE,
-                        outcome["primaryIssue"]["detail"]["phase"].as_str(),
-                    ),
-                    (
-                        telemetry::attribute::FAILURE_CODE,
-                        outcome["primaryIssue"]["detail"]["code"].as_str(),
-                    ),
-                ] {
-                    if let Some(value) = value {
-                        self.run_event.set(KeyValue::new(key, value.to_owned()));
-                    }
+                        phase.to_owned(),
+                    ));
+                }
+                if let Some(code) = detail["code"].as_str() {
+                    self.run_event.failure_code(code);
                 }
             }
             Some("cancelled") => self.run_event.result("cancelled"),
             _ => self.run_event.result("aborted"),
         }
         if let Some(reason) = outcome["reason"].as_str() {
-            self.run_event.set(KeyValue::new(
-                telemetry::attribute::INTERRUPTION_CAUSE,
-                reason.to_owned(),
-            ));
+            self.run_event.interruption_cause(reason);
         }
     }
 

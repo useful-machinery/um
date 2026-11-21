@@ -19,6 +19,7 @@ mod join_key;
 mod pool;
 mod serve;
 mod status;
+mod watch;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -99,6 +100,8 @@ enum RunnerCommand {
     Show(ShowCommand),
     #[command(about = status::ABOUT)]
     Status(status::Command),
+    #[command(about = watch::ABOUT)]
+    Watch(watch::Command),
 }
 
 type CloudOptions = super::CommonArgs<super::RunnerJson, super::PrincipalAuthenticationArgs>;
@@ -280,6 +283,7 @@ impl Command {
             Some(RunnerCommand::Doctor(command)) => command.execute(),
             Some(RunnerCommand::Serve(command)) => command.execute(),
             Some(RunnerCommand::Status(command)) => command.execute(),
+            Some(RunnerCommand::Watch(command)) => command.execute(),
         }
     }
 }
@@ -300,8 +304,8 @@ fn initialized_operator_config_path(config: Option<&Path>) -> anyhow::Result<Pat
     }
 }
 
-/// The control socket of a command that only asks the live runner, `status`
-/// and `grant sync`: the one the file `--config` names, which touches no runner
+/// The control socket of a command that only asks the live runner, `status`,
+/// `watch` and `grant sync`: the one the file `--config` names, which touches no runner
 /// home, or else the one the runner home's configuration names, the home's
 /// `runner/control.sock` when it holds none. Creates nothing
 /// (REQ-RUNNERENROLL-112).

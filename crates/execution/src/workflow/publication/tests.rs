@@ -1363,7 +1363,11 @@ fn publishes_streams_within_live_tui_run_budget() {
     const STEP_COUNT: usize = 12;
     const INJECTED_STREAM_BYTES: usize = 1_024;
 
-    let production_stream_bytes = super::super::maximum_retained_bytes_per_stream(STEP_COUNT);
+    // The share the run interface's model keeps of a step's output at this step count.
+    let production_stream_bytes = u64::try_from(
+        super::super::run_view_model::StepLogCapacity::for_step_count(STEP_COUNT).maximum_bytes(),
+    )
+    .unwrap();
     assert_eq!(
         production_stream_bytes,
         super::super::MAXIMUM_RETAINED_BYTES_PER_STREAM

@@ -8,10 +8,17 @@
 //! take an offer only while every run it holds waits and to fence the reports of an ended
 //! run only when it never reported a wait (INV-RUNNER-40), and an admission's own setup
 //! reads the activities of the other runs held when its preparation began.
+//!
+//! Beside that it keeps the loop's last read of the run directory (REQ-RUNNERENROLL-134),
+//! which the assignment manager's overview copies, and where the run's directory and its log
+//! are (REQ-RUNNERENROLL-144), which the manager's read of one assignment copies; nothing
+//! decides by either.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
 use crate::agent_login::setup::AssignmentGate;
+use crate::control_protocol::{OverviewRunningStep, OverviewWait, StepPathPart};
 
 /// One held run's activity, shared by its tree run and the assignment manager.
 pub(in crate::service) struct RunActivity {
@@ -30,6 +37,33 @@ struct ActivityState {
     in_flight: usize,
     /// Whether a setup holds the activity while it installs or removes a login.
     held: bool,
+    /// The loop's last read of the run directory; `None` until its first.
+    read: Option<RunRead>,
+    /// Where the run's directory and its log are; each `None` until published.
+    paths: RunPaths,
+}
+
+/// Where a held tree run's files are, as the manager's read of one assignment gives them
+/// (REQ-RUNNERENROLL-144): the run directory once the loop has located it, which for an
+/// adopted run is under the earlier attempt's home, and the assignment's own `tree-run.log`.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(in crate::service) struct RunPaths {
+    pub(in crate::service) directory: Option<PathBuf>,
+    pub(in crate::service) log: Option<PathBuf>,
+}
+
+/// The resume loop's read of a run directory, as an overview publishes it
+/// (REQ-RUNNERENROLL-134): the record's position and subject, the wait the read held, and
+/// the steps running now.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(in crate::service) struct RunRead {
+    pub(in crate::service) position: Vec<StepPathPart>,
+    pub(in crate::service) subject: Option<String>,
+    pub(in crate::service) wait: Option<OverviewWait>,
+    /// At most 16, in the order the step reader scans them.
+    pub(in crate::service) running_steps: Vec<OverviewRunningStep>,
+    /// The steps running now left out past the 16 listed.
+    pub(in crate::service) running_steps_omitted: u64,
 }
 
 impl RunActivity {
@@ -50,6 +84,36 @@ impl RunActivity {
         let mut state = self.state();
         state.waiting = waiting;
         state.reported_wait |= waiting;
+    }
+
+    /// Keeps `read` as the loop's last read of the run directory, which decides nothing; the
+    /// lock is held for the exchange alone and the earlier read dropped after it.
+    pub(in crate::service) fn record_read(&self, read: RunRead) {
+        let earlier = self.state().read.replace(read);
+        drop(earlier);
+    }
+
+    /// The loop's last read of the run directory; `None` before its first.
+    pub(in crate::service) fn last_read(&self) -> Option<RunRead> {
+        self.state().read.clone()
+    }
+
+    /// Keeps `log` as where the run's log is, set once where the log is made.
+    pub(in crate::service) fn publish_log(&self, log: PathBuf) {
+        self.state().paths.log = Some(log);
+    }
+
+    /// Keeps `directory` as where the run's directory is, as the loop has located it; the
+    /// earlier path is dropped after the lock.
+    pub(in crate::service) fn publish_directory(&self, directory: Option<PathBuf>) {
+        let earlier = std::mem::replace(&mut self.state().paths.directory, directory);
+        drop(earlier);
+    }
+
+    /// Where the run's directory and its log are, each `None` until published; the lock is
+    /// held for the copy alone.
+    pub(in crate::service) fn paths(&self) -> RunPaths {
+        self.state().paths.clone()
     }
 
     /// Sets the run working when the answer is dropped, as the loop's end does.
@@ -94,12 +158,18 @@ impl RunActivity {
     }
 }
 
-/// The end of a run's loop, which leaves the run working when dropped.
+/// The end of a run's loop, which leaves the run working when dropped, its last read
+/// holding no wait and no step running, since the run has no process once the loop ends.
 pub(in crate::service) struct WorkingAtEnd<'a>(&'a RunActivity);
 
 impl Drop for WorkingAtEnd<'_> {
     fn drop(&mut self) {
         self.0.reported(false);
+        if let Some(read) = &mut self.0.state().read {
+            read.wait = None;
+            read.running_steps.clear();
+            read.running_steps_omitted = 0;
+        }
     }
 }
 

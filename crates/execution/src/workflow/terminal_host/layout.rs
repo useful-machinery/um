@@ -329,26 +329,60 @@ pub(super) fn render_too_small(
     snapshot: &WorkflowRunViewSnapshot,
     color: bool,
 ) {
-    let mut lines = vec![
-        Line::from(Span::styled(
-            "Terminal too small",
-            tone_style(color, Tone::Failure),
-        )),
-        Line::from(format!(
-            "Resize to at least {MINIMUM_WIDTH}x{MINIMUM_HEIGHT}."
-        )),
-    ];
-    match lifecycle_control(snapshot) {
-        LifecycleControl::Cancel => lines.push(Line::from("Ctrl-C cancels the workflow.")),
-        LifecycleControl::Quit => lines.push(Line::from("Press q to quit.")),
-        LifecycleControl::None => lines.push(Line::from("Finishing workflow lifecycle…")),
-    }
+    let control = match lifecycle_control(snapshot) {
+        LifecycleControl::Cancel => "Ctrl-C cancels the workflow.",
+        LifecycleControl::Quit => "Press q to quit.",
+        LifecycleControl::None => "Finishing workflow lifecycle…",
+    };
+    render_too_small_notice(
+        frame,
+        area,
+        " Useful Machinery workflow run ",
+        control,
+        color,
+    );
+}
+
+/// The too-small notice of a viewer, where only `q` and Ctrl-C act (REQ-LOCALRUN-9,
+/// REQ-LOCALRUN-10).
+pub(super) fn render_viewer_too_small(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &'static str,
+    color: bool,
+) {
+    render_too_small_notice(
+        frame,
+        area,
+        title,
+        "Press q to quit or Ctrl-C to interrupt the viewer.",
+        color,
+    );
+}
+
+fn render_too_small_notice(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &'static str,
+    control: &'static str,
+    color: bool,
+) {
     frame.render_widget(
-        Paragraph::new(lines).block(
+        Paragraph::new(vec![
+            Line::from(Span::styled(
+                "Terminal too small",
+                tone_style(color, Tone::Failure),
+            )),
+            Line::from(format!(
+                "Resize to at least {MINIMUM_WIDTH}x{MINIMUM_HEIGHT}."
+            )),
+            Line::from(control),
+        ])
+        .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(separator_style(color))
-                .title(" Useful Machinery workflow run "),
+                .title(title),
         ),
         area,
     );

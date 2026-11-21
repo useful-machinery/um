@@ -14,8 +14,10 @@ use super::artifact_delivery::{
 };
 use super::config::Config;
 use super::execution::{
-    AssignmentProcessGuards, ExecutionAuthority, ExecutionJob, InfrastructureInterruption,
+    AssignmentProcessGuards, AssignmentRunView, ExecutionAuthority, ExecutionJob,
+    InfrastructureInterruption,
 };
+use super::history::{EventLog, LoggedEvent, RECENT_ASSIGNMENTS, Ring};
 use super::lease_clock::{LeaseClock, LeaseClockError, LeaseInstant, LeaseWaitCancellation};
 use super::run_inputs::{HttpRunInputBroker, PreparationDeadline, RunInputBroker, RunInputFailure};
 use super::source::{HttpSourceCredentialBroker, MaterializationFailure, SourceCredentialBroker};
@@ -26,7 +28,7 @@ use super::workspace::{
     WorkRootLease, WorkspaceDisposition,
 };
 use crate::agent_login::grant_token::AssignmentGrantTokens;
-use crate::control_protocol::AssignmentCounts;
+use crate::control_protocol::{AssignmentCounts, OverviewRecentAssignment};
 use crate::telemetry::{Event as TelemetryEvent, Outcome as TelemetryOutcome};
 #[cfg(test)]
 use useful_execution::RUNNER_TERMINAL_FRAME_BYTES;
@@ -58,6 +60,7 @@ mod finalization;
 mod lease_authority;
 mod observation;
 mod outbox;
+mod overview;
 mod root_preparation;
 mod spec_validation;
 
@@ -66,6 +69,8 @@ pub(super) use commands::*;
 pub(super) use lease_authority::*;
 pub(super) use observation::*;
 pub(super) use outbox::*;
+use overview::OfferFacts;
+pub(super) use overview::{AssignmentOverview, AssignmentRead};
 use root_preparation::*;
 use spec_validation::*;
 const MAXIMUM_RETAINED_DECISIONS: usize = 256;
@@ -263,6 +268,11 @@ pub(super) struct RunEvent(Arc<Mutex<RunEventState>>);
 struct RunEventState {
     event: Option<TelemetryEvent>,
     result: Option<&'static str>,
+    // What the run's end gives beside its result, kept where each is set on `event`, and
+    // whether or not `event` was started (REQ-RUNNERENROLL-137).
+    failure_code: Option<String>,
+    interruption_cause: Option<String>,
+    chosen_outcome: Option<String>,
     // The run, assignment and attempt IDs, built once at `start`.
     ids: Vec<KeyValue>,
     // The open phase child of `event`; at most one at a time.
@@ -500,6 +510,34 @@ impl RunEvent {
         }
     }
 
+    /// Sets the run's failure code on its record and keeps it for its end.
+    pub(super) fn failure_code(&self, code: &str) {
+        self.set(KeyValue::new(
+            crate::telemetry::attribute::FAILURE_CODE,
+            code.to_owned(),
+        ));
+        self.state().failure_code = Some(code.to_owned());
+    }
+
+    /// Sets the cause of the run's interruption on its record and keeps it for its end.
+    pub(super) fn interruption_cause(&self, cause: &str) {
+        self.set(KeyValue::new(
+            crate::telemetry::attribute::INTERRUPTION_CAUSE,
+            cause.to_owned(),
+        ));
+        self.state().interruption_cause = Some(cause.to_owned());
+    }
+
+    /// Whether the run's record takes `cause` as the cause of its interruption.
+    pub(super) fn interrupted_for(&self, cause: &str) -> bool {
+        self.state().interruption_cause.as_deref() == Some(cause)
+    }
+
+    /// Keeps the outcome a tree run's root chose for the run's end; no record carries it.
+    pub(super) fn chosen_outcome(&self, outcome: Option<String>) {
+        self.state().chosen_outcome = outcome;
+    }
+
     pub(super) fn result(&self, result: &'static str) {
         let mut state = self.state();
         state.result = Some(result);
@@ -511,7 +549,9 @@ impl RunEvent {
         }
     }
 
-    fn finish(&self, override_result: Option<&'static str>) {
+    /// Ends the record with `override_result`, else the result set, else `aborted`, and
+    /// answers that end; a later call ends nothing and answers the same.
+    fn finish(&self, override_result: Option<&'static str>) -> RunEnd {
         let mut state = self.state();
         let result = override_result.or(state.result).unwrap_or("aborted");
         let outcome = match result {
@@ -531,7 +571,21 @@ impl RunEvent {
             ));
             event.finish(outcome);
         }
+        RunEnd {
+            result,
+            failure_code: state.failure_code.clone(),
+            interruption_cause: state.interruption_cause.clone(),
+            chosen_outcome: state.chosen_outcome.clone(),
+        }
     }
+}
+
+/// How a `runner.run` record ended: its result and the texts kept beside it.
+pub(super) struct RunEnd {
+    pub(super) result: &'static str,
+    pub(super) failure_code: Option<String>,
+    pub(super) interruption_cause: Option<String>,
+    pub(super) chosen_outcome: Option<String>,
 }
 
 struct RunningAssignment {
@@ -555,6 +609,10 @@ struct RunningAssignment {
     /// and the offer rule read (INV-RUNNER-15, INV-RUNNER-40); none for a run on the
     /// embedded engine, which always works.
     activity: Option<Arc<RunActivity>>,
+    /// The view of a run on the embedded engine, which the manager's reads take its steps
+    /// in flight from and hand to the control socket (REQ-RUNNERENROLL-134,
+    /// REQ-RUNNERENROLL-144); none for a tree run.
+    view: Option<AssignmentRunView>,
 }
 
 impl RunningAssignment {
@@ -1018,6 +1076,9 @@ pub(super) struct AssignmentDependencies {
     execution_version: Arc<str>,
     recorder: Option<Arc<crate::telemetry::Recorder>>,
     guard_processes: bool,
+    /// The log the manager and its outbox record the runner's events in
+    /// (REQ-RUNNERENROLL-138).
+    events: Arc<EventLog>,
 }
 
 impl AssignmentDependencies {
@@ -1041,7 +1102,15 @@ impl AssignmentDependencies {
             execution_version,
             recorder,
             guard_processes,
+            events: Arc::new(EventLog::new()),
         }
+    }
+
+    /// Records the runner's events in `events`, the log the live status lists
+    /// (REQ-RUNNERENROLL-138).
+    pub(super) fn with_events(mut self, events: Arc<EventLog>) -> Self {
+        self.events = events;
+        self
     }
 
     /// Executes published trees with `tree_run` (REQ-RUNNERENROLL-91).
@@ -1145,8 +1214,17 @@ pub(super) struct AssignmentManager {
     input_broker: Option<Arc<dyn RunInputBroker>>,
     tree_run: TreeRunDependencies,
     recorder: Option<Arc<crate::telemetry::Recorder>>,
+    /// The log of the runner's own events the manager records a lost grant of time and an
+    /// accepted continuation in (REQ-RUNNERENROLL-138); its outbox records in it too.
+    pub(in crate::service) runner_events: Arc<EventLog>,
     runner_id: String,
     run_events: BTreeMap<String, RunEvent>,
+    /// What each held or reporting assignment's offer said, by assignment ID, which the
+    /// overview gives (REQ-RUNNERENROLL-134).
+    offer_facts: BTreeMap<String, OfferFacts>,
+    /// The assignments whose `runner.run` record ended most recently, which the overview
+    /// lists once they are held no longer (REQ-RUNNERENROLL-137, INV-RUNNER-46).
+    recent_assignments: Ring<OverviewRecentAssignment>,
     lease_policy: Option<ExecutionLeasePolicy>,
     /// The assignments the runner holds, by assignment ID (INV-RUNNER-40).
     held: BTreeMap<String, HeldAssignment>,
@@ -1265,6 +1343,7 @@ impl AssignmentManager {
 impl Drop for AssignmentManager {
     fn drop(&mut self) {
         for event in self.run_events.values() {
+            // The process is going: no overview lists what ends here.
             event.finish(Some("aborted"));
         }
     }
@@ -1553,6 +1632,7 @@ pub(super) mod test_support {
             .checked_sub(bases.elapsed_since_request)
             .expect("fixture delay remains before cancellation");
         let identity = AssignmentIdentity::from_offer(&offer);
+        manager.keep_offer_facts(&offer);
         let response = AssignmentDecision::Accepted {
             effect_id: offer.effect_id.clone(),
             assignment_id: offer.assignment_id.clone(),
@@ -1605,6 +1685,7 @@ pub(super) mod test_support {
             run_event: RunEvent::default(),
             _grant_tokens: None,
             activity: None,
+            view: None,
         })));
         RenewalTimingFixture {
             clock,
@@ -1617,6 +1698,32 @@ pub(super) mod test_support {
             identity,
             initial_cancellation_headroom,
         }
+    }
+
+    /// Gives the installed running assignment `assignment_id` the activity of a tree run,
+    /// which its loop would share with the manager.
+    pub(in crate::service) fn install_run_activity(
+        manager: &mut AssignmentManager,
+        assignment_id: &str,
+        activity: Arc<RunActivity>,
+    ) {
+        manager
+            .running_mut(assignment_id)
+            .expect("the installed assignment runs")
+            .activity = Some(activity);
+    }
+
+    /// Gives the installed running assignment `assignment_id` the view of a run on the
+    /// embedded engine, which its start would share with the run's observer.
+    pub(in crate::service) fn install_run_view(
+        manager: &mut AssignmentManager,
+        assignment_id: &str,
+        view: AssignmentRunView,
+    ) {
+        manager
+            .running_mut(assignment_id)
+            .expect("the installed assignment runs")
+            .view = Some(view);
     }
 
     pub(in crate::service) fn install_root_preparer(

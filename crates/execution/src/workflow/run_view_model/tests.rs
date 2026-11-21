@@ -7,6 +7,10 @@ use std::time::{Duration, Instant};
 use time::format_description::well_known::Rfc3339;
 
 use super::*;
+use crate::workflow::local_run::{
+    LiveRunViewRequest, LiveRunningStep, RunViewObservedOutput, RunViewOutput, RunViewRecord,
+    RunViewStep, RunViewStepOutput, RunViewWork, live_run_view, live_running_steps,
+};
 use crate::workflow::observation::{
     CommandOutputObservation, ObservedExecutions, SourceSequence, TransitionObservation,
 };
@@ -1323,4 +1327,645 @@ fn terminal_reconciliation_keeps_a_stages_failed_child() {
     assert_eq!(design.state, StepStateKind::Succeeded);
     assert_eq!(design.failed_child, Some(failed_child_record()));
     assert_eq!(design.presented_state(), StepStateKind::Failed);
+}
+
+fn model_with_budget(
+    workflow: &ResolvedWorkflow,
+    clock: ControlledClock,
+    budget: RunLogBudget,
+) -> WorkflowRunViewModel<ControlledClock> {
+    let opened_at = clock.sample();
+    let timing = RunTimingObservation::new(opened_at);
+    timing.mark_execution_started(opened_at);
+    WorkflowRunViewModel::with_log_budget(workflow, 2, timing, clock, budget)
+}
+
+/// A workflow of `ids.len()` `cmd` steps, each depending on the one before it, so the
+/// presentation order is the order of `ids`.
+fn chained_workflow(ids: &[&str]) -> (tempfile::TempDir, ResolvedWorkflow) {
+    let mut source = "schemaVersion: 1\nsteps:\n".to_owned();
+    for (index, id) in ids.iter().enumerate() {
+        source.push_str(&format!(
+            "  {id}:\n    kind: cmd\n    command:\n      argv: [\"{id}\"]\n"
+        ));
+        if let Some(previous) = index.checked_sub(1).map(|previous| ids[previous]) {
+            source.push_str(&format!("    dependsOn: [{previous}]\n"));
+        }
+    }
+    resolve_workflow(&source)
+}
+
+/// A `cmd` step `build` with a declared `cwd` and output, an `agent` step `review` that needs
+/// it, and the finalizer `cleanup`.
+fn live_workflow() -> (tempfile::TempDir, ResolvedWorkflow) {
+    resolve_tree(&[
+        (
+            "workflow.yaml",
+            "schemaVersion: 1
+agentProfiles:
+  reviewer:
+    harness:
+      kind: claude_code
+      config:
+        model: example/model
+        effort: high
+steps:
+  build:
+    kind: cmd
+    cwd: tools
+    command:
+      argv: [\"make\", \"build\"]
+    outputs:
+      report:
+        kind: text
+        from: path
+        path: report.txt
+  review:
+    kind: agent
+    dependsOn: [build]
+    agent:
+      profile: reviewer
+      systemPrompt: system.md
+      message:
+        text:
+          - file: message.md
+finalizers:
+  cleanup:
+    kind: cmd
+    command:
+      argv: [\"cleanup\"]
+",
+        ),
+        ("system.md", "System.\n"),
+        ("message.md", "Message.\n"),
+    ])
+}
+
+fn live_request(step: Option<&str>, maximum_output_bytes: u64) -> LiveRunViewRequest {
+    LiveRunViewRequest {
+        step: step.map(str::to_owned),
+        maximum_steps: 16,
+        maximum_output_bytes,
+    }
+}
+
+fn inherited_detail() -> crate::workflow::evidence::InheritedDetail {
+    crate::workflow::evidence::InheritedDetail {
+        prior_attempt_id: "00000000-0000-0000-0000-000000000001".to_owned(),
+        prior_attempt_number: 1,
+        prior_state: crate::workflow::evidence::InheritedPriorState::Succeeded,
+        definition_changed: false,
+    }
+}
+
+/// Shows `view` the step `id` inherited as succeeded with `outputs`, as a seed would.
+fn inherit(
+    view: &WorkflowRunViewModel<ControlledClock>,
+    id: &str,
+    detail: &crate::workflow::evidence::InheritedDetail,
+    outputs: &[&'static str],
+) {
+    view.observe_inherited(|step| {
+        (step == id).then(|| InheritedStepFacts {
+            detail,
+            disposition: crate::workflow::runtime::InheritedDisposition::Succeeded,
+            outputs: outputs.to_vec(),
+        })
+    });
+}
+
+fn record(source: &str, text: &str, continuation: bool) -> RunViewRecord {
+    RunViewRecord {
+        source: source.to_owned(),
+        text: text.to_owned(),
+        continuation,
+    }
+}
+
+// REQ-RUNNERENROLL-147, REQ-LOCALRUN-38, REQ-LOCALRUN-39
+#[tokio::test]
+async fn a_log_budget_bounds_each_step_by_its_share_of_the_run() {
+    let (_temporary, workflow) = chained_workflow(&["a", "b", "c", "d"]);
+    let base = useful_support::monotonic_now();
+    let clock = ControlledClock::new(point(base, 0));
+    let view = model_with_budget(
+        &workflow,
+        clock,
+        RunLogBudget {
+            step_bytes: 32_768,
+            run_bytes: 65_536,
+            step_records: 4,
+            run_records: 8,
+        },
+    );
+
+    let mut sequence = SourceSequence::first();
+    for line in ["first\n", "second\n", "third\n"] {
+        view.observe(output(
+            "a",
+            CommandOutputSource::StandardOutput,
+            sequence,
+            line.as_bytes(),
+        ))
+        .await;
+        sequence = sequence.next();
+    }
+    view.observe(output(
+        "b",
+        CommandOutputSource::StandardOutput,
+        SourceSequence::first(),
+        b"other\n".as_slice(),
+    ))
+    .await;
+    // Two records of the most a record holds fill the run's 16384-byte share of a step, not
+    // the step bound of 32768.
+    let mut sequence = SourceSequence::first();
+    for index in 0..2 {
+        view.observe(output(
+            "c",
+            CommandOutputSource::StandardOutput,
+            sequence,
+            maximum_record(index),
+        ))
+        .await;
+        sequence = sequence.next();
+    }
+
+    let snapshot = view.snapshot();
+    let a = &step(&snapshot, "a").log;
+    assert_eq!(
+        a.records
+            .iter()
+            .map(|record| record.payload.as_ref())
+            .collect::<Vec<_>>(),
+        ["second", "third"]
+    );
+    assert_eq!((a.discarded_records, a.discarded_bytes), (1, 5));
+    let b = &step(&snapshot, "b").log;
+    assert_eq!((b.retained_records, b.discarded_records), (1, 0));
+    assert_eq!(b.records[0].payload.as_ref(), "other");
+    let c = &step(&snapshot, "c").log;
+    assert_eq!((c.retained_records, c.discarded_records), (1, 1));
+    assert!(c.records[0].payload.starts_with("record-001"));
+
+    // A run share under one record, in records and in bytes, still keeps the newest record.
+    let (_temporary, workflow) = chained_workflow(&["a", "b", "c", "d"]);
+    let view = model_with_budget(
+        &workflow,
+        ControlledClock::new(point(base, 0)),
+        RunLogBudget {
+            step_bytes: 32_768,
+            run_bytes: 4,
+            step_records: 4,
+            run_records: 2,
+        },
+    );
+    let mut sequence = SourceSequence::first();
+    for index in 0..2 {
+        view.observe(output(
+            "a",
+            CommandOutputSource::StandardOutput,
+            sequence,
+            maximum_record(index),
+        ))
+        .await;
+        sequence = sequence.next();
+    }
+    let snapshot = view.snapshot();
+    let a = &step(&snapshot, "a").log;
+    assert_eq!((a.retained_records, a.discarded_records), (1, 1));
+    assert!(a.records[0].payload.starts_with("record-001"));
+}
+
+// REQ-RUNNERENROLL-147
+#[tokio::test]
+async fn a_seed_shows_its_inherited_step_with_the_outputs_it_holds_and_no_start() {
+    let (_temporary, workflow) = resolve_workflow(
+        "schemaVersion: 1
+steps:
+  prepare:
+    kind: cmd
+    command:
+      argv: [\"prepare\"]
+    outputs:
+      report:
+        kind: text
+        from: path
+        path: report.txt
+      unused:
+        kind: text
+        from: path
+        path: unused.txt
+  consume:
+    kind: cmd
+    dependsOn: [prepare]
+    command:
+      argv: [\"consume\"]
+",
+    );
+    let base = useful_support::monotonic_now();
+    let clock = ControlledClock::new(point(base, 0));
+    let view = model(&workflow, clock.clone());
+    let changes = view.subscribe();
+    let detail = inherited_detail();
+
+    inherit(&view, "prepare", &detail, &["report"]);
+    assert!(changes.has_changed().unwrap());
+    view.observe(step_transition(
+        "consume",
+        StepStateKind::Pending,
+        StepStateKind::Starting,
+        None,
+    ))
+    .await;
+
+    let snapshot = view.snapshot();
+    let prepare = step(&snapshot, "prepare");
+    assert_eq!(prepare.state, StepStateKind::Inherited);
+    assert_eq!(prepare.inherited.as_ref(), Some(&detail));
+    assert_eq!(
+        prepare.outputs["report"],
+        WorkflowRunOutputDisposition::Committed
+    );
+    assert_eq!(
+        prepare.outputs["unused"],
+        WorkflowRunOutputDisposition::Pending
+    );
+    assert_eq!(prepare.timing, None);
+
+    let live = live_run_view(&view, &live_request(None, 262_144));
+    let prepare = &live.steps[0];
+    assert_eq!(
+        (
+            prepare.id.as_str(),
+            prepare.state.as_str(),
+            &prepare.started_at,
+            prepare.duration
+        ),
+        ("prepare", "inherited", &None, None)
+    );
+    assert_eq!(
+        prepare
+            .outputs
+            .iter()
+            .map(|output| (output.name.as_str(), output.committed))
+            .collect::<Vec<_>>(),
+        [("report", true), ("unused", false)]
+    );
+    assert_eq!(
+        live_running_steps(&view, 16).steps,
+        [LiveRunningStep {
+            id: "consume".to_owned(),
+            state: "starting".to_owned(),
+        }]
+    );
+}
+
+// REQ-RUNNERENROLL-144
+#[tokio::test]
+async fn a_live_run_view_answers_the_running_workflow_and_its_steps() {
+    let (_temporary, workflow) = live_workflow();
+    let base = useful_support::monotonic_now();
+    let clock = ControlledClock::new(point(base, 0));
+    let view = model(&workflow, clock.clone());
+
+    clock.set(point(base, 1_000));
+    view.observe(step_transition(
+        "build",
+        StepStateKind::Pending,
+        StepStateKind::Starting,
+        None,
+    ))
+    .await;
+    view.observe(step_transition(
+        "build",
+        StepStateKind::Starting,
+        StepStateKind::Running,
+        None,
+    ))
+    .await;
+    clock.set(point(base, 6_000));
+
+    let live = live_run_view(&view, &live_request(None, 262_144));
+    assert_eq!(
+        (
+            live.workflow_path.as_str(),
+            live.state.as_str(),
+            live.attempts,
+            live.attempt_number,
+            live.attempt_state.as_str(),
+            &live.wait,
+            &live.outcome,
+            live.steps_omitted,
+            &live.output,
+        ),
+        (
+            "workflow.yaml",
+            "running",
+            1,
+            1,
+            "running",
+            &None,
+            &None,
+            0,
+            &RunViewStepOutput::NotGiven,
+        )
+    );
+    let build = RunViewStep {
+        id: "build".to_owned(),
+        role: "step".to_owned(),
+        state: "running".to_owned(),
+        failure_policy: "required".to_owned(),
+        needs: Vec::new(),
+        started_at: Some("2026-08-04T12:00:01Z".to_owned()),
+        duration: Some(Duration::from_secs(5)),
+        work: RunViewWork::Command {
+            argv: vec!["make".to_owned(), "build".to_owned()],
+            cwd: Some("tools".to_owned()),
+        },
+        outputs: vec![RunViewOutput {
+            name: "report".to_owned(),
+            kind: "text".to_owned(),
+            committed: false,
+        }],
+    };
+    let review = RunViewStep {
+        id: "review".to_owned(),
+        role: "step".to_owned(),
+        state: "pending".to_owned(),
+        failure_policy: "required".to_owned(),
+        needs: vec!["build".to_owned()],
+        started_at: None,
+        duration: None,
+        work: RunViewWork::Agent {
+            profile: "reviewer".to_owned(),
+            harness: "claude_code".to_owned(),
+            model: "example/model".to_owned(),
+            effort: "high".to_owned(),
+        },
+        outputs: Vec::new(),
+    };
+    let cleanup = RunViewStep {
+        id: "cleanup".to_owned(),
+        role: "finalizer".to_owned(),
+        state: "pending".to_owned(),
+        failure_policy: "required".to_owned(),
+        needs: Vec::new(),
+        started_at: None,
+        duration: None,
+        work: RunViewWork::Command {
+            argv: vec!["cleanup".to_owned()],
+            cwd: None,
+        },
+        outputs: Vec::new(),
+    };
+    assert_eq!(live.steps, [build.clone(), review.clone(), cleanup.clone()]);
+    assert_eq!(
+        crate::workflow::schema_common::parse_canonical_utc_timestamp(
+            live.steps[0].started_at.as_deref().unwrap()
+        ),
+        Some(point(base, 1_000).utc)
+    );
+
+    view.observe(step_transition(
+        "build",
+        StepStateKind::CapturingOutputs,
+        StepStateKind::Succeeded,
+        Some(ObservedStepTransition::OutputsCommitted {
+            outputs: vec!["report".to_owned()],
+            failed_child: None,
+        }),
+    ))
+    .await;
+    clock.set(point(base, 60_000));
+    let settled = RunViewStep {
+        state: "succeeded".to_owned(),
+        outputs: vec![RunViewOutput {
+            committed: true,
+            ..build.outputs[0].clone()
+        }],
+        ..build
+    };
+    let live = live_run_view(&view, &live_request(None, 262_144));
+    assert_eq!(live.steps[0], settled);
+
+    view.observe(workflow_transition(
+        WorkflowState::Executing {
+            gate: SchedulingGate::Open,
+        },
+        WorkflowState::Succeeded,
+    ))
+    .await;
+    let live = live_run_view(&view, &live_request(None, 262_144));
+    assert_eq!(
+        (live.state.as_str(), live.attempt_state.as_str()),
+        ("exited", "succeeded")
+    );
+    assert_eq!(live.steps, [settled, review, cleanup]);
+
+    let limited = live_run_view(
+        &view,
+        &LiveRunViewRequest {
+            maximum_steps: 1,
+            ..live_request(None, 262_144)
+        },
+    );
+    assert_eq!(
+        (
+            limited
+                .steps
+                .iter()
+                .map(|step| step.id.as_str())
+                .collect::<Vec<_>>(),
+            limited.steps_omitted
+        ),
+        (vec!["build"], 2)
+    );
+}
+
+// REQ-RUNNERENROLL-145
+#[tokio::test]
+async fn a_live_run_view_gives_the_named_steps_newest_records_in_order() {
+    use crate::workflow::agent::{
+        AgentInvocationIdentity, AgentObservation, AgentObservationEnvelope, WorkflowRunId,
+    };
+
+    let (_temporary, workflow) = live_workflow();
+    let base = useful_support::monotonic_now();
+    let clock = ControlledClock::new(point(base, 0));
+    let view = model_with_budget(
+        &workflow,
+        clock,
+        RunLogBudget {
+            step_bytes: 262_144,
+            run_bytes: 16_777_216,
+            step_records: 4,
+            run_records: 65_536,
+        },
+    );
+    let mut long_line = vec![b'x'; MAX_NORMALIZED_CHILD_RECORD_BYTES];
+    long_line.extend_from_slice(b"tail\n");
+    let observations = [
+        (
+            CommandOutputSource::StandardOutput,
+            b"compiling core\n".to_vec(),
+        ),
+        (
+            CommandOutputSource::StandardError,
+            b"warning: unused import\n".to_vec(),
+        ),
+        (CommandOutputSource::StandardOutput, long_line),
+        (CommandOutputSource::StandardOutput, b"done\n".to_vec()),
+    ];
+    let mut stdout = SourceSequence::first();
+    let mut stderr = SourceSequence::first();
+    for (source, bytes) in observations {
+        let sequence = match source {
+            CommandOutputSource::StandardOutput => &mut stdout,
+            CommandOutputSource::StandardError => &mut stderr,
+        };
+        view.observe(output("build", source, *sequence, bytes))
+            .await;
+        *sequence = sequence.next();
+    }
+    view.observe(ExecutionObservation::<OffsetDateTime>::Agent(
+        AgentObservationEnvelope::fixture(
+            AgentInvocationIdentity::new(
+                WorkflowRunId::from(Arc::from("run")),
+                Arc::from("review"),
+                ActionId {
+                    transition_sequence: TransitionSequence::default(),
+                },
+            ),
+            1,
+            AgentObservation::AssistantText {
+                text: Arc::from("looks good"),
+            },
+        ),
+    ))
+    .await;
+
+    // The step keeps four records: the first, `compiling core`, is discarded.
+    let maximum = "x".repeat(MAX_NORMALIZED_CHILD_RECORD_BYTES);
+    let build = live_run_view(&view, &live_request(Some("build"), 262_144));
+    assert_eq!(
+        build.output,
+        RunViewStepOutput::Observed(RunViewObservedOutput {
+            records: vec![
+                record("stderr", "warning: unused import", false),
+                record("stdout", &maximum, false),
+                record("stdout", "tail", true),
+                record("stdout", "done", false),
+            ],
+            omitted_records: 1,
+            omitted_bytes: 14,
+        })
+    );
+
+    let bounded = live_run_view(
+        &view,
+        &live_request(
+            Some("build"),
+            u64::try_from(MAX_NORMALIZED_CHILD_RECORD_BYTES).unwrap() + 7,
+        ),
+    );
+    assert_eq!(
+        bounded.output,
+        RunViewStepOutput::Observed(RunViewObservedOutput {
+            records: vec![
+                record("stdout", "tail", true),
+                record("stdout", "done", false)
+            ],
+            omitted_records: 3,
+            omitted_bytes: 14 + 22 + u64::try_from(MAX_NORMALIZED_CHILD_RECORD_BYTES).unwrap(),
+        })
+    );
+
+    let review = live_run_view(&view, &live_request(Some("review"), 262_144));
+    assert_eq!(
+        review.output,
+        RunViewStepOutput::Observed(RunViewObservedOutput {
+            records: vec![record("assistant", "looks good", false)],
+            omitted_records: 0,
+            omitted_bytes: 0,
+        })
+    );
+
+    let cleanup = live_run_view(&view, &live_request(Some("cleanup"), 262_144));
+    assert_eq!(
+        cleanup.output,
+        RunViewStepOutput::Observed(RunViewObservedOutput {
+            records: Vec::new(),
+            omitted_records: 0,
+            omitted_bytes: 0,
+        })
+    );
+    for step in [None, Some("missing")] {
+        assert_eq!(
+            live_run_view(&view, &live_request(step, 262_144)).output,
+            RunViewStepOutput::NotGiven
+        );
+    }
+}
+
+// REQ-RUNNERENROLL-145: the viewer reads a record's source word back.
+#[test]
+fn every_log_source_word_reads_back_as_its_source() {
+    let sources = [
+        WorkflowRunLogSource::Command(CommandOutputSource::StandardOutput),
+        WorkflowRunLogSource::Command(CommandOutputSource::StandardError),
+    ]
+    .into_iter()
+    .chain(AGENT_OBSERVATION_KINDS.map(WorkflowRunLogSource::Agent));
+    let mut words = std::collections::BTreeSet::new();
+    for source in sources {
+        assert_eq!(WorkflowRunLogSource::from_word(source.word()), Some(source));
+        assert!(words.insert(source.word()));
+    }
+    assert_eq!(words.len(), 12);
+    assert_eq!(WorkflowRunLogSource::from_word("stdin"), None);
+}
+
+// REQ-RUNNERENROLL-134
+#[tokio::test]
+async fn the_steps_in_flight_are_those_started_and_not_settled_in_presentation_order() {
+    let ids = ["a", "b", "c", "d", "e", "f", "g", "h"];
+    let (_temporary, workflow) = chained_workflow(&ids);
+    let base = useful_support::monotonic_now();
+    let clock = ControlledClock::new(point(base, 0));
+    let view = model(&workflow, clock);
+    let detail = inherited_detail();
+
+    inherit(&view, "b", &detail, &[]);
+    for (id, to) in [
+        ("a", StepStateKind::Succeeded),
+        ("c", StepStateKind::Starting),
+        ("d", StepStateKind::Running),
+        ("e", StepStateKind::CapturingOutputs),
+        ("f", StepStateKind::Recovering),
+        ("g", StepStateKind::Cancelling),
+    ] {
+        view.observe(step_transition(id, StepStateKind::Pending, to, None))
+            .await;
+    }
+
+    let in_flight = |id: &str, state: &str| LiveRunningStep {
+        id: id.to_owned(),
+        state: state.to_owned(),
+    };
+    let running = live_running_steps(&view, 16);
+    assert_eq!(
+        running.steps,
+        [
+            in_flight("c", "starting"),
+            in_flight("d", "running"),
+            in_flight("e", "capturing_outputs"),
+            in_flight("f", "recovering"),
+            in_flight("g", "cancelling"),
+        ]
+    );
+    assert_eq!(running.omitted, 0);
+    let bounded = live_running_steps(&view, 1);
+    assert_eq!(bounded.steps, [in_flight("c", "starting")]);
+    assert_eq!(bounded.omitted, 4);
 }

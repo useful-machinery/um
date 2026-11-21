@@ -651,7 +651,6 @@ impl<Output> ExecutionSeed<Output> {
     }
 }
 
-#[cfg(test)]
 impl<Output> ExecutionSeed<Output> {
     pub(crate) fn inherited_step(&self, id: &str) -> Option<&InheritedStepSeed<Output>> {
         self.steps.get(id)

@@ -582,6 +582,7 @@ pub(super) fn vertical_navigation(event: TerminalInputEvent) -> Option<VerticalN
         | TerminalInputEvent::Quit
         | TerminalInputEvent::Cancel
         | TerminalInputEvent::Resize
+        | TerminalInputEvent::Character(_)
         | TerminalInputEvent::Other => None,
     }
 }

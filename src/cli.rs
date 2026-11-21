@@ -3025,6 +3025,7 @@ mod tests {
             "runner serve",
             "runner show",
             "runner status",
+            "runner watch",
             "service-principal",
             "service-principal create",
             "service-principal credential",

@@ -228,6 +228,12 @@ impl AssignmentManager {
                     match *admission {
                         Ok(accepted) => {
                             self.hold(HeldAssignment::Accepted(Box::new(accepted)));
+                            if offer.continuation.is_some() {
+                                self.runner_events.record(LoggedEvent::RunContinued {
+                                    run_id: offer.run_id.clone(),
+                                    assignment_id: offer.assignment_id.clone(),
+                                });
+                            }
                             let response = AssignmentDecision::Accepted {
                                 effect_id: prepare_effect_id.clone(),
                                 assignment_id: offer.assignment_id.clone(),
@@ -308,6 +314,13 @@ impl AssignmentManager {
                         continue;
                     };
                     let reported_wait = running.reported_wait();
+                    self.keep_settled_run(&running);
+                    if running
+                        .run_event
+                        .interrupted_for(CancellationReason::ExecutionLeaseExpired.as_str())
+                    {
+                        self.record_lease_lost(&running.identity);
+                    }
                     let identity = running.identity;
                     let retained_root = retained_root.map(|root| *root);
                     let deadline_status = if quiescence != ProcessQuiescence::Failed
@@ -544,6 +557,7 @@ impl AssignmentManager {
             }
         }
         self.interrupt_held_after_cleanup_failure();
+        self.forget_ended_offer_facts();
     }
 
     pub(super) fn has_pending_pre_execution_cancellation(&self, assignment_id: &str) -> bool {
@@ -630,31 +644,36 @@ impl AssignmentManager {
         }
     }
 
-    // Ends the assignment's `runner.run` record once; a later call finds
-    // nothing and writes nothing.
+    // Ends the assignment's `runner.run` record once and lists the assignment as
+    // recent; a later call finds nothing and writes nothing.
     pub(super) fn finish_run_event(&mut self, assignment_id: &str, result: Option<&'static str>) {
         if let Some(event) = self.run_events.remove(assignment_id) {
-            event.finish(result);
+            let end = event.finish(result);
+            self.keep_recent_assignment(assignment_id, end);
         }
     }
 
     // Ends `run`, the run opened for an offer the runner is giving up, and
-    // forgets it only while it is still the assignment's recorded run: a
-    // declined duplicate offer must not end a live run of the same assignment.
+    // forgets it and lists the assignment as recent only while it is still the
+    // assignment's recorded run: a declined duplicate offer must not end a live
+    // run of the same assignment.
     pub(super) fn finish_offered_run(
         &mut self,
         assignment_id: &str,
         run: &RunEvent,
         result: &'static str,
     ) {
-        if self
+        let recorded = self
             .run_events
             .get(assignment_id)
-            .is_some_and(|recorded| recorded.is(run))
-        {
+            .is_some_and(|recorded| recorded.is(run));
+        if recorded {
             self.run_events.remove(assignment_id);
         }
-        run.finish(Some(result));
+        let end = run.finish(Some(result));
+        if recorded {
+            self.keep_recent_assignment(assignment_id, end);
+        }
     }
 
     /// Ends the run opened for an offer the runner answers with `decline`: names the

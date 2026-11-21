@@ -78,28 +78,81 @@ pub(super) fn workflow_display_name(workflow_path: &str) -> String {
         .unwrap_or_else(|| visible_text(workflow_path))
 }
 
-// Both live and archived steps expose the same read-only identity and timing to widgets.
+// Every step the widgets draw, live, archived or read from a runner, exposes the same
+// read-only identity, words and timing. The per-row members borrow; nothing here allocates.
 pub(super) struct StepHeader<'a> {
     pub(super) id: &'a str,
-    pub(super) definition: &'a WorkflowPresentationStep,
+    /// The workflow format's kind word: `cmd`, `agent`, `workflow`, or a word as received.
+    pub(super) kind: &'a str,
+    /// The failure-policy word: `required`, `advisory`, or a word as received.
+    pub(super) failure_policy: &'a str,
+    pub(super) direct_dependencies: &'a [String],
+    pub(super) work: StepWork<'a>,
     pub(super) state: StepStateKind,
-    pub(super) timing: Option<&'a crate::workflow::run_view_model::WorkflowRunElapsed>,
+    pub(super) timing: Option<crate::workflow::run_view_model::WorkflowRunElapsed>,
 }
 
 impl<'a> StepHeader<'a> {
-    pub(super) fn new(
+    /// The one conversion of the engine's typed definition that the live and the archived
+    /// projections share.
+    pub(super) fn presented(
         id: &'a str,
         definition: &'a WorkflowPresentationStep,
         state: StepStateKind,
         timing: Option<&'a crate::workflow::run_view_model::WorkflowRunElapsed>,
     ) -> Self {
+        let work = match definition {
+            WorkflowPresentationStep::Command { cwd, .. } => StepWork::Command {
+                cwd: cwd.as_deref(),
+            },
+            WorkflowPresentationStep::Agent {
+                profile, harness, ..
+            } => StepWork::Agent {
+                profile,
+                harness: StepHarness::Presented(harness),
+            },
+            WorkflowPresentationStep::Workflow { file, .. } => StepWork::Workflow { file },
+        };
         Self {
             id,
-            definition,
+            kind: step_kind(definition),
+            failure_policy: failure_policy_name(definition.failure_policy()),
+            direct_dependencies: definition.direct_dependencies(),
+            work,
             state,
-            timing,
+            timing: timing.cloned(),
         }
     }
+}
+
+/// What a step runs, as far as the inspector draws it. A command's text comes from
+/// `StepProjection::inspector_command`.
+#[derive(Clone, Copy)]
+pub(super) enum StepWork<'a> {
+    Command {
+        cwd: Option<&'a str>,
+    },
+    Agent {
+        profile: &'a str,
+        harness: StepHarness<'a>,
+    },
+    Workflow {
+        file: &'a str,
+    },
+    /// A kind this release does not know: its own word, with no work fields
+    /// (REQ-RUNNERENROLL-135).
+    Unknown,
+}
+
+/// An agent's harness: the engine's typed one, or the words a runner answered with.
+#[derive(Clone, Copy)]
+pub(super) enum StepHarness<'a> {
+    Presented(&'a AgentPresentationHarness),
+    Words {
+        harness: &'a str,
+        model: Option<&'a str>,
+        effort: Option<&'a str>,
+    },
 }
 
 pub(super) trait StepProjection {
@@ -109,15 +162,35 @@ pub(super) trait StepProjection {
         self.header().id
     }
 
-    fn definition(&self) -> &WorkflowPresentationStep {
-        self.header().definition
+    fn kind(&self) -> &str {
+        self.header().kind
+    }
+
+    fn failure_policy(&self) -> &str {
+        self.header().failure_policy
+    }
+
+    fn direct_dependencies(&self) -> &[String] {
+        self.header().direct_dependencies
+    }
+
+    fn work(&self) -> StepWork<'_> {
+        self.header().work
     }
 
     fn state(&self) -> StepStateKind {
         self.header().state
     }
 
-    fn timing(&self) -> Option<&crate::workflow::run_view_model::WorkflowRunElapsed> {
+    /// The state word when it is one this release has no `StepStateKind` for. Such a step's
+    /// `state` answers `Pending`, so that it is drawn muted, without a start time and never
+    /// as in flight, and the widgets draw the neutral mark and this word in place of that
+    /// state's symbol and label (REQ-RUNNERENROLL-135).
+    fn unknown_state(&self) -> Option<&str> {
+        None
+    }
+
+    fn timing(&self) -> Option<crate::workflow::run_view_model::WorkflowRunElapsed> {
         self.header().timing
     }
 

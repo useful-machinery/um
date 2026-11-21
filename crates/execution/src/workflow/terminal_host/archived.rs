@@ -7,7 +7,6 @@ mod interaction;
 mod tests;
 mod widgets;
 use self::interaction::ArchivedHostInteraction;
-use self::interaction::*;
 use self::widgets::*;
 use crate::workflow::archived_attempt::{
     ArchivedDiagnosticStream, ArchivedStep, ArchivedStepDetail, LocalArchivedAttempt,
@@ -42,8 +41,7 @@ impl ArchivedTerminalExitRequest {
 }
 
 pub struct ArchivedWorkflowTerminalHost {
-    exit: tokio::sync::mpsc::UnboundedSender<ArchivedTerminalHostExit>,
-    task: Option<tokio::task::JoinHandle<Result<ArchivedTerminalHostExit, PresentationFailure>>>,
+    task: ViewerTask,
 }
 
 impl ArchivedWorkflowTerminalHost {
@@ -61,83 +59,108 @@ impl ArchivedWorkflowTerminalHost {
     {
         let view = ArchivedTerminalView::new(attempt);
         let mut terminal = RestoringTerminal::new(boundary);
-        let setup = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            let area = terminal.boundary.setup().map_err(|error| {
-                presentation_failure(PresentationFailureOperation::TerminalSetup, &error)
-            })?;
+        let interaction = open_viewer(&mut terminal, |boundary, area| {
             let mut interaction = ArchivedHostInteraction {
                 terminal_area: area,
                 ..ArchivedHostInteraction::default()
             };
-            terminal
-                .boundary
-                .draw_archived(&view, &mut interaction, color)
-                .map_err(|error| {
-                    presentation_failure(PresentationFailureOperation::TerminalDraw, &error)
-                })?;
-            Ok::<_, PresentationFailure>(interaction)
-        }));
-        let interaction = match setup {
-            Ok(Ok(interaction)) => interaction,
-            Ok(Err(failure)) => {
-                let _ = terminal.restore();
-                return Err(failure);
-            }
-            Err(payload) => {
-                let _ = terminal.restore();
-                return Err(report_terminal_panic(payload));
-            }
-        };
-        let _ = terminal
-            .boundary
-            .notify_lifecycle(TerminalLifecycleEvent::QuitEligible);
+            boundary.draw_archived(&view, &mut interaction, color)?;
+            Ok(interaction)
+        })?;
+        Ok(Self {
+            task: ViewerTask::spawn(|exit_receiver| {
+                run_archived_terminal(terminal, view, color, exit_receiver, interaction)
+            }),
+        })
+    }
 
+    pub fn exit_request(&self) -> ArchivedTerminalExitRequest {
+        self.task.exit_request()
+    }
+
+    pub async fn wait(self) -> Result<ArchivedTerminalHostExit, PresentationFailure> {
+        self.task.wait().await
+    }
+}
+
+/// Sets a viewer's terminal up and draws its first frame, restoring the terminal when
+/// either fails or panics.
+pub(super) fn open_viewer<Boundary, Interaction>(
+    terminal: &mut RestoringTerminal<Boundary>,
+    first_frame: impl FnOnce(&mut Boundary, Rect) -> io::Result<Interaction>,
+) -> Result<Interaction, PresentationFailure>
+where
+    Boundary: TerminalBoundary,
+{
+    let setup = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        let area = terminal.boundary.setup().map_err(|error| {
+            presentation_failure(PresentationFailureOperation::TerminalSetup, &error)
+        })?;
+        first_frame(&mut terminal.boundary, area).map_err(|error| {
+            presentation_failure(PresentationFailureOperation::TerminalDraw, &error)
+        })
+    }));
+    let interaction = match setup {
+        Ok(Ok(interaction)) => interaction,
+        Ok(Err(failure)) => {
+            let _ = terminal.restore();
+            return Err(failure);
+        }
+        Err(payload) => {
+            let _ = terminal.restore();
+            return Err(report_terminal_panic(payload));
+        }
+    };
+    let _ = terminal
+        .boundary
+        .notify_lifecycle(TerminalLifecycleEvent::QuitEligible);
+    Ok(interaction)
+}
+
+/// A viewer's spawned loop and the channel that asks it to end; dropping it asks for
+/// `Terminated`.
+pub(super) struct ViewerTask {
+    exit: tokio::sync::mpsc::UnboundedSender<ArchivedTerminalHostExit>,
+    task: Option<tokio::task::JoinHandle<Result<ArchivedTerminalHostExit, PresentationFailure>>>,
+}
+
+impl ViewerTask {
+    pub(super) fn spawn<Run, Loop>(run: Run) -> Self
+    where
+        Run: FnOnce(tokio::sync::mpsc::UnboundedReceiver<ArchivedTerminalHostExit>) -> Loop,
+        Loop:
+            Future<Output = Result<ArchivedTerminalHostExit, PresentationFailure>> + Send + 'static,
+    {
         let (exit, exit_receiver) = tokio::sync::mpsc::unbounded_channel();
+        let run = run(exit_receiver);
         let task = tokio::spawn(async move {
-            match AssertUnwindSafe(run_archived_terminal(
-                terminal,
-                view,
-                color,
-                exit_receiver,
-                interaction,
-            ))
-            .catch_unwind()
-            .await
-            {
+            match AssertUnwindSafe(run).catch_unwind().await {
                 Ok(result) => result,
                 // Unwinding dropped the restoring terminal before reporting the panic.
                 Err(payload) => Err(report_terminal_panic(payload)),
             }
         });
-        Ok(Self {
+        Self {
             exit,
             task: Some(task),
-        })
+        }
     }
 
-    pub fn exit_request(&self) -> ArchivedTerminalExitRequest {
+    pub(super) fn exit_request(&self) -> ArchivedTerminalExitRequest {
         ArchivedTerminalExitRequest {
             exit: self.exit.clone(),
         }
     }
 
-    pub async fn wait(mut self) -> Result<ArchivedTerminalHostExit, PresentationFailure> {
-        archived_join_result(self.take_task()?.await)
-    }
-
-    fn take_task(
-        &mut self,
-    ) -> Result<
-        tokio::task::JoinHandle<Result<ArchivedTerminalHostExit, PresentationFailure>>,
-        PresentationFailure,
-    > {
-        self.task.take().ok_or_else(|| {
+    pub(super) async fn wait(mut self) -> Result<ArchivedTerminalHostExit, PresentationFailure> {
+        let task = self.task.take().ok_or_else(|| {
             PresentationFailure::operation(PresentationFailureOperation::TerminalTask)
-        })
+        })?;
+        archived_join_result(task.await)
     }
 }
 
-impl Drop for ArchivedWorkflowTerminalHost {
+impl Drop for ViewerTask {
     fn drop(&mut self) {
         let _ = self.exit.send(ArchivedTerminalHostExit::Terminated);
     }
@@ -209,34 +232,10 @@ async fn run_archived_terminal<Boundary: ArchivedTerminalBoundary>(
                 );
             }
             event = terminal.boundary.next_event() => {
-                let event = match event {
-                    Ok(event) => event,
-                    Err(error) => {
-                        return fail_archived_terminal(
-                            &mut terminal,
-                            PresentationFailureOperation::TerminalInput,
-                            &error,
-                        );
-                    }
-                };
-                if event == TerminalInputEvent::Resize {
-                    match terminal.boundary.resize() {
-                        Ok(area) => interaction.terminal_area = area,
-                        Err(error) => {
-                            return fail_archived_terminal(
-                                &mut terminal,
-                                PresentationFailureOperation::TerminalDraw,
-                                &error,
-                            );
-                        }
-                    }
-                } else if let Some(exit) = interaction.handle_key(event, &view) {
-                    return restore_archived_terminal(&mut terminal, exit);
-                }
-                if event == TerminalInputEvent::Help && interaction.help_visible {
-                    let _ = terminal
-                        .boundary
-                        .notify_lifecycle(TerminalLifecycleEvent::HelpOpened);
+                if let Some(ending) = viewer_input(&mut terminal, event, &mut interaction, |interaction, event| {
+                    interaction.handle_key(event, &view)
+                }) {
+                    return ending;
                 }
                 if let Err(error) = terminal
                     .boundary
@@ -253,7 +252,68 @@ async fn run_archived_terminal<Boundary: ArchivedTerminalBoundary>(
     }
 }
 
-fn restore_archived_terminal<Boundary: TerminalBoundary>(
+/// A viewer's interaction as the shared input step reads it.
+pub(super) trait ViewerInteraction {
+    fn set_terminal_area(&mut self, area: Rect);
+
+    fn help_visible(&self) -> bool;
+}
+
+impl ViewerInteraction for ArchivedHostInteraction {
+    fn set_terminal_area(&mut self, area: Rect) {
+        self.terminal_area = area;
+    }
+
+    fn help_visible(&self) -> bool {
+        self.help_visible
+    }
+}
+
+/// Handles one terminal input of a viewer: a resize takes the boundary's new area and any
+/// other input goes to `handle_key`. Answers the viewer's ending when the input ends it.
+pub(super) fn viewer_input<Boundary, Interaction>(
+    terminal: &mut RestoringTerminal<Boundary>,
+    event: io::Result<TerminalInputEvent>,
+    interaction: &mut Interaction,
+    handle_key: impl FnOnce(&mut Interaction, TerminalInputEvent) -> Option<ArchivedTerminalHostExit>,
+) -> Option<Result<ArchivedTerminalHostExit, PresentationFailure>>
+where
+    Boundary: TerminalBoundary,
+    Interaction: ViewerInteraction,
+{
+    let event = match event {
+        Ok(event) => event,
+        Err(error) => {
+            return Some(fail_archived_terminal(
+                terminal,
+                PresentationFailureOperation::TerminalInput,
+                &error,
+            ));
+        }
+    };
+    if event == TerminalInputEvent::Resize {
+        match terminal.boundary.resize() {
+            Ok(area) => interaction.set_terminal_area(area),
+            Err(error) => {
+                return Some(fail_archived_terminal(
+                    terminal,
+                    PresentationFailureOperation::TerminalDraw,
+                    &error,
+                ));
+            }
+        }
+    } else if let Some(exit) = handle_key(interaction, event) {
+        return Some(restore_archived_terminal(terminal, exit));
+    }
+    if event == TerminalInputEvent::Help && interaction.help_visible() {
+        let _ = terminal
+            .boundary
+            .notify_lifecycle(TerminalLifecycleEvent::HelpOpened);
+    }
+    None
+}
+
+pub(super) fn restore_archived_terminal<Boundary: TerminalBoundary>(
     terminal: &mut RestoringTerminal<Boundary>,
     exit: ArchivedTerminalHostExit,
 ) -> Result<ArchivedTerminalHostExit, PresentationFailure> {
@@ -268,7 +328,7 @@ fn restore_archived_terminal<Boundary: TerminalBoundary>(
     )
 }
 
-fn fail_archived_terminal<Boundary: TerminalBoundary>(
+pub(super) fn fail_archived_terminal<Boundary: TerminalBoundary>(
     terminal: &mut RestoringTerminal<Boundary>,
     operation: PresentationFailureOperation,
     error: &io::Error,
@@ -298,7 +358,7 @@ struct ArchivedTerminalStepView {
     timing: Option<super::super::run_view_model::WorkflowRunElapsed>,
     detail: ArchivedStepDetail,
     output: ArchivedCommandOutputView,
-    document: Vec<ArchivedOutputRow>,
+    document: Vec<OutputRow>,
     maximum_document_width: usize,
     recovery: Option<super::super::publication::StepRecoverySummaryV1>,
     invocations: Vec<super::super::publication::RecoveryInvocationV1>,
@@ -393,11 +453,7 @@ impl ArchivedTerminalStepView {
                 });
         let document = output_document(&output);
         let committed_outputs = step.committed_output_count(definition.outputs().len());
-        let maximum_document_width = document
-            .iter()
-            .map(|row| display_width(&row.text))
-            .max()
-            .unwrap_or(0);
+        let maximum_document_width = document_width(&document);
         Self {
             document,
             maximum_document_width,
@@ -436,7 +492,7 @@ impl StepProjection for ArchivedTerminalStepView {
     // These accessors deliberately keep the archived terminal projection separate from
     // the live observation-backed view model while sharing read-only renderer geometry.
     fn header(&self) -> StepHeader<'_> {
-        StepHeader::new(&self.id, &self.definition, self.state, self.timing.as_ref())
+        StepHeader::presented(&self.id, &self.definition, self.state, self.timing.as_ref())
     }
 
     fn dag_detail(&self) -> Option<String> {

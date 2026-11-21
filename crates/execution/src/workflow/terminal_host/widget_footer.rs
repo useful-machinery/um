@@ -57,9 +57,41 @@ pub(super) fn render_contextual_footer(
             )
         })
         .collect();
+    render_fitting_footer(frame, area, label, options, color);
+}
+
+/// A surface's footer: its label and the first of its forms, longest first, that fits.
+pub(super) fn render_fitting_footer(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    label: &'static str,
+    options: Vec<Vec<HelpCommand>>,
+    color: bool,
+) {
     let reserved_width = u16::try_from(display_width(label).saturating_add(4)).unwrap_or(u16::MAX);
     let commands = fitting_footer(options, area.width.saturating_sub(reserved_width));
     render_footer_text(frame, area, label, commands, color);
+}
+
+/// A viewer's footer forms: the surface's keys, without `F` where nothing follows, then
+/// quitting and help.
+pub(super) fn viewer_footer_options(
+    options: &[&[HelpCommand]],
+    follows: bool,
+) -> Vec<Vec<HelpCommand>> {
+    options
+        .iter()
+        .map(|commands| {
+            let mut commands = commands
+                .iter()
+                .copied()
+                .filter(|command| follows || command.keys != "F")
+                .collect::<Vec<_>>();
+            commands.push(help("q", "quit"));
+            commands.push(help("?", "help"));
+            commands
+        })
+        .collect()
 }
 
 pub(super) fn footer_option(
@@ -206,8 +238,18 @@ pub(super) fn render_help_overlay_groups(
 
 #[derive(Clone, Copy)]
 pub(super) enum OutputHelpMode {
+    /// The run interface's log: records, followed.
     Live,
+    /// The archived viewer's retained output: rows, never followed.
     Archived,
+    /// The runner viewer's log: rows, followed.
+    FollowedRows,
+}
+
+impl OutputHelpMode {
+    const fn follows(self) -> bool {
+        !matches!(self, Self::Archived)
+    }
 }
 
 pub(super) fn surface_help_groups(surface: HostSurface, mode: OutputHelpMode) -> Vec<HelpGroup> {
@@ -233,6 +275,7 @@ pub(super) fn surface_help_groups(surface: HostSurface, mode: OutputHelpMode) ->
                     description: match mode {
                         OutputHelpMode::Live => "open step log",
                         OutputHelpMode::Archived => "open retained output",
+                        OutputHelpMode::FollowedRows => "open log",
                     },
                 }],
             },
@@ -253,10 +296,10 @@ pub(super) fn surface_help_groups(surface: HostSurface, mode: OutputHelpMode) ->
         HostSurface::FullLog => {
             let noun = match mode {
                 OutputHelpMode::Live => "record",
-                OutputHelpMode::Archived => "row",
+                OutputHelpMode::Archived | OutputHelpMode::FollowedRows => "row",
             };
             let mut view_commands = Vec::new();
-            if matches!(mode, OutputHelpMode::Live) {
+            if mode.follows() {
                 view_commands.push(HelpCommand {
                     keys: "F",
                     description: "follow latest",
@@ -317,14 +360,14 @@ pub(super) fn surface_help_groups(surface: HostSurface, mode: OutputHelpMode) ->
                             keys: "g",
                             description: match mode {
                                 OutputHelpMode::Live => "first record",
-                                OutputHelpMode::Archived => "top",
+                                OutputHelpMode::Archived | OutputHelpMode::FollowedRows => "top",
                             },
                         },
                         HelpCommand {
                             keys: "G",
                             description: match mode {
                                 OutputHelpMode::Live => "retained bottom",
-                                OutputHelpMode::Archived => "bottom",
+                                OutputHelpMode::Archived | OutputHelpMode::FollowedRows => "bottom",
                             },
                         },
                         HelpCommand {
@@ -343,6 +386,21 @@ pub(super) fn surface_help_groups(surface: HostSurface, mode: OutputHelpMode) ->
                 },
             ]
         }
+    }
+}
+
+/// A viewer's help: the surface's groups and the keys that leave the viewer.
+pub(super) fn viewer_help_groups(surface: HostSurface, mode: OutputHelpMode) -> Vec<HelpGroup> {
+    let mut groups = surface_help_groups(surface, mode);
+    groups.push(viewer_help_group());
+    groups
+}
+
+/// The keys that leave a viewer.
+pub(super) fn viewer_help_group() -> HelpGroup {
+    HelpGroup {
+        title: "VIEWER",
+        commands: vec![help("q", "quit"), help("^C", "interrupt")],
     }
 }
 

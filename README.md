@@ -2729,8 +2729,8 @@ configuration, reported as an invalid configuration; or when the configuration n
 `runnerStatePath` other than the home's `runner/state.json` while a file exists there, as
 in a home that was moved or copied, reported as a conflict naming both paths.
 
-`runner status` and `runner integration sync` given no `--config` create and change nothing under
-the `useful` home. When the runner home holds a configuration they ask the control socket it
+`runner status`, `runner watch` and `runner integration sync` given no `--config` create and
+change nothing under the `useful` home. When the runner home holds a configuration they ask the control socket it
 names, and one that does not load is their failure; when it holds none they ask
 `runner/control.sock`, so a home no runner serves from answers as an absent socket does,
 with exit 4. A command that reads the configuration, given no `--config` while neither
@@ -2754,6 +2754,34 @@ assignments:    2 total (preparing: 1, waiting: 1)
 run:            run_01k0z6r1w8f4jy2m7q9v3x5abp · working
 run:            run_01k0z6r1w8f4jy2m7q9v3x5abq · waiting
 ```
+
+`runner watch` shows the same live runner in a full-screen terminal view that it refreshes
+every second: the runner's ID, boot ID, version and uptime, its connection and credential
+IDs, each provider's agent-login readiness, one entry for each run it holds, with the steps
+running or what a waiting run waits for, the runs that ended recently and the runner's own
+events, times of day in UTC. `↑`/`↓` (or `k`/`j`) move through the runs, `C` reloads the
+credential, `L` sets up agent logins and shows each provider's readiness, Esc dismisses an
+outcome, `?` opens the help and `q` leaves. It needs a terminal on standard input and
+output, and without one exits 1 naming `runner status`; it asks the runner once before
+taking the terminal over and exits 4 when no runner answers. Once open it stays up while
+the runner restarts or does not answer, marking what it shows as last known until the
+runner answers again. Leaving it, with `q`, Ctrl-C or a signal, stops, cancels and changes
+nothing in the runner, which finishes an operation already sent.
+
+Enter on a run opens it. The opened view shows the run's facts (its subject or run ID, the
+assignment, its attempt and phase, and the time Cloud granted it) with the run's Cloud URL
+whole on a row of its own to copy, then the run interface's step graph, the selected
+step's inspector and a preview of its output, refreshed every second. `↑`/`↓` (or
+`k`/`j`) move through the steps; Enter on a step that started child runs opens the newest
+one, and on any other step opens the output full-screen, as `o` does anywhere; there the
+movement keys pause the view and `F` follows the newest output again; Esc leaves the
+full-screen output, then each child run, then returns to the overview. In a run of a
+workflow tree, the output a step retained is shown once the step has settled; a command
+step that ran without recovery retains none, and the view says so. Beside a step still
+pending or running, and beside a step that starts child runs, the view shows the run log
+instead. A run without a workflow tree shows each step's output so far, record by record
+under its label, while the step runs, and has no run log. When the run ends the
+view says so and keeps the last steps it drew. `C` and `L` act on the overview only.
 
 A start that finds no enrolled state and is given neither a join key nor `--personal` or
 `--pool-id` exits 1 saying the host is not enrolled and naming `useful runner enroll --activation-file <PATH>` and

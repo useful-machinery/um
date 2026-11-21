@@ -6,7 +6,8 @@ pub(super) struct ArchivedHostInteraction {
     pub(super) surface: HostSurface,
     pub(super) help_visible: bool,
     pub(super) terminal_area: Rect,
-    pub(super) output: ArchivedOutputInteraction,
+    /// The retained output's viewport, its rows keyed by their index and never followed.
+    pub(super) output: OutputViewport<usize>,
 }
 
 impl ArchivedHostInteraction {
@@ -39,8 +40,8 @@ impl ArchivedHostInteraction {
         if self.surface == HostSurface::FullLog {
             self.synchronize_output(view);
             if let Some(navigation) = vertical_navigation(event) {
-                let row_count = self.selected_document(view).len();
-                self.output.navigate(row_count, navigation);
+                self.output
+                    .navigate(self.selected_document(view), navigation);
                 return None;
             }
         }
@@ -50,7 +51,7 @@ impl ArchivedHostInteraction {
                 if self.surface == HostSurface::Split && !view.steps.is_empty() =>
             {
                 self.surface = HostSurface::FullLog;
-                self.output = ArchivedOutputInteraction::default();
+                self.output = OutputViewport::default();
                 self.synchronize_output(view);
             }
             TerminalInputEvent::Escape => self.surface = HostSurface::Split,
@@ -63,7 +64,7 @@ impl ArchivedHostInteraction {
                 }
             }
             TerminalInputEvent::PanLeft if self.surface == HostSurface::FullLog => {
-                self.output.horizontal_offset = self.output.horizontal_offset.saturating_sub(1);
+                self.output.pan_left();
             }
             TerminalInputEvent::PanRight if self.surface == HostSurface::FullLog => {
                 let width = view
@@ -83,71 +84,16 @@ impl ArchivedHostInteraction {
         };
         let (width, rows) = archived_output_dimensions(self.terminal_area, step);
         self.output.synchronize(
-            step.document.len(),
+            step.document.as_slice(),
             step.maximum_document_width,
             width,
             rows,
         );
     }
 
-    pub(super) fn selected_document<'a>(
-        &self,
-        view: &'a ArchivedTerminalView,
-    ) -> &'a [ArchivedOutputRow] {
+    pub(super) fn selected_document<'a>(&self, view: &'a ArchivedTerminalView) -> &'a [OutputRow] {
         view.steps
             .get(self.selected)
             .map_or(&[], |step| step.document.as_slice())
     }
-}
-
-#[derive(Default)]
-pub(super) struct ArchivedOutputInteraction {
-    pub(super) top: usize,
-    pub(super) horizontal_offset: usize,
-    pub(super) available_width: usize,
-    pub(super) available_rows: usize,
-}
-
-impl ArchivedOutputInteraction {
-    pub(super) fn synchronize(
-        &mut self,
-        row_count: usize,
-        document_width: usize,
-        width: usize,
-        rows: usize,
-    ) {
-        self.available_width = width;
-        self.available_rows = rows;
-        self.top = self.top.min(maximum_document_top(row_count, rows));
-        self.horizontal_offset = self
-            .horizontal_offset
-            .min(document_width.saturating_sub(width));
-    }
-
-    pub(super) fn navigate(&mut self, row_count: usize, navigation: VerticalNavigation) {
-        let bottom = maximum_document_top(row_count, self.available_rows);
-        let page = self.available_rows.max(1);
-        let half_page = (page / 2).max(1);
-        self.top = match navigation {
-            VerticalNavigation::Up => self.top.saturating_sub(1),
-            VerticalNavigation::Down => self.top.saturating_add(1).min(bottom),
-            VerticalNavigation::PageUp => self.top.saturating_sub(page),
-            VerticalNavigation::PageDown => self.top.saturating_add(page).min(bottom),
-            VerticalNavigation::HalfPageUp => self.top.saturating_sub(half_page),
-            VerticalNavigation::HalfPageDown => self.top.saturating_add(half_page).min(bottom),
-            VerticalNavigation::Top => 0,
-            VerticalNavigation::Bottom => bottom,
-        };
-    }
-
-    pub(super) fn pan_right(&mut self, document_width: usize) {
-        self.horizontal_offset = self
-            .horizontal_offset
-            .saturating_add(1)
-            .min(document_width.saturating_sub(self.available_width));
-    }
-}
-
-pub(super) fn maximum_document_top(row_count: usize, available_rows: usize) -> usize {
-    row_count.saturating_sub(available_rows)
 }

@@ -55,7 +55,7 @@ impl DagLayout {
         Self::new(
             steps
                 .iter()
-                .map(|step| (step.id(), step.definition().direct_dependencies())),
+                .map(|step| (step.id(), step.direct_dependencies())),
         )
     }
 

@@ -239,12 +239,21 @@ impl AssignmentManager {
         })?;
         if let Some(event) = self.run_events.get(&identity.assignment_id) {
             event.result("interrupted");
-            event.set(KeyValue::new(
-                crate::telemetry::attribute::INTERRUPTION_CAUSE,
-                reason.to_owned(),
-            ));
+            event.interruption_cause(reason);
+        }
+        if reason == CancellationReason::ExecutionLeaseExpired.as_str() {
+            self.record_lease_lost(identity);
         }
         Ok(id)
+    }
+
+    /// Lists among the runner's events that it settled the run of `identity` interrupted
+    /// for its lapsed grant of time (REQ-RUNNERENROLL-138).
+    pub(super) fn record_lease_lost(&self, identity: &AssignmentIdentity) {
+        self.runner_events.record(LoggedEvent::LeaseLost {
+            run_id: identity.run_id.clone(),
+            assignment_id: identity.assignment_id.clone(),
+        });
     }
 
     pub(super) fn finish_before_execution(

@@ -22,11 +22,22 @@ mod validation;
 
 use std::fmt;
 
+pub use control_client::request_assignment;
+pub use control_client::request_overview;
 pub use control_client::{RequestFailure, request};
+pub use control_protocol::{AgentLoginCheckCause, SyncedAgentLogins, UnansweredCheck};
 pub use control_protocol::{
-    AgentLoginProvider, AgentLoginReadiness, AgentLoginState, AgentLoginUse, AssignmentCounts,
-    ConnectionFailure, ConnectionState, ControlError, CredentialSource, HeldRun, HeldRunState,
-    Operation, ProcessState, ProtocolFailure, ProviderReadiness, Response, StatusSnapshot,
+    AgentLoginProvider, AgentLoginReadiness, AgentLoginSetupCause, AgentLoginSetupResult,
+    AgentLoginState, AgentLoginUse, AssignmentAgent, AssignmentAnswer, AssignmentChildRun,
+    AssignmentCommand, AssignmentCounts, AssignmentDetail, AssignmentLog, AssignmentLogRecord,
+    AssignmentLogSource, AssignmentLogStream, AssignmentOutput, AssignmentPhase, AssignmentQuery,
+    AssignmentRun, AssignmentStep, AssignmentWorkflow, ConnectionFailure, ConnectionState,
+    ControlError, CredentialSource, HeldRun, HeldRunState, LeaseHealth, LiveStepState, OpenWord,
+    Operation, Overview, OverviewAgentLogins, OverviewAnswer, OverviewAssignment,
+    OverviewConnection, OverviewCounts, OverviewEvent, OverviewLease, OverviewProviderReadiness,
+    OverviewRecentAssignment, OverviewRunElement, OverviewRunner, OverviewRunningStep,
+    OverviewWait, ProcessState, ProtocolFailure, ProviderReadiness, Response, RunResult,
+    RunnerEventKind, StatusSnapshot, StepPathPart,
 };
 pub use doctor::{
     CheckDescriptor, CheckResult, CredentialKind, CredentialOrigin, CredentialRequirement,

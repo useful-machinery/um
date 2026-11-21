@@ -93,6 +93,38 @@ fn selected_terminal_events_map_to_host_controls() {
     }
 }
 
+// REQ-RUNNERENROLL-142
+#[test]
+fn shifted_letters_no_binding_takes_map_to_their_character() {
+    for (code, modifiers, expected) in [
+        (
+            KeyCode::Char('C'),
+            KeyModifiers::SHIFT,
+            TerminalInputEvent::Character('C'),
+        ),
+        (
+            KeyCode::Char('L'),
+            KeyModifiers::SHIFT,
+            TerminalInputEvent::Character('L'),
+        ),
+        (
+            KeyCode::Char('l'),
+            KeyModifiers::NONE,
+            TerminalInputEvent::PanRight,
+        ),
+        (
+            KeyCode::Char('c'),
+            KeyModifiers::CONTROL,
+            TerminalInputEvent::Cancel,
+        ),
+    ] {
+        assert_eq!(
+            terminal_input_event(Event::Key(crossterm::event::KeyEvent::new(code, modifiers))),
+            expected
+        );
+    }
+}
+
 // REQ-LOCALRUN-43
 #[test]
 fn enter_opens_the_selected_steps_full_screen_log() {

@@ -48,9 +48,9 @@ mod steps;
 #[cfg(test)]
 mod tests;
 
-pub(super) use activity::{HeldRuns, RunActivity};
+pub(super) use activity::{HeldRuns, RunActivity, RunPaths, RunRead};
 pub(super) use download::{HttpTreeBroker, TreeBroker, is_safe_tree_path};
-pub(super) use records::{TransportResult, TreeConclusion};
+pub(super) use records::{TransportResult, TreeConclusion, published_path};
 pub(super) use resume_loop::{DriveFailure, ReportSink, TreeEnd};
 
 use command::{PublishFailure, RunLog, UsefulCommand};
@@ -282,6 +282,13 @@ impl TreeLayout {
     }
 }
 
+/// A run's activity, which publishes `log` as where the run's log is (REQ-RUNNERENROLL-144).
+fn activity_logging_to(log: &Path) -> Arc<RunActivity> {
+    let activity = RunActivity::new();
+    activity.publish_log(log.to_owned());
+    activity
+}
+
 /// The run-scoped home a tree run's assignment creates under its private directory: the
 /// home an adopting attempt looks for in each earlier attempt of the run.
 pub(super) fn tree_home(private: &Path) -> PathBuf {
@@ -465,7 +472,7 @@ pub(super) fn prepare(
         executable: (dependencies.executable)()
             .map_err(|_| environment_decline("workflow_tree_publication"))?,
         environment: preparation.environment.clone(),
-        activity: RunActivity::new(),
+        activity: activity_logging_to(&layout.log),
         home: layout.home.clone(),
         log: RunLog::new(layout.log.clone()),
         sleeper: Arc::clone(&preparation.sleeper),
@@ -613,7 +620,7 @@ pub(super) fn adopt(
         executable: (dependencies.executable)()
             .map_err(|_| environment_decline("workflow_tree_adoption"))?,
         environment: adoption.environment.clone(),
-        activity: RunActivity::new(),
+        activity: activity_logging_to(&layout.log),
         home: adoption.home.to_owned(),
         log: RunLog::new(layout.log),
         sleeper: Arc::clone(&adoption.sleeper),

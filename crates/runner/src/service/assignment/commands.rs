@@ -356,6 +356,15 @@ impl AssignmentManager {
             .entry(accepted.assignment_id().to_owned())
             .or_default()
             .clone();
+        // The run's view, which the manager's reads and the run's observer share
+        // (REQ-RUNNERENROLL-147); none for a tree run.
+        let view = match &accepted.execution {
+            AcceptedExecution::Engine(admitted) => Some(AssignmentRunView::new(
+                admitted.workflow(),
+                admitted.execution().limits().maximum_parallel_steps().get(),
+            )),
+            AcceptedExecution::Tree(_) => None,
+        };
         self.hold(HeldAssignment::Running(Box::new(RunningAssignment {
             identity: accepted.identity.clone(),
             cancellation,
@@ -376,8 +385,9 @@ impl AssignmentManager {
                 AcceptedExecution::Tree(tree) => Some(Arc::clone(tree.activity())),
                 AcceptedExecution::Engine(_) => None,
             },
+            view: view.clone(),
         })));
-        Ok(Some(ExecutionJob::new(
+        let job = ExecutionJob::new(
             *accepted,
             self.outbox.clone(),
             self.artifact_delivery.clone(),
@@ -391,7 +401,11 @@ impl AssignmentManager {
                 start_authority: start_authority_receiver,
                 infrastructure_interruption: infrastructure_interruption_receiver,
             },
-        )))
+        );
+        Ok(Some(match view {
+            Some(view) => job.feeding(view),
+            None => job,
+        }))
     }
 
     pub(super) fn matching_decision_index(

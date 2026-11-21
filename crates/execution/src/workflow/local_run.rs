@@ -3112,6 +3112,13 @@ pub enum LocalStatusResult {
     PublicationFailed { phase: &'static str },
 }
 
+mod run_view;
+pub use run_view::{
+    LiveRunViewRequest, LiveRunningStep, LiveRunningSteps, RunView, RunViewChildRun, RunViewError,
+    RunViewObservedOutput, RunViewOutput, RunViewPathElement, RunViewRecord, RunViewRequest,
+    RunViewRetainedOutput, RunViewStage, RunViewStep, RunViewStepOutput, RunViewStream,
+    RunViewWait, RunViewWork, live_run_view, live_running_steps, read_run_view,
+};
 mod status_state;
 pub use status_state::{
     LocalStatusNode, LocalStatusProgress, LocalStatusStart, LocalStatusStateView,
@@ -3892,25 +3899,7 @@ impl StateStore {
                     });
                 }
             }
-            attempt.state = match &commit.state.workflow {
-                WorkflowState::Executing {
-                    gate: super::runtime::SchedulingGate::Cancelling { .. },
-                }
-                | WorkflowState::Finalizing {
-                    gate: super::runtime::FinalizationGate::Cancelling { .. },
-                    ..
-                } => AttemptStateV1::Cancelling,
-                WorkflowState::Executing { .. }
-                | WorkflowState::Finalizing {
-                    gate: super::runtime::FinalizationGate::Open,
-                    ..
-                } => AttemptStateV1::Running,
-                WorkflowState::Succeeded => AttemptStateV1::Succeeded,
-                WorkflowState::Failed { .. } => AttemptStateV1::WorkflowFailed,
-                WorkflowState::Cancelled { .. } => AttemptStateV1::Cancelled,
-                WorkflowState::Waiting { .. } => AttemptStateV1::Waiting,
-                WorkflowState::Continued { .. } => AttemptStateV1::Continued,
-            };
+            attempt.state = attempt_state_of(&commit.state.workflow);
             // A continued attempt keeps the edge it took, so a run whose next attempt never
             // began continues from it (REQ-CONTINUE-78).
             if let WorkflowState::Continued { edge } = &commit.state.workflow {
@@ -7964,6 +7953,51 @@ pub fn read_run_file_bounded(
     name: &str,
     maximum_bytes: u64,
 ) -> Result<Vec<u8>, LocalRunDirectoryError> {
+    let (parent, file) = open_run_file_parent(requested, name)?;
+    read_regular_file_bounded(&parent, file, maximum_bytes)
+}
+
+/// The end of a file: at most the bytes asked for, and the bytes of the file before them.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FileTail {
+    pub bytes: Vec<u8>,
+    pub omitted_bytes: u64,
+}
+
+/// Reads the last `maximum_bytes` of the file `name` beneath the directory at `requested`,
+/// walking the path as `read_run_file_bounded` does, without following a symbolic link or
+/// waiting on a FIFO, and answers them with the number of bytes of the file before them. A
+/// file of any size is read only from its window: a step's retained output and a run log
+/// can be far larger than a reader wants of them (REQ-RUNNERENROLL-145).
+pub fn read_run_file_tail(
+    requested: &Path,
+    name: &str,
+    maximum_bytes: u64,
+) -> Result<FileTail, LocalRunDirectoryError> {
+    use std::io::{Seek as _, SeekFrom};
+
+    let (parent, name) = open_run_file_parent(requested, name)?;
+    let (mut file, size) = open_regular_file(&parent, name)?;
+    let omitted_bytes = size.saturating_sub(maximum_bytes);
+    file.seek(SeekFrom::Start(omitted_bytes))
+        .map_err(|source| file_error(&parent, name, "seek", source))?;
+    let mut bytes = Vec::new();
+    file.take(maximum_bytes)
+        .read_to_end(&mut bytes)
+        .map_err(|source| file_error(&parent, name, "read", source))?;
+    Ok(FileTail {
+        bytes,
+        omitted_bytes,
+    })
+}
+
+/// The directory holding the file `name` beneath the directory at `requested`, each
+/// directory on the way opened without following a symbolic link, and the file's own name;
+/// a name with any component other than a plain name is refused.
+fn open_run_file_parent<'name>(
+    requested: &Path,
+    name: &'name str,
+) -> Result<(OwnedFd, &'name str), LocalRunDirectoryError> {
     let (_, mut parent) = open_run_root(requested)?;
     let mut components = Path::new(name).components();
     let file = match components.next_back() {
@@ -7984,7 +8018,7 @@ pub fn read_run_file_bounded(
     for directory in components {
         parent = open_directory_at(&parent, directory)?;
     }
-    read_regular_file_bounded(&parent, file, maximum_bytes)
+    Ok((parent, file))
 }
 
 pub(super) fn open_run_root(
@@ -10756,6 +10790,29 @@ pub(super) const fn attempt_trigger_name(trigger: AttemptTriggerV1) -> &'static 
     }
 }
 
+/// The attempt state the engine's workflow state is recorded as.
+const fn attempt_state_of<Deadline>(workflow: &WorkflowState<Deadline>) -> AttemptStateV1 {
+    match workflow {
+        WorkflowState::Executing {
+            gate: super::runtime::SchedulingGate::Cancelling { .. },
+        }
+        | WorkflowState::Finalizing {
+            gate: super::runtime::FinalizationGate::Cancelling { .. },
+            ..
+        } => AttemptStateV1::Cancelling,
+        WorkflowState::Executing { .. }
+        | WorkflowState::Finalizing {
+            gate: super::runtime::FinalizationGate::Open,
+            ..
+        } => AttemptStateV1::Running,
+        WorkflowState::Succeeded => AttemptStateV1::Succeeded,
+        WorkflowState::Failed { .. } => AttemptStateV1::WorkflowFailed,
+        WorkflowState::Cancelled { .. } => AttemptStateV1::Cancelled,
+        WorkflowState::Waiting { .. } => AttemptStateV1::Waiting,
+        WorkflowState::Continued { .. } => AttemptStateV1::Continued,
+    }
+}
+
 const fn attempt_state_name(state: AttemptStateV1) -> &'static str {
     match state {
         AttemptStateV1::Created => "created",
@@ -12520,6 +12577,27 @@ fn read_regular_file_bounded(
     name: &str,
     maximum_bytes: u64,
 ) -> Result<Vec<u8>, LocalRunDirectoryError> {
+    let (mut file, size) = open_regular_file(parent, name)?;
+    if size > maximum_bytes {
+        return Err(invalid_file_size(parent, name));
+    }
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(maximum_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| file_error(parent, name, "read", source))?;
+    if u64::try_from(bytes.len())
+        .ok()
+        .is_none_or(|size| size > maximum_bytes)
+    {
+        return Err(invalid_file_size(parent, name));
+    }
+    Ok(bytes)
+}
+
+/// The regular file `name` of `parent` opened without following a symbolic link or waiting
+/// on a FIFO, and its size.
+fn open_regular_file(parent: &OwnedFd, name: &str) -> Result<(File, u64), LocalRunDirectoryError> {
     let file = openat(
         parent,
         name,
@@ -12535,26 +12613,8 @@ fn read_regular_file_bounded(
             source: Box::new(LocalRunDirectoryError::RegularFileInvalid),
         });
     }
-    if metadata.st_size < 0
-        || u64::try_from(metadata.st_size)
-            .ok()
-            .is_none_or(|size| size > maximum_bytes)
-    {
-        return Err(invalid_file_size(parent, name));
-    }
-    let mut file = File::from(file);
-    let mut bytes = Vec::new();
-    Read::by_ref(&mut file)
-        .take(maximum_bytes + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|source| file_error(parent, name, "read", source))?;
-    if u64::try_from(bytes.len())
-        .ok()
-        .is_none_or(|size| size > maximum_bytes)
-    {
-        return Err(invalid_file_size(parent, name));
-    }
-    Ok(bytes)
+    let size = u64::try_from(metadata.st_size).map_err(|_| invalid_file_size(parent, name))?;
+    Ok((File::from(file), size))
 }
 
 fn invalid_file_size(parent: &OwnedFd, name: &str) -> LocalRunDirectoryError {

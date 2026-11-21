@@ -208,7 +208,8 @@ separate entity family.
   `login`, `logout`, `move`, `preview`, `propose`, `reference`, `remove`, `rename`,
   `request`, `retire`, `retry`, `revoke`, `run`, `schema`, `seal`, `serve`,
   `set`, `set-principal`, `show`, `signup`, `status`, `unarchive`, `update`, `upload`, `uses` (the record of
-  tokens issued from a grant), `validate`, `version`, `view`, `wait`. A new leaf
+  tokens issued from a grant), `validate`, `version`, `view`, `wait`, `watch` (follows a
+  live process and redraws until left; `view` shows a recorded one). A new leaf
   verb requires an amendment to this list; an existing command is not precedent
   for adding one.
 - **Minting:** choose the creation verb from the immediate sibling leaf set. If

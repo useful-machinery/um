@@ -21,6 +21,8 @@ pub(in crate::service) struct ObservationOutbox {
     state: Arc<Mutex<ObservationOutboxState>>,
     changed: Arc<Notify>,
     pub(super) maximum_encoded_bytes: u64,
+    /// The log a refusal of a full outbox is recorded in (REQ-RUNNERENROLL-138).
+    pub(super) events: Arc<EventLog>,
 }
 
 impl ObservationOutbox {
@@ -33,7 +35,14 @@ impl ObservationOutbox {
             })),
             changed: Arc::new(Notify::new()),
             maximum_encoded_bytes: MAXIMUM_ENCODED_OUTBOX_BYTES,
+            events: Arc::new(EventLog::new()),
         }
+    }
+
+    /// Records each refusal of a full outbox in `events` (REQ-RUNNERENROLL-138).
+    pub(super) fn with_events(mut self, events: Arc<EventLog>) -> Self {
+        self.events = events;
+        self
     }
 
     pub(super) fn reserve(
@@ -98,11 +107,16 @@ impl ObservationOutbox {
             || retained_bytes
                 .and_then(|total| total.checked_add(u64::try_from(encoded_bytes).ok()?))
                 .is_none_or(|total| total > self.maximum_encoded_bytes)
-            || (terminal
-                && state.entries.iter().any(|entry| {
-                    entry.observation.is_terminal()
-                        && entry.observation.assignment_id() == observation.assignment_id()
-                }))
+        {
+            // The outbox is full: the one refusal the runner's events list.
+            self.events.record(LoggedEvent::ObservationRefused);
+            return Err(OutboxFailure::Capacity);
+        }
+        if terminal
+            && state.entries.iter().any(|entry| {
+                entry.observation.is_terminal()
+                    && entry.observation.assignment_id() == observation.assignment_id()
+            })
         {
             return Err(OutboxFailure::Capacity);
         }
