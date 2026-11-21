@@ -10,7 +10,7 @@ use super::bearer_authorization;
 use super::http_client::{HttpClient, HttpEndpointError};
 use super::http_util::{self, BufferedResponseError};
 use super::human_principal::{self, HumanPrincipal};
-use super::problem::{self, FORBIDDEN, IDEMPOTENCY_CONFLICT, UNAUTHORIZED};
+use super::problem::{self, FORBIDDEN, IDEMPOTENCY_CONFLICT, RATE_LIMIT_EXCEEDED, UNAUTHORIZED};
 use super::{UnreachableCategory, classify_reqwest_error};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
@@ -29,6 +29,7 @@ pub enum SignupOutcome {
     Forbidden,
     AlreadyProvisioned,
     IdempotencyConflict,
+    RateLimited { retry_after: u64 },
     Unreachable(UnreachableCategory),
 }
 
@@ -188,26 +189,31 @@ async fn execute_signup_request(
 }
 
 async fn decode_response(response: Response) -> Result<SignupOutcome, AttemptError> {
-    let (status, content_type, body) =
-        http_util::decode_response_parts(response)
-            .await
-            .map_err(|error| match error {
-                BufferedResponseError::InvalidContentType { status } => {
-                    AttemptError::Protocol(SignupError::protocol(
-                        "the Content-Type header is not valid text",
-                        status == StatusCode::UNAUTHORIZED,
-                    ))
-                }
-                BufferedResponseError::TooLarge { status } => {
-                    AttemptError::Protocol(SignupError::protocol(
-                        "the response body exceeds 1 MiB",
-                        status == StatusCode::UNAUTHORIZED,
-                    ))
-                }
-                BufferedResponseError::Transport { source, .. } => {
-                    AttemptError::Transport(classify_reqwest_error(&source))
-                }
-            })?;
+    let http_util::BufferedResponse {
+        status,
+        content_type,
+        retry_after,
+        body,
+        ..
+    } = http_util::buffer_response(response)
+        .await
+        .map_err(|error| match error {
+            BufferedResponseError::InvalidContentType { status } => {
+                AttemptError::Protocol(SignupError::protocol(
+                    "the Content-Type header is not valid text",
+                    status == StatusCode::UNAUTHORIZED,
+                ))
+            }
+            BufferedResponseError::TooLarge { status } => {
+                AttemptError::Protocol(SignupError::protocol(
+                    "the response body exceeds 1 MiB",
+                    status == StatusCode::UNAUTHORIZED,
+                ))
+            }
+            BufferedResponseError::Transport { source, .. } => {
+                AttemptError::Transport(classify_reqwest_error(&source))
+            }
+        })?;
 
     match status {
         StatusCode::CREATED => {
@@ -259,7 +265,21 @@ async fn decode_response(response: Response) -> Result<SignupOutcome, AttemptErr
             }
         }
         StatusCode::TOO_MANY_REQUESTS => {
-            Ok(SignupOutcome::Unreachable(UnreachableCategory::RateLimited))
+            problem::require_type_parts(
+                &body,
+                StatusCode::TOO_MANY_REQUESTS,
+                content_type.as_deref(),
+                RATE_LIMIT_EXCEEDED,
+            )
+            .map_err(|reason| AttemptError::Protocol(SignupError::protocol(reason, false)))?;
+            parse_retry_after(retry_after.as_ref())
+                .map(|retry_after| SignupOutcome::RateLimited { retry_after })
+                .ok_or_else(|| {
+                    AttemptError::Protocol(SignupError::protocol(
+                        "a 429 response has an invalid Retry-After header",
+                        false,
+                    ))
+                })
         }
         status if status.is_server_error() => {
             Ok(SignupOutcome::Unreachable(UnreachableCategory::Server))
@@ -273,4 +293,13 @@ async fn decode_response(response: Response) -> Result<SignupOutcome, AttemptErr
             false,
         ))),
     }
+}
+
+/// The delay-seconds form of `Retry-After` the signup 429 promises: ASCII digits only, above zero.
+fn parse_retry_after(header: Option<&HeaderValue>) -> Option<u64> {
+    header
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
 }

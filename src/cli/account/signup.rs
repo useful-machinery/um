@@ -29,6 +29,7 @@ fn outcome_class(outcome: &SignupOutcome) -> OutcomeClass {
     match outcome {
         SignupOutcome::Authenticated(_) => OutcomeClass::Success,
         SignupOutcome::Unauthenticated => OutcomeClass::Unauthenticated,
+        SignupOutcome::RateLimited { .. } => OutcomeClass::RateLimited,
         SignupOutcome::Unreachable(category) => super::super::unreachable_outcome_class(*category),
         SignupOutcome::SignupNotPermitted | SignupOutcome::Forbidden => OutcomeClass::Forbidden,
         SignupOutcome::AlreadyProvisioned | SignupOutcome::IdempotencyConflict => {
@@ -49,13 +50,21 @@ struct SignupResult<'a> {
 #[derive(Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 enum SignupResultBody<'a> {
-    Authenticated { principal: PrincipalResult<'a> },
+    Authenticated {
+        principal: PrincipalResult<'a>,
+    },
     Unauthenticated,
     SignupNotPermitted,
     Forbidden,
     AlreadyProvisioned,
     IdempotencyConflict,
-    Unreachable { category: &'static str },
+    #[serde(rename_all = "camelCase")]
+    RateLimited {
+        retry_after: u64,
+    },
+    Unreachable {
+        category: &'static str,
+    },
 }
 
 impl<'a> SignupResult<'a> {
@@ -69,6 +78,9 @@ impl<'a> SignupResult<'a> {
             SignupOutcome::Forbidden => SignupResultBody::Forbidden,
             SignupOutcome::AlreadyProvisioned => SignupResultBody::AlreadyProvisioned,
             SignupOutcome::IdempotencyConflict => SignupResultBody::IdempotencyConflict,
+            SignupOutcome::RateLimited { retry_after } => SignupResultBody::RateLimited {
+                retry_after: *retry_after,
+            },
             SignupOutcome::Unreachable(category) => SignupResultBody::Unreachable {
                 category: category.as_str(),
             },
@@ -116,6 +128,11 @@ fn write_human_result(deployment: &str, outcome: &SignupOutcome) -> anyhow::Resu
             stdout,
             "! Account signup could not be completed because its request conflicted."
         ),
+        SignupOutcome::RateLimited { retry_after } => writeln!(
+            stdout,
+            "! Useful Machinery can't create your account just yet.\n\nTry again in {}:\n  useful account signup",
+            seconds(*retry_after)
+        ),
         SignupOutcome::Unreachable(category) => writeln!(
             stdout,
             "! Couldn't confirm Useful Machinery account creation ({}).\n\nRun before trying again:\n  useful auth status",
@@ -136,4 +153,12 @@ fn write_created_account(
     }
     writeln!(output, "  Principal:  {}", principal.id)?;
     writeln!(output, "  Deployment: {deployment}")
+}
+
+fn seconds(count: u64) -> String {
+    if count == 1 {
+        "1 second".to_owned()
+    } else {
+        format!("{count} seconds")
+    }
 }

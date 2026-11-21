@@ -509,6 +509,7 @@ pub enum SignupHumanError {
     Status401(models::Problem),
     Status403(models::Problem),
     Status409(models::Problem),
+    Status429(models::Problem),
     Status500(models::Problem),
     UnknownValue(serde_json::Value),
 }
@@ -2761,7 +2762,7 @@ pub fn revoke_integration_token_authorization(
     }
 }
 
-/// Explicitly provisions a human principal for the authenticated identity when the deployment's signup policy admits that identity: any authenticated human identity under `open`; under `invitation`, only an identity whose access token asserts a verified email that an outstanding, unexpired email invitation of an active organization is addressed to, the request naming no invitation; and none under `disabled`. The request has no body; identity and optional profile attributes come only from verified access-token claims.  Idempotency-Key is required. Keys are scoped to the authenticated identity and this operation and are retained for seven days. Retrying with the same key returns the original 201 response without repeating the principal or audit-record mutation. After signup, a new key for the same identity receives a conflict response.  Problem types: 403 `signup-not-permitted`; 409 `principal-already-provisioned`.
+/// Explicitly provisions a human principal for the authenticated identity when the deployment's signup policy admits that identity: any authenticated human identity under `open`; under `invitation`, only an identity whose access token asserts a verified email that an outstanding, unexpired email invitation of an active organization is addressed to, the request naming no invitation; and none under `disabled`. The request has no body; identity and optional profile attributes come only from verified access-token claims.  Idempotency-Key is required. Keys are scoped to the authenticated identity and this operation and are retained for seven days. Retrying with the same key returns the original 201 response without repeating the principal or audit-record mutation. After signup, a new key for the same identity receives a conflict response.  While the deployment's signup rate window is full, only a request that would otherwise create an account receives 429: a replay, an identity that already has an account, and an identity the policy does not admit are answered as while the window has room. The 429 creates nothing and keeps no result for its key, so the same request may be repeated with the same Idempotency-Key after `Retry-After`.  Problem types: 403 `signup-not-permitted`; 409 `principal-already-provisioned`; 429 `rate-limit-exceeded`.
 pub fn signup_human(
     configuration: &configuration::Configuration,
     idempotency_key: &str,

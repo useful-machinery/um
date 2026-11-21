@@ -884,6 +884,83 @@ async fn concurrent_consumers_copy_one_committed_file_without_shared_mutation() 
     .await;
 }
 
+// REQ-WFCOND-45, INV-ENGINE-44
+#[tokio::test]
+async fn a_first_of_input_materializes_the_chosen_file_output() {
+    with_watchdog(async {
+        let temporary = tempfile::tempdir().unwrap();
+        let execution_root = temporary.path().join("execution");
+        fs::create_dir(&execution_root).unwrap();
+        fs::write(execution_root.join("a.bin"), b"from a").unwrap();
+        fs::write(execution_root.join("b.bin"), b"from b").unwrap();
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let control_address = listener.local_addr().unwrap().to_string();
+        let executable = std::env::current_exe().unwrap();
+        let arguments = fixture_arguments();
+        let argv = serde_json::to_string(
+            &std::iter::once(executable.to_str().unwrap())
+                .chain(arguments.iter().map(String::as_str))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        // The sources' outputs are named apart, so a value read through the wrong source
+        // fails the start instead of passing.
+        let source = format!(
+            "schemaVersion: 1\ninputs:\n  request: {{kind: text}}\nsteps:\n  a:\n    kind: cmd\n    condition: {{equals: [{{ref: inputs.request}}, {{value: a}}]}}\n    command:\n      argv: [\"unused\"]\n    outputs:\n      first: {{kind: file, from: path, path: a.bin, mediaType: application/fixture}}\n  b:\n    kind: cmd\n    condition: {{equals: [{{ref: inputs.request}}, {{value: b}}]}}\n    command:\n      argv: {argv}\n    outputs:\n      second: {{kind: file, from: path, path: b.bin, mediaType: application/fixture}}\n  c:\n    kind: cmd\n    inputs:\n      report: {{firstOf: [outputs.a.first, outputs.b.second]}}\n    command:\n      argv: {argv}\n"
+        );
+        let admitted = admit_fixture_with_inputs(
+            temporary.path(),
+            &execution_root,
+            &source,
+            fixture_environment(&control_address, 0, &execution_root, None),
+            FixtureExecution {
+                limits: ExecutionPolicyLimits::new(
+                    1,
+                    CaptureLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024),
+                    InputLimits::new(1024, 1024 * 1024, 64 * 1024 * 1024, 64 * 1024 * 1024),
+                    1024 * 1024,
+                ),
+                imports: ResolvedInputs::new(BTreeMap::from([(
+                    "request".to_owned(),
+                    ResolvedInput::Text(Arc::from("b")),
+                )])),
+            },
+        );
+        let artifacts = test_artifacts(&admitted);
+        let diagnostics = StepDiagnosticLog::default();
+        let (commit_sender, _commits) = mpsc::unbounded_channel();
+        let execution = execute_workflow(
+            admitted,
+            &artifacts.staging,
+            &artifacts.inputs,
+            &diagnostics,
+            TestClock,
+            RecordingCommitPort {
+                commits: commit_sender,
+            },
+        );
+        let commands = async {
+            let (producer_control, _) = accept_report(&listener).await;
+            release(producer_control).await;
+            let (consumer_control, consumer_report) = accept_report(&listener).await;
+            let inputs = PathBuf::from(&consumer_report.environment["USEFUL_STEP_INPUTS"]);
+            let value = fs::read(inputs.join("values/report")).unwrap();
+            release(consumer_control).await;
+            value
+        };
+
+        let (result, value) = tokio::join!(execution, commands);
+        assert_eq!(value, b"from b");
+        let result = result.unwrap();
+        assert_eq!(result.state.workflow, WorkflowState::Succeeded);
+        assert!(matches!(
+            result.state.steps["a"].state,
+            StepState::Skipped { .. }
+        ));
+    })
+    .await;
+}
+
 #[tokio::test]
 async fn workflow_execution_dispatches_start_actions_to_the_step_runtime() {
     with_watchdog(async {
@@ -941,6 +1018,7 @@ async fn workflow_execution_dispatches_start_actions_to_the_step_runtime() {
                 condition_passed: false,
                 failure_kind: None,
                 failed_child: None,
+                input_sources: Vec::new(),
             }
         );
         assert_eq!(
@@ -2399,6 +2477,91 @@ steps:
     ));
 }
 
+// REQ-WFEXEC-56
+// INV-ENGINE-17
+#[tokio::test]
+async fn every_first_of_outcome_source_is_checked_at_capture() {
+    let temporary = tempfile::tempdir().unwrap();
+    let execution_root = temporary.path().join("execution");
+    fs::create_dir(&execution_root).unwrap();
+    for file in ["adopt.txt", "pick.txt"] {
+        fs::write(execution_root.join(file), b"shipped").unwrap();
+    }
+    let source = r#"schemaVersion: 1
+outcomes: [planned, blocked, failed]
+outcome:
+  from: {firstOf: [outputs.route.verdict, outputs.adopt.verdict]}
+  onFailure: failed
+steps:
+  pick:
+    kind: cmd
+    command: {argv: ["/bin/true"]}
+    outputs:
+      verdict: {kind: text, from: path, path: pick.txt}
+  route:
+    kind: cmd
+    condition: {equals: [{ref: outputs.pick.verdict}, {value: route}]}
+    command: {argv: ["/bin/true"]}
+    outputs:
+      verdict: {kind: text, from: path, path: route.txt}
+  adopt:
+    kind: cmd
+    condition: {equals: [{ref: outputs.pick.verdict}, {value: adopt}]}
+    command: {argv: ["/bin/true"]}
+    outputs:
+      verdict: {kind: text, from: path, path: adopt.txt}
+"#;
+    let admitted = admit_fixture(
+        temporary.path(),
+        &execution_root,
+        source,
+        EnvironmentSnapshot::default(),
+        1,
+    );
+    let (sender, mut receiver) = occurrence_channel(NonZeroUsize::new(2).unwrap());
+    let artifacts = test_artifacts(&admitted);
+    let runtime = StepRuntime::new(
+        admitted.clone(),
+        artifacts.staging.clone(),
+        artifacts.inputs.clone(),
+        sender,
+        TestClock,
+    );
+    let action = |sequence| ActionId {
+        transition_sequence: TransitionSequence(sequence),
+    };
+
+    // The second listed source's text outside `outcomes` fails its capture.
+    runtime
+        .capture_outputs("adopt".to_owned(), action(1))
+        .await
+        .unwrap();
+    let (occurrence, acknowledgement) = next_acknowledged_occurrence(&mut receiver).await;
+    acknowledgement.resolve(false).await;
+    let Occurrence::OutputCaptureFailed { step, cause, .. } = &occurrence else {
+        panic!("an undeclared outcome did not report outputCaptureFailed: {occurrence:?}");
+    };
+    assert_eq!(step, "adopt");
+    assert_eq!(
+        cause,
+        &StepFailureCause::OutputCapture(OutputCaptureFailure::OutcomeUndeclared {
+            output: "verdict".to_owned(),
+        })
+    );
+
+    // A step the outcome does not name commits the same text.
+    runtime
+        .capture_outputs("pick".to_owned(), action(2))
+        .await
+        .unwrap();
+    let (occurrence, acknowledgement) = next_acknowledged_occurrence(&mut receiver).await;
+    acknowledgement.resolve(false).await;
+    assert!(
+        matches!(&occurrence, Occurrence::OutputsCaptured { step, .. } if step == "pick"),
+        "{occurrence:?}"
+    );
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct CaptureBudgetTranscript {
     winner: String,
@@ -3239,7 +3402,13 @@ async fn prelaunch_cancellation_releases_inputs_before_reporting_quiescence() {
         );
         let deadline = TestInstant(Duration::from_secs(41));
         let (start, cancel) = running_cancellation_actions(&admitted, deadline);
-        let Action::StartStep { step, inputs, .. } = start.action else {
+        let Action::StartStep {
+            step,
+            inputs,
+            input_sources,
+            ..
+        } = start.action
+        else {
             panic!("fixture did not produce a start action");
         };
         let Action::CancelStep {
@@ -3284,7 +3453,8 @@ async fn prelaunch_cancellation_releases_inputs_before_reporting_quiescence() {
         assert!(agent_deadline.is_none());
         wake.unwrap().send(()).unwrap();
 
-        let execution = runtime.execute_registered_step(step, start.id, inputs, cancellation);
+        let execution =
+            runtime.execute_registered_step(step, start.id, inputs, input_sources, cancellation);
         tokio::pin!(execution);
         std::future::poll_fn(|context| match execution.as_mut().poll(context) {
             Poll::Ready(result) => panic!("quiescence bypassed channel backpressure: {result:?}"),

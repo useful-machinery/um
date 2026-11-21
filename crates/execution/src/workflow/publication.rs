@@ -32,7 +32,7 @@ use super::artifact_set;
 use super::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};
 use super::document::{FailurePolicy, FinalizationTrigger};
 use super::evidence::{
-    FailedChild, FailureDetail, NodeDetail, PrimaryIssue, deserialize_non_null_option,
+    FailedChild, FailureDetail, InputSource, NodeDetail, PrimaryIssue, deserialize_non_null_option,
 };
 use super::execution_root::open_directory;
 use super::export_presentation::{ContentReason, Field, resolve_text};
@@ -110,6 +110,9 @@ pub struct WorkflowRunStep {
     /// The failed child a `succeeded` `workflow` step recorded (REQ-WFEXEC-77); `None` for
     /// any other step.
     pub failed_child: Option<FailedChild>,
+    /// The source each `firstOf` of the step's body took; empty for a step that did not
+    /// start in the attempt and a step with no `firstOf` (REQ-EVIDENCE-28).
+    pub input_sources: Vec<InputSource>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1096,6 +1099,10 @@ pub struct WorkflowStepV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub(crate) failed_child: Option<FailedChild>,
+    /// The source each `firstOf` of a step that started took (REQ-EVIDENCE-28); absent
+    /// from a result an earlier `useful` published.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) input_sources: Vec<InputSource>,
     #[serde(
         default,
         deserialize_with = "deserialize_non_null_option",
@@ -3265,6 +3272,7 @@ fn step_v1(step: &WorkflowRunStep, local: bool) -> Result<WorkflowStepV1, LocalP
         detail,
         diagnostic,
         failed_child,
+        input_sources: step.input_sources.clone(),
         command_output,
     })
 }

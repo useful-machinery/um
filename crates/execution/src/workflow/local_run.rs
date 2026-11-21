@@ -927,6 +927,11 @@ pub(super) struct AttemptStepV1 {
         skip_serializing_if = "Option::is_none"
     )]
     pub(super) failed_child: Option<super::evidence::FailedChild>,
+    /// The source each `firstOf` of a step that started took, kept through recovery
+    /// executions and whatever state the step then reaches (REQ-EVIDENCE-28); absent from a
+    /// state an earlier `useful` wrote.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(super) input_sources: Vec<super::evidence::InputSource>,
     /// The time of the commit that first moved the node out of `pending` in this attempt,
     /// kept through recovery executions and after the node ends (REQ-LOCALRUN-201).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -6073,6 +6078,7 @@ fn update_progress_nodes<Cause, Output>(
             StepState::Succeeded { .. } => runtime.failed_child.clone(),
             _ => None,
         };
+        node.input_sources.clone_from(&runtime.input_sources);
     }
     Ok(())
 }
@@ -10438,6 +10444,7 @@ fn fresh_progress_node(
         detail: None,
         diagnostic: None,
         failed_child: None,
+        input_sources: Vec::new(),
         started_at: None,
         recovery: None,
     })
@@ -11383,6 +11390,7 @@ fn validate_attempt_step<'a>(
     if !attempt_step_detail_valid(step.role, step.state, step.detail.as_ref())
         || !attempt_step_diagnostic_valid(step.state, step.diagnostic.as_ref())
         || !attempt_step_started_at_valid(step.state, step.started_at.as_deref())
+        || !attempt_step_input_sources_valid(step.state, &step.input_sources)
     {
         return Err(LocalRunDirectoryError::AttemptStepDetailInvalid);
     }
@@ -11874,6 +11882,8 @@ fn validate_attempt_finalization<'a>(
                             finalizer.state,
                             finalizer.started_at.as_deref(),
                         )
+                        // A finalizer's body takes no `firstOf` (REQ-EVIDENCE-28).
+                        || !finalizer.input_sources.is_empty()
                         || !retained_output_set_valid(
                             finalizer.role,
                             &finalizer.id,
@@ -12366,6 +12376,24 @@ fn attempt_step_started_at_valid(state: AttemptStepStateV1, started_at: Option<&
             AttemptStepStateV1::Pending | AttemptStepStateV1::Inherited
         ) && valid_timestamp(started_at)
     })
+}
+
+/// A step that started in its attempt may carry the well-formed sources its `firstOf`s
+/// took; a pending, blocked, skipped, not-run or inherited step never does
+/// (REQ-EVIDENCE-28).
+fn attempt_step_input_sources_valid(
+    state: AttemptStepStateV1,
+    sources: &[super::evidence::InputSource],
+) -> bool {
+    sources.is_empty()
+        || (!matches!(
+            state,
+            AttemptStepStateV1::Pending
+                | AttemptStepStateV1::Blocked
+                | AttemptStepStateV1::Skipped
+                | AttemptStepStateV1::NotRun
+                | AttemptStepStateV1::Inherited
+        ) && super::evidence::valid_input_sources(sources))
 }
 
 fn attempt_step_detail_valid(

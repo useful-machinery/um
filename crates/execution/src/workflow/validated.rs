@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use super::claude_code::ClaudeCodeConfig;
@@ -56,7 +57,8 @@ pub struct ValidatedWorkflow {
     pub finalizers: BTreeMap<String, ValidatedFinalizer>,
     pub finalizer_source_order: Vec<String>,
     pub finalizer_presentation_order: Vec<String>,
-    pub exports: BTreeMap<String, ResolvedOutputSource>,
+    /// Each export's sources in written order (REQ-WFFORMAT-65, REQ-WFFORMAT-107).
+    pub exports: BTreeMap<String, OutputSources>,
     pub export_presentation: BTreeMap<String, ValidatedExportPresentation>,
     /// The declared outcomes and their source (REQ-WFFORMAT-87, REQ-WFFORMAT-88); `None`
     /// leaves the implicit outcomes `succeeded` and `failed`.
@@ -110,12 +112,14 @@ impl ValidatedWorkflow {
     }
 }
 
-/// A workflow's declared outcomes: `source` is a `text` output of a required,
-/// unconditional ordinary step, and `on_failure` is one of `names`.
+/// A workflow's declared outcomes: `source` holds the `text` outputs of required ordinary
+/// steps that `outcome.from` names, in written order, a list of one for a single reference,
+/// whose step then declares no `condition` (REQ-WFFORMAT-88, REQ-WFFORMAT-108); `on_failure`
+/// is one of `names`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ValidatedOutcome {
     pub names: Vec<String>,
-    pub source: ResolvedOutputSource,
+    pub source: OutputSources,
     pub on_failure: String,
 }
 
@@ -261,6 +265,10 @@ pub(crate) struct ResolvedDirectPrerequisite {
     pub(crate) disposition_control: bool,
     pub(crate) data: bool,
     pub(crate) condition_data: bool,
+    /// The producer is a source of a `firstOf` in the consumer's body (REQ-WFFORMAT-39),
+    /// independent of `data`: a source may be skipped and passed over, so it is never a
+    /// data prerequisite unless the consumer also names it by a single reference.
+    pub(crate) first_of: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -297,6 +305,154 @@ pub(crate) enum ResolvedValueSource {
     Item {
         field: Option<String>,
     },
+    /// A `firstOf`, its sources in the order they are tried; an ordinary step's `inputs`
+    /// and agent message only (REQ-WFFORMAT-105). The reference's `value_type` is the kind
+    /// every source shares (REQ-WFFORMAT-106).
+    FirstOf(Vec<ResolvedOutputSource>),
+}
+
+impl ResolvedValueSource {
+    /// The step outputs the value may be taken from: its output reference, every source of a
+    /// `firstOf`, and none for a value that names no output.
+    pub(crate) fn output_sources(&self) -> &[ResolvedOutputSource] {
+        match self {
+            Self::Output(output) => std::slice::from_ref(output),
+            Self::FirstOf(sources) => sources,
+            Self::Input(_)
+            | Self::FinalizationContext
+            | Self::Wait(_)
+            | Self::ControlsAnswers
+            | Self::Item { .. } => &[],
+        }
+    }
+}
+
+/// The list of an agent step's message an entry belongs to.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum MessageList {
+    Text,
+    Attachments,
+}
+
+/// Where a `firstOf` is bound in an ordinary step's body (REQ-WFFORMAT-105): a command
+/// step's input by name, or an agent message entry by list and zero-based index. The order
+/// is inputs by name, then text entries, then attachments, each by index.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum FirstOfBinding {
+    Input(String),
+    Message { list: MessageList, index: usize },
+}
+
+/// The source each `firstOf` of a step's body took when the step was started
+/// (REQ-WFCOND-45, INV-ENGINE-44).
+pub(crate) type ChosenSources = BTreeMap<FirstOfBinding, ResolvedOutputSource>;
+
+impl ValidatedStep {
+    /// Each `firstOf` in the step's body with its sources in written order; empty for a
+    /// `workflow` step, whose body never holds one.
+    pub(crate) fn first_of_bindings(&self) -> BTreeMap<FirstOfBinding, &[ResolvedOutputSource]> {
+        match self {
+            Self::Command(command) => command
+                .inputs
+                .iter()
+                .filter_map(|(name, reference)| match &reference.source {
+                    ResolvedValueSource::FirstOf(sources) => {
+                        Some((FirstOfBinding::Input(name.clone()), sources.as_slice()))
+                    }
+                    _ => None,
+                })
+                .collect(),
+            Self::Agent(agent) => {
+                let message = &agent.agent.message;
+                [
+                    (MessageList::Text, &message.text),
+                    (MessageList::Attachments, &message.attachments),
+                ]
+                .into_iter()
+                .flat_map(|(list, entries)| {
+                    entries
+                        .iter()
+                        .enumerate()
+                        .filter_map(move |(index, entry)| match entry {
+                            ValidatedMessageSource::Reference {
+                                source: ResolvedValueSource::FirstOf(sources),
+                                ..
+                            } => {
+                                Some((FirstOfBinding::Message { list, index }, sources.as_slice()))
+                            }
+                            _ => None,
+                        })
+                })
+                .collect()
+            }
+            Self::Workflow(_) => BTreeMap::new(),
+        }
+    }
+}
+
+/// The single source a `firstOf` bound at `binding` resolves to: the chosen source, when
+/// the list holds it. Anything else leaves the `firstOf` in place, which every reader of a
+/// body refuses as an unavailable input.
+fn chosen_source(
+    binding: &FirstOfBinding,
+    source: &ResolvedValueSource,
+    chosen: &ChosenSources,
+) -> Option<ResolvedValueSource> {
+    let ResolvedValueSource::FirstOf(sources) = source else {
+        return None;
+    };
+    chosen
+        .get(binding)
+        .filter(|choice| sources.contains(choice))
+        .cloned()
+        .map(ResolvedValueSource::Output)
+}
+
+impl ValidatedCommandStep {
+    /// The step with each `firstOf` input replaced by the source the reducer chose for it, so
+    /// the input is materialized as a single reference's (INV-ENGINE-44).
+    pub(crate) fn with_chosen_sources(&self, chosen: &ChosenSources) -> Cow<'_, Self> {
+        if chosen.is_empty() {
+            return Cow::Borrowed(self);
+        }
+        let mut resolved = self.clone();
+        for (name, reference) in &mut resolved.inputs {
+            if let Some(source) = chosen_source(
+                &FirstOfBinding::Input(name.clone()),
+                &reference.source,
+                chosen,
+            ) {
+                reference.source = source;
+            }
+        }
+        Cow::Owned(resolved)
+    }
+}
+
+impl ValidatedAgentStep {
+    /// The step with each `firstOf` message entry replaced by the source the reducer chose
+    /// for it, so the entry is read as a single reference's (INV-ENGINE-44).
+    pub(crate) fn with_chosen_sources(&self, chosen: &ChosenSources) -> Cow<'_, Self> {
+        if chosen.is_empty() {
+            return Cow::Borrowed(self);
+        }
+        let mut resolved = self.clone();
+        let message = &mut resolved.agent.message;
+        for (list, entries) in [
+            (MessageList::Text, &mut message.text),
+            (MessageList::Attachments, &mut message.attachments),
+        ] {
+            for (index, entry) in entries.iter_mut().enumerate() {
+                if let ValidatedMessageSource::Reference { source, .. } = entry
+                    && let Some(chosen) =
+                        chosen_source(&FirstOfBinding::Message { list, index }, source, chosen)
+                {
+                    *source = chosen;
+                }
+            }
+        }
+        Cow::Owned(resolved)
+    }
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -310,6 +466,127 @@ impl ResolvedOutputSource {
     pub(crate) fn reference(&self) -> String {
         format!("outputs.{}.{}", self.node.id, self.output)
     }
+}
+
+/// The sources an export or the outcome takes its value from, in written order: one for a
+/// single reference, two to sixteen for a `firstOf` (REQ-WFFORMAT-107, REQ-WFFORMAT-108). It
+/// is never empty, and every source has the kind of the first (REQ-WFFORMAT-106).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutputSources {
+    first: ResolvedOutputSource,
+    rest: Vec<ResolvedOutputSource>,
+}
+
+impl OutputSources {
+    /// The one source a single reference names.
+    pub(crate) fn single(source: ResolvedOutputSource) -> Self {
+        Self {
+            first: source,
+            rest: Vec::new(),
+        }
+    }
+
+    /// The sources in written order; `None` for an empty list.
+    pub(crate) fn from_list(sources: Vec<ResolvedOutputSource>) -> Option<Self> {
+        let mut sources = sources.into_iter();
+        let first = sources.next()?;
+        Some(Self {
+            first,
+            rest: sources.collect(),
+        })
+    }
+
+    /// The first source in written order, which is the only one of a single reference.
+    pub fn first(&self) -> &ResolvedOutputSource {
+        &self.first
+    }
+
+    /// Every source in written order.
+    pub fn iter(&self) -> impl Iterator<Item = &ResolvedOutputSource> + Clone {
+        std::iter::once(&self.first).chain(&self.rest)
+    }
+
+    /// The kind every source shares, which is the value's type.
+    pub fn value_type(&self) -> WorkflowValueType {
+        self.first.value_type
+    }
+
+    /// The source the value resolves to once the run has ended (INV-ENGINE-45): the source
+    /// the choice takes, or else the first that neither succeeded nor was skipped, or the
+    /// first source when every source was skipped. `None` while a source is not terminal.
+    pub(crate) fn settled_source(
+        &self,
+        ended: impl Fn(&ResolvedOutputSource) -> SourceEnd,
+    ) -> Option<&ResolvedOutputSource> {
+        match choose_first_of(self.iter(), ended) {
+            FirstOfChoice::Waiting => None,
+            FirstOfChoice::Chosen(source) => Some(source),
+            FirstOfChoice::Blocked(sources) => {
+                Some(sources.first().copied().unwrap_or(&self.first))
+            }
+        }
+    }
+}
+
+/// How the step of a `firstOf` source stands, as the choice reads it (INV-ENGINE-44).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SourceEnd {
+    /// The step has not reached a terminal state.
+    Pending,
+    /// The step succeeded or was inherited as succeeded.
+    Succeeded,
+    /// The step was skipped or inherited as skipped.
+    Skipped,
+    /// The step ended any other way: failed, blocked, not run or cancelled.
+    Unsupplied,
+}
+
+/// How a `firstOf` stands, from the node states of its sources alone (REQ-WFCOND-45,
+/// REQ-WFCOND-46, INV-ENGINE-44).
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum FirstOfChoice<'a> {
+    /// A source has not reached a terminal state.
+    Waiting,
+    /// Every source is terminal, none ended other than succeeded or skipped, and this is the
+    /// first in written order that succeeded or was inherited as succeeded.
+    Chosen(&'a ResolvedOutputSource),
+    /// The sources that leave the `firstOf` without a value, in written order: each that
+    /// ended failed, blocked, not run or cancelled, as soon as one has, or every source when
+    /// all of them were skipped.
+    Blocked(Vec<&'a ResolvedOutputSource>),
+}
+
+/// The choice of a `firstOf` (INV-ENGINE-44), the one rule a step's body, an export and the
+/// archived view apply; `ended` answers how each source's step stands.
+pub(crate) fn choose_first_of<'a, Sources>(
+    sources: Sources,
+    ended: impl Fn(&ResolvedOutputSource) -> SourceEnd,
+) -> FirstOfChoice<'a>
+where
+    Sources: IntoIterator<Item = &'a ResolvedOutputSource>,
+    Sources::IntoIter: Clone,
+{
+    let sources = sources.into_iter();
+    let unsupplied = sources
+        .clone()
+        .filter(|source| ended(source) == SourceEnd::Unsupplied)
+        .collect::<Vec<_>>();
+    if !unsupplied.is_empty() {
+        return FirstOfChoice::Blocked(unsupplied);
+    }
+    if sources
+        .clone()
+        .any(|source| ended(source) == SourceEnd::Pending)
+    {
+        return FirstOfChoice::Waiting;
+    }
+    sources
+        .clone()
+        .find(|source| ended(source) == SourceEnd::Succeeded)
+        .map_or_else(
+            || FirstOfChoice::Blocked(sources.collect()),
+            FirstOfChoice::Chosen,
+        )
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

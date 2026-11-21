@@ -237,6 +237,16 @@ inputs:
 | `outputs.<node>.<output>` | The declared output's exact type. |
 | `finalization.context` | Engine-owned JSON; finalizer command input, agent attachment, or condition only. Context schema version 2 contains stable run/attempt IDs and bounded classified failed/blocked ordinary-step facts; unavailable diagnostics are null, not inferred. Resuming an attempt retains identity; retry/continuation uses a new attempt ID. |
 
+In a `cmd` step's `inputs` or an ordinary agent step's `message.text` or
+`message.attachments` an entry may be
+`{ firstOf: [outputs.a.out, outputs.b.out] }`: 2 to 16 distinct output references, each
+checked as a `ref` there. The step waits until every named step is terminal, passes over
+skipped ones and takes the first that succeeded; any other ending of a named step, or all
+skipped, blocks it. Sources share one kind, JSON sources one `schema` path and file
+sources one `mediaType`. An entry after one naming the same step, or a step without a
+`condition`, is unreachable and refused. Exports and `outcome.from` also accept
+`firstOf`; nothing else does.
+
 Nodes reference inputs and ordinary outputs; finalizers may also reference finalizer
 outputs and `finalization.context`. Inputs add no edges. Conditions admit only Text/JSON
 values. An input is required unless `optional: true` or defaulted. A JSON default string
@@ -333,16 +343,20 @@ That `$schema` belongs in the separate result-schema JSON file. Do not add a roo
 
 `exports` gives stable names to outputs without conversion. Export sources must be
 required nodes. A finalizer export also requires `succeeded` in that finalizer's trigger
-set.
+set. A `firstOf` export, which keeps `presentation`, lists outputs of required ordinary
+`cmd` or `agent` steps, never `git_branch`. It is available with the first that succeeded
+when the rest succeeded or skipped; otherwise unavailable with the reason of the first
+that neither succeeded nor skipped, or `source_skipped` if all skipped.
 
 `outcomes` lists 1 to 64 distinct names a run may end with. Each name
 matches `^[a-z][a-z0-9_]*$`, has at most 64 characters, and is not one of the engine
 outcomes `withdrawn`, `canceled`, or `superseded`. `outcome` names where the choice comes
-from: `from` is an `outputs.<step>.<output>` reference and `onFailure` is the name a
-failed run takes. Declare both keys or neither; `onFailure` must be one of `outcomes`
-(else `invalid_outcome_declaration`). The source must be a declared `text`
-output of a required ordinary step without a `condition` (else
-`invalid_outcome_source`). Without the declaration a workflow has the implicit outcomes
+from: `from` is an `outputs.<step>.<output>` reference or a `firstOf` and `onFailure` is
+the name a failed run takes. Declare both keys or neither; `onFailure` must be one of `outcomes`
+(else `invalid_outcome_declaration`). Each source must be a declared `text`
+output of a required ordinary step, without a `condition` unless in a `firstOf` (else
+`invalid_outcome_source`). A `firstOf` gives the text of the first that succeeded, or
+`onFailure` if all skipped. Without the declaration a workflow has the implicit outcomes
 `succeeded` and `failed`.
 
 ```yaml

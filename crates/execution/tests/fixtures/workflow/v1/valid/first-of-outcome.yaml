@@ -1,0 +1,32 @@
+schemaVersion: 1
+inputs:
+  route:
+    kind: text
+outcomes: [planned, adopted, failed]
+outcome:
+  from:
+    firstOf: [outputs.plan.verdict, outputs.adopt.verdict]
+  onFailure: failed
+steps:
+  plan:
+    kind: cmd
+    condition:
+      equals: [{ ref: inputs.route }, { value: plan }]
+    command:
+      argv: ["./scripts/plan.sh"]
+    outputs:
+      verdict:
+        kind: text
+        from: path
+        path: plan.txt
+  adopt:
+    kind: cmd
+    condition:
+      equals: [{ ref: inputs.route }, { value: adopt }]
+    command:
+      argv: ["./scripts/adopt.sh"]
+    outputs:
+      verdict:
+        kind: text
+        from: path
+        path: adopt.txt

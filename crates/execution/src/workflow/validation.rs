@@ -11,18 +11,20 @@ use super::document::{
     Agent, AgentProfile, CommonNode, ConditionOperand, ConditionPredicate, EdgeTarget,
     ExportPresentation, FailurePolicy, FinalizerDefinition, ForEach, InputDeclaration, JsonDefault,
     MessageSource, NodeBody, Output, OutputReference, PresentationSource, RecoveryHandler,
-    RootBlocks, StepDefinition, StepRecovery, ValueReference, WaitKind, WaitRule, WorkflowDocument,
+    RootBlocks, SourceReference, StepDefinition, StepRecovery, ValueReference, WaitKind, WaitRule,
+    WorkflowDocument,
 };
 use super::evidence::{MAXIMUM_PREREQUISITES, Prerequisite};
 use super::export_presentation::{Field, resolve_text};
 use super::validated::{
-    DeclaredInputs, ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueReference,
-    ResolvedValueSource, Scheduling, ValidatedAgent, ValidatedAgentMessage, ValidatedAgentStep,
-    ValidatedChildInput, ValidatedCommandStep, ValidatedCommonStep, ValidatedEdgeTarget,
-    ValidatedExportPresentation, ValidatedFinalizer, ValidatedForEach, ValidatedHarness,
-    ValidatedInputDefault, ValidatedMessageSource, ValidatedOutcome, ValidatedOutput,
-    ValidatedPresentationField, ValidatedRecoveryHandler, ValidatedStep, ValidatedStepRecovery,
-    ValidatedWorkflow, ValidatedWorkflowStep, WorkflowNode, WorkflowNodeRole, WorkflowValueType,
+    DeclaredInputs, OutputSources, ResolvedDirectPrerequisite, ResolvedOutputSource,
+    ResolvedValueReference, ResolvedValueSource, Scheduling, ValidatedAgent, ValidatedAgentMessage,
+    ValidatedAgentStep, ValidatedChildInput, ValidatedCommandStep, ValidatedCommonStep,
+    ValidatedEdgeTarget, ValidatedExportPresentation, ValidatedFinalizer, ValidatedForEach,
+    ValidatedHarness, ValidatedInputDefault, ValidatedMessageSource, ValidatedOutcome,
+    ValidatedOutput, ValidatedPresentationField, ValidatedRecoveryHandler, ValidatedStep,
+    ValidatedStepRecovery, ValidatedWorkflow, ValidatedWorkflowStep, WorkflowNode,
+    WorkflowNodeRole, WorkflowValueType,
 };
 use super::wait::{Operand, parse_where};
 
@@ -44,6 +46,8 @@ pub(crate) enum ValidationFailureKind {
     UnknownOutput,
     MessageTypeMismatch,
     TerminalOutputReference,
+    IncompatibleReferenceSources,
+    UnreachableReferenceSource,
     ExcessAgentResponseOutput,
     ExcessAgentResultOutput,
     ConflictingAgentValueOutputs,
@@ -241,7 +245,7 @@ impl ChildWorkflowSummary {
             exports: child
                 .exports
                 .iter()
-                .map(|(name, source)| (name.clone(), source.value_type))
+                .map(|(name, sources)| (name.clone(), sources.value_type()))
                 .collect(),
             inputs: child
                 .declared_inputs
@@ -1298,16 +1302,7 @@ fn insert_control_prerequisite(
     if !target_exists {
         return Err(failure(missing_kind));
     }
-    prerequisites.insert(
-        dependency.clone(),
-        ResolvedDirectPrerequisite {
-            producer: dependency.clone(),
-            control: true,
-            disposition_control: false,
-            data: false,
-            condition_data: false,
-        },
-    );
+    direct_prerequisite(prerequisites, dependency).control = true;
     Ok(())
 }
 
@@ -1462,16 +1457,7 @@ fn infer_condition_prerequisites(
                 ));
             }
             if consumer_role == target_role {
-                prerequisites
-                    .entry(node.clone())
-                    .and_modify(|prerequisite| prerequisite.disposition_control = true)
-                    .or_insert_with(|| ResolvedDirectPrerequisite {
-                        producer: node.clone(),
-                        control: false,
-                        disposition_control: true,
-                        data: false,
-                        condition_data: false,
-                    });
+                direct_prerequisite(prerequisites, node).disposition_control = true;
             }
         }
     }
@@ -1503,11 +1489,13 @@ fn infer_condition_value_reference(
             Ok(())
         }
         // The structural schema admits the control values and the element only in a
-        // `workflow` step's inputs, never in a condition.
+        // `workflow` step's inputs and a first-of only in an ordinary step's body, never in
+        // a condition.
         ValueReference::FinalizationContext
         | ValueReference::Wait { .. }
         | ValueReference::ControlsAnswers
-        | ValueReference::Item { .. } => Err(ValidationFailure::new(
+        | ValueReference::Item { .. }
+        | ValueReference::FirstOf(_) => Err(ValidationFailure::new(
             ValidationFailureKind::InvalidConditionReference,
             location,
         )),
@@ -1708,43 +1696,67 @@ fn infer_reference_prerequisite(
         | ValueReference::ControlsAnswers
         | ValueReference::Item { .. } => return Ok(()),
         ValueReference::Output(reference) => {
-            let (producer_role, producer_body, output) =
-                declared_output(document, reference, location.clone())?;
-            if matches!(output, Output::GitBranchWorkspace) {
-                return Err(ValidationFailure::new(
-                    ValidationFailureKind::TerminalOutputReference,
-                    location,
-                ));
-            }
-            if reference.node == consumer_name && producer_role == consumer_role {
-                return Err(ValidationFailure::new(
-                    ValidationFailureKind::SelfDependency,
-                    location,
-                ));
-            }
-            if consumer_role == WorkflowNodeRole::Step
-                && producer_role == WorkflowNodeRole::Finalizer
-            {
-                return Err(ValidationFailure::new(
-                    ValidationFailureKind::CrossPhaseOutputReference,
-                    location,
-                ));
-            }
-            validate_data_dependency_authority(
-                document,
+            let producer_role = check_output_reference(
                 consumer_name,
-                &reference.node,
                 consumer_role,
-                producer_role,
-                common_node(producer_body).failure_policy,
+                reference,
+                document,
                 &location,
             )?;
             if consumer_role == producer_role {
                 mark_data_prerequisite(prerequisites, &reference.node, false);
             }
         }
+        // Each source is checked as a single reference in this place is (REQ-WFFORMAT-106)
+        // and orders the consumer, but may be skipped, so it is never a data prerequisite.
+        ValueReference::FirstOf(sources) => {
+            for source in sources {
+                let producer_role = check_output_reference(
+                    consumer_name,
+                    consumer_role,
+                    source,
+                    document,
+                    &location,
+                )?;
+                if consumer_role == producer_role {
+                    direct_prerequisite(prerequisites, &source.node).first_of = true;
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Checks an output reference in a node's body and answers its producer's role.
+fn check_output_reference(
+    consumer_name: &str,
+    consumer_role: WorkflowNodeRole,
+    reference: &OutputReference,
+    document: &WorkflowDocument,
+    location: &ValidationLocation,
+) -> Result<WorkflowNodeRole, ValidationFailure> {
+    let failure = |kind| Err(ValidationFailure::new(kind, location.clone()));
+    let (producer_role, producer_body, output) =
+        declared_output(document, reference, location.clone())?;
+    if matches!(output, Output::GitBranchWorkspace) {
+        return failure(ValidationFailureKind::TerminalOutputReference);
+    }
+    if reference.node == consumer_name && producer_role == consumer_role {
+        return failure(ValidationFailureKind::SelfDependency);
+    }
+    if consumer_role == WorkflowNodeRole::Step && producer_role == WorkflowNodeRole::Finalizer {
+        return failure(ValidationFailureKind::CrossPhaseOutputReference);
+    }
+    validate_data_dependency_authority(
+        document,
+        consumer_name,
+        &reference.node,
+        consumer_role,
+        producer_role,
+        common_node(producer_body).failure_policy,
+        location,
+    )?;
+    Ok(producer_role)
 }
 
 fn mark_data_prerequisite(
@@ -1752,19 +1764,26 @@ fn mark_data_prerequisite(
     producer: &str,
     condition_data: bool,
 ) {
+    let prerequisite = direct_prerequisite(prerequisites, producer);
+    prerequisite.data = true;
+    prerequisite.condition_data |= condition_data;
+}
+
+/// The consumer's prerequisite on `producer`, added with no reason set when it is new.
+fn direct_prerequisite<'p>(
+    prerequisites: &'p mut BTreeMap<String, ResolvedDirectPrerequisite>,
+    producer: &str,
+) -> &'p mut ResolvedDirectPrerequisite {
     prerequisites
         .entry(producer.to_owned())
-        .and_modify(|prerequisite| {
-            prerequisite.data = true;
-            prerequisite.condition_data |= condition_data;
-        })
         .or_insert_with(|| ResolvedDirectPrerequisite {
             producer: producer.to_owned(),
             control: false,
             disposition_control: false,
-            data: true,
-            condition_data,
-        });
+            data: false,
+            condition_data: false,
+            first_of: false,
+        })
 }
 
 fn validate_output_rules(document: &WorkflowDocument) -> Result<(), ValidationFailure> {
@@ -2175,6 +2194,13 @@ fn resolve_condition_reference(
         ResolvedValueSource::ControlsAnswers => "controls.answers".to_owned(),
         ResolvedValueSource::Item { field: None } => "item".to_owned(),
         ResolvedValueSource::Item { field: Some(field) } => format!("item.{field}"),
+        // The structural schema admits a first-of in no condition (REQ-WFFORMAT-105).
+        ResolvedValueSource::FirstOf(_) => {
+            return Err(ValidationFailure::new(
+                ValidationFailureKind::InvalidConditionReference,
+                condition_location(node_name, role),
+            ));
+        }
     };
     Ok((canonical, resolved.source, kind))
 }
@@ -2275,12 +2301,23 @@ fn evidence_prerequisites(
         .filter_map(|prerequisite| Prerequisite::control(prerequisite.producer.clone()).ok())
         .collect::<Vec<_>>();
     retain_condition_descriptors(common_node(body).condition.as_ref(), &mut descriptors);
+    // Each source of a first-of is a body prerequisite of its own (REQ-WFCOND-15).
     let mut retain_reference = |reference: &ValueReference| {
-        if let ValueReference::Output(output) = reference
-            && let Ok(descriptor) =
+        let outputs = match reference {
+            ValueReference::Output(output) => std::slice::from_ref(output),
+            ValueReference::FirstOf(sources) => sources.as_slice(),
+            ValueReference::Input { .. }
+            | ValueReference::FinalizationContext
+            | ValueReference::Wait { .. }
+            | ValueReference::ControlsAnswers
+            | ValueReference::Item { .. } => &[],
+        };
+        for output in outputs {
+            if let Ok(descriptor) =
                 Prerequisite::body(format!("outputs.{}.{}", output.node, output.output))
-        {
-            descriptors.push(descriptor);
+            {
+                descriptors.push(descriptor);
+            }
         }
     };
     match body {
@@ -2434,20 +2471,13 @@ fn resolve_value_reference(
             })
         }
         ValueReference::Output(reference) => {
-            let (role, _, output) = declared_output(document, reference, location)?;
-            let value_type = output_value_type(output);
+            let (source, _) = resolve_output_source(document, reference, location)?;
             Ok(ResolvedValueReference {
-                source: ResolvedValueSource::Output(ResolvedOutputSource {
-                    node: WorkflowNode {
-                        id: reference.node.clone(),
-                        role,
-                    },
-                    output: reference.output.clone(),
-                    value_type,
-                }),
-                value_type,
+                value_type: source.value_type,
+                source: ResolvedValueSource::Output(source),
             })
         }
+        ValueReference::FirstOf(sources) => resolve_first_of(sources, document, location),
         ValueReference::FinalizationContext => Ok(ResolvedValueReference {
             source: ResolvedValueSource::FinalizationContext,
             value_type: WorkflowValueType::Json,
@@ -2469,6 +2499,80 @@ fn resolve_value_reference(
             },
             value_type: WorkflowValueType::Json,
         }),
+    }
+}
+
+fn resolve_output_source<'a>(
+    document: &'a WorkflowDocument,
+    reference: &OutputReference,
+    location: ValidationLocation,
+) -> Result<(ResolvedOutputSource, &'a Output), ValidationFailure> {
+    let (role, _, output) = declared_output(document, reference, location)?;
+    let source = ResolvedOutputSource {
+        node: WorkflowNode {
+            id: reference.node.clone(),
+            role,
+        },
+        output: reference.output.clone(),
+        value_type: output_value_type(output),
+    };
+    Ok((source, output))
+}
+
+/// Resolves a first-of whose sources passed the single-reference checks. A source is
+/// unreachable when an earlier one names its step or names a step without a `condition`,
+/// which is never skipped (REQ-WFCOND-29); the sources are incompatible unless they share
+/// a kind and, as written, a JSON `schema` or a file `mediaType` (REQ-WFFORMAT-106).
+fn resolve_first_of(
+    sources: &[OutputReference],
+    document: &WorkflowDocument,
+    location: ValidationLocation,
+) -> Result<ResolvedValueReference, ValidationFailure> {
+    let sources = resolve_first_of_sources(sources, document, location)?;
+    Ok(ResolvedValueReference {
+        value_type: sources.value_type(),
+        source: ResolvedValueSource::FirstOf(sources.iter().cloned().collect()),
+    })
+}
+
+fn resolve_first_of_sources(
+    sources: &[OutputReference],
+    document: &WorkflowDocument,
+    location: ValidationLocation,
+) -> Result<OutputSources, ValidationFailure> {
+    let failure = |kind| ValidationFailure::new(kind, location.clone());
+    let mut resolved = Vec::with_capacity(sources.len());
+    let mut shared = None;
+    for (index, source) in sources.iter().enumerate() {
+        if sources[..index].iter().any(|earlier| {
+            earlier.node == source.node
+                || node_body(document, &earlier.node)
+                    .is_some_and(|(_, body)| common_node(body).condition.is_none())
+        }) {
+            return Err(failure(ValidationFailureKind::UnreachableReferenceSource));
+        }
+        let (resolved_source, output) = resolve_output_source(document, source, location.clone())?;
+        let shape = (resolved_source.value_type, output_contract(output));
+        if *shared.get_or_insert(shape) != shape {
+            return Err(failure(ValidationFailureKind::IncompatibleReferenceSources));
+        }
+        resolved.push(resolved_source);
+    }
+    // The structural schema requires two sources; without one, none could be taken.
+    OutputSources::from_list(resolved)
+        .ok_or_else(|| failure(ValidationFailureKind::UnreachableReferenceSource))
+}
+
+/// The `schema` of a JSON output or the `mediaType` of a file output, as written.
+fn output_contract(output: &Output) -> Option<&str> {
+    match output {
+        Output::JsonPath { schema, .. } | Output::JsonAgentResult { schema } => Some(schema),
+        Output::FilePath { media_type, .. } => Some(media_type),
+        Output::TextPath { .. }
+        | Output::TextAgentResponse
+        | Output::GitBranchWorkspace
+        | Output::ChildExport { .. }
+        | Output::ChildOutcome => None,
     }
 }
 
@@ -2580,21 +2684,30 @@ fn validate_message_source(
         }
         MessageSource::Reference(reference) => reference,
     };
-    let value = resolve_value_reference(reference, document, declared_inputs, location.clone())?;
-    let compatible = match destination {
-        MessageDestination::Text => value.value_type == WorkflowValueType::Text,
+    let accepts = |value_type| match destination {
+        MessageDestination::Text => value_type == WorkflowValueType::Text,
         MessageDestination::Attachment => matches!(
-            value.value_type,
+            value_type,
             WorkflowValueType::AttachmentCollection
                 | WorkflowValueType::Json
                 | WorkflowValueType::File
         ),
     };
-    if !compatible {
-        return Err(ValidationFailure::new(
-            ValidationFailureKind::MessageTypeMismatch,
-            location,
-        ));
+    let mismatch =
+        || ValidationFailure::new(ValidationFailureKind::MessageTypeMismatch, location.clone());
+    // Every source of a first-of meets the destination's rule before the sources are
+    // compared with each other (REQ-WFFORMAT-49).
+    if let ValueReference::FirstOf(sources) = reference {
+        for source in sources {
+            let (_, _, output) = declared_output(document, source, location.clone())?;
+            if !accepts(output_value_type(output)) {
+                return Err(mismatch());
+            }
+        }
+    }
+    let value = resolve_value_reference(reference, document, declared_inputs, location.clone())?;
+    if !accepts(value.value_type) {
+        return Err(mismatch());
     }
 
     Ok(ValidatedMessageSource::Reference {
@@ -2603,7 +2716,48 @@ fn validate_message_source(
     })
 }
 
+/// Resolve an export's source (REQ-WFFORMAT-65, REQ-WFFORMAT-107). Every source of a
+/// `firstOf` meets a single reference's rules, then is an output of an ordinary `cmd` or
+/// `agent` step that is not a `git_branch` output, before the sources are compared with
+/// each other at the export (REQ-WFFORMAT-106).
 fn resolve_export(
+    name: &str,
+    source: &SourceReference,
+    document: &WorkflowDocument,
+) -> Result<OutputSources, ValidationFailure> {
+    let references = match source {
+        SourceReference::Reference(reference) => {
+            return resolve_export_source(name, reference, document).map(OutputSources::single);
+        }
+        SourceReference::FirstOf(references) => references,
+    };
+    for reference in references {
+        resolve_export_source(name, reference, document)?;
+    }
+    for reference in references {
+        let ordinary_output =
+            document
+                .steps
+                .get(&reference.node)
+                .and_then(|step| match &step.body {
+                    NodeBody::Command(command) => command.common.outputs.get(&reference.output),
+                    NodeBody::Agent(agent) => agent.common.outputs.get(&reference.output),
+                    NodeBody::Workflow(_) => None,
+                });
+        if ordinary_output.is_none_or(|output| matches!(output, Output::GitBranchWorkspace)) {
+            return Err(invalid_export(name));
+        }
+    }
+    resolve_first_of_sources(
+        references,
+        document,
+        ValidationLocation::Export {
+            name: name.to_owned(),
+        },
+    )
+}
+
+fn resolve_export_source(
     name: &str,
     reference: &OutputReference,
     document: &WorkflowDocument,
@@ -2644,9 +2798,10 @@ fn resolve_export(
     })
 }
 
-/// Resolve `outcomes` and `outcome` (REQ-WFFORMAT-87, REQ-WFFORMAT-88). The source must
-/// be a `text` output of a required ordinary step without a `condition`, so that a succeeded
-/// run always holds its value.
+/// Resolve `outcomes` and `outcome` (REQ-WFFORMAT-87, REQ-WFFORMAT-88, REQ-WFFORMAT-108).
+/// Each source must be a `text` output of a required ordinary step. A single reference's step
+/// declares no `condition`, so that a succeeded run always holds its value; the sources of a
+/// `firstOf` may, and then meet the reachability rule at the outcome (REQ-WFFORMAT-106).
 fn resolve_outcome(
     document: &WorkflowDocument,
 ) -> Result<Option<ValidatedOutcome>, ValidationFailure> {
@@ -2659,35 +2814,52 @@ fn resolve_outcome(
     if !document.outcomes.contains(&declaration.on_failure) {
         return Err(failure(ValidationFailureKind::InvalidOutcomeDeclaration));
     }
-    let reference = &declaration.from;
-    let source = match node_body(document, &reference.node) {
-        Some((WorkflowNodeRole::Step, body)) => {
-            let common = common_node(body);
-            common
-                .outputs
-                .get(&reference.output)
-                .filter(|output| {
-                    common.failure_policy != FailurePolicy::Advisory
-                        && common.condition.is_none()
-                        && output_value_type(output) == WorkflowValueType::Text
-                })
-                .map(|_| ResolvedOutputSource {
-                    node: WorkflowNode {
-                        id: reference.node.clone(),
-                        role: WorkflowNodeRole::Step,
-                    },
-                    output: reference.output.clone(),
-                    value_type: WorkflowValueType::Text,
-                })
+    let invalid = || failure(ValidationFailureKind::InvalidOutcomeSource);
+    let source = match &declaration.from {
+        SourceReference::Reference(reference) => {
+            OutputSources::single(outcome_source(document, reference, true).ok_or_else(invalid)?)
         }
-        Some((WorkflowNodeRole::Finalizer, _)) | None => None,
-    }
-    .ok_or_else(|| failure(ValidationFailureKind::InvalidOutcomeSource))?;
+        SourceReference::FirstOf(references) => {
+            for reference in references {
+                outcome_source(document, reference, false).ok_or_else(invalid)?;
+            }
+            resolve_first_of_sources(references, document, ValidationLocation::Outcome)?
+        }
+    };
     Ok(Some(ValidatedOutcome {
         names: document.outcomes.clone(),
         source,
         on_failure: declaration.on_failure.clone(),
     }))
+}
+
+/// The outcome source `reference` names when it is a declared `text` output of a required
+/// ordinary step, which declares no `condition` when `unconditional` holds.
+fn outcome_source(
+    document: &WorkflowDocument,
+    reference: &OutputReference,
+    unconditional: bool,
+) -> Option<ResolvedOutputSource> {
+    let Some((WorkflowNodeRole::Step, body)) = node_body(document, &reference.node) else {
+        return None;
+    };
+    let common = common_node(body);
+    common
+        .outputs
+        .get(&reference.output)
+        .filter(|output| {
+            common.failure_policy != FailurePolicy::Advisory
+                && !(unconditional && common.condition.is_some())
+                && output_value_type(output) == WorkflowValueType::Text
+        })
+        .map(|_| ResolvedOutputSource {
+            node: WorkflowNode {
+                id: reference.node.clone(),
+                role: WorkflowNodeRole::Step,
+            },
+            output: reference.output.clone(),
+            value_type: WorkflowValueType::Text,
+        })
 }
 
 fn resolve_export_presentation(

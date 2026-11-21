@@ -323,6 +323,7 @@ fn succeeded_step(id: &str, outputs: OutputSet<CapturedValue>) -> WorkflowRunSte
         recovery: None,
         invocations: Vec::new(),
         failed_child: None,
+        input_sources: Vec::new(),
     }
 }
 

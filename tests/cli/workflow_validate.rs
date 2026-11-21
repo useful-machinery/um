@@ -638,6 +638,59 @@ fn undeclared_node_environment_passthrough_names_the_step() {
     assert_eq!(location["step"], "inspect");
 }
 
+// REQ-WFFORMAT-106
+#[test]
+fn first_of_diagnostics_name_the_step_and_its_input() {
+    let bundle = WorkflowBundle::valid();
+    let workflow = |sources: &str| {
+        format!(
+            "schemaVersion: 1\ninputs:\n  branch: {{kind: text}}\nsteps:\n  a:\n    kind: cmd\n    condition: {{equals: [{{ref: inputs.branch}}, {{value: a}}]}}\n    command: {{argv: [\"true\"]}}\n    outputs:\n      result: {{kind: text, from: path, path: a.txt}}\n      data: {{kind: json, from: path, path: a.json, schema: ../schemas/result.schema.json}}\n  b:\n    kind: cmd\n    command: {{argv: [\"true\"]}}\n    outputs:\n      result: {{kind: text, from: path, path: b.txt}}\n  join:\n    kind: cmd\n    inputs:\n      value: {{firstOf: {sources}}}\n    command: {{argv: [\"true\"]}}\n"
+        )
+    };
+    for (sources, code) in [
+        (
+            "[outputs.a.data, outputs.b.result]",
+            "incompatible_reference_sources",
+        ),
+        (
+            "[outputs.b.result, outputs.a.result]",
+            "unreachable_reference_source",
+        ),
+    ] {
+        bundle.replace_workflow(&workflow(sources));
+
+        let output = validate(&bundle, true);
+        assert_eq!(output.status.code(), Some(1), "{code}");
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let diagnostics = report["diagnostics"].as_array().unwrap();
+        assert_eq!(diagnostics.len(), 1, "{code}");
+        assert_eq!(diagnostics[0]["code"], code);
+        let location = &diagnostics[0]["location"];
+        assert_eq!(location["kind"], "step_input");
+        assert_eq!(location["step"], "join");
+        assert_eq!(location["input"], "value");
+    }
+}
+
+// REQ-WFFORMAT-107
+#[test]
+fn first_of_export_diagnostics_name_the_export() {
+    let bundle = WorkflowBundle::valid();
+    bundle.replace_workflow(
+        "schemaVersion: 1\ninputs:\n  branch: {kind: text}\nsteps:\n  a:\n    kind: cmd\n    condition: {equals: [{ref: inputs.branch}, {value: a}]}\n    command: {argv: [\"true\"]}\n    outputs:\n      data: {kind: json, from: path, path: a.json, schema: ../schemas/result.schema.json}\n  b:\n    kind: cmd\n    command: {argv: [\"true\"]}\n    outputs:\n      result: {kind: text, from: path, path: b.txt}\nexports:\n  joined:\n    firstOf: [outputs.a.data, outputs.b.result]\n",
+    );
+
+    let output = validate(&bundle, true);
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let diagnostics = report["diagnostics"].as_array().unwrap();
+    assert_eq!(diagnostics.len(), 1, "{report}");
+    assert_eq!(diagnostics[0]["code"], "incompatible_reference_sources");
+    let location = &diagnostics[0]["location"];
+    assert_eq!(location["kind"], "export");
+    assert_eq!(location["export"], "joined");
+}
+
 // REQ-WFFORMAT-98, REQ-WFFORMAT-99
 #[test]
 fn for_each_diagnostics_name_the_step_and_its_input() {

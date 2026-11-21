@@ -1,12 +1,14 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::Path;
 
 use super::poll_until;
 use super::workflow_run::{
-    INHERITED_SOURCE_COMMIT, RunBundle, TreeBundle, assert_second_attempt_saw_the_source_revision,
-    failed_source_revision_run, git, initialize_git_repository, isolated_command, run_record,
-    workflow_run_schema,
+    FIRST_OF_EXPORT_WORKFLOW, FIRST_OF_WORKFLOW, INHERITED_SOURCE_COMMIT, RunBundle, TreeBundle,
+    assert_run_view_accepts, assert_second_attempt_saw_the_source_revision,
+    failed_source_revision_run, git, initialize_git_repository, input_sources, isolated_command,
+    run_record, workflow_run_schema,
 };
 use super::workflow_run_control::{
     control_command, control_count, control_file, recorded_as, refused, run_control,
@@ -1011,6 +1013,258 @@ fn continuation_refuses_a_required_consumer_of_a_skipped_inherited_output() {
                 "{attempt}"
             );
         }
+    }
+}
+
+// SC-WFCOND-5, REQ-CONTINUE-7, REQ-WFCOND-45: a continuation re-executes a `firstOf`
+// consumer, which chooses again from re-executed and inherited sources, and is refused only
+// when every source was inherited skipped.
+#[test]
+fn continuation_chooses_a_first_of_again_and_refuses_it_when_every_source_was_skipped() {
+    let bundle = RunBundle::new(&format!(
+        "{FIRST_OF_WORKFLOW}  check:\n    kind: cmd\n    dependsOn: [c]\n    command: {{argv: [\"sh\", \"-c\", \"test \\\"$PHASE\\\" = continuation\"]}}\n"
+    ));
+    let copied = bundle.execution_root().join("c.txt");
+    let initial = |name: &str, branch: &str| {
+        let run = bundle.result(name);
+        let mut args = bundle.args(&run);
+        args.splice(
+            args.len() - 1..args.len() - 1,
+            [
+                "--input-text".to_owned(),
+                "branch".to_owned(),
+                branch.to_owned(),
+                "--json".to_owned(),
+            ],
+        );
+        assert_eq!(
+            isolated_command(&args)
+                .env("PHASE", "initial")
+                .output()
+                .unwrap()
+                .status
+                .code(),
+            Some(1),
+            "{name}"
+        );
+        run
+    };
+    let resume = |run: &Path, from: &str| {
+        fs::remove_file(&copied).unwrap();
+        let output = isolated_command(&continue_args(run, &[from]))
+            .env("PHASE", "continuation")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(run.join("state.json")).unwrap()).unwrap();
+        let attempt = state["attempts"][1].clone();
+        let inherited = attempt["continuation"]["inheritedSteps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        (attempt, inherited)
+    };
+    let recorded = BTreeMap::from([(
+        "c".to_owned(),
+        serde_json::json!([{"input": "result", "ref": "outputs.a.result"}]),
+    )]);
+
+    let from_a = initial("from-a", "a");
+    let (attempt, inherited) = resume(&from_a, "a");
+    assert_eq!(
+        attempt["continuation"]["reexecutedSteps"],
+        serde_json::json!(["a", "c", "check"]),
+        "{attempt}"
+    );
+    assert_eq!(inherited, ["b"]);
+    assert_eq!(fs::read_to_string(&copied).unwrap(), "from a");
+    assert_eq!(input_sources(&attempt["progress"]["steps"]), recorded);
+
+    let from_c = initial("from-c", "a");
+    // The re-executed `c` takes the value retained for the inherited `a`, not the file.
+    fs::write(bundle.execution_root().join("a.txt"), "changed").unwrap();
+    let (attempt, inherited) = resume(&from_c, "c");
+    assert_eq!(
+        attempt["continuation"]["reexecutedSteps"],
+        serde_json::json!(["c", "check"]),
+        "{attempt}"
+    );
+    assert_eq!(inherited, ["a", "b"]);
+    assert_eq!(fs::read_to_string(&copied).unwrap(), "from a");
+    assert_eq!(input_sources(&attempt["progress"]["steps"]), recorded);
+
+    let neither = initial("neither", "neither");
+    let before = fs::read(neither.join("state.json")).unwrap();
+    let refused = isolated_command(&continue_args(&neither, &["c"]))
+        .env("PHASE", "continuation")
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1));
+    let refusal: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert!(workflow_run_schema().is_valid(&refusal), "{refusal}");
+    assert_eq!(
+        refusal["diagnostics"],
+        serde_json::json!([
+            {"code": "continuation_nodes_unsatisfied",
+                "location": {"kind": "required_skipped", "consumer": "c", "producer": "a"}},
+            {"code": "continuation_nodes_unsatisfied",
+                "location": {"kind": "required_skipped", "consumer": "c", "producer": "b"}}
+        ]),
+        "{refusal}"
+    );
+    assert_eq!(fs::read(neither.join("state.json")).unwrap(), before);
+    assert!(!neither.join("attempts/000002").exists());
+}
+
+// REQ-CONTINUE-17, REQ-EXPORTS-2: an inherited source of a `firstOf` export keeps the
+// attempt that produced its value, and the result names it as the export's source.
+#[test]
+fn a_continuation_names_the_inherited_source_a_first_of_export_took() {
+    let bundle = RunBundle::new(&FIRST_OF_EXPORT_WORKFLOW.replace(
+        "exports:\n",
+        "  check:\n    kind: cmd\n    command: {argv: [\"sh\", \"-c\", \"test \\\"$PHASE\\\" = continuation\"]}\nexports:\n",
+    ));
+    let run = bundle.result("first-of-export");
+    let mut initial = bundle.args(&run);
+    initial.splice(
+        initial.len() - 1..initial.len() - 1,
+        [
+            "--input-text".to_owned(),
+            "branch".to_owned(),
+            "a".to_owned(),
+            "--json".to_owned(),
+        ],
+    );
+    assert_eq!(
+        isolated_command(&initial)
+            .env("PHASE", "initial")
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(1)
+    );
+    let continued = isolated_command(&continue_args(&run, &["check"]))
+        .env("PHASE", "continuation")
+        .output()
+        .unwrap();
+    assert!(
+        continued.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&continued.stdout),
+        String::from_utf8_lossy(&continued.stderr)
+    );
+    let state: serde_json::Value =
+        serde_json::from_slice(&fs::read(run.join("state.json")).unwrap()).unwrap();
+    let inherited = state["attempts"][1]["continuation"]["inheritedSteps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|step| step["id"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(inherited, ["a", "b"]);
+    let result: serde_json::Value =
+        serde_json::from_slice(&fs::read(run.join("attempts/000002/result/result.json")).unwrap())
+            .unwrap();
+    let export = &result["exports"]["result"];
+    assert_eq!(export["state"], "available", "{result}");
+    assert_eq!(export["provenance"], "inherited", "{result}");
+    assert_eq!(export["producer"]["attemptNumber"], 1, "{result}");
+    assert_eq!(
+        result["exportSources"]["result"]["node"]["id"], "a",
+        "{result}"
+    );
+    assert_eq!(
+        result["exportSources"]["result"]["output"], "result",
+        "{result}"
+    );
+    assert_run_view_accepts(&run);
+}
+
+// REQ-WFEXEC-57, REQ-CONTINUE-16: an inherited outcome source that nothing re-executed reads
+// still names the continuation's outcome, as one reference and as a `firstOf` whose first
+// source was inherited as skipped.
+#[test]
+fn a_continuation_takes_its_outcome_from_an_inherited_source() {
+    let source = r#"schemaVersion: 1
+environmentPassthrough: [PHASE]
+inputs:
+  branch: {kind: text}
+outcomes: [planned, failed]
+outcome:
+  from: FROM
+  onFailure: failed
+steps:
+  gate:
+    kind: cmd
+    condition: {equals: [{ref: inputs.branch}, {value: gate}]}
+    command: {argv: ["sh", "-c", "printf planned > gate.txt"]}
+    outputs:
+      verdict: {kind: text, from: path, path: gate.txt}
+  decide:
+    kind: cmd
+    command: {argv: ["sh", "-c", "printf planned > decide.txt"]}
+    outputs:
+      verdict: {kind: text, from: path, path: decide.txt}
+  check:
+    kind: cmd
+    dependsOn: [decide]
+    command: {argv: ["sh", "-c", "test \"$PHASE\" = continuation"]}
+"#;
+    for from in [
+        "outputs.decide.verdict",
+        "{firstOf: [outputs.gate.verdict, outputs.decide.verdict]}",
+    ] {
+        let bundle = TreeBundle::new(&source.replace("FROM", from));
+        let run = bundle.result("outcome");
+        let mut initial = bundle.args(&run);
+        initial.extend([
+            "--input-text".to_owned(),
+            "branch".to_owned(),
+            "decide".to_owned(),
+        ]);
+        let output = isolated_command(&initial)
+            .env("PHASE", "initial")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{from}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(run_record(&run)["outcome"], "failed", "{from}");
+
+        let continued = isolated_command(&continue_args(&run, &["check"]))
+            .env("PHASE", "continuation")
+            .output()
+            .unwrap();
+        assert!(
+            continued.status.success(),
+            "{from}: {} {}",
+            String::from_utf8_lossy(&continued.stdout),
+            String::from_utf8_lossy(&continued.stderr)
+        );
+        let state: serde_json::Value =
+            serde_json::from_slice(&fs::read(run.join("state.json")).unwrap()).unwrap();
+        let inherited = state["attempts"][1]["continuation"]["inheritedSteps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|step| step["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(inherited, ["gate", "decide"], "{from}");
+        let record = run_record(&run);
+        assert_eq!(record["attempts"], 2, "{from}");
+        assert_eq!(record["outcome"], "planned", "{from}: {record}");
     }
 }
 

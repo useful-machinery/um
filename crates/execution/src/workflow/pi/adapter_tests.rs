@@ -2721,7 +2721,12 @@ fn stubborn_process_fixture() {
 
     interrupted.recv().unwrap();
     write_process_fixture_signal("PI_FIXTURE_STDIN", b"interrupted\n");
-    std::process::exit(0);
+    // The leader stays alive after acknowledging the interrupt: the child guard
+    // kills the whole group as soon as its leader exits, so only a live leader
+    // leaves the injected force deadline as what removes the stubborn descendant.
+    loop {
+        std::thread::park();
+    }
 }
 
 #[test]

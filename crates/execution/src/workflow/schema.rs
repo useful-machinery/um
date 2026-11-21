@@ -10,8 +10,9 @@ use super::document::{
     ForEach, InputDeclaration, Integration, IntegrationAs, IntegrationBinding, IntegrationProvider,
     JsonDefault, MessageSource, NodeBody, OutcomeDeclaration, Output, OutputReference,
     OwnerDeclaration, OwnerSource, PresentationSource, RecoveryHandler, RootBlocks, RootRequires,
-    StartRule, StepDefinition, StepRecovery, StopBefore, Trigger, TriggerControlAction,
-    TriggerRule, ValueReference, WaitKind, WaitRule, WorkflowDocument, WorkflowNode,
+    SourceReference, StartRule, StepDefinition, StepRecovery, StopBefore, Trigger,
+    TriggerControlAction, TriggerRule, ValueReference, WaitKind, WaitRule, WorkflowDocument,
+    WorkflowNode,
 };
 use super::mirror::{MirrorBlock, MirrorState};
 use super::validated::ValidatedHarness;
@@ -586,7 +587,7 @@ struct CommandNodeDto {
     #[serde(flatten)]
     common: CommonNodeDto,
     #[serde(default)]
-    inputs: BTreeMap<String, ReferenceDto>,
+    inputs: BTreeMap<String, InputBindingDto>,
     command: CommandDto,
 }
 
@@ -686,6 +687,12 @@ enum MessageSourceDto {
     Reference {
         #[serde(rename = "ref")]
         reference: String,
+    },
+    /// The structural schema admits it only in an ordinary step's message
+    /// (REQ-WFFORMAT-105).
+    FirstOf {
+        #[serde(rename = "firstOf")]
+        sources: Vec<String>,
     },
 }
 
@@ -847,6 +854,22 @@ struct ReferenceDto {
     reference: String,
 }
 
+/// A command node's input: a `{ref}`, or a `{firstOf}`, which the structural schema admits
+/// only in an ordinary step's `inputs` (REQ-WFFORMAT-105).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum InputBindingDto {
+    Reference(ReferenceDto),
+    FirstOf(FirstOfDto),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FirstOfDto {
+    #[serde(rename = "firstOf")]
+    sources: Vec<String>,
+}
+
 fn deserialize_environment_passthrough<'de, D>(
     deserializer: D,
 ) -> Result<BTreeSet<String>, D::Error>
@@ -881,20 +904,32 @@ where
     deserialize_environment_passthrough(deserializer).map(Some)
 }
 
+/// An export: the structural schema requires exactly one of `ref` and `firstOf`
+/// (REQ-WFFORMAT-107).
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ExportDto {
     #[serde(rename = "ref")]
-    reference: String,
+    reference: Option<String>,
+    #[serde(rename = "firstOf")]
+    first_of: Option<Vec<String>>,
     presentation: Option<ExportPresentationDto>,
 }
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OutcomeDto {
-    from: String,
+    from: OutcomeSourceDto,
     #[serde(rename = "onFailure")]
     on_failure: String,
+}
+
+/// `outcome.from`: an output reference string, or a `{firstOf}` (REQ-WFFORMAT-108).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum OutcomeSourceDto {
+    Reference(String),
+    FirstOf(FirstOfDto),
 }
 
 #[derive(Deserialize)]
@@ -1018,7 +1053,15 @@ impl WorkflowDto {
             .exports
             .into_iter()
             .map(|(name, reference)| {
-                let source = parse_output_reference(&reference.reference)?;
+                let source = match (&reference.reference, &reference.first_of) {
+                    (Some(single), None) => {
+                        SourceReference::Reference(parse_output_reference(single)?)
+                    }
+                    (None, Some(sources)) => {
+                        SourceReference::FirstOf(parse_output_references(sources)?)
+                    }
+                    (Some(_), Some(_)) | (None, None) => return None,
+                };
                 let presentation = if let Some(presentation) = reference.presentation {
                     let title = match presentation.title {
                         Some(title) => Some(title.into_source()?),
@@ -1047,7 +1090,14 @@ impl WorkflowDto {
 
         let outcome = match self.outcome {
             Some(outcome) => Some(OutcomeDeclaration {
-                from: parse_output_reference(&outcome.from)?,
+                from: match outcome.from {
+                    OutcomeSourceDto::Reference(reference) => {
+                        SourceReference::Reference(parse_output_reference(&reference)?)
+                    }
+                    OutcomeSourceDto::FirstOf(first_of) => {
+                        SourceReference::FirstOf(parse_output_references(&first_of.sources)?)
+                    }
+                },
                 on_failure: outcome.on_failure,
             }),
             None => None,
@@ -1132,7 +1182,19 @@ impl CommandNodeDto {
     fn into_body(self) -> Option<NodeBody> {
         Some(NodeBody::Command(CommandNode {
             common: self.common.into_common_node()?,
-            inputs: parse_references(self.inputs, parse_value_reference)?,
+            inputs: self
+                .inputs
+                .into_iter()
+                .map(|(name, binding)| {
+                    let reference = match binding {
+                        InputBindingDto::Reference(reference) => {
+                            parse_value_reference(&reference.reference)
+                        }
+                        InputBindingDto::FirstOf(first_of) => parse_first_of(&first_of.sources),
+                    };
+                    reference.map(|reference| (name, reference))
+                })
+                .collect::<Option<_>>()?,
             argv: self.command.argv,
         }))
     }
@@ -1317,6 +1379,9 @@ fn message_sources(sources: Vec<MessageSourceDto>) -> Option<Vec<MessageSource>>
             MessageSourceDto::Reference { reference } => {
                 parse_value_reference(&reference).map(MessageSource::Reference)
             }
+            MessageSourceDto::FirstOf { sources } => {
+                parse_first_of(&sources).map(MessageSource::Reference)
+            }
         })
         .collect()
 }
@@ -1366,6 +1431,18 @@ fn parse_value_reference(reference: &str) -> Option<ValueReference> {
     }
 
     parse_output_reference(reference).map(ValueReference::Output)
+}
+
+/// The structural schema bounds the list and keeps its entries distinct output references.
+fn parse_first_of(sources: &[String]) -> Option<ValueReference> {
+    parse_output_references(sources).map(ValueReference::FirstOf)
+}
+
+fn parse_output_references(sources: &[String]) -> Option<Vec<OutputReference>> {
+    sources
+        .iter()
+        .map(|source| parse_output_reference(source))
+        .collect()
 }
 
 /// A `workflow` step's inputs also read the control that resolved a wait and the

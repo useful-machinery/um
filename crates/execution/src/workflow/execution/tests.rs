@@ -858,6 +858,71 @@ async fn chosen_outcome_names_the_declared_implicit_or_engine_outcome() {
     .await;
 }
 
+/// `route` runs when `pick` writes `route` and `adopt` when it writes `adopt`, each writing
+/// its own declared outcome; `outcome.from` takes the first of the two that succeeded.
+fn first_of_outcome_source(pick: &str, status: u8) -> String {
+    let branch = |name: &str, verdict: &str| {
+        format!(
+            "  {name}:\n    kind: cmd\n    condition: {{equals: [{{ref: outputs.pick.choice}}, {{value: {name}}}]}}\n    command:\n      argv: [/bin/sh, -c, \"printf '%s' {verdict} > {name}.txt\"]\n    outputs:\n      verdict: {{kind: text, from: path, path: {name}.txt}}\n"
+        )
+    };
+    format!(
+        "schemaVersion: 1\noutcomes: [planned, adopted, blocked]\noutcome:\n  from: {{firstOf: [outputs.route.verdict, outputs.adopt.verdict]}}\n  onFailure: blocked\nsteps:\n  pick:\n    kind: cmd\n    command:\n      argv: [/bin/sh, -c, \"printf '%s' {pick} > pick.txt; exit {status}\"]\n    outputs:\n      choice: {{kind: text, from: path, path: pick.txt}}\n{}{}",
+        branch("route", "planned"),
+        branch("adopt", "adopted"),
+    )
+}
+
+// REQ-WFEXEC-57, REQ-WFFORMAT-108
+#[tokio::test]
+async fn chosen_outcome_takes_the_first_succeeded_source_of_a_first_of() {
+    with_watchdog(async {
+        let (declared, routed) = executed_definition(&first_of_outcome_source("route", 0)).await;
+        assert_eq!(routed.outcome, RunOutcome::Succeeded);
+        assert!(matches!(routed.steps["adopt"], StepState::Skipped { .. }));
+        assert_eq!(chosen_outcome(&declared, &routed), "planned");
+
+        let (_, adopted) = executed_definition(&first_of_outcome_source("adopt", 0)).await;
+        assert!(matches!(adopted.steps["route"], StepState::Skipped { .. }));
+        assert_eq!(chosen_outcome(&declared, &adopted), "adopted");
+
+        // Both succeeded: the first in written order is taken.
+        let mut both = routed.clone();
+        both.steps
+            .insert("adopt".to_owned(), adopted.steps["adopt"].clone());
+        assert_eq!(chosen_outcome(&declared, &both), "planned");
+
+        // `route` inherited as succeeded is taken as a succeeded one is.
+        let StepState::Succeeded { outputs } = both.steps["route"].clone() else {
+            panic!("route did not succeed: {:?}", both.steps["route"]);
+        };
+        both.steps.insert(
+            "route".to_owned(),
+            StepState::Inherited {
+                detail: crate::workflow::evidence::InheritedDetail {
+                    prior_attempt_id: "00000000-0000-4000-8000-000000000001".to_owned(),
+                    prior_attempt_number: 1,
+                    prior_state: crate::workflow::evidence::InheritedPriorState::Succeeded,
+                    definition_changed: false,
+                },
+                disposition: crate::workflow::runtime::InheritedDisposition::Succeeded,
+                outputs,
+            },
+        );
+        assert_eq!(chosen_outcome(&declared, &both), "planned");
+
+        // Every source skipped is a succeeded run that takes `onFailure`.
+        let (_, neither) = executed_definition(&first_of_outcome_source("neither", 0)).await;
+        assert_eq!(neither.outcome, RunOutcome::Succeeded);
+        assert_eq!(chosen_outcome(&declared, &neither), "blocked");
+
+        let (_, failed) = executed_definition(&first_of_outcome_source("route", 3)).await;
+        assert!(matches!(failed.outcome, RunOutcome::Failed { .. }));
+        assert_eq!(chosen_outcome(&declared, &failed), "blocked");
+    })
+    .await;
+}
+
 const EDGE_PARENT: &str = "schemaVersion: 1
 outcomes: [landed, failed]
 steps:

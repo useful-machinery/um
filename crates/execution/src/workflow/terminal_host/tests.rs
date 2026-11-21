@@ -3023,6 +3023,7 @@ fn complete_scripted_view(
             recovery: None,
             invocations: Vec::new(),
             failed_child: None,
+            input_sources: Vec::new(),
         }],
         finalization: None,
         exports: BTreeMap::new(),

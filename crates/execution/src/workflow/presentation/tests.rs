@@ -324,6 +324,7 @@ impl Fixture {
                     recovery: None,
                     invocations: Vec::new(),
                     failed_child: None,
+                    input_sources: Vec::new(),
                 })
                 .collect(),
             finalization: None,
@@ -1092,6 +1093,7 @@ steps:
         recovery: None,
         invocations: Vec::new(),
         failed_child: None,
+        input_sources: Vec::new(),
     };
     let (_, summary_detail, _) = summary_step(&step, StepSuccessPresentation::Agent).unwrap();
     assert_eq!(summary_detail, "1 output committed");

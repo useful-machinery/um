@@ -621,7 +621,10 @@ fn resolve_children(
                     .definition
                     .exports
                     .iter()
-                    .filter_map(|(export, source)| {
+                    // Every source of a `firstOf` declares the same `schema` path
+                    // (REQ-WFFORMAT-106), so the first source's schema is the export's.
+                    .filter_map(|(export, sources)| {
+                        let source = sources.first();
                         child
                             .json_schema(&source.node.id, &source.output)
                             .map(|schema| (export.clone(), schema.clone()))

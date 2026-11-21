@@ -27,7 +27,10 @@ use crate::workflow::input::{InputStaging, InputValue};
 use crate::workflow::pi::Thinking;
 use crate::workflow::resolution;
 use crate::workflow::runtime::{ActionId, TransitionSequence};
-use crate::workflow::validated::{ValidatedHarness, WorkflowNode, WorkflowNodeRole};
+use crate::workflow::validated::{
+    ChosenSources, FirstOfBinding, MessageList, ValidatedHarness, ValidatedStep, WorkflowNode,
+    WorkflowNodeRole,
+};
 
 const SYSTEM_PROMPT: &str = "System @ exact.\n";
 const STATIC_MESSAGE: &str = "static - text\n";
@@ -267,6 +270,7 @@ impl Fixture {
             &self.staging,
             &self.diagnostic_sessions,
             identity(),
+            consumer_step(&self.admitted),
             &self.upstream,
             None,
             cancellation,
@@ -390,6 +394,15 @@ fn output_source(step: &str, output: &str, value_type: WorkflowValueType) -> Res
         output: output.to_owned(),
         value_type,
     }
+}
+
+/// The fixture's `consumer` agent step as admitted.
+fn consumer_step(admitted: &AdmittedWorkflow) -> &ValidatedAgentStep {
+    let Some(ValidatedStep::Agent(consumer)) = admitted.workflow().definition.steps.get("consumer")
+    else {
+        panic!("the fixture consumer must be an agent step");
+    };
+    consumer
 }
 
 fn identity() -> AgentInvocationIdentity {
@@ -774,6 +787,7 @@ fn cancellation_at_the_ready_barrier_removes_partial_staging_without_launch() {
             &materializing_staging,
             &diagnostic_sessions,
             identity(),
+            consumer_step(&admitted),
             &upstream,
             None,
             cancellation,
@@ -910,6 +924,7 @@ fn execution_root_rebinding_during_materialization_is_rejected_before_launch() {
         &staging,
         &fixture.diagnostic_sessions,
         identity(),
+        consumer_step(&fixture.admitted),
         &fixture.upstream,
         None,
         CancellationSource::new(),
@@ -1020,4 +1035,50 @@ fn finalization_context_bytes_are_shared_by_command_and_agent() {
         fs::read(command_view.path().join("values/context")).unwrap(),
         bytes
     );
+}
+
+// REQ-WFCOND-45, INV-ENGINE-44
+#[test]
+fn a_first_of_message_entry_reads_the_chosen_source() {
+    let fixture = Fixture::new(ConsumerValueMode::None);
+    let mut consumer = consumer_step(&fixture.admitted).clone();
+    let skipped = output_source("skippedProducer", "response", WorkflowValueType::Text);
+    let chosen = output_source("responseProducer", "response", WorkflowValueType::Text);
+    consumer.agent.message.text = vec![ValidatedMessageSource::Reference {
+        source: ResolvedValueSource::FirstOf(vec![skipped, chosen.clone()]),
+        value_type: WorkflowValueType::Text,
+    }];
+    consumer.agent.message.attachments = Vec::new();
+    let harness = fixture.admitted.agent_step("consumer").unwrap();
+    let binding = FirstOfBinding::Message {
+        list: MessageList::Text,
+        index: 0,
+    };
+
+    let resolved = consumer.with_chosen_sources(&ChosenSources::from([(binding, chosen)]));
+    let plan = build_plan(
+        &fixture.admitted,
+        "consumer",
+        &resolved,
+        &fixture.upstream,
+        None,
+        harness,
+    )
+    .unwrap();
+    assert_eq!(plan.prompt.message(), "@ upstream response");
+
+    let unresolved = consumer.with_chosen_sources(&ChosenSources::new());
+    assert!(matches!(
+        build_plan(
+            &fixture.admitted,
+            "consumer",
+            &unresolved,
+            &fixture.upstream,
+            None,
+            harness,
+        ),
+        Err(AgentInputMaterializationError::Start(
+            AgentInputStartFailure::InputsUnavailable
+        ))
+    ));
 }

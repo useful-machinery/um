@@ -718,6 +718,14 @@ fn validation_classification(kind: ValidationFailureKind) -> (&'static str, &'st
             "terminal_output_reference",
             "Export git_branch directly; it cannot bind a downstream step value.",
         ),
+        ValidationFailureKind::IncompatibleReferenceSources => (
+            "incompatible_reference_sources",
+            "List firstOf outputs of one kind, with the same schema or media type.",
+        ),
+        ValidationFailureKind::UnreachableReferenceSource => (
+            "unreachable_reference_source",
+            "Name each step once in firstOf, and put a step without a condition last.",
+        ),
         ValidationFailureKind::ExcessAgentResponseOutput => (
             "excess_agent_response_output",
             "Declare at most one agent response output on a step.",

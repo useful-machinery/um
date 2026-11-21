@@ -1154,10 +1154,27 @@ fn validate_steps(
         let diagnostic_valid = step.diagnostic.as_ref().is_none_or(|diagnostic| {
             step.state == WorkflowStepStateV1::Failed && valid_failure_diagnostic(diagnostic)
         });
+        // Only an ordinary `cmd` or `agent` step that started records the sources its
+        // `firstOf`s took, in order and each binding once (REQ-EVIDENCE-28).
+        let input_sources_valid = step.input_sources.is_empty()
+            || (expected_role == WorkflowNodeRoleV1::Step
+                && step.kind != "workflow"
+                && match step.state {
+                    WorkflowStepStateV1::Succeeded | WorkflowStepStateV1::Cancelled => true,
+                    WorkflowStepStateV1::Failed => {
+                        failure_phase != Some(super::evidence::FailurePhase::Condition)
+                    }
+                    WorkflowStepStateV1::Inherited
+                    | WorkflowStepStateV1::Blocked
+                    | WorkflowStepStateV1::Skipped
+                    | WorkflowStepStateV1::NotRun => false,
+                }
+                && super::evidence::valid_input_sources(&step.input_sources));
         if !exact_fields
             || !timing_valid
             || !output_valid
             || !diagnostic_valid
+            || !input_sources_valid
             || step.command_output.as_ref().is_some_and(|output| {
                 !valid_stream(&output.stdout, maximum_stream_bytes)
                     || !valid_stream(&output.stderr, maximum_stream_bytes)

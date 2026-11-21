@@ -1682,3 +1682,99 @@ fn cancelled_node_detail_is_the_closed_authoritative_stop_reason() {
         );
     }
 }
+
+/// `result` with `sources` as the `inputSources` of the node at `pointer`.
+fn with_input_sources(mut result: Value, pointer: &str, sources: Value) -> Value {
+    result.pointer_mut(pointer).unwrap()["inputSources"] = sources;
+    result
+}
+
+// REQ-EVIDENCE-28
+#[test]
+fn only_an_ordinary_step_that_started_records_input_sources() {
+    let sources = json!([{ "message": "text", "index": 0, "ref": "outputs.a.result" }]);
+    let started = with_input_sources(result_fixture(), "/steps/0", sources.clone());
+    assert!(decode(&encode(&started)).is_ok());
+
+    let mut condition_failure = failed_result_fixture("condition", condition_failure_detail());
+    strip_timing(&mut condition_failure["steps"][0]);
+    let mut workflow_step = result_fixture();
+    workflow_step["steps"][0]["kind"] = json!("workflow");
+    for (result, pointer) in [
+        (skipped_fixture(), "/steps/1"),
+        (stopped_downstream_fixture(), "/steps/1"),
+        (stopped_downstream_fixture(), "/steps/2"),
+        (continuation_result_fixture(), "/steps/0"),
+        (condition_failure, "/steps/0"),
+        (finalized_result_fixture(), "/finalization/finalizers/0"),
+        (workflow_step, "/steps/0"),
+    ] {
+        assert!(decode(&encode(&result)).is_ok(), "{pointer}: {result}");
+        let recorded = with_input_sources(result, pointer, sources.clone());
+        assert_eq!(
+            decode(&encode(&recorded)),
+            Err(ResultMetadataError),
+            "{pointer}: {recorded}"
+        );
+    }
+}
+
+// REQ-EVIDENCE-28
+#[test]
+fn input_sources_name_output_references_once_each_in_binding_order() {
+    let entry = |binding: Value, reference: &str| {
+        let mut entry = binding;
+        entry["ref"] = json!(reference);
+        entry
+    };
+    let input = |name: &str| json!({ "input": name });
+    let message = |list: &str, index: u64| json!({ "message": list, "index": index });
+    let decoded = |sources: Vec<Value>| {
+        decode(&encode(&with_input_sources(
+            result_fixture(),
+            "/steps/0",
+            Value::Array(sources),
+        )))
+        .map(|_| ())
+    };
+    assert_eq!(
+        decoded(vec![
+            entry(input("left"), "outputs.a.result"),
+            entry(input("right"), "outputs.b.result"),
+            entry(message("text", 0), "outputs.a.result"),
+            entry(message("text", 2), "outputs.a.result"),
+            entry(message("attachments", 0), "outputs.b.report"),
+        ]),
+        Ok(())
+    );
+    for invalid in [
+        vec![entry(input("left"), "inputs.left")],
+        vec![
+            entry(input("left"), "outputs.a.result"),
+            entry(input("left"), "outputs.b.result"),
+        ],
+        vec![
+            entry(input("right"), "outputs.a.result"),
+            entry(input("left"), "outputs.b.result"),
+        ],
+        vec![
+            entry(message("attachments", 0), "outputs.a.report"),
+            entry(message("text", 0), "outputs.a.result"),
+        ],
+        vec![
+            entry(message("text", 1), "outputs.a.result"),
+            entry(message("text", 0), "outputs.a.result"),
+        ],
+        vec![entry(
+            json!({ "input": "left", "index": 0 }),
+            "outputs.a.result",
+        )],
+        vec![entry(message("body", 0), "outputs.a.result")],
+    ] {
+        assert_eq!(
+            decoded(invalid.clone()),
+            Err(ResultMetadataError),
+            "{invalid:?}"
+        );
+    }
+}

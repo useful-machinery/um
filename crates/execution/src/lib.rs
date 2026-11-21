@@ -100,7 +100,7 @@ pub use workflow::document::{BusyBehavior, OwnerDeclaration, OwnerSource, StopBe
 pub use workflow::evidence::{BlockedDetail, Prerequisite};
 pub use workflow::evidence::{
     FailedChild, FailingNode, FailingNodeState, FailureDetail, InheritedDetail,
-    InheritedPriorState, NodeDetail, PrimaryIssue,
+    InheritedPriorState, InputSource, NodeDetail, PrimaryIssue,
 };
 pub use workflow::execution::{
     CloudStepCommitPort, NoopCommitPort, WorkflowExecutionResult, chosen_outcome, execute_workflow,

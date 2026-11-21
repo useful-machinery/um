@@ -8,8 +8,8 @@ use super::document::{
     Binding, BindingKind, BindingValue, EdgeTarget, FailurePolicy, FinalizationTrigger, ForEach,
     InputDeclaration, Integration, IntegrationAs, IntegrationBinding, IntegrationProvider,
     JsonDefault, MessageSource, NodeBody, OutcomeDeclaration, Output, OutputReference,
-    RecoveryHandler, StartRule, Trigger, TriggerControlAction, ValueReference, WaitKind, WaitRule,
-    WorkflowNode,
+    RecoveryHandler, SourceReference, StartRule, Trigger, TriggerControlAction, ValueReference,
+    WaitKind, WaitRule, WorkflowNode,
 };
 use super::pi::{PiConfig, Thinking};
 use super::validated::ValidatedHarness;
@@ -444,17 +444,17 @@ fn canonical_workflow_decodes_into_the_complete_execution_document() {
 
     assert_eq!(
         workflow.exports["response"].source,
-        OutputReference {
+        SourceReference::Reference(OutputReference {
             node: "implement".to_owned(),
             output: "response".to_owned(),
-        }
+        })
     );
     assert_eq!(
         workflow.exports["testReport"].source,
-        OutputReference {
+        SourceReference::Reference(OutputReference {
             node: "test".to_owned(),
             output: "report".to_owned(),
-        }
+        })
     );
 }
 
@@ -975,10 +975,10 @@ fn typed_outcomes_decode_the_names_and_the_outcome_source() {
     assert_eq!(
         workflow.outcome,
         Some(OutcomeDeclaration {
-            from: OutputReference {
+            from: SourceReference::Reference(OutputReference {
                 node: "decide".to_owned(),
                 output: "verdict".to_owned(),
-            },
+            }),
             on_failure: "failed".to_owned(),
         })
     );
@@ -1167,7 +1167,7 @@ fn workflow_steps_decode_backward_limited_and_external_edges() {
     );
 }
 
-// REQ-WFFORMAT-2, REQ-WFFORMAT-8, REQ-WFFORMAT-11, REQ-WFFORMAT-34, REQ-WFFORMAT-36, REQ-WFFORMAT-37, REQ-WFFORMAT-41, REQ-WFFORMAT-42, REQ-WFFORMAT-45, REQ-WFFORMAT-46, REQ-WFFORMAT-53, REQ-WFFORMAT-54, REQ-WFFORMAT-61, REQ-WFRECOVERY-56, REQ-WFRECOVERY-57, REQ-WFFORMAT-28, REQ-WFFORMAT-82, REQ-WFFORMAT-89, REQ-WFFORMAT-92, REQ-WFFORMAT-95, REQ-WFFORMAT-96, REQ-WFFORMAT-102
+// REQ-WFFORMAT-2, REQ-WFFORMAT-8, REQ-WFFORMAT-11, REQ-WFFORMAT-34, REQ-WFFORMAT-36, REQ-WFFORMAT-37, REQ-WFFORMAT-41, REQ-WFFORMAT-42, REQ-WFFORMAT-45, REQ-WFFORMAT-46, REQ-WFFORMAT-53, REQ-WFFORMAT-54, REQ-WFFORMAT-61, REQ-WFRECOVERY-56, REQ-WFRECOVERY-57, REQ-WFFORMAT-28, REQ-WFFORMAT-82, REQ-WFFORMAT-89, REQ-WFFORMAT-92, REQ-WFFORMAT-95, REQ-WFFORMAT-96, REQ-WFFORMAT-102, REQ-WFFORMAT-105
 #[test]
 fn every_canonical_invalid_fixture_is_a_structural_failure() {
     let invalid_root = fixture_root().join("invalid");

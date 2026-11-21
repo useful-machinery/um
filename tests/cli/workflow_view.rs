@@ -31,7 +31,7 @@ use rustix::termios::Winsize;
 
 #[cfg(target_os = "linux")]
 use super::poll_until;
-use super::workflow_run::{RunBundle, isolated_command, run};
+use super::workflow_run::{FIRST_OF_WORKFLOW, RunBundle, isolated_command, run, run_with_branch};
 #[cfg(target_os = "linux")]
 use super::workflow_run::{
     TuiProcess, finalizer_signal_bundle, open_tui_pty, signal_bundle, spawn_tui_run,
@@ -371,6 +371,57 @@ fn view_accepts_explicit_noninteractive_modes_and_rejects_their_conflict() {
         .unwrap();
     assert_eq!(conflict.status.code(), Some(2));
     assert!(conflict.stdout.is_empty());
+}
+
+// REQ-EVIDENCE-13, REQ-EVIDENCE-29
+#[test]
+fn plain_view_shows_the_source_a_first_of_took_and_refuses_one_the_state_does_not_hold() {
+    let bundle = RunBundle::new(FIRST_OF_WORKFLOW);
+    let (produced, run_directory) = run_with_branch(&bundle, "first-of", "a");
+    assert!(produced.status.success(), "{produced:?}");
+
+    let plain = isolated_command(&view_args(&run_directory, &["--plain", "--color", "never"]))
+        .output()
+        .unwrap();
+    assert!(plain.status.success(), "{plain:?}");
+    let plain = String::from_utf8(plain.stdout).unwrap();
+    let lines = plain.lines().collect::<Vec<_>>();
+    let row = lines
+        .iter()
+        .position(|line| line.starts_with("- node c "))
+        .unwrap_or_else(|| panic!("{plain}"));
+    let source = lines.get(row + 1).copied().unwrap_or_default();
+    assert!(
+        source.contains("outputs.a.result")
+            && source.replace("outputs.a.result", "").contains("result"),
+        "{plain}"
+    );
+    assert_eq!(plain.matches("outputs.a.result").count(), 1, "{plain}");
+
+    // A source the attempt's state does not record makes the result invalid.
+    let state_path = run_directory.join("state.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+    let consumer = state["attempts"][0]["progress"]["steps"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|step| step["id"] == "c")
+        .unwrap();
+    consumer["inputSources"][0]["ref"] = serde_json::json!("outputs.b.result");
+    let mut bytes = serde_json::to_vec_pretty(&state).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(state_path, bytes).unwrap();
+    let refused = isolated_command(&view_args(&run_directory, &["--json"]))
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let refused: serde_json::Value = serde_json::from_slice(&refused.stdout).unwrap();
+    assert!(workflow_view_schema().is_valid(&refused), "{refused}");
+    assert_eq!(
+        refused["error"]["code"], "published_result_invalid",
+        "{refused}"
+    );
 }
 
 // REQ-LOCALRUN-180, REQ-LOCALRUN-166

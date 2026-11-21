@@ -1184,6 +1184,7 @@ fn invalid_result_publication_retains_the_original_command_failure() {
         recovery: None,
         invocations: Vec::new(),
         failed_child: None,
+        input_sources: Vec::new(),
     };
     retain_result_publication_failure(
         private_root.path(),

@@ -18,7 +18,9 @@ use super::step_runtime::{
     StepExecutionFailure, StepFailureCause, StepFailureKind, StepStartFailure,
     WorkingDirectoryFailure,
 };
-use super::validated::{WorkflowNode, WorkflowNodeRole};
+use super::validated::{
+    ChosenSources, FirstOfBinding, MessageList, WorkflowNode, WorkflowNodeRole,
+};
 
 pub(crate) const MAXIMUM_PREREQUISITES: usize = 1_024;
 
@@ -897,6 +899,139 @@ impl FailedChild {
             None => step.to_owned(),
         }
     }
+}
+
+/// The output one `firstOf` of a step's body took when the step was started
+/// (REQ-EVIDENCE-28, REQ-WFCOND-45): where the `firstOf` is bound and the
+/// `outputs.<step>.<output>` reference the value was taken from, never the value. It is
+/// written `{input, ref}` for a command step's input and `{message, index, ref}` for an
+/// agent message entry.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(from = "InputSourceWire", into = "InputSourceWire")]
+pub struct InputSource {
+    pub(crate) binding: FirstOfBinding,
+    pub(crate) reference: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum InputSourceWire {
+    Input(InputBindingWire),
+    Message(MessageBindingWire),
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InputBindingWire {
+    input: String,
+    r#ref: String,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MessageBindingWire {
+    message: MessageListWire,
+    index: usize,
+    r#ref: String,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum MessageListWire {
+    Text,
+    Attachments,
+}
+
+impl From<InputSourceWire> for InputSource {
+    fn from(wire: InputSourceWire) -> Self {
+        match wire {
+            InputSourceWire::Input(input) => Self {
+                binding: FirstOfBinding::Input(input.input),
+                reference: input.r#ref,
+            },
+            InputSourceWire::Message(message) => Self {
+                binding: FirstOfBinding::Message {
+                    list: match message.message {
+                        MessageListWire::Text => MessageList::Text,
+                        MessageListWire::Attachments => MessageList::Attachments,
+                    },
+                    index: message.index,
+                },
+                reference: message.r#ref,
+            },
+        }
+    }
+}
+
+impl From<InputSource> for InputSourceWire {
+    fn from(source: InputSource) -> Self {
+        match source.binding {
+            FirstOfBinding::Input(input) => Self::Input(InputBindingWire {
+                input,
+                r#ref: source.reference,
+            }),
+            FirstOfBinding::Message { list, index } => Self::Message(MessageBindingWire {
+                message: match list {
+                    MessageList::Text => MessageListWire::Text,
+                    MessageList::Attachments => MessageListWire::Attachments,
+                },
+                index,
+                r#ref: source.reference,
+            }),
+        }
+    }
+}
+
+impl InputSource {
+    /// The `outputs.<step>.<output>` reference the value was taken from.
+    pub fn reference(&self) -> &str {
+        &self.reference
+    }
+}
+
+/// A binding as a person reads it: the input's name, or `message.text[i]` or
+/// `message.attachments[i]` for a message entry.
+impl fmt::Display for FirstOfBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Input(name) => formatter.write_str(name),
+            Self::Message {
+                list: MessageList::Text,
+                index,
+            } => write!(formatter, "message.text[{index}]"),
+            Self::Message {
+                list: MessageList::Attachments,
+                index,
+            } => write!(formatter, "message.attachments[{index}]"),
+        }
+    }
+}
+
+/// The `inputSources` of a step started with `chosen`, in the order REQ-EVIDENCE-28 gives,
+/// which is the order of `FirstOfBinding`.
+pub(crate) fn input_sources(chosen: &ChosenSources) -> Vec<InputSource> {
+    chosen
+        .iter()
+        .map(|(binding, source)| InputSource {
+            binding: binding.clone(),
+            reference: source.reference(),
+        })
+        .collect()
+}
+
+/// Whether `sources` is a well-formed `inputSources` list (REQ-EVIDENCE-28): each input an
+/// identifier, each `ref` an output reference, and the bindings strictly ascending, so no
+/// binding repeats and the entries are in order.
+pub(crate) fn valid_input_sources(sources: &[InputSource]) -> bool {
+    sources.iter().all(|source| {
+        is_output_reference(&source.reference)
+            && match &source.binding {
+                FirstOfBinding::Input(name) => is_identifier(name),
+                FirstOfBinding::Message { .. } => true,
+            }
+    }) && sources
+        .windows(2)
+        .all(|pair| matches!(pair, [first, second] if first.binding < second.binding))
 }
 
 /// The failing node of a failed child, as [`FailedChild::failing_node`] gives it.

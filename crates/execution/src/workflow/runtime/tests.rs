@@ -62,6 +62,7 @@ fn definition(
                                 disposition_control: false,
                                 data: false,
                                 condition_data: false,
+                                first_of: false,
                             })
                             .collect::<Vec<_>>()
                             .into(),
@@ -71,6 +72,7 @@ fn definition(
                             .collect::<Vec<_>>()
                             .into(),
                         inputs: BTreeMap::new(),
+                        first_of: BTreeMap::new(),
                         declared_outputs: outputs
                             .iter()
                             .map(|output| (*output).to_owned())
@@ -90,10 +92,7 @@ fn definition(
             .map(|(name, step, output)| {
                 (
                     (*name).to_owned(),
-                    RuntimeExport {
-                        step: (*step).to_owned(),
-                        output: (*output).to_owned(),
-                    },
+                    OutputSources::single(text_source(step, output)),
                 )
             })
             .collect(),
@@ -297,6 +296,7 @@ fn start_action(value: u64, step: &str) -> TestAction {
             step: step.to_owned(),
             execution_number: TargetExecutionNumber::FIRST,
             inputs: BTreeMap::new(),
+            input_sources: ChosenSources::new(),
         },
     }
 }
@@ -417,6 +417,7 @@ fn finalizer_definition(
                     prerequisites: Arc::from([]),
                     evidence_prerequisites: Arc::from([]),
                     inputs: BTreeMap::new(),
+                    first_of: BTreeMap::new(),
                     declared_outputs: outputs.iter().map(|output| (*output).to_owned()).collect(),
                     recovery: None,
                     when: BTreeSet::new(),
@@ -441,6 +442,7 @@ fn finalizer_definition(
                             disposition_control: false,
                             data: false,
                             condition_data: false,
+                            first_of: false,
                         })
                         .collect::<Vec<_>>()
                         .into(),
@@ -479,6 +481,7 @@ fn finalizer_definition(
                             ((*name).to_owned(), source)
                         })
                         .collect(),
+                    first_of: BTreeMap::new(),
                     declared_outputs: BTreeSet::new(),
                     recovery: None,
                     when: when.iter().copied().collect(),
@@ -2170,6 +2173,150 @@ fn successful_exports_are_committed_to_state_and_the_only_finish_action() {
     assert_noop(&state, &late_cancellation);
 }
 
+fn skipped_state() -> StepState<String> {
+    StepState::Skipped {
+        detail: ConditionFalseDetail::new([
+            crate::workflow::evidence::EvaluatedPredicateEvidence {
+                path: String::new(),
+                result: false,
+            },
+        ])
+        .unwrap(),
+    }
+}
+
+fn inherited_state(disposition: InheritedDisposition, value: Option<&str>) -> StepState<String> {
+    StepState::Inherited {
+        detail: InheritedDetail {
+            prior_attempt_id: "00000000-0000-0000-0000-000000000002".to_owned(),
+            prior_attempt_number: 2,
+            prior_state: crate::workflow::evidence::InheritedPriorState::Succeeded,
+            definition_changed: false,
+        },
+        disposition,
+        outputs: value.map_or_else(OutputSet::new, |value| output_set(&[("result", value)])),
+    }
+}
+
+// REQ-EXPORTS-2, REQ-EXPORTS-3, INV-ENGINE-45
+#[test]
+fn a_first_of_export_settles_on_the_first_source_that_succeeded_or_the_first_that_did_not() {
+    let succeeded = |value: &str| StepState::Succeeded {
+        outputs: output_set(&[("result", value)]),
+    };
+    let inherited_succeeded =
+        |value: &str| inherited_state(InheritedDisposition::Succeeded, Some(value));
+    let inherited_skipped = inherited_state(InheritedDisposition::Skipped, None);
+    let failed = failed_state(FailurePhase::Execution, "a failed");
+    let blocked = blocked_state([Prerequisite::control("x").unwrap()]);
+    let not_run = not_run_state(WorkflowNodeRole::Step, NonExecutionCode::FailureStop);
+    let available = |value: &str| ExportValue::Available {
+        output: value.to_owned(),
+    };
+    let unavailable = |reason| ExportValue::Unavailable { reason };
+    for (a, b, value, source) in [
+        (
+            succeeded("from a"),
+            skipped_state(),
+            available("from a"),
+            "a",
+        ),
+        (
+            skipped_state(),
+            succeeded("from b"),
+            available("from b"),
+            "b",
+        ),
+        (
+            succeeded("from a"),
+            succeeded("from b"),
+            available("from a"),
+            "a",
+        ),
+        (
+            inherited_succeeded("from a"),
+            inherited_skipped.clone(),
+            available("from a"),
+            "a",
+        ),
+        (
+            inherited_skipped.clone(),
+            inherited_succeeded("from b"),
+            available("from b"),
+            "b",
+        ),
+        (
+            skipped_state(),
+            inherited_skipped.clone(),
+            unavailable(ExportUnavailableReason::Skipped),
+            "a",
+        ),
+        // The first source that neither succeeded nor was skipped names the reason, even
+        // when another succeeded.
+        (
+            failed.clone(),
+            succeeded("from b"),
+            unavailable(ExportUnavailableReason::Failed),
+            "a",
+        ),
+        (
+            succeeded("from a"),
+            blocked.clone(),
+            unavailable(ExportUnavailableReason::Blocked),
+            "b",
+        ),
+        (
+            skipped_state(),
+            not_run.clone(),
+            unavailable(ExportUnavailableReason::NotRun),
+            "b",
+        ),
+        (
+            not_run,
+            failed,
+            unavailable(ExportUnavailableReason::NotRun),
+            "a",
+        ),
+        // A chosen source whose value the attempt does not hold is not passed over.
+        (
+            inherited_state(InheritedDisposition::Succeeded, None),
+            succeeded("from b"),
+            unavailable(ExportUnavailableReason::Failed),
+            "a",
+        ),
+    ] {
+        let case = format!("{a:?} / {b:?}");
+        let mut definition =
+            definition(&[("a", &[], &["result"]), ("b", &[], &["result"])], &[], 2);
+        definition.exports.insert(
+            "result".to_owned(),
+            OutputSources::from_list(vec![text_source("a", "result"), text_source("b", "result")])
+                .unwrap(),
+        );
+        let mut reduction = initialize_test(definition);
+        reduction.events.clear();
+        reduction.actions.clear();
+        reduction.state.steps.get_mut("a").unwrap().state = a;
+        reduction.state.steps.get_mut("b").unwrap().state = b;
+        let sequence = reduction.state.last_transition_sequence.0 + 1;
+
+        finish_run(&mut reduction, OrdinaryOutcome::Succeeded, None);
+
+        let exports = ExportSet::from([("result".to_owned(), value)]);
+        assert_eq!(reduction.state.exports, Some(exports.clone()), "{case}");
+        assert_eq!(
+            reduction.state.export_sources,
+            BTreeMap::from([("result".to_owned(), text_source(source, "result"))]),
+            "{case}"
+        );
+        assert_eq!(
+            reduction.actions,
+            [finish_action(sequence, exports)],
+            "{case}"
+        );
+    }
+}
+
 // INV-ENGINE-1
 #[test]
 fn duplicate_and_stale_success_occurrences_are_noops() {
@@ -3771,6 +3918,7 @@ fn advisory_failure_blocks_data_without_synthesis_and_satisfies_later_control() 
         disposition_control: false,
         data: true,
         condition_data: false,
+        first_of: false,
     }]);
     summarize.evidence_prerequisites = Arc::from([
         Prerequisite::control("analyze").unwrap(),
@@ -7585,4 +7733,444 @@ fn an_interrupted_nested_runs_repair_wait_is_carried() {
         finished_outcome(&completed),
         Some(&RunOutcome::Waiting { wait })
     );
+}
+
+/// The shape of the `firstOf` fixture: `a` runs when the input `left` is `run` and `b` when
+/// `right` is, or always when `b_conditioned` is false; `c` binds
+/// `{firstOf: [outputs.a.result, outputs.b.result]}`.
+#[derive(Clone, Copy, Default)]
+struct FirstOfShape {
+    b_conditioned: bool,
+    advisory: bool,
+    /// `c` runs only when `left` is `run`.
+    c_conditioned: bool,
+    extra_steps: &'static str,
+}
+
+fn first_of_condition(input: &str) -> String {
+    format!(
+        "    condition:\n      equals:\n        - {{ref: inputs.{input}}}\n        - {{value: run}}\n"
+    )
+}
+
+fn admit_first_of(
+    shape: FirstOfShape,
+    left: &str,
+    right: &str,
+) -> (tempfile::TempDir, AdmittedWorkflow) {
+    let policy = if shape.advisory {
+        "    failurePolicy: advisory\n"
+    } else {
+        ""
+    };
+    let b_condition = if shape.b_conditioned {
+        first_of_condition("right")
+    } else {
+        String::new()
+    };
+    let c_condition = if shape.c_conditioned {
+        first_of_condition("left")
+    } else {
+        String::new()
+    };
+    let a_condition = first_of_condition("left");
+    let extra_steps = shape.extra_steps;
+    let source = format!(
+        r#"schemaVersion: 1
+inputs:
+  left: {{kind: text}}
+  right: {{kind: text}}
+steps:
+  a:
+    kind: cmd
+{policy}{a_condition}    command: {{argv: ["true"]}}
+    outputs:
+      result: {{kind: text, from: path, path: a.txt}}
+  b:
+    kind: cmd
+{policy}{b_condition}    command: {{argv: ["true"]}}
+    outputs:
+      result: {{kind: text, from: path, path: b.txt}}
+  c:
+    kind: cmd
+{policy}{c_condition}    inputs:
+      result:
+        firstOf: [outputs.a.result, outputs.b.result]
+    command: {{argv: ["true"]}}
+{extra_steps}"#
+    );
+    admit_test_workflow_with_inputs(
+        &source,
+        ResolvedInputs::new(BTreeMap::from([
+            ("left".to_owned(), ResolvedInput::Text(Arc::from(left))),
+            ("right".to_owned(), ResolvedInput::Text(Arc::from(right))),
+        ])),
+    )
+}
+
+/// Runs a started step that declares the text output `result` to success with `value`.
+fn complete_with_result(
+    state: &mut TestRuntimeState,
+    step: &str,
+    start: ActionId,
+    value: &str,
+) -> TestReduction {
+    complete_with_outputs(state, step, start, &[("result", value)])
+}
+
+/// Runs a started step to success with `outputs`.
+fn complete_with_outputs(
+    state: &mut TestRuntimeState,
+    step: &str,
+    start: ActionId,
+    outputs: &[(&str, &str)],
+) -> TestReduction {
+    reduce_and_advance(
+        state,
+        Occurrence::StepStarted {
+            step: step.to_owned(),
+            action: start,
+        },
+    );
+    let completed = reduce_and_advance(
+        state,
+        Occurrence::StepExecutionCompleted {
+            step: step.to_owned(),
+            action: start,
+            provisional: String::new(),
+        },
+    );
+    let capture = completed
+        .actions
+        .iter()
+        .find_map(|requested| match &requested.action {
+            Action::CaptureOutputs { step: captured, .. } if captured == step => Some(requested.id),
+            _ => None,
+        })
+        .unwrap();
+    reduce_and_advance(
+        state,
+        Occurrence::OutputsCaptured {
+            step: step.to_owned(),
+            action: capture,
+            outputs: output_set(outputs),
+        },
+    )
+}
+
+/// The value `c`'s start carries for its input `result` and the source the start names.
+fn first_of_start(reduction: &TestReduction) -> Option<(ActionInput<String>, ChosenSources)> {
+    reduction
+        .actions
+        .iter()
+        .find_map(|requested| match &requested.action {
+            Action::StartStep {
+                step,
+                inputs,
+                input_sources,
+                ..
+            } if step == "c" => Some((inputs["result"].clone(), input_sources.clone())),
+            _ => None,
+        })
+}
+
+fn chose(source: &str, value: &str) -> Option<(ActionInput<String>, ChosenSources)> {
+    Some((
+        ActionInput::Output(value.to_owned()),
+        ChosenSources::from([(
+            FirstOfBinding::Input("result".to_owned()),
+            ResolvedOutputSource {
+                node: ordinary_node(source),
+                output: "result".to_owned(),
+                value_type: crate::workflow::validated::WorkflowValueType::Text,
+            },
+        )]),
+    ))
+}
+
+fn first_of_body(steps: &[&str]) -> StepState<String> {
+    blocked_state(
+        steps
+            .iter()
+            .map(|step| Prerequisite::body(format!("outputs.{step}.result")).unwrap()),
+    )
+}
+
+// REQ-WFCOND-45, INV-ENGINE-44
+#[test]
+fn first_of_waits_for_every_source_and_takes_the_first_that_succeeded() {
+    // `b` has no condition, so it is the last source and runs beside `a`.
+    let unconditioned_b = FirstOfShape::default();
+    let (_temporary, admitted) = admit_first_of(unconditioned_b, "run", "run");
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    let a = started_step(&initialization, "a").unwrap();
+    let b = started_step(&initialization, "b").unwrap();
+    let mut state = initialization.state;
+    let a_settled = complete_with_result(&mut state, "a", a, "from a");
+    assert_eq!(first_of_start(&a_settled), None);
+    assert_step(&state, "c", StepStateKind::Pending);
+    let b_settled = complete_with_result(&mut state, "b", b, "from b");
+    assert_eq!(first_of_start(&b_settled), chose("a", "from a"));
+
+    let conditioned_b = FirstOfShape {
+        b_conditioned: true,
+        ..FirstOfShape::default()
+    };
+    let (_temporary, admitted) = admit_first_of(conditioned_b, "run", "skip");
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    assert_step(&initialization.state, "b", StepStateKind::Skipped);
+    let a = started_step(&initialization, "a").unwrap();
+    let mut state = initialization.state;
+    let a_settled = complete_with_result(&mut state, "a", a, "from a");
+    assert_eq!(first_of_start(&a_settled), chose("a", "from a"));
+
+    let (_temporary, admitted) = admit_first_of(conditioned_b, "skip", "run");
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    assert_step(&initialization.state, "a", StepStateKind::Skipped);
+    let b = started_step(&initialization, "b").unwrap();
+    let mut state = initialization.state;
+    let b_settled = complete_with_result(&mut state, "b", b, "from b");
+    assert_eq!(first_of_start(&b_settled), chose("b", "from b"));
+}
+
+// REQ-WFCOND-46, REQ-WFCOND-29
+#[test]
+fn first_of_blocks_on_a_source_that_did_not_supply_or_when_every_source_was_skipped() {
+    let conditioned_b = FirstOfShape {
+        b_conditioned: true,
+        ..FirstOfShape::default()
+    };
+    let (_temporary, admitted) = admit_first_of(conditioned_b, "skip", "skip");
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    assert_eq!(
+        initialization.state.steps["c"].state,
+        first_of_body(&["a", "b"])
+    );
+
+    // An advisory source that failed blocks the step although the other succeeded.
+    let advisory = FirstOfShape {
+        advisory: true,
+        ..FirstOfShape::default()
+    };
+    let (_temporary, admitted) = admit_first_of(advisory, "run", "run");
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    let a = started_step(&initialization, "a").unwrap();
+    let b = started_step(&initialization, "b").unwrap();
+    let mut state = initialization.state;
+    complete_with_result(&mut state, "b", b, "from b");
+    assert_step(&state, "c", StepStateKind::Pending);
+    let a_failed = reduce_and_advance(
+        &mut state,
+        Occurrence::StepStartFailed {
+            step: "a".to_owned(),
+            action: a,
+            cause: "failed to start".to_owned(),
+        },
+    );
+    assert_eq!(first_of_start(&a_failed), None);
+    assert_eq!(state.steps["c"].state, first_of_body(&["a"]));
+
+    // The step's own false condition skips it before its sources are considered.
+    let own_condition = FirstOfShape {
+        b_conditioned: true,
+        c_conditioned: true,
+        ..FirstOfShape::default()
+    };
+    let (_temporary, admitted) = admit_first_of(own_condition, "skip", "skip");
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    assert_step(&initialization.state, "c", StepStateKind::Skipped);
+}
+
+// REQ-WFCOND-46, REQ-WFEXEC-11
+#[test]
+fn a_failure_stop_settles_a_pending_first_of_consumer() {
+    // A required source that fails blocks the step while the other still runs.
+    let (_temporary, admitted) = admit_first_of(FirstOfShape::default(), "run", "run");
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    let a = started_step(&initialization, "a").unwrap();
+    let b = started_step(&initialization, "b").unwrap();
+    let mut state = initialization.state;
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStartFailed {
+            step: "a".to_owned(),
+            action: a,
+            cause: "failed to start".to_owned(),
+        },
+    );
+    assert_eq!(state.steps["c"].state, first_of_body(&["a"]));
+    complete_with_result(&mut state, "b", b, "from b");
+    assert_eq!(state.steps["c"].state, first_of_body(&["a"]));
+
+    // `aa` and `ab` hold both slots once `a` has succeeded, so `c` is ready but pending when
+    // `aa` stops the run.
+    let held = FirstOfShape {
+        b_conditioned: true,
+        extra_steps: "  aa:\n    kind: cmd\n    command: {argv: [\"true\"]}\n  ab:\n    kind: cmd\n    command: {argv: [\"true\"]}\n",
+        ..FirstOfShape::default()
+    };
+    let (_temporary, admitted) = admit_first_of(held, "run", "skip");
+    let initialization = initialize::<String, String, String, TestDeadline>(&admitted, None);
+    let a = started_step(&initialization, "a").unwrap();
+    let aa = started_step(&initialization, "aa").unwrap();
+    let mut state = initialization.state;
+    let a_settled = complete_with_result(&mut state, "a", a, "from a");
+    assert!(started_step(&a_settled, "ab").is_some());
+    assert_step(&state, "c", StepStateKind::Pending);
+    reduce_and_advance(
+        &mut state,
+        Occurrence::StepStartFailed {
+            step: "aa".to_owned(),
+            action: aa,
+            cause: "failed to start".to_owned(),
+        },
+    );
+    assert_eq!(
+        state.steps["c"].state,
+        not_run_state(WorkflowNodeRole::Step, NonExecutionCode::FailureStop)
+    );
+}
+
+// REQ-WFCOND-45, INV-ENGINE-44
+#[test]
+fn an_inherited_first_of_source_supplies_its_retained_output() {
+    let conditioned_b = FirstOfShape {
+        b_conditioned: true,
+        ..FirstOfShape::default()
+    };
+    let (_temporary, admitted) = admit_first_of(conditioned_b, "skip", "run");
+    let mut seed = inherited_seed(
+        "a",
+        crate::workflow::evidence::InheritedPriorState::Succeeded,
+        InheritedDisposition::Succeeded,
+        output_set(&[("result", "retained")]),
+    );
+    seed.steps.extend(
+        inherited_seed(
+            "b",
+            crate::workflow::evidence::InheritedPriorState::Skipped,
+            InheritedDisposition::Skipped,
+            BTreeMap::new(),
+        )
+        .steps,
+    );
+    let reduction =
+        ReductionBuilder::<String, TestDeadline>::new(RuntimeDefinition::from_admitted(&admitted))
+            .seeded(seed)
+            .build::<String, String>();
+    assert_eq!(first_of_start(&reduction), chose("a", "retained"));
+}
+
+/// The output `output` of the ordinary step `step`, as a `firstOf` lists it.
+fn text_source(step: &str, output: &str) -> ResolvedOutputSource {
+    ResolvedOutputSource {
+        node: ordinary_node(step),
+        output: output.to_owned(),
+        value_type: crate::workflow::validated::WorkflowValueType::Text,
+    }
+}
+
+/// `a` and `b` each declare `result` and `report`, and the agent step `c`, retried once
+/// without a handler, binds `{firstOf: [outputs.a.result, outputs.b.result]}` as its second
+/// text entry and `{firstOf: [outputs.b.report, outputs.a.report]}` as its first attachment.
+fn agent_first_of_definition() -> RuntimeDefinition {
+    use crate::workflow::validated::MessageList;
+    let mut graph = definition(
+        &[
+            ("a", &[], &["result", "report"]),
+            ("b", &[], &["result", "report"]),
+            ("c", &[], &[]),
+        ],
+        &[],
+        3,
+    );
+    configure_recovery(&mut graph, "c", 1, None, 100);
+    let consumer = graph.steps.get_mut("c").unwrap();
+    consumer.is_agent = true;
+    consumer.prerequisites = ["a", "b"]
+        .into_iter()
+        .map(|producer| ResolvedDirectPrerequisite {
+            producer: producer.to_owned(),
+            control: false,
+            disposition_control: false,
+            data: false,
+            condition_data: false,
+            first_of: true,
+        })
+        .collect::<Vec<_>>()
+        .into();
+    consumer.first_of = BTreeMap::from([
+        (
+            FirstOfBinding::Message {
+                list: MessageList::Attachments,
+                index: 0,
+            },
+            vec![text_source("b", "report"), text_source("a", "report")],
+        ),
+        (
+            FirstOfBinding::Message {
+                list: MessageList::Text,
+                index: 1,
+            },
+            vec![text_source("a", "result"), text_source("b", "result")],
+        ),
+    ]);
+    graph
+}
+
+// REQ-EVIDENCE-28, INV-ENGINE-44
+#[test]
+fn a_started_step_records_its_message_sources_through_recovery_and_failure() {
+    use crate::workflow::validated::MessageList;
+    let initialization = initialize_test(agent_first_of_definition());
+    let a = started_step(&initialization, "a").unwrap();
+    let b = started_step(&initialization, "b").unwrap();
+    let mut state = initialization.state;
+    complete_with_outputs(&mut state, "a", a, &[("result", "a"), ("report", "a")]);
+    assert!(state.steps["c"].input_sources.is_empty());
+    let settled = complete_with_outputs(&mut state, "b", b, &[("result", "b"), ("report", "b")]);
+    let first = started_step(&settled, "c").unwrap();
+    // Text entries come before attachments whatever their index.
+    let recorded = vec![
+        InputSource {
+            binding: FirstOfBinding::Message {
+                list: MessageList::Text,
+                index: 1,
+            },
+            reference: "outputs.a.result".to_owned(),
+        },
+        InputSource {
+            binding: FirstOfBinding::Message {
+                list: MessageList::Attachments,
+                index: 0,
+            },
+            reference: "outputs.b.report".to_owned(),
+        },
+    ];
+    assert_eq!(state.steps["c"].input_sources, recorded);
+
+    let fail = |state: &mut TestRuntimeState, action: ActionId| {
+        reduce_and_advance(
+            state,
+            Occurrence::StepStarted {
+                step: "c".into(),
+                action,
+            },
+        );
+        reduce_and_advance(
+            state,
+            Occurrence::StepExecutionFailed {
+                step: "c".into(),
+                action,
+                cause: "exit 1".into(),
+            },
+        )
+    };
+    let recheck = fail(&mut state, first);
+    let second = started_step(&recheck, "c").unwrap();
+    assert_eq!(state.steps["c"].target_execution.unwrap().get(), 2);
+    assert_eq!(state.steps["c"].input_sources, recorded);
+    fail(&mut state, second);
+    assert_step(&state, "c", StepStateKind::Failed);
+    assert_eq!(state.steps["c"].input_sources, recorded);
 }

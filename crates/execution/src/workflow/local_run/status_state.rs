@@ -112,6 +112,24 @@ impl LocalStatusStateView {
         }
     }
 
+    /// The source each `firstOf` of the current attempt's steps took, a line each naming the
+    /// step, the binding and the reference; nothing for an attempt that has none
+    /// (REQ-EVIDENCE-29, REQ-LOCALRUN-145).
+    pub fn write_input_sources(&self, writer: &mut impl Write) -> io::Result<()> {
+        for step in &self.current()?.progress.steps {
+            for source in &step.input_sources {
+                writeln!(
+                    writer,
+                    "input source: {} · {} · from {}",
+                    safe_text(&step.id),
+                    safe_text(&source.binding.to_string()),
+                    safe_text(source.reference())
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn write_recovery(
         &self,
         writer: &mut impl Write,

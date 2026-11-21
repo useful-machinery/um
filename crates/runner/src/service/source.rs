@@ -3165,11 +3165,11 @@ mod tests {
                 .definition
                 .exports
                 .iter()
-                .map(|(name, source)| {
+                .map(|(name, sources)| {
                     (
                         name.clone(),
                         ExportValue::Available {
-                            output: outputs[&source.output].clone(),
+                            output: outputs[&sources.first().output].clone(),
                         },
                     )
                 })
@@ -3227,10 +3227,17 @@ mod tests {
                     recovery: None,
                     invocations: Vec::new(),
                     failed_child: None,
+                    input_sources: Vec::new(),
                 }],
                 finalization: None,
                 exports,
-                export_sources: admitted.workflow().definition.exports.clone(),
+                export_sources: admitted
+                    .workflow()
+                    .definition
+                    .exports
+                    .iter()
+                    .map(|(name, sources)| (name.clone(), sources.first().clone()))
+                    .collect(),
                 export_presentation: admitted.workflow().definition.export_presentation.clone(),
             };
             prepare_cloud_workflow_result(

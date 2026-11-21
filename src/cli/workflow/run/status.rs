@@ -393,6 +393,8 @@ fn write_plain_snapshot(
     snapshot
         .status_state
         .write_recovery(writer, archived_result.as_ref())?;
+    // REQ-LOCALRUN-145, REQ-EVIDENCE-29: the sources the current attempt's steps took.
+    snapshot.status_state.write_input_sources(writer)?;
     if let LocalRecoveryStatus::OwnershipUnproven { guard_ids, reason } = &snapshot.recovery {
         writeln!(writer, "ownership reason: {}", reason.as_str())?;
         writeln!(writer, "remedy: {}", reason.remedy())?;

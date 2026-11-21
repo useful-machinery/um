@@ -4774,6 +4774,7 @@ fn a_nodes_start_is_recorded_once_when_it_becomes_active() {
                         condition_passed: false,
                         failure_kind: None,
                         failed_child: None,
+                        input_sources: Vec::new(),
                     },
                 )
             }),
@@ -5032,11 +5033,13 @@ async fn cloud_continuation_recovers_unexported_output_across_three_attempts() {
             finalization_summary: None,
             force_abort: None,
             exports: BTreeMap::new(),
+            export_sources: BTreeMap::new(),
             provenance: fixture.admitted.workflow().source.clone(),
             content_digest: fixture.admitted.workflow().content_digest.clone(),
             withdrawn: false,
             exit_outcome: None,
             failed_children: BTreeMap::new(),
+            input_sources: BTreeMap::new(),
         };
     retain_cloud_completed_steps(
         &private1,
@@ -5101,11 +5104,13 @@ async fn cloud_continuation_recovers_unexported_output_across_three_attempts() {
             finalization_summary: None,
             force_abort: None,
             exports: BTreeMap::new(),
+            export_sources: BTreeMap::new(),
             provenance: fixture.admitted.workflow().source.clone(),
             content_digest: fixture.admitted.workflow().content_digest.clone(),
             withdrawn: false,
             exit_outcome: None,
             failed_children: BTreeMap::new(),
+            input_sources: BTreeMap::new(),
         };
     retain_cloud_completed_steps(
         &private2,

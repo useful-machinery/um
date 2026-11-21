@@ -46,8 +46,8 @@ use super::schema_common::{
     parse_canonical_utc_timestamp,
 };
 use super::validated::{
-    ResolvedDirectPrerequisite, ResolvedValueSource, ValidatedMessageSource, ValidatedStep,
-    WorkflowNodeRole, WorkflowValueType,
+    ResolvedDirectPrerequisite, ResolvedOutputSource, SourceEnd, ValidatedMessageSource,
+    ValidatedStep, WorkflowNodeRole, WorkflowValueType,
 };
 
 const SHA256_ALGORITHM: &str = "sha256";
@@ -178,6 +178,8 @@ pub(crate) struct ArchivedStep {
     /// The failed child of a `succeeded` `workflow` step (REQ-LOCALRUN-219); `None` for
     /// any other step.
     pub(crate) failed_child: Option<FailedChild>,
+    /// The source each `firstOf` of a step that started took (REQ-EVIDENCE-28).
+    pub(crate) input_sources: Vec<super::evidence::InputSource>,
     /// The count of outputs the step committed, as the attempt recorded them; `None` for an
     /// attempt recorded without them, which keeps the declared count (REQ-LOCALRUN-221).
     pub(crate) committed_outputs: Option<usize>,
@@ -937,6 +939,7 @@ fn project_steps(
                 || !step_state_matches(step.state, durable.state)
                 || durable.detail != step.detail
                 || durable.failed_child != step.failed_child
+                || durable.input_sources != step.input_sources
                 || !durable_recovery_matches_wire(root, attempt, durable, step)
             {
                 return Err(());
@@ -1112,29 +1115,19 @@ fn finalizer_disposition_matches_definition(
     }
 }
 
+// Every source of a `firstOf` is consumed: a blocked step names each one that did not
+// supply its value (REQ-WFCOND-46).
 fn consumed_output_sources(step: &ValidatedStep) -> Vec<&super::validated::ResolvedOutputSource> {
-    fn output_source(
-        source: &ResolvedValueSource,
-    ) -> Option<&super::validated::ResolvedOutputSource> {
-        match source {
-            ResolvedValueSource::Output(source) => Some(source),
-            ResolvedValueSource::Input(_)
-            | ResolvedValueSource::FinalizationContext
-            | ResolvedValueSource::Wait(_)
-            | ResolvedValueSource::ControlsAnswers
-            | ResolvedValueSource::Item { .. } => None,
-        }
-    }
     match step {
         ValidatedStep::Command(command) => command
             .inputs
             .values()
-            .filter_map(|reference| output_source(&reference.source))
+            .flat_map(|reference| reference.source.output_sources())
             .collect(),
         ValidatedStep::Workflow(workflow) => workflow
             .inputs
             .values()
-            .filter_map(|input| output_source(&input.reference.source))
+            .flat_map(|input| input.reference.source.output_sources())
             .collect(),
         ValidatedStep::Agent(agent) => agent
             .agent
@@ -1142,21 +1135,9 @@ fn consumed_output_sources(step: &ValidatedStep) -> Vec<&super::validated::Resol
             .text
             .iter()
             .chain(&agent.agent.message.attachments)
-            .filter_map(|source| match source {
-                ValidatedMessageSource::Reference {
-                    source: ResolvedValueSource::Output(source),
-                    ..
-                } => Some(source),
-                ValidatedMessageSource::Reference {
-                    source:
-                        ResolvedValueSource::Input(_)
-                        | ResolvedValueSource::FinalizationContext
-                        | ResolvedValueSource::Wait(_)
-                        | ResolvedValueSource::ControlsAnswers
-                        | ResolvedValueSource::Item { .. },
-                    ..
-                }
-                | ValidatedMessageSource::File { .. } => None,
+            .flat_map(|source| match source {
+                ValidatedMessageSource::Reference { source, .. } => source.output_sources(),
+                ValidatedMessageSource::File { .. } => &[],
             })
             .collect(),
     }
@@ -1453,6 +1434,18 @@ fn project_step(
     {
         return Err(());
     }
+    // Each recorded source names a `firstOf` of the step's body and a reference its list
+    // holds (REQ-EVIDENCE-28).
+    let first_of = definition.first_of_bindings();
+    if !step.input_sources.iter().all(|recorded| {
+        first_of.get(&recorded.binding).is_some_and(|sources| {
+            sources
+                .iter()
+                .any(|source| source.reference() == recorded.reference)
+        })
+    }) {
+        return Err(());
+    }
     let (started_at, duration) = match (&step.started_at, step.duration_milliseconds) {
         (Some(started_at), Some(duration)) => (
             Some(parse_canonical_utc_timestamp(started_at).ok_or(())?),
@@ -1564,6 +1557,7 @@ fn project_step(
         recovery: step.recovery.clone(),
         invocations: step.invocations.clone(),
         failed_child: step.failed_child.clone(),
+        input_sources: step.input_sources.clone(),
         committed_outputs,
     })
 }
@@ -1761,12 +1755,25 @@ fn validate_exports(
     attempt: &LocalAttemptV1,
     steps: &[ArchivedStep],
 ) -> Result<(), ()> {
-    if !result.exports.keys().eq(workflow.definition.exports.keys())
+    // Each export's source is the one the reducer settled on, by the same rule over the
+    // steps the attempt ended with (INV-ENGINE-45).
+    let sources = workflow
+        .definition
+        .exports
+        .iter()
+        .map(|(name, sources)| {
+            sources
+                .settled_source(|source| archived_source_end(steps, source))
+                .map(|source| (name, source))
+                .ok_or(())
+        })
+        .collect::<Result<BTreeMap<_, _>, ()>>()?;
+    if !result.exports.keys().eq(sources.keys().copied())
         || (result.continuation.is_none() && !result.export_sources.is_empty())
         || result.continuation.is_some()
             && (!result.export_sources.keys().eq(result.exports.keys())
                 || result.export_sources.iter().any(|(name, recorded)| {
-                    workflow.definition.exports.get(name).is_none_or(|source| {
+                    sources.get(name).is_none_or(|source| {
                         recorded.node.id != source.node.id
                             || recorded.node.role
                                 != match source.node.role {
@@ -1781,7 +1788,7 @@ fn validate_exports(
     }
 
     let mut owner_ordinals = BTreeMap::<(String, String), usize>::new();
-    for (index, source) in workflow.definition.exports.values().enumerate() {
+    for (index, source) in sources.values().enumerate() {
         let source_step = steps
             .iter()
             .find(|step| step.id == source.node.id)
@@ -1795,10 +1802,8 @@ fn validate_exports(
 
     let mut paths_by_source = BTreeMap::<(String, String), String>::new();
     let mut sources_by_path = BTreeMap::<String, (String, String)>::new();
-    for ((name, export), (expected_name, source)) in
-        result.exports.iter().zip(&workflow.definition.exports)
-    {
-        if name != expected_name {
+    for ((name, export), (expected_name, source)) in result.exports.iter().zip(&sources) {
+        if name != *expected_name {
             return Err(());
         }
         let source_step = steps
@@ -1916,6 +1921,21 @@ fn validate_exports(
         }
     }
     Ok(())
+}
+
+/// How the archived step of `source` ended, as the choice of a `firstOf` reads it: a
+/// step whose data is available succeeded, and a skipped step, or one inherited without its
+/// data, was skipped.
+fn archived_source_end(steps: &[ArchivedStep], source: &ResolvedOutputSource) -> SourceEnd {
+    match steps.iter().find(|step| step.id == source.node.id) {
+        Some(step) if archived_step_data_available(step) => SourceEnd::Succeeded,
+        Some(ArchivedStep {
+            detail: ArchivedStepDetail::Evidence(NodeDetail::Skipped(_)),
+            ..
+        }) => SourceEnd::Skipped,
+        Some(step) if step.state == WorkflowStepStateV1::Inherited => SourceEnd::Skipped,
+        Some(_) | None => SourceEnd::Unsupplied,
+    }
 }
 
 fn archived_step_data_available(step: &ArchivedStep) -> bool {
@@ -2046,7 +2066,16 @@ fn prerequisite_satisfied(
                 producer.state,
                 WorkflowStepStateV1::Failed | WorkflowStepStateV1::Blocked
             ));
-    (!prerequisite.control || control_satisfied) && (!prerequisite.data || succeeded)
+    // A `firstOf` source is satisfied by its success or its skip (REQ-WFCOND-45); an
+    // inherited step was inherited as one or the other.
+    let first_of_satisfied = succeeded
+        || matches!(
+            producer.state,
+            WorkflowStepStateV1::Inherited | WorkflowStepStateV1::Skipped
+        );
+    (!prerequisite.control || control_satisfied)
+        && (!prerequisite.data || succeeded)
+        && (!prerequisite.first_of || first_of_satisfied)
 }
 
 // A step an edge-scheduled walk never reached is part of a success (REQ-WFEXEC-58).
@@ -2096,6 +2125,7 @@ mod tests {
             recovery: None,
             invocations: Vec::new(),
             failed_child: None,
+            input_sources: Vec::new(),
             committed_outputs: None,
         }
     }

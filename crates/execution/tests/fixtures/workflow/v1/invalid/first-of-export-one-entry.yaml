@@ -1,0 +1,11 @@
+schemaVersion: 1
+steps:
+  a:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: a.txt }
+exports:
+  result:
+    firstOf: [outputs.a.result]

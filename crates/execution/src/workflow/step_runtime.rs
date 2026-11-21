@@ -68,9 +68,9 @@ use super::runtime::{
     RequestedAction, later_step,
 };
 use super::validated::{
-    ResolvedOutputSource, ResolvedValueSource, ValidatedAgentStep, ValidatedCommandStep,
-    ValidatedCommonStep, ValidatedEdgeTarget, ValidatedMessageSource, ValidatedRecoveryHandler,
-    ValidatedStep, ValidatedWorkflowStep, WorkflowValueType,
+    ChosenSources, ResolvedOutputSource, ResolvedValueSource, ValidatedAgentStep,
+    ValidatedCommandStep, ValidatedCommonStep, ValidatedEdgeTarget, ValidatedMessageSource,
+    ValidatedRecoveryHandler, ValidatedStep, ValidatedWorkflowStep, WorkflowValueType,
 };
 use super::validation::CHILD_OUTCOME_OUTPUT;
 use super::value::{CapturedJson, CapturedValue};
@@ -1080,8 +1080,14 @@ where
         let Some(cancellation) = self.register_start(step.clone(), action) else {
             return Ok(());
         };
-        self.execute_registered_step(step, action, BTreeMap::new(), cancellation)
-            .await
+        self.execute_registered_step(
+            step,
+            action,
+            BTreeMap::new(),
+            ChosenSources::new(),
+            cancellation,
+        )
+        .await
     }
 
     fn spawn_step_task(
@@ -1173,6 +1179,7 @@ where
         step: String,
         action: ActionId,
         inputs: BTreeMap<String, ActionInput<CapturedValue>>,
+        input_sources: ChosenSources,
         cancellation: oneshot::Receiver<()>,
     ) -> Result<(), StepRuntimeError> {
         let preparation_runtime = self.clone();
@@ -1210,7 +1217,7 @@ where
             }
         }
         let prepared = tokio::task::spawn_blocking(move || {
-            preparation_runtime.prepare_step(&preparation_step, action, &inputs)
+            preparation_runtime.prepare_step(&preparation_step, action, &inputs, &input_sources)
         })
         .await
         .unwrap_or(Err(StepStartFailure::PreparationTaskUnavailable));
@@ -2681,16 +2688,20 @@ where
         .await
     }
 
+    // Each `firstOf` is resolved to the source the reducer chose (`input_sources`) before the
+    // body is read, so its value is materialized as a single reference's (INV-ENGINE-44).
     fn prepare_step(
         &self,
         step: &str,
         action: ActionId,
         action_inputs: &BTreeMap<String, ActionInput<CapturedValue>>,
+        input_sources: &ChosenSources,
     ) -> Result<PreparedStep, StepStartFailure> {
         let definition =
             workflow_node(&self.admitted, step).ok_or(StepStartFailure::StepUnavailable)?;
         let body = match StepBody::from(definition) {
             StepBody::Command(command) => {
+                let command = command.with_chosen_sources(input_sources);
                 if command.common.outputs.values().any(|output| {
                     matches!(
                         &output.definition,
@@ -2713,7 +2724,7 @@ where
                     return Err(StepStartFailure::InputsUnavailable);
                 }
                 if !command.inputs.is_empty() {
-                    let values = self.resolve_input_values(command, action_inputs)?;
+                    let values = self.resolve_input_values(&command, action_inputs)?;
                     let view = self
                         .inputs
                         .materialize(&values, &self.artifacts)
@@ -2737,7 +2748,8 @@ where
                 else {
                     return Err(StepStartFailure::AgentRuntimeUnavailable);
                 };
-                let upstream = resolve_agent_upstream_outputs(agent, action_inputs)?;
+                let agent = agent.with_chosen_sources(input_sources);
+                let upstream = resolve_agent_upstream_outputs(&agent, action_inputs)?;
                 let finalization_context = action_inputs.values().find_map(|input| match input {
                     ActionInput::FinalizationContext(bytes) => Some(bytes.as_ref()),
                     ActionInput::WorkflowInput
@@ -2751,6 +2763,7 @@ where
                     staging,
                     diagnostic_sessions,
                     identity.clone(),
+                    &agent,
                     &upstream,
                     finalization_context,
                     self.admitted.execution().cancellation().source().clone(),
@@ -3330,25 +3343,27 @@ impl CaptureWorker {
     }
 }
 
-/// The failure a capture of `step` settles as when `step` is the source of the workflow's
-/// `outcome` and the captured text is not one of its declared names (REQ-WFEXEC-56,
-/// INV-ENGINE-17). Validation admits only a text output as the source, so any other shape
-/// is refused the same way rather than committed.
+/// The failure a capture of `step` settles as when `outcome.from` names `step`, alone or as
+/// a source of a `firstOf`, and the captured text of the output it names is not one of the
+/// declared names (REQ-WFEXEC-56, INV-ENGINE-17). Validation names a step at most once and
+/// admits only a text output as a source, so any other shape is refused the same way rather
+/// than committed.
 fn undeclared_outcome(
     admitted: &AdmittedWorkflow,
     step: &str,
     values: &BTreeMap<String, CapturedValue>,
 ) -> Option<OutputCaptureFailure> {
     let outcome = admitted.workflow().definition.outcome.as_ref()?;
-    if outcome.source.node.id != step {
-        return None;
-    }
-    let declared = match values.get(&outcome.source.output) {
+    let source = outcome
+        .source
+        .iter()
+        .find(|source| source.node.id == step)?;
+    let declared = match values.get(&source.output) {
         Some(CapturedValue::Text(text)) => outcome.names.iter().any(|name| name == text.as_str()),
         _ => false,
     };
     (!declared).then(|| OutputCaptureFailure::OutcomeUndeclared {
-        output: outcome.source.output.clone(),
+        output: source.output.clone(),
     })
 }
 
@@ -4031,6 +4046,7 @@ where
                     step,
                     execution_number: _,
                     inputs,
+                    input_sources,
                 } => {
                     let Some(cancellation) = runtime.register_start(step.clone(), requested.id)
                     else {
@@ -4044,7 +4060,13 @@ where
                         async move {
                             execution.reach_step_task_boundary(&step);
                             execution
-                                .execute_registered_step(step, requested.id, inputs, cancellation)
+                                .execute_registered_step(
+                                    step,
+                                    requested.id,
+                                    inputs,
+                                    input_sources,
+                                    cancellation,
+                                )
                                 .await
                         },
                     );
@@ -4444,7 +4466,8 @@ fn resolve_agent_upstream_outputs(
                     | ResolvedValueSource::FinalizationContext
                     | ResolvedValueSource::Wait(_)
                     | ResolvedValueSource::ControlsAnswers
-                    | ResolvedValueSource::Item { .. },
+                    | ResolvedValueSource::Item { .. }
+                    | ResolvedValueSource::FirstOf(_),
                 ..
             } => None,
         })
@@ -4726,7 +4749,8 @@ pub(crate) fn child_preflight_inputs<Error>(
             ResolvedValueSource::Wait(_)
             | ResolvedValueSource::ControlsAnswers
             | ResolvedValueSource::Item { .. }
-            | ResolvedValueSource::FinalizationContext => ActionInput::Unavailable,
+            | ResolvedValueSource::FinalizationContext
+            | ResolvedValueSource::FirstOf(_) => ActionInput::Unavailable,
         };
         action_inputs.insert(name, value);
     }

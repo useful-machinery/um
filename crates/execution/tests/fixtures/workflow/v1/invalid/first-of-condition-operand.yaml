@@ -1,0 +1,22 @@
+schemaVersion: 1
+steps:
+  a:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: a.txt }
+  b:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: b.txt }
+  gate:
+    kind: cmd
+    condition:
+      equals:
+        - firstOf: [outputs.a.result, outputs.b.result]
+        - value: done
+    command:
+      argv: ["true"]

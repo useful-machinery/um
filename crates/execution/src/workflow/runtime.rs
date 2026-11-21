@@ -13,17 +13,18 @@ use super::document::{FailurePolicy, FinalizationTrigger, WaitKind, WaitRule};
 pub(crate) use super::evidence::FailurePhase;
 use super::evidence::{
     BlockedDetail, CancellationDetail, ConditionFalseDetail, EvaluatedPredicateEvidence,
-    FailedChild, FailureDetail, InheritedDetail, NodeFailureSource, NonExecutionCode,
-    NonExecutionDetail, Prerequisite, PrimaryIssue, PrimaryIssueDetail,
+    FailedChild, FailureDetail, InheritedDetail, InputSource, NodeFailureSource, NonExecutionCode,
+    NonExecutionDetail, Prerequisite, PrimaryIssue, PrimaryIssueDetail, input_sources,
 };
 use super::finalization_context::{
     self, FinalizationContext, OrdinaryIssue, OrdinaryIssueDisposition,
 };
 use super::step_runtime::StepFailureKind;
 use super::validated::{
-    ResolvedDirectPrerequisite, ResolvedValueSource, Scheduling, ValidatedEdgeTarget,
+    ChosenSources, FirstOfBinding, FirstOfChoice, OutputSources, ResolvedDirectPrerequisite,
+    ResolvedOutputSource, ResolvedValueSource, Scheduling, SourceEnd, ValidatedEdgeTarget,
     ValidatedFinalizer, ValidatedMessageSource, ValidatedRecoveryHandler, ValidatedStep,
-    ValidatedStepRecovery, ValidatedWorkflow, WorkflowNode, WorkflowNodeRole,
+    ValidatedStepRecovery, ValidatedWorkflow, WorkflowNode, WorkflowNodeRole, choose_first_of,
 };
 use super::validation::CHILD_OUTCOME_OUTPUT;
 use super::value::CapturedValue;
@@ -799,6 +800,10 @@ pub(crate) struct StepRuntimeState<Cause, Output> {
     /// captures its outputs and once it is `succeeded`, and dropped when it moves to any
     /// other state (REQ-WFEXEC-77, INV-ENGINE-42).
     pub(crate) failed_child: Option<FailedChild>,
+    /// The source each `firstOf` of the step's body took, recorded each time the step is
+    /// authorized and kept whatever state it then reaches; empty for a step that never
+    /// started in the attempt (REQ-EVIDENCE-28).
+    pub(crate) input_sources: Vec<InputSource>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -820,7 +825,11 @@ struct RuntimeStep {
     condition_values: BTreeMap<String, ResolvedValueSource>,
     prerequisites: Arc<[ResolvedDirectPrerequisite]>,
     evidence_prerequisites: Arc<[Prerequisite]>,
+    /// The body's single sources, keyed by input name for a command and by reference for an
+    /// agent message.
     inputs: BTreeMap<String, ResolvedValueSource>,
+    /// Each `firstOf` of the body with its sources in written order (REQ-WFCOND-45).
+    first_of: BTreeMap<FirstOfBinding, Vec<ResolvedOutputSource>>,
     declared_outputs: BTreeSet<String>,
     recovery: Option<RuntimeRecovery>,
     when: BTreeSet<FinalizationTrigger>,
@@ -892,18 +901,12 @@ fn edge_target_text(target: &ValidatedEdgeTarget) -> String {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct RuntimeExport {
-    step: String,
-    output: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RuntimeDefinition {
     steps: BTreeMap<String, RuntimeStep>,
     ordinary_ids: BTreeSet<String>,
     finalizer_ids: BTreeSet<String>,
     finalizer_presentation_order: Vec<String>,
-    exports: BTreeMap<String, RuntimeExport>,
+    exports: BTreeMap<String, OutputSources>,
     maximum_parallel_steps: NonZeroUsize,
     maximum_transitions: u64,
     text_inputs: BTreeMap<String, Arc<str>>,
@@ -976,19 +979,7 @@ impl RuntimeDefinition {
                     .map(|(id, finalizer)| (id.clone(), runtime_finalizer(finalizer))),
             )
             .collect();
-        let exports = workflow
-            .exports
-            .iter()
-            .map(|(name, source)| {
-                (
-                    name.clone(),
-                    RuntimeExport {
-                        step: source.node.id.clone(),
-                        output: source.output.clone(),
-                    },
-                )
-            })
-            .collect();
+        let exports = workflow.exports.clone();
         Self {
             steps,
             ordinary_ids,
@@ -1039,6 +1030,9 @@ fn runtime_step(
             ValidatedStep::Command(command) => command
                 .inputs
                 .iter()
+                .filter(|(_, reference)| {
+                    !matches!(reference.source, ResolvedValueSource::FirstOf(_))
+                })
                 .map(|(name, reference)| (name.clone(), reference.source.clone()))
                 .collect(),
             // A fan-out's list reaches the child-run driver as the action input `@forEach`,
@@ -1069,15 +1063,22 @@ fn runtime_step(
                             "finalization.context".to_owned(),
                             ResolvedValueSource::FinalizationContext,
                         )),
+                        // A `firstOf` is kept in `first_of`, its value keyed when chosen.
                         ResolvedValueSource::Input(_)
                         | ResolvedValueSource::Wait(_)
                         | ResolvedValueSource::ControlsAnswers
-                        | ResolvedValueSource::Item { .. } => None,
+                        | ResolvedValueSource::Item { .. }
+                        | ResolvedValueSource::FirstOf(_) => None,
                     },
                     ValidatedMessageSource::File { .. } => None,
                 })
                 .collect(),
         },
+        first_of: step
+            .first_of_bindings()
+            .into_iter()
+            .map(|(binding, sources)| (binding, sources.to_vec()))
+            .collect(),
         declared_outputs: common.outputs.keys().cloned().collect(),
         recovery: recovery.map(|recovery| RuntimeRecovery {
             retries: recovery.retries,
@@ -1198,6 +1199,9 @@ pub(crate) struct RuntimeState<Cause, Output, Deadline = ()> {
     pub(crate) steps: BTreeMap<String, StepRuntimeState<Cause, Output>>,
     pub(crate) output_producers: BTreeMap<(String, String), OutputProducer>,
     pub(crate) exports: Option<ExportSet<Output>>,
+    /// The source each export resolved to when the run finished (INV-ENGINE-45), set with
+    /// `exports`.
+    pub(crate) export_sources: BTreeMap<String, ResolvedOutputSource>,
     pub(crate) finalization_summary: Option<FinalizationSummary<Deadline>>,
     finalization: Option<FinalizationRuntime<Deadline>>,
     pub(crate) force_abort: Option<ForceAbortEvidence>,
@@ -1406,7 +1410,11 @@ pub(crate) enum Action<Provisional, Cause, Output, Deadline> {
     StartStep {
         step: String,
         execution_number: TargetExecutionNumber,
+        /// The body's values: under the input's name for a command and under the source's
+        /// reference for an agent message, a `firstOf`'s under its chosen source's.
         inputs: BTreeMap<String, ActionInput<Output>>,
+        /// The source each `firstOf` of the body took (REQ-WFCOND-45, INV-ENGINE-44).
+        input_sources: ChosenSources,
     },
     StartRecoveryHandler {
         step: String,
@@ -1618,6 +1626,7 @@ where
                     condition_passed: false,
                     failure_kind: None,
                     failed_child: None,
+                    input_sources: Vec::new(),
                 },
             )
         })
@@ -1632,6 +1641,7 @@ where
             steps,
             output_producers,
             exports: None,
+            export_sources: BTreeMap::new(),
             finalization_summary: None,
             finalization: None,
             force_abort: None,
@@ -2205,6 +2215,8 @@ fn settle_unstarted_on_wait<Provisional, Cause, Output, Deadline>(
         runtime.target_execution = None;
         runtime.target_invocation = None;
         runtime.active_invocation = None;
+        // A step that never started records no sources (REQ-EVIDENCE-28).
+        runtime.input_sources.clear();
     }
     transition_step(
         reduction,
@@ -3667,10 +3679,12 @@ fn condition_sources_available<Cause, Output, Deadline>(
                     || state.definition.json_inputs.contains_key(name)
             }
             ResolvedValueSource::FinalizationContext => state.finalization.is_some(),
-            // A condition never reads a control value (REQ-WFFORMAT-95).
+            // A condition never reads a control value (REQ-WFFORMAT-95) or a first-of
+            // (REQ-WFFORMAT-105).
             ResolvedValueSource::Wait(_)
             | ResolvedValueSource::ControlsAnswers
-            | ResolvedValueSource::Item { .. } => false,
+            | ResolvedValueSource::Item { .. }
+            | ResolvedValueSource::FirstOf(_) => false,
             ResolvedValueSource::Output(source) => state
                 .steps
                 .get(&source.node.id)
@@ -3706,7 +3720,8 @@ where
             }
             ResolvedValueSource::Wait(_)
             | ResolvedValueSource::ControlsAnswers
-            | ResolvedValueSource::Item { .. } => {}
+            | ResolvedValueSource::Item { .. }
+            | ResolvedValueSource::FirstOf(_) => {}
             ResolvedValueSource::Output(source) => {
                 let Some(output) = state
                     .steps
@@ -3753,6 +3768,49 @@ fn step_data_available<Output>(state: &StepState<Output>) -> bool {
                 ..
             }
         )
+}
+
+fn step_skipped<Output>(state: &StepState<Output>) -> bool {
+    matches!(
+        state,
+        StepState::Skipped { .. }
+            | StepState::Inherited {
+                disposition: InheritedDisposition::Skipped,
+                ..
+            }
+    )
+}
+
+fn first_of_state<'a, Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    sources: &'a [ResolvedOutputSource],
+) -> FirstOfChoice<'a> {
+    choose_first_of(sources, |source| source_end(state, source))
+}
+
+/// How the step of `source` stands, as the choice of a `firstOf` reads it; a step the state
+/// does not hold is not terminal.
+fn source_end<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    source: &ResolvedOutputSource,
+) -> SourceEnd {
+    step_source_end(
+        state
+            .steps
+            .get(&source.node.id)
+            .map(|producer| &producer.state),
+    )
+}
+
+/// How a step in `state` stands, as the choice of a `firstOf` reads it (INV-ENGINE-44); a
+/// step that is absent or not terminal is pending.
+pub(crate) fn step_source_end<Output>(state: Option<&StepState<Output>>) -> SourceEnd {
+    match state {
+        Some(producer) if step_data_available(producer) => SourceEnd::Succeeded,
+        Some(producer) if step_skipped(producer) => SourceEnd::Skipped,
+        Some(producer) if producer.is_terminal() => SourceEnd::Unsupplied,
+        Some(_) | None => SourceEnd::Pending,
+    }
 }
 
 pub(crate) fn step_outputs<Output>(state: &StepState<Output>) -> Option<&OutputSet<Output>> {
@@ -3981,6 +4039,8 @@ fn ordinary_unsatisfied_prerequisites<Cause, Output, Deadline>(
         {
             blockers.push(blocker);
         }
+        // A producer may also be a `firstOf` source, whose references block only as the
+        // list does below.
         if prerequisite.data && !succeeded {
             blockers.extend(
                 definition
@@ -3989,13 +4049,38 @@ fn ordinary_unsatisfied_prerequisites<Cause, Output, Deadline>(
                     .filter(|descriptor| {
                         matches!(descriptor, Prerequisite::Body { r#ref }
                             if output_reference_producer(r#ref)
-                                == Some(prerequisite.producer.as_str()))
+                                == Some(prerequisite.producer.as_str())
+                                && binds_singly(definition, r#ref))
                     })
                     .cloned(),
             );
         }
     }
+    for sources in definition.first_of.values() {
+        let FirstOfChoice::Blocked(unsupplied) = first_of_state(state, sources) else {
+            continue;
+        };
+        for source in unsupplied {
+            if let Ok(blocker) = Prerequisite::body(source.reference())
+                && !blockers.contains(&blocker)
+            {
+                blockers.push(blocker);
+            }
+        }
+    }
     blockers
+}
+
+/// Whether the body binds `reference` as a single reference and not only as a `firstOf`
+/// source.
+fn binds_singly(definition: &RuntimeStep, reference: &str) -> bool {
+    definition.inputs.values().any(|source| {
+        matches!(source, ResolvedValueSource::Output(output) if output.reference() == reference)
+    }) || !definition
+        .first_of
+        .values()
+        .flatten()
+        .any(|source| source.reference() == reference)
 }
 
 fn output_reference_producer(reference: &str) -> Option<&str> {
@@ -4022,6 +4107,7 @@ fn ordinary_prerequisite_satisfied<Cause, Output, Deadline>(
     (!prerequisite.control || ordinary_control_satisfied(state, prerequisite))
         && (!prerequisite.data || succeeded)
         && (!prerequisite.disposition_control || producer.state.is_terminal())
+        && (!prerequisite.first_of || succeeded || step_skipped(&producer.state))
 }
 
 fn ordinary_control_satisfied<Cause, Output, Deadline>(
@@ -4242,11 +4328,17 @@ fn select_ready_nodes<Provisional, Cause, Output, Deadline>(
     }
 }
 
+/// The values a step starts with and the source each of its `firstOf`s took.
+struct StartInputs<Output> {
+    values: BTreeMap<String, ActionInput<Output>>,
+    sources: ChosenSources,
+}
+
 fn authorize_target<Provisional, Cause, Output, Deadline>(
     reduction: &mut Reduction<Provisional, Cause, Output, Deadline>,
     step: String,
     execution_number: TargetExecutionNumber,
-    inputs: BTreeMap<String, ActionInput<Output>>,
+    inputs: StartInputs<Output>,
 ) {
     if let Some(runtime) = reduction.state.steps.get_mut(&step) {
         runtime.target_execution = Some(execution_number);
@@ -4256,6 +4348,9 @@ fn authorize_target<Provisional, Cause, Output, Deadline>(
     if let Some(runtime) = reduction.state.steps.get_mut(&step) {
         runtime.target_invocation = Some(action_id);
         runtime.active_invocation = Some(ActiveStepInvocation::Target { execution_number });
+        // REQ-EVIDENCE-28: the sources this start took, which a recovery execution chooses
+        // again from the same node states (INV-ENGINE-44).
+        runtime.input_sources = input_sources(&inputs.sources);
     }
     set_current_action(&mut reduction.state, &step, action_id);
     reduction.actions.push(RequestedAction {
@@ -4263,19 +4358,24 @@ fn authorize_target<Provisional, Cause, Output, Deadline>(
         action: Action::StartStep {
             step,
             execution_number,
-            inputs,
+            inputs: inputs.values,
+            input_sources: inputs.sources,
         },
     });
 }
 
+// Every start of a step, its recovery executions included, chooses each `firstOf` again from
+// the attempt's current node states (INV-ENGINE-44). A chosen source whose value the attempt
+// does not hold leaves the input unavailable, so the start fails as a single reference's does
+// and no later source is tried.
 fn resolved_action_inputs<Cause, Output, Deadline>(
     state: &RuntimeState<Cause, Output, Deadline>,
     definition: &RuntimeStep,
-) -> BTreeMap<String, ActionInput<Output>>
+) -> StartInputs<Output>
 where
     Output: Clone,
 {
-    definition
+    let mut values = definition
         .inputs
         .iter()
         .map(|(input, source)| {
@@ -4286,6 +4386,8 @@ where
                 ResolvedValueSource::Wait(_)
                 | ResolvedValueSource::ControlsAnswers
                 | ResolvedValueSource::Item { .. } => ActionInput::Unavailable,
+                // A step's `firstOf`s are kept apart from its single sources.
+                ResolvedValueSource::FirstOf(_) => ActionInput::Unavailable,
                 ResolvedValueSource::FinalizationContext => state
                     .finalization
                     .as_ref()
@@ -4293,17 +4395,53 @@ where
                         ActionInput::FinalizationContext(Arc::clone(&finalization.context))
                     })
                     .unwrap_or(ActionInput::Unavailable),
-                ResolvedValueSource::Output(source) => state
-                    .steps
-                    .get(&source.node.id)
-                    .and_then(|producer| step_outputs(&producer.state))
-                    .and_then(|outputs| outputs.get(&source.output))
-                    .cloned()
-                    .map_or(ActionInput::Unavailable, ActionInput::Output),
+                ResolvedValueSource::Output(source) => output_action_input(state, source),
             };
             (input.clone(), value)
         })
-        .collect()
+        .collect::<BTreeMap<_, _>>();
+    let mut sources = ChosenSources::new();
+    for (binding, list) in &definition.first_of {
+        let chosen = match first_of_state(state, list) {
+            FirstOfChoice::Chosen(source) => Some(source),
+            FirstOfChoice::Waiting | FirstOfChoice::Blocked(_) => None,
+        };
+        match (binding, chosen) {
+            (FirstOfBinding::Input(name), chosen) => {
+                values.insert(
+                    name.clone(),
+                    chosen.map_or(ActionInput::Unavailable, |source| {
+                        output_action_input(state, source)
+                    }),
+                );
+            }
+            // An agent reads an output by its reference, the key a single `ref` to it has.
+            (FirstOfBinding::Message { .. }, Some(source)) => {
+                values.insert(source.reference(), output_action_input(state, source));
+            }
+            (FirstOfBinding::Message { .. }, None) => {}
+        }
+        if let Some(source) = chosen {
+            sources.insert(binding.clone(), source.clone());
+        }
+    }
+    StartInputs { values, sources }
+}
+
+fn output_action_input<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    source: &ResolvedOutputSource,
+) -> ActionInput<Output>
+where
+    Output: Clone,
+{
+    state
+        .steps
+        .get(&source.node.id)
+        .and_then(|producer| step_outputs(&producer.state))
+        .and_then(|outputs| outputs.get(&source.output))
+        .cloned()
+        .map_or(ActionInput::Unavailable, ActionInput::Output)
 }
 
 // A node with a condition is selected to start only after that condition passed in the current
@@ -4329,6 +4467,10 @@ where
         .prerequisites
         .iter()
         .all(|prerequisite| ordinary_prerequisite_satisfied(state, prerequisite))
+        && definition
+            .first_of
+            .values()
+            .all(|sources| matches!(first_of_state(state, sources), FirstOfChoice::Chosen(_)))
         && edge_authorized(state, step_id)
 }
 
@@ -5008,7 +5150,7 @@ fn finish_run<Provisional, Cause, Output, Deadline>(
     Output: Clone,
     Deadline: Clone,
 {
-    let Some(exports) = derive_exports(&reduction.state) else {
+    let Some((exports, export_sources)) = derive_exports(&reduction.state) else {
         return;
     };
     let (to, outcome) = match ordinary_outcome {
@@ -5043,6 +5185,7 @@ fn finish_run<Provisional, Cause, Output, Deadline>(
     let sequence = next_sequence(&mut reduction.state);
     reduction.state.workflow = to.clone();
     reduction.state.exports = Some(exports.clone());
+    reduction.state.export_sources = export_sources;
     reduction.state.finalization_summary = summary.clone();
     reduction.events.push(TransitionEvent::Workflow {
         sequence,
@@ -5055,89 +5198,102 @@ fn finish_run<Provisional, Cause, Output, Deadline>(
     });
 }
 
+/// Each export's value and the source it resolved to (INV-ENGINE-45), or `None` while a
+/// source the export resolves to is not terminal.
 fn derive_exports<Cause, Output, Deadline>(
     state: &RuntimeState<Cause, Output, Deadline>,
-) -> Option<ExportSet<Output>>
+) -> Option<(ExportSet<Output>, BTreeMap<String, ResolvedOutputSource>)>
 where
     Output: Clone,
 {
-    state
-        .definition
-        .exports
-        .iter()
-        .map(|(name, source)| {
-            let step = state.steps.get(&source.step)?;
-            let value = match &step.state {
-                StepState::Succeeded { outputs } => match outputs.get(&source.output) {
-                    Some(output) => ExportValue::Available {
-                        output: output.clone(),
-                    },
-                    // A `workflow` step commits only the child exports that were available,
-                    // so an export of one it left out is unavailable, as for an inherited
-                    // step whose output was not retained.
-                    None if state
-                        .definition
-                        .steps
-                        .get(&source.step)
-                        .is_some_and(|definition| definition.edges.is_some()) =>
-                    {
-                        ExportValue::Unavailable {
-                            reason: ExportUnavailableReason::Failed,
-                        }
-                    }
-                    None => return None,
-                },
-                StepState::Inherited {
-                    disposition: InheritedDisposition::Succeeded,
-                    outputs,
-                    ..
-                } => outputs.get(&source.output).map_or(
-                    ExportValue::Unavailable {
-                        reason: ExportUnavailableReason::Failed,
-                    },
-                    |output| ExportValue::Available {
-                        output: output.clone(),
-                    },
-                ),
-                StepState::Inherited {
-                    disposition: InheritedDisposition::Skipped,
-                    ..
-                } => ExportValue::Unavailable {
-                    reason: ExportUnavailableReason::Skipped,
-                },
-                StepState::Failed { .. } => ExportValue::Unavailable {
+    let mut exports = ExportSet::new();
+    let mut sources = BTreeMap::new();
+    for (name, export) in &state.definition.exports {
+        let source = export.settled_source(|source| source_end(state, source))?;
+        exports.insert(name.clone(), derive_export(state, source)?);
+        sources.insert(name.clone(), source.clone());
+    }
+    Some((exports, sources))
+}
+
+/// The value an export takes from the one source it resolved to.
+fn derive_export<Cause, Output, Deadline>(
+    state: &RuntimeState<Cause, Output, Deadline>,
+    source: &ResolvedOutputSource,
+) -> Option<ExportValue<Output>>
+where
+    Output: Clone,
+{
+    let step = state.steps.get(&source.node.id)?;
+    let value = match &step.state {
+        StepState::Succeeded { outputs } => match outputs.get(&source.output) {
+            Some(output) => ExportValue::Available {
+                output: output.clone(),
+            },
+            // A `workflow` step commits only the child exports that were available,
+            // so an export of one it left out is unavailable, as for an inherited
+            // step whose output was not retained.
+            None if state
+                .definition
+                .steps
+                .get(&source.node.id)
+                .is_some_and(|definition| definition.edges.is_some()) =>
+            {
+                ExportValue::Unavailable {
                     reason: ExportUnavailableReason::Failed,
+                }
+            }
+            None => return None,
+        },
+        StepState::Inherited {
+            disposition: InheritedDisposition::Succeeded,
+            outputs,
+            ..
+        } => outputs.get(&source.output).map_or(
+            ExportValue::Unavailable {
+                reason: ExportUnavailableReason::Failed,
+            },
+            |output| ExportValue::Available {
+                output: output.clone(),
+            },
+        ),
+        StepState::Inherited {
+            disposition: InheritedDisposition::Skipped,
+            ..
+        } => ExportValue::Unavailable {
+            reason: ExportUnavailableReason::Skipped,
+        },
+        StepState::Failed { .. } => ExportValue::Unavailable {
+            reason: ExportUnavailableReason::Failed,
+        },
+        StepState::Blocked { .. } => ExportValue::Unavailable {
+            reason: ExportUnavailableReason::Blocked,
+        },
+        StepState::Skipped { .. } => ExportValue::Unavailable {
+            reason: ExportUnavailableReason::Skipped,
+        },
+        StepState::NotRun {
+            detail:
+                NonExecutionDetail {
+                    code: NonExecutionCode::FinalizerTriggerNotSelected,
                 },
-                StepState::Blocked { .. } => ExportValue::Unavailable {
-                    reason: ExportUnavailableReason::Blocked,
-                },
-                StepState::Skipped { .. } => ExportValue::Unavailable {
-                    reason: ExportUnavailableReason::Skipped,
-                },
-                StepState::NotRun {
-                    detail:
-                        NonExecutionDetail {
-                            code: NonExecutionCode::FinalizerTriggerNotSelected,
-                        },
-                } => ExportValue::Unavailable {
-                    reason: ExportUnavailableReason::TriggerNotSelected,
-                },
-                StepState::NotRun { .. } => ExportValue::Unavailable {
-                    reason: ExportUnavailableReason::NotRun,
-                },
-                StepState::Cancelled { .. } => ExportValue::Unavailable {
-                    reason: ExportUnavailableReason::Cancelled,
-                },
-                StepState::Pending
-                | StepState::Starting
-                | StepState::Running
-                | StepState::CapturingOutputs
-                | StepState::Recovering { .. }
-                | StepState::Cancelling { .. } => return None,
-            };
-            Some((name.clone(), value))
-        })
-        .collect()
+        } => ExportValue::Unavailable {
+            reason: ExportUnavailableReason::TriggerNotSelected,
+        },
+        StepState::NotRun { .. } => ExportValue::Unavailable {
+            reason: ExportUnavailableReason::NotRun,
+        },
+        StepState::Cancelled { .. } => ExportValue::Unavailable {
+            reason: ExportUnavailableReason::Cancelled,
+        },
+        StepState::Pending
+        | StepState::Starting
+        | StepState::Running
+        | StepState::CapturingOutputs
+        | StepState::Recovering { .. }
+        | StepState::Cancelling { .. } => return None,
+    };
+    Some(value)
 }
 
 fn step_accepts<Cause, Output, Deadline>(

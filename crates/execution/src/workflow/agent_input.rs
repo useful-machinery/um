@@ -47,7 +47,7 @@ use super::result_validation::RetainedJsonSchema;
 use super::step_runtime::{WorkingDirectoryFailure, resolve_working_directory};
 use super::validated::{
     ResolvedOutputSource, ResolvedValueSource, ValidatedAgentStep, ValidatedMessageSource,
-    ValidatedRecoveryHandler, ValidatedStep, WorkflowValueType,
+    ValidatedRecoveryHandler, WorkflowValueType,
 };
 use super::value::CapturedValue;
 
@@ -543,6 +543,8 @@ impl AttachmentBudget {
     }
 }
 
+/// `step` is the definition of the step `identity` names, each `firstOf` of its message
+/// resolved to the source chosen for it; one left unresolved fails as an unavailable input.
 #[expect(
     clippy::too_many_arguments,
     reason = "materialization makes every launch-owned dependency explicit"
@@ -553,6 +555,7 @@ pub(crate) fn materialize_agent_invocation<Sink>(
     staging: &AgentInputStaging,
     diagnostic_sessions: &AgentDiagnosticSessionStore,
     identity: AgentInvocationIdentity,
+    step: &ValidatedAgentStep,
     upstream_outputs: &BTreeMap<ResolvedOutputSource, CapturedValue>,
     finalization_context: Option<&[u8]>,
     cancellation: CancellationSource,
@@ -564,14 +567,6 @@ where
 {
     check_cancellation(&cancellation)?;
     let step_name = identity.step();
-    let definition = admitted
-        .workflow()
-        .definition
-        .node(step_name)
-        .ok_or_else(|| start_error(AgentInputStartFailure::StepUnavailable))?;
-    let ValidatedStep::Agent(step) = definition else {
-        return Err(start_error(AgentInputStartFailure::StepUnavailable));
-    };
     let admitted_step = admitted
         .agent_step(step_name)
         .ok_or_else(|| start_error(AgentInputStartFailure::AgentAdmissionUnavailable))?;

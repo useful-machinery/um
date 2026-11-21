@@ -225,19 +225,23 @@ pub(crate) fn check_inheritance(
         if let Some(step) = workflow.steps.get(id)
             && step.common().failure_policy == FailurePolicy::Required
         {
-            let mut body_references = BTreeSet::new();
-            check_body_references(step, &mut body_references);
-            for producer in body_references
-                .iter()
-                .map(|source| &source.node.id)
-                .collect::<BTreeSet<_>>()
-            {
-                if inherited.contains(producer.as_str()) && effectively_skipped.contains(producer) {
-                    violations.push(AdmissionViolation::RequiredSkipped {
-                        consumer: id.clone(),
-                        producer: producer.clone(),
-                    });
+            // A single reference is unsatisfied when its producer was inherited skipped, and a
+            // `firstOf` only when every source was; otherwise the step chooses when it starts
+            // (REQ-CONTINUE-7, REQ-WFCOND-45).
+            let mut producers = BTreeSet::new();
+            visit_body_references(step, &mut |sources| {
+                if sources.iter().all(|source| {
+                    inherited.contains(source.node.id.as_str())
+                        && effectively_skipped.contains(&source.node.id)
+                }) {
+                    producers.extend(sources.iter().map(|source| source.node.id.clone()));
                 }
+            });
+            for producer in producers {
+                violations.push(AdmissionViolation::RequiredSkipped {
+                    consumer: id.clone(),
+                    producer,
+                });
             }
         }
     }
@@ -329,7 +333,16 @@ pub(crate) fn referenced_outputs(
     for finalizer in workflow.finalizers.values() {
         check_step_references(&finalizer.body, &mut references);
     }
-    references.extend(workflow.exports.values().cloned());
+    // Every source of an export and of the outcome, so that an inherited one's value is
+    // loaded whichever the export or the outcome settles on (INV-ENGINE-45).
+    references.extend(
+        workflow
+            .exports
+            .values()
+            .chain(workflow.outcome.as_ref().map(|outcome| &outcome.source))
+            .flat_map(|sources| sources.iter())
+            .cloned(),
+    );
     references
 }
 
@@ -341,21 +354,30 @@ fn check_step_references(step: &ValidatedStep, references: &mut BTreeSet<Resolve
 }
 
 fn check_body_references(step: &ValidatedStep, references: &mut BTreeSet<ResolvedOutputSource>) {
+    visit_body_references(step, &mut |sources| {
+        references.extend(sources.iter().cloned())
+    });
+}
+
+/// Visit each output reference of a step's body as the sources it may take: one for a single
+/// reference, a `firstOf`'s list in written order (REQ-WFFORMAT-105), and none for a value
+/// that names no output.
+fn visit_body_references(step: &ValidatedStep, visit: &mut impl FnMut(&[ResolvedOutputSource])) {
     match step {
         ValidatedStep::Command(command) => {
             for reference in command.inputs.values() {
-                add_reference(&reference.source, references);
+                visit(reference.source.output_sources());
             }
         }
         ValidatedStep::Workflow(workflow) => {
             for input in workflow.inputs.values() {
-                add_reference(&input.reference.source, references);
+                visit(input.reference.source.output_sources());
             }
             if let Some(for_each) = &workflow.for_each {
-                add_reference(&for_each.items.source, references);
+                visit(for_each.items.source.output_sources());
             }
             for target in workflow.edges.values() {
-                add_rule_references(target, references);
+                add_rule_references(target, visit);
             }
         }
         ValidatedStep::Agent(agent) => {
@@ -369,7 +391,7 @@ fn check_body_references(step: &ValidatedStep, references: &mut BTreeSet<Resolve
                 .chain(&agent.agent.message.attachments)
             {
                 if let ValidatedMessageSource::Reference { source, .. } = source {
-                    add_reference(source, references);
+                    visit(source.output_sources());
                 }
             }
         }
@@ -381,7 +403,7 @@ fn check_body_references(step: &ValidatedStep, references: &mut BTreeSet<Resolve
 /// value is loaded for the attempt.
 fn add_rule_references(
     target: &ValidatedEdgeTarget,
-    references: &mut BTreeSet<ResolvedOutputSource>,
+    visit: &mut impl FnMut(&[ResolvedOutputSource]),
 ) {
     match target {
         ValidatedEdgeTarget::Wait {
@@ -393,18 +415,18 @@ fn add_rule_references(
                 .flat_map(|(left, right)| [left, right])
             {
                 if let Operand::Outputs { step, output } = operand {
-                    references.insert(ResolvedOutputSource {
+                    visit(&[ResolvedOutputSource {
                         node: WorkflowNode {
                             id: step.clone(),
                             role: WorkflowNodeRole::Step,
                         },
                         output: output.clone(),
                         value_type: WorkflowValueType::Text,
-                    });
+                    }]);
                 }
             }
         }
-        ValidatedEdgeTarget::Limited { else_, .. } => add_rule_references(else_, references),
+        ValidatedEdgeTarget::Limited { else_, .. } => add_rule_references(else_, visit),
         ValidatedEdgeTarget::Wait { rule: None, .. }
         | ValidatedEdgeTarget::Step(_)
         | ValidatedEdgeTarget::Exit(_) => {}
@@ -412,9 +434,7 @@ fn add_rule_references(
 }
 
 fn add_reference(source: &ResolvedValueSource, references: &mut BTreeSet<ResolvedOutputSource>) {
-    if let ResolvedValueSource::Output(output) = source {
-        references.insert(output.clone());
-    }
+    references.extend(source.output_sources().iter().cloned());
 }
 
 /// Compare resolved node semantics and only the retained static bytes reachable
@@ -963,5 +983,95 @@ mod tests {
                 producer: "cached".to_owned()
             })
         );
+    }
+
+    // REQ-CONTINUE-7, REQ-WFCOND-45: a `firstOf` refuses a required re-executed consumer only
+    // when every source is inherited and was skipped, naming each producer; a source that is
+    // re-executed, or inherited and succeeded, admits it, and an advisory consumer is
+    // admitted in every case. Every source of a re-executed consumer is a referenced output.
+    #[test]
+    fn a_first_of_refuses_a_required_consumer_only_when_every_source_was_skipped() {
+        let validated = |policy: &str| {
+            let document = super::super::decode(format!("schemaVersion: 1\ninputs:\n  branch: {{kind: text}}\nsteps:\n  a:\n    kind: cmd\n    condition: {{equals: [{{ref: inputs.branch}}, {{value: a}}]}}\n    command: {{argv: [\"true\"]}}\n    outputs:\n      result: {{kind: text, from: path, path: a.txt}}\n  b:\n    kind: cmd\n    condition: {{equals: [{{ref: inputs.branch}}, {{value: b}}]}}\n    command: {{argv: [\"true\"]}}\n    outputs:\n      result: {{kind: text, from: path, path: b.txt}}\n  c:\n    kind: cmd\n    failurePolicy: {policy}\n    inputs:\n      result: {{firstOf: [outputs.a.result, outputs.b.result]}}\n    command: {{argv: [\"true\"]}}\n").as_bytes()).unwrap();
+            super::super::validation::validate(document).unwrap()
+        };
+        let source = |id: &str| ResolvedOutputSource {
+            node: WorkflowNode {
+                id: id.to_owned(),
+                role: WorkflowNodeRole::Step,
+            },
+            output: "result".to_owned(),
+            value_type: WorkflowValueType::Text,
+        };
+        let skipped = |ids: &[&str]| {
+            ids.iter()
+                .map(|id| (*id).to_owned())
+                .collect::<BTreeSet<_>>()
+        };
+        for policy in ["required", "advisory"] {
+            let workflow = validated(policy);
+            let from_c = partition(&workflow, &["c".to_owned()], &BTreeSet::new()).unwrap();
+            assert_eq!(
+                referenced_outputs(&workflow, &from_c.reexecuted),
+                BTreeSet::from([source("a"), source("b")])
+            );
+            let refused = if policy == "required" {
+                vec![
+                    AdmissionViolation::RequiredSkipped {
+                        consumer: "c".to_owned(),
+                        producer: "a".to_owned(),
+                    },
+                    AdmissionViolation::RequiredSkipped {
+                        consumer: "c".to_owned(),
+                        producer: "b".to_owned(),
+                    },
+                ]
+            } else {
+                Vec::new()
+            };
+            let both_skipped = BTreeMap::from([
+                ("a".to_owned(), PriorState::Skipped),
+                ("b".to_owned(), PriorState::Skipped),
+            ]);
+            assert_eq!(
+                check_inheritance(
+                    &workflow,
+                    &workflow,
+                    &from_c,
+                    &both_skipped,
+                    &skipped(&["a", "b"])
+                ),
+                refused,
+                "{policy}"
+            );
+            let a_succeeded = BTreeMap::from([
+                ("a".to_owned(), PriorState::Succeeded),
+                ("b".to_owned(), PriorState::Skipped),
+            ]);
+            assert!(
+                check_inheritance(
+                    &workflow,
+                    &workflow,
+                    &from_c,
+                    &a_succeeded,
+                    &skipped(&["b"])
+                )
+                .is_empty(),
+                "{policy}"
+            );
+            let from_a = partition(&workflow, &["a".to_owned()], &BTreeSet::new()).unwrap();
+            assert_eq!(from_a.reexecuted, ["a", "c"]);
+            assert!(
+                check_inheritance(
+                    &workflow,
+                    &workflow,
+                    &from_a,
+                    &both_skipped,
+                    &skipped(&["a", "b"])
+                )
+                .is_empty(),
+                "{policy}"
+            );
+        }
     }
 }

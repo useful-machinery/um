@@ -1042,6 +1042,7 @@ steps:
             recovery: None,
             invocations: Vec::new(),
             failed_child: None,
+            input_sources: Vec::new(),
             committed_outputs: None,
         };
         assert_eq!(
@@ -1126,6 +1127,7 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
                 recovery: None,
                 invocations: Vec::new(),
                 failed_child: None,
+                input_sources: Vec::new(),
             },
             super::super::publication::WorkflowRunStep {
                 id: "consume".to_owned(),
@@ -1146,6 +1148,7 @@ fn succeeded_run_result(workflow: &ResolvedWorkflow, base: Instant) -> WorkflowR
                 recovery: None,
                 invocations: Vec::new(),
                 failed_child: None,
+                input_sources: Vec::new(),
             },
         ],
         finalization: None,

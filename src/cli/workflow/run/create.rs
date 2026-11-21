@@ -4792,6 +4792,7 @@ fn build_run_result(
     let mut states = execution.steps;
     let mut recoveries = execution.recoveries;
     let mut failed_children = execution.failed_children;
+    let mut input_sources = execution.input_sources;
     let mut steps = Vec::with_capacity(states.len());
     for id in &workflow.definition.presentation_order {
         let state = states
@@ -4851,6 +4852,7 @@ fn build_run_result(
             recovery,
             invocations,
             failed_child: failed_children.remove(id),
+            input_sources: input_sources.remove(id).unwrap_or_default(),
         });
     }
     let finalization = match (
@@ -4917,8 +4919,9 @@ fn build_run_result(
                     } else {
                         Vec::new()
                     },
-                    // A finalizer runs no child.
+                    // A finalizer runs no child and its body takes no `firstOf`.
                     failed_child: None,
+                    input_sources: Vec::new(),
                 });
             }
             if !retained.is_empty() {
@@ -4975,7 +4978,7 @@ fn build_run_result(
         steps,
         finalization,
         exports: execution.exports,
-        export_sources: workflow.definition.exports.clone(),
+        export_sources: execution.export_sources,
         export_presentation: workflow.definition.export_presentation.clone(),
     })
 }

@@ -646,6 +646,7 @@ fn archived_attempt(command_output: Option<ArchivedCommandOutput>) -> LocalArchi
                 recovery: None,
                 invocations: Vec::new(),
                 failed_child: None,
+                input_sources: Vec::new(),
                 committed_outputs: None,
             },
             ArchivedStep {
@@ -661,6 +662,7 @@ fn archived_attempt(command_output: Option<ArchivedCommandOutput>) -> LocalArchi
                 recovery: None,
                 invocations: Vec::new(),
                 failed_child: None,
+                input_sources: Vec::new(),
                 committed_outputs: None,
             },
         ],

@@ -17,8 +17,9 @@ use rustix::process::{Pid, Signal, kill_process};
 use super::poll_until;
 use super::workflow_definition::{Home, Tree, read_json};
 use super::workflow_run::{
-    RunBundle, child_tree, child_tree_args, finalizer_signal_bundle, isolated_command, run,
-    run_record, signal_bundle, spawn_held_child_tree, tree_finalizer_signal_bundle,
+    FIRST_OF_WORKFLOW, RunBundle, child_tree, child_tree_args, finalizer_signal_bundle,
+    isolated_command, run, run_record, run_with_branch, signal_bundle, spawn_held_child_tree,
+    tree_finalizer_signal_bundle,
 };
 use super::workflow_view::workflow_view_schema;
 
@@ -96,6 +97,39 @@ pub(super) fn status_schema() -> jsonschema::Validator {
     )))
     .unwrap();
     jsonschema::draft202012::new(&schema).unwrap()
+}
+
+// REQ-EVIDENCE-29, REQ-LOCALRUN-145
+#[test]
+fn plain_status_lists_the_sources_the_current_attempt_took() {
+    let bundle = RunBundle::new(FIRST_OF_WORKFLOW);
+    let (produced, run_directory) = run_with_branch(&bundle, "first-of", "a");
+    assert!(produced.status.success(), "{produced:?}");
+    let output = status(&run_directory, &["--plain", "--color", "never"]);
+    assert!(output.status.success(), "{output:?}");
+    let plain = String::from_utf8(output.stdout).unwrap();
+    let sources = plain
+        .lines()
+        .filter(|line| line.contains("outputs."))
+        .collect::<Vec<_>>();
+    let [source] = sources.as_slice() else {
+        panic!("{plain}");
+    };
+    let named = source.replace("outputs.a.result", "");
+    assert!(
+        source.contains("outputs.a.result")
+            && named.contains("result")
+            && named
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .any(|word| word == "c"),
+        "{plain}"
+    );
+
+    let (_bundle, run_directory) = completed_run("no-first-of");
+    let output = status(&run_directory, &["--plain", "--color", "never"]);
+    assert!(output.status.success(), "{output:?}");
+    let plain = String::from_utf8(output.stdout).unwrap();
+    assert!(!plain.contains("outputs."), "{plain}");
 }
 
 // REQ-WFRECOVERY-46, REQ-LOCALRUN-145

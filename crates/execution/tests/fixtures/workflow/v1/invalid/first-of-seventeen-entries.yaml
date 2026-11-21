@@ -1,0 +1,111 @@
+schemaVersion: 1
+steps:
+  s0:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s0.txt }
+  s1:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s1.txt }
+  s2:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s2.txt }
+  s3:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s3.txt }
+  s4:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s4.txt }
+  s5:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s5.txt }
+  s6:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s6.txt }
+  s7:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s7.txt }
+  s8:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s8.txt }
+  s9:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s9.txt }
+  s10:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s10.txt }
+  s11:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s11.txt }
+  s12:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s12.txt }
+  s13:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s13.txt }
+  s14:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s14.txt }
+  s15:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s15.txt }
+  s16:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: s16.txt }
+  join:
+    kind: cmd
+    inputs:
+      result:
+        firstOf: [outputs.s0.result, outputs.s1.result, outputs.s2.result, outputs.s3.result, outputs.s4.result, outputs.s5.result, outputs.s6.result, outputs.s7.result, outputs.s8.result, outputs.s9.result, outputs.s10.result, outputs.s11.result, outputs.s12.result, outputs.s13.result, outputs.s14.result, outputs.s15.result, outputs.s16.result]
+    command:
+      argv: ["true"]

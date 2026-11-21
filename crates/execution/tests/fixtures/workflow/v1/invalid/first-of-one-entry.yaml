@@ -1,0 +1,15 @@
+schemaVersion: 1
+steps:
+  a:
+    kind: cmd
+    command:
+      argv: ["true"]
+    outputs:
+      result: { kind: text, from: path, path: a.txt }
+  join:
+    kind: cmd
+    inputs:
+      result:
+        firstOf: [outputs.a.result]
+    command:
+      argv: ["true"]

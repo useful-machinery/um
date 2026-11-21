@@ -7,10 +7,10 @@ use super::super::document::{
 };
 use super::super::pi::{PiConfig, Thinking};
 use super::super::validated::{
-    ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueReference, ResolvedValueSource,
-    Scheduling, ValidatedEdgeTarget, ValidatedForEach, ValidatedHarness, ValidatedMessageSource,
-    ValidatedOutcome, ValidatedStep, ValidatedWorkflow, ValidatedWorkflowStep, WorkflowNode,
-    WorkflowNodeRole, WorkflowValueType,
+    OutputSources, ResolvedDirectPrerequisite, ResolvedOutputSource, ResolvedValueReference,
+    ResolvedValueSource, Scheduling, ValidatedEdgeTarget, ValidatedForEach, ValidatedHarness,
+    ValidatedMessageSource, ValidatedOutcome, ValidatedStep, ValidatedWorkflow,
+    ValidatedWorkflowStep, WorkflowNode, WorkflowNodeRole, WorkflowValueType,
 };
 use super::super::{DecodeFailureKind, decode};
 use super::{
@@ -1459,10 +1459,13 @@ exports:
         ("result", "resultProducer", WorkflowValueType::Json),
         ("file", "responseProducer", WorkflowValueType::File),
     ] {
-        assert_eq!(workflow.exports[name].node.id, step);
-        assert_eq!(workflow.exports[name].node.role, WorkflowNodeRole::Step);
-        assert_eq!(workflow.exports[name].output, name);
-        assert_eq!(workflow.exports[name].value_type, expected_type);
+        assert_eq!(workflow.exports[name].first().node.id, step);
+        assert_eq!(
+            workflow.exports[name].first().node.role,
+            WorkflowNodeRole::Step
+        );
+        assert_eq!(workflow.exports[name].first().output, name);
+        assert_eq!(workflow.exports[name].value_type(), expected_type);
     }
 }
 
@@ -1520,7 +1523,7 @@ steps:
     let exported = format!("{producer}exports:\n  changes:\n    ref: outputs.produce.changes\n");
     let workflow = validate_yaml(&exported).unwrap();
     assert_eq!(
-        workflow.exports["changes"].value_type,
+        workflow.exports["changes"].value_type(),
         WorkflowValueType::GitBranch
     );
 
@@ -1783,14 +1786,14 @@ fn outcomes_and_outcome_are_declared_together_with_a_member_failure_name() {
         workflow.outcome,
         Some(ValidatedOutcome {
             names: vec!["planned".to_owned(), "failed".to_owned()],
-            source: ResolvedOutputSource {
+            source: OutputSources::single(ResolvedOutputSource {
                 node: WorkflowNode {
                     id: "decide".to_owned(),
                     role: WorkflowNodeRole::Step,
                 },
                 output: "verdict".to_owned(),
                 value_type: WorkflowValueType::Text,
-            },
+            }),
             on_failure: "failed".to_owned(),
         })
     );
@@ -1822,6 +1825,120 @@ fn the_outcome_source_is_a_text_output_of_a_required_unconditional_step() {
             "unexpected failure for {from}"
         );
     }
+}
+
+/// `route` and `adopt` run under opposite conditions on `request`; `plain` has no
+/// condition, `advise` is advisory and `report` is a finalizer.
+const FIRST_OF_OUTCOME_WORKFLOW: &str = "schemaVersion: 1
+inputs:
+  request: {kind: text}
+outcomes: [planned, failed]
+outcome:
+  from: FROM
+  onFailure: failed
+steps:
+  route:
+    kind: cmd
+    condition: {equals: [{ref: inputs.request}, {value: route}]}
+    command: {argv: [\"true\"]}
+    outputs:
+      verdict: {kind: text, from: path, path: route.txt}
+      note: {kind: text, from: path, path: note.txt}
+      structured: {kind: json, from: path, path: route.json, schema: verdict.schema.json}
+  adopt:
+    kind: cmd
+    condition: {equals: [{ref: inputs.request}, {value: adopt}]}
+    command: {argv: [\"true\"]}
+    outputs:
+      verdict: {kind: text, from: path, path: adopt.txt}
+  plain:
+    kind: cmd
+    command: {argv: [\"true\"]}
+    outputs:
+      verdict: {kind: text, from: path, path: plain.txt}
+  advise:
+    kind: cmd
+    failurePolicy: advisory
+    condition: {equals: [{ref: inputs.request}, {value: advise}]}
+    command: {argv: [\"true\"]}
+    outputs:
+      verdict: {kind: text, from: path, path: advice.txt}
+finalizers:
+  report:
+    kind: cmd
+    command: {argv: [\"true\"]}
+    outputs:
+      verdict: {kind: text, from: path, path: final.txt}
+";
+
+fn first_of_outcome(sources: &str) -> String {
+    FIRST_OF_OUTCOME_WORKFLOW.replace("FROM", &format!("{{firstOf: [{sources}]}}"))
+}
+
+// REQ-WFFORMAT-108, REQ-WFFORMAT-106
+#[test]
+fn the_outcome_takes_a_first_of_of_text_outputs_of_required_ordinary_steps() {
+    let workflow = validate_yaml(&first_of_outcome(
+        "outputs.route.verdict, outputs.adopt.verdict",
+    ))
+    .unwrap();
+    let source = |node: &str| ResolvedOutputSource {
+        node: WorkflowNode {
+            id: node.to_owned(),
+            role: WorkflowNodeRole::Step,
+        },
+        output: "verdict".to_owned(),
+        value_type: WorkflowValueType::Text,
+    };
+    assert_eq!(
+        workflow.outcome.unwrap().source,
+        OutputSources::from_list(vec![source("route"), source("adopt")]).unwrap()
+    );
+
+    for (sources, kind) in [
+        (
+            "outputs.missing.verdict, outputs.adopt.verdict",
+            ValidationFailureKind::InvalidOutcomeSource,
+        ),
+        (
+            "outputs.route.verdict, outputs.adopt.missing",
+            ValidationFailureKind::InvalidOutcomeSource,
+        ),
+        (
+            "outputs.route.verdict, outputs.report.verdict",
+            ValidationFailureKind::InvalidOutcomeSource,
+        ),
+        (
+            "outputs.route.verdict, outputs.advise.verdict",
+            ValidationFailureKind::InvalidOutcomeSource,
+        ),
+        (
+            "outputs.route.structured, outputs.adopt.verdict",
+            ValidationFailureKind::InvalidOutcomeSource,
+        ),
+        (
+            "outputs.route.verdict, outputs.route.note",
+            ValidationFailureKind::UnreachableReferenceSource,
+        ),
+        (
+            "outputs.plain.verdict, outputs.adopt.verdict",
+            ValidationFailureKind::UnreachableReferenceSource,
+        ),
+    ] {
+        let failure = validate_yaml(&first_of_outcome(sources)).unwrap_err();
+        assert_eq!(
+            (failure.kind(), failure.location()),
+            (kind, &ValidationLocation::Outcome),
+            "unexpected failure for {sources}"
+        );
+    }
+
+    // A `from` that is one reference keeps the rule that its step declares no condition.
+    assert_failure(
+        &FIRST_OF_OUTCOME_WORKFLOW.replace("FROM", "outputs.route.verdict"),
+        ValidationFailureKind::InvalidOutcomeSource,
+        ValidationLocation::Outcome,
+    );
 }
 
 const EDGE_WORKFLOW: &str = "schemaVersion: 1
@@ -3102,10 +3219,10 @@ exports:
     };
     assert!(cleanup.common.prerequisites.is_empty());
     assert_eq!(
-        workflow.exports["report"].node.role,
+        workflow.exports["report"].first().node.role,
         WorkflowNodeRole::Finalizer
     );
-    assert_eq!(workflow.exports["report"].node.id, "report");
+    assert_eq!(workflow.exports["report"].first().node.id, "report");
 }
 
 // REQ-WFFORMAT-62
@@ -3325,7 +3442,10 @@ exports:
         .replace("POLICY", "failurePolicy: required")
         .replace("TRIGGER", "succeeded");
     assert_eq!(
-        validate_yaml(&accepted).unwrap().exports["value"].node.role,
+        validate_yaml(&accepted).unwrap().exports["value"]
+            .first()
+            .node
+            .role,
         WorkflowNodeRole::Finalizer
     );
 }
@@ -3393,6 +3513,531 @@ finalizers:
     ));
 }
 
+/// Every producer's outputs: two of each kind but `git_branch`, the files of two media types.
+const FIRST_OF_OUTPUTS: &str = "{result: {kind: text, from: path, path: result.txt}, \
+    other: {kind: text, from: path, path: other.txt}, \
+    data: {kind: json, from: path, path: data.json, schema: schemas/one.json}, \
+    otherData: {kind: json, from: path, path: other.json, schema: schemas/two.json}, \
+    report: {kind: file, from: path, path: report.pdf, mediaType: application/pdf}, \
+    copy: {kind: file, from: path, path: copy.pdf, mediaType: application/pdf}, \
+    otherReport: {kind: file, from: path, path: report.bin, mediaType: application/octet-stream}, \
+    changes: {kind: git_branch, from: workspace}}";
+
+/// Two conditioned producers `a` and `b` with outputs of every kind, an unconditioned
+/// `always`, an advisory `advisory`, a command consumer `join` binding `@input` and an agent
+/// consumer `review` holding `@text` at `message.text[1]` and `@attachment` at
+/// `message.attachments[0]`.
+const FIRST_OF_WORKFLOW: &str = "schemaVersion: 1
+inputs:
+  branch: {kind: text}
+agentProfiles:
+  coding:
+    harness: {kind: pi, config: {model: openai/gpt-5, thinking: high}}
+steps:
+  a:
+    kind: cmd
+#a
+    condition: {equals: [{ref: inputs.branch}, {value: a}]}
+    command: {argv: [\"true\"]}
+    outputs: @outputs
+  b:
+    kind: cmd
+    condition: {equals: [{ref: inputs.branch}, {value: b}]}
+    command: {argv: [\"true\"]}
+    outputs: @outputs
+  always:
+    kind: cmd
+    command: {argv: [\"true\"]}
+    outputs: @outputs
+  advisory:
+    kind: cmd
+    failurePolicy: advisory
+    condition: {equals: [{ref: inputs.branch}, {value: c}]}
+    command: {argv: [\"true\"]}
+    outputs: @outputs
+  join:
+    kind: cmd
+    inputs:
+      result: {firstOf: @input}
+    command: {argv: [\"true\"]}
+    outputs:
+      own: {kind: text, from: path, path: own.txt}
+  review:
+    kind: agent
+    agent:
+      profile: coding
+      systemPrompt: prompts/system.md
+      message:
+        text:
+          - file: prompts/message.md
+          - firstOf: @text
+        attachments:
+          - firstOf: @attachment
+    outputs:
+      own: {kind: text, from: path, path: own.txt}
+      ownReport: {kind: file, from: path, path: own.pdf, mediaType: application/pdf}
+";
+
+#[derive(Clone, Copy, Debug)]
+enum FirstOfPlace {
+    Input,
+    Text,
+    Attachment,
+}
+
+/// The workflow with `sources` at `place` and valid lists elsewhere, and the location a
+/// single reference at `place` reports.
+fn first_of_workflow(place: FirstOfPlace, sources: &str) -> (String, ValidationLocation) {
+    let mut input = "[outputs.a.result, outputs.b.result]";
+    let mut text = "[outputs.a.result, outputs.b.result]";
+    let mut attachment = "[outputs.a.report, outputs.b.report]";
+    let location = match place {
+        FirstOfPlace::Input => {
+            input = sources;
+            ValidationLocation::StepInput {
+                step: "join".to_owned(),
+                input: "result".to_owned(),
+            }
+        }
+        FirstOfPlace::Text => {
+            text = sources;
+            ValidationLocation::MessageText {
+                step: "review".to_owned(),
+                index: 1,
+            }
+        }
+        FirstOfPlace::Attachment => {
+            attachment = sources;
+            ValidationLocation::MessageAttachment {
+                step: "review".to_owned(),
+                index: 0,
+            }
+        }
+    };
+    let source = FIRST_OF_WORKFLOW
+        .replace("@outputs", FIRST_OF_OUTPUTS)
+        .replace("@input", input)
+        .replace("@text", text)
+        .replace("@attachment", attachment);
+    (source, location)
+}
+
+fn first_of_prerequisites(step: &ValidatedStep) -> Vec<(&str, bool, bool, bool)> {
+    step.common()
+        .prerequisites
+        .iter()
+        .map(|prerequisite| {
+            (
+                prerequisite.producer.as_str(),
+                prerequisite.control,
+                prerequisite.data,
+                prerequisite.first_of,
+            )
+        })
+        .collect()
+}
+
+fn body_descriptors(references: &[&str]) -> Vec<super::super::evidence::Prerequisite> {
+    references
+        .iter()
+        .map(|reference| super::super::evidence::Prerequisite::body(*reference).unwrap())
+        .collect()
+}
+
+fn first_of_source(
+    step: &str,
+    output: &str,
+    value_type: WorkflowValueType,
+) -> ResolvedOutputSource {
+    ResolvedOutputSource {
+        node: WorkflowNode {
+            id: step.to_owned(),
+            role: WorkflowNodeRole::Step,
+        },
+        output: output.to_owned(),
+        value_type,
+    }
+}
+
+// REQ-WFFORMAT-105, REQ-WFFORMAT-106, REQ-WFFORMAT-39
+#[test]
+fn a_first_of_binds_the_common_kind_and_makes_every_source_a_prerequisite() {
+    let (source, _) =
+        first_of_workflow(FirstOfPlace::Input, "[outputs.a.result, outputs.b.result]");
+    let workflow = validate_yaml(&source).unwrap();
+
+    let ValidatedStep::Command(join) = &workflow.steps["join"] else {
+        panic!("join must be a command step");
+    };
+    assert_eq!(
+        join.inputs["result"],
+        ResolvedValueReference {
+            source: ResolvedValueSource::FirstOf(vec![
+                first_of_source("a", "result", WorkflowValueType::Text),
+                first_of_source("b", "result", WorkflowValueType::Text),
+            ]),
+            value_type: WorkflowValueType::Text,
+        }
+    );
+    // A source is not a data prerequisite: it may be skipped.
+    assert_eq!(
+        first_of_prerequisites(&workflow.steps["join"]),
+        [("a", false, false, true), ("b", false, false, true)]
+    );
+    assert_eq!(
+        join.common.evidence_prerequisites,
+        body_descriptors(&["outputs.a.result", "outputs.b.result"])
+    );
+
+    let ValidatedStep::Agent(review) = &workflow.steps["review"] else {
+        panic!("review must be an agent step");
+    };
+    assert_eq!(
+        review.agent.message.text[1],
+        ValidatedMessageSource::Reference {
+            source: ResolvedValueSource::FirstOf(vec![
+                first_of_source("a", "result", WorkflowValueType::Text),
+                first_of_source("b", "result", WorkflowValueType::Text),
+            ]),
+            value_type: WorkflowValueType::Text,
+        }
+    );
+    assert_eq!(
+        review.agent.message.attachments[0],
+        ValidatedMessageSource::Reference {
+            source: ResolvedValueSource::FirstOf(vec![
+                first_of_source("a", "report", WorkflowValueType::File),
+                first_of_source("b", "report", WorkflowValueType::File),
+            ]),
+            value_type: WorkflowValueType::File,
+        }
+    );
+    assert_eq!(
+        first_of_prerequisites(&workflow.steps["review"]),
+        [("a", false, false, true), ("b", false, false, true)]
+    );
+    assert_eq!(
+        review.common.evidence_prerequisites,
+        body_descriptors(&[
+            "outputs.a.report",
+            "outputs.a.result",
+            "outputs.b.report",
+            "outputs.b.result",
+        ])
+    );
+
+    // A producer the step also names by a single reference is both kinds of prerequisite,
+    // and the last source may be a step that is never skipped.
+    let both = source.replace(
+        "      result: {firstOf: [outputs.a.result, outputs.b.result]}\n",
+        "      result: {firstOf: [outputs.a.result, outputs.b.result, outputs.always.result]}\n      direct: {ref: outputs.a.other}\n",
+    );
+    let workflow = validate_yaml(&both).unwrap();
+    assert_eq!(
+        first_of_prerequisites(&workflow.steps["join"]),
+        [
+            ("a", false, true, true),
+            ("always", false, false, true),
+            ("b", false, false, true),
+        ]
+    );
+    assert_eq!(
+        workflow.steps["join"].common().evidence_prerequisites,
+        body_descriptors(&[
+            "outputs.a.other",
+            "outputs.a.result",
+            "outputs.always.result",
+            "outputs.b.result",
+        ])
+    );
+}
+
+// REQ-WFFORMAT-106
+#[test]
+fn first_of_sources_that_cannot_stand_in_for_each_other_are_refused_in_place() {
+    for (place, sources) in [
+        (FirstOfPlace::Input, "[outputs.a.result, outputs.b.data]"),
+        (
+            FirstOfPlace::Attachment,
+            "[outputs.a.report, outputs.b.data]",
+        ),
+        (FirstOfPlace::Input, "[outputs.a.data, outputs.b.otherData]"),
+        (
+            FirstOfPlace::Attachment,
+            "[outputs.a.data, outputs.b.otherData]",
+        ),
+        (
+            FirstOfPlace::Input,
+            "[outputs.a.report, outputs.b.otherReport]",
+        ),
+        (
+            FirstOfPlace::Attachment,
+            "[outputs.a.report, outputs.b.report, outputs.always.otherReport]",
+        ),
+    ] {
+        let (source, location) = first_of_workflow(place, sources);
+        assert_failure(
+            &source,
+            ValidationFailureKind::IncompatibleReferenceSources,
+            location,
+        );
+    }
+}
+
+// REQ-WFFORMAT-106, REQ-WFCOND-29
+#[test]
+fn a_first_of_source_that_could_never_be_taken_is_refused_in_place() {
+    for (place, sources) in [
+        (FirstOfPlace::Input, "[outputs.a.result, outputs.a.other]"),
+        (
+            FirstOfPlace::Text,
+            "[outputs.a.result, outputs.b.result, outputs.a.other]",
+        ),
+        (
+            FirstOfPlace::Attachment,
+            "[outputs.a.report, outputs.a.copy]",
+        ),
+        (
+            FirstOfPlace::Input,
+            "[outputs.always.result, outputs.a.result]",
+        ),
+        (
+            FirstOfPlace::Text,
+            "[outputs.a.result, outputs.always.result, outputs.b.result]",
+        ),
+        (
+            FirstOfPlace::Attachment,
+            "[outputs.always.report, outputs.a.report]",
+        ),
+    ] {
+        let (source, location) = first_of_workflow(place, sources);
+        assert_failure(
+            &source,
+            ValidationFailureKind::UnreachableReferenceSource,
+            location,
+        );
+    }
+}
+
+// REQ-WFFORMAT-106, REQ-WFFORMAT-38, REQ-WFFORMAT-40, REQ-WFFORMAT-43, REQ-WFFORMAT-49, REQ-WFFORMAT-55
+#[test]
+fn each_first_of_source_keeps_the_single_reference_failures() {
+    let single = [
+        (
+            "outputs.missing.result",
+            ValidationFailureKind::UnknownOutputStep,
+        ),
+        ("outputs.b.missing", ValidationFailureKind::UnknownOutput),
+        (
+            "outputs.advisory.@",
+            ValidationFailureKind::AdvisoryDataDependency,
+        ),
+    ];
+    for place in [
+        FirstOfPlace::Input,
+        FirstOfPlace::Text,
+        FirstOfPlace::Attachment,
+    ] {
+        let output = match place {
+            FirstOfPlace::Attachment => "report",
+            FirstOfPlace::Input | FirstOfPlace::Text => "result",
+        };
+        let consumer = match place {
+            FirstOfPlace::Input => "join",
+            FirstOfPlace::Text | FirstOfPlace::Attachment => "review",
+        };
+        let own = match place {
+            FirstOfPlace::Input | FirstOfPlace::Text => "own",
+            FirstOfPlace::Attachment => "ownReport",
+        };
+        let failures = single
+            .iter()
+            .map(|(reference, kind)| (reference.replace('@', output), *kind))
+            .chain([
+                // Every source is checked even when an earlier one would be taken, and a
+                // single reference's failure is reported in place of an incompatibility.
+                (
+                    "outputs.b.changes".to_owned(),
+                    ValidationFailureKind::TerminalOutputReference,
+                ),
+                (
+                    format!("outputs.{consumer}.{own}"),
+                    ValidationFailureKind::SelfDependency,
+                ),
+            ]);
+        for (reference, kind) in failures {
+            let (source, location) =
+                first_of_workflow(place, &format!("[outputs.a.{output}, {reference}]"));
+            assert_failure(&source, kind, location);
+        }
+    }
+    // The destination's type rule holds for every source before the sources are compared.
+    for (place, sources) in [
+        (FirstOfPlace::Text, "[outputs.a.result, outputs.b.data]"),
+        (
+            FirstOfPlace::Attachment,
+            "[outputs.a.result, outputs.b.result]",
+        ),
+    ] {
+        let (source, location) = first_of_workflow(place, sources);
+        assert_failure(
+            &source,
+            ValidationFailureKind::MessageTypeMismatch,
+            location,
+        );
+    }
+    // A cycle through a source is a cycle.
+    let (source, _) =
+        first_of_workflow(FirstOfPlace::Input, "[outputs.a.result, outputs.b.result]");
+    assert_failure(
+        &source.replace("#a\n", "    dependsOn: [join]\n"),
+        ValidationFailureKind::DependencyCycle,
+        ValidationLocation::WorkflowGraph,
+    );
+}
+
+/// `FIRST_OF_WORKFLOW` with the finalizers `published`, run when the workflow succeeded, and
+/// `rescued`, run when it failed, each declaring the text output `result`, and the export
+/// `result` over `sources`, followed by `presentation`.
+fn first_of_export_workflow(sources: &str, presentation: &str) -> String {
+    let (workflow, _) =
+        first_of_workflow(FirstOfPlace::Input, "[outputs.a.result, outputs.b.result]");
+    let finalizer = |name: &str, when: &str| {
+        format!(
+            "  {name}:\n    kind: cmd\n    when: [{when}]\n    command: {{argv: [\"true\"]}}\n    outputs:\n      result: {{kind: text, from: path, path: result.txt}}\n"
+        )
+    };
+    format!(
+        "{workflow}finalizers:\n{}{}exports:\n  result:\n    firstOf: {sources}\n{presentation}",
+        finalizer("published", "succeeded"),
+        finalizer("rescued", "failed"),
+    )
+}
+
+fn at_export(name: &str) -> ValidationLocation {
+    ValidationLocation::Export {
+        name: name.to_owned(),
+    }
+}
+
+// REQ-WFFORMAT-107, REQ-WFFORMAT-91
+#[test]
+fn a_first_of_export_holds_its_sources_in_order_and_their_kind() {
+    let presented = "    presentation:\n      title: {value: Result}\n";
+    for presentation in ["", presented] {
+        let workflow = validate_yaml(&first_of_export_workflow(
+            "[outputs.a.result, outputs.b.result]",
+            presentation,
+        ))
+        .unwrap();
+        let export = &workflow.exports["result"];
+        assert_eq!(
+            export.iter().cloned().collect::<Vec<_>>(),
+            [
+                first_of_source("a", "result", WorkflowValueType::Text),
+                first_of_source("b", "result", WorkflowValueType::Text),
+            ]
+        );
+        assert_eq!(export.value_type(), WorkflowValueType::Text);
+        assert_eq!(
+            workflow.export_presentation.contains_key("result"),
+            !presentation.is_empty()
+        );
+    }
+
+    // An export creates no graph edge, whichever form names its source.
+    let (without, _) =
+        first_of_workflow(FirstOfPlace::Input, "[outputs.a.result, outputs.b.result]");
+    let without = validate_yaml(&without).unwrap();
+    let with = validate_yaml(&first_of_export_workflow(
+        "[outputs.b.data, outputs.always.data]",
+        "",
+    ))
+    .unwrap();
+    for (id, step) in &with.steps {
+        assert_eq!(
+            step.common().prerequisites,
+            without.steps[id].common().prerequisites,
+            "{id}"
+        );
+    }
+    // A parent's `workflow` step derives its output from the sources' kind.
+    assert_eq!(
+        ChildWorkflowSummary::of(&with, &[], BTreeSet::new()).exports["result"],
+        WorkflowValueType::Json
+    );
+}
+
+// REQ-WFFORMAT-107, REQ-WFFORMAT-106, REQ-WFFORMAT-66
+#[test]
+fn a_first_of_export_refuses_sources_at_the_export() {
+    for (sources, kind) in [
+        (
+            "[outputs.a.result, outputs.missing.result]",
+            ValidationFailureKind::InvalidExportTarget,
+        ),
+        (
+            "[outputs.a.result, outputs.b.missing]",
+            ValidationFailureKind::InvalidExportTarget,
+        ),
+        // A finalizer's output is no source of a `firstOf`, even one run on success.
+        (
+            "[outputs.a.result, outputs.published.result]",
+            ValidationFailureKind::InvalidExportTarget,
+        ),
+        // A source still meets a single reference's rules first.
+        (
+            "[outputs.a.result, outputs.rescued.result]",
+            ValidationFailureKind::FinalizerExportTrigger,
+        ),
+        (
+            "[outputs.a.changes, outputs.b.changes]",
+            ValidationFailureKind::InvalidExportTarget,
+        ),
+        (
+            "[outputs.a.result, outputs.advisory.result]",
+            ValidationFailureKind::AdvisoryExportTarget,
+        ),
+        (
+            "[outputs.a.result, outputs.b.data]",
+            ValidationFailureKind::IncompatibleReferenceSources,
+        ),
+        (
+            "[outputs.a.data, outputs.b.otherData]",
+            ValidationFailureKind::IncompatibleReferenceSources,
+        ),
+        (
+            "[outputs.a.result, outputs.a.other]",
+            ValidationFailureKind::UnreachableReferenceSource,
+        ),
+        (
+            "[outputs.always.result, outputs.a.result]",
+            ValidationFailureKind::UnreachableReferenceSource,
+        ),
+        // A single reference's failure is reported in place of an incompatibility.
+        (
+            "[outputs.a.result, outputs.b.data, outputs.b.missing]",
+            ValidationFailureKind::InvalidExportTarget,
+        ),
+    ] {
+        assert_failure(
+            &first_of_export_workflow(sources, ""),
+            kind,
+            at_export("result"),
+        );
+    }
+
+    // A `workflow` step's output is no source of a `firstOf` either.
+    assert_edge_failure(
+        &format!(
+            "{EDGE_WORKFLOW}exports:\n  result:\n    firstOf: [outputs.design.plan, outputs.build.outcome]\n"
+        ),
+        &child_summaries(),
+        ValidationFailureKind::InvalidExportTarget,
+        at_export("result"),
+    );
+}
+
 // REQ-WFCOND-15
 #[test]
 fn workflow_node_evidence_definition_limit_applies_to_steps_and_finalizers() {
@@ -3440,6 +4085,47 @@ fn workflow_node_evidence_definition_limit_applies_to_steps_and_finalizers() {
                     ValidationFailureKind::TooManyPrerequisites
                 );
             }
+        }
+    }
+
+    // Each source of a `firstOf` counts as a body reference (REQ-WFFORMAT-105).
+    for count in [1_022, 1_023] {
+        let mut outputs = String::new();
+        let mut inputs = String::new();
+        for index in 0..count {
+            let name = format!("value{index:04}");
+            outputs.push_str(&format!(
+                "      {name}:\n        kind: text\n        from: path\n        path: {name}.txt\n"
+            ));
+            inputs.push_str(&format!(
+                "      {name}:\n        ref: outputs.producer.{name}\n"
+            ));
+        }
+        let branch = |name: &str| {
+            format!(
+                "  {name}:\n    kind: cmd\n    condition: {{equals: [{{ref: inputs.branch}}, {{value: {name}}}]}}\n    command:\n      argv: [\"true\"]\n    outputs:\n      result: {{kind: text, from: path, path: result.txt}}\n"
+            )
+        };
+        let source = format!(
+            "schemaVersion: 1\ninputs:\n  branch: {{kind: text}}\nsteps:\n  producer:\n    kind: cmd\n    command:\n      argv: [\"true\"]\n    outputs:\n{outputs}{}{}  consume:\n    kind: cmd\n    inputs:\n{inputs}      joined:\n        firstOf: [outputs.a.result, outputs.b.result]\n    command:\n      argv: [\"true\"]\n",
+            branch("a"),
+            branch("b"),
+        );
+        let resolved = validate_yaml(&source);
+        if count == 1_022 {
+            let workflow = resolved.unwrap();
+            assert_eq!(
+                workflow.steps["consume"]
+                    .common()
+                    .evidence_prerequisites
+                    .len(),
+                1_024
+            );
+        } else {
+            assert_eq!(
+                resolved.unwrap_err().kind(),
+                ValidationFailureKind::TooManyPrerequisites
+            );
         }
     }
 }

@@ -417,6 +417,7 @@ impl ExecutionJob {
                 .ok_or_else(|| RunnerResultFailure::new("cancellation_inconsistent"))?;
         let mut states = execution.steps;
         let mut recoveries = execution.recoveries;
+        let mut input_sources = execution.input_sources;
         let mut steps = Vec::with_capacity(states.len());
         for id in &workflow.definition.presentation_order {
             let state = states
@@ -447,6 +448,7 @@ impl ExecutionJob {
                 invocations: observer.invocations_for_step(id),
                 // The runner runs no child.
                 failed_child: None,
+                input_sources: input_sources.remove(id).unwrap_or_default(),
             });
         }
         let finalization = match (
@@ -505,6 +507,7 @@ impl ExecutionJob {
                         recovery: None,
                         invocations: observer.invocations_for_step(id),
                         failed_child: None,
+                        input_sources: Vec::new(),
                     });
                 }
                 if !summarized.is_empty() {
@@ -575,7 +578,7 @@ impl ExecutionJob {
             steps,
             finalization,
             exports: execution.exports,
-            export_sources: workflow.definition.exports.clone(),
+            export_sources: execution.export_sources,
             export_presentation: workflow.definition.export_presentation.clone(),
         })
     }

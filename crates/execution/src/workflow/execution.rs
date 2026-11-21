@@ -7,7 +7,7 @@ use super::admission::AdmittedWorkflow;
 use super::artifact::ArtifactStaging;
 use super::coordinator::{CommitPort, CommittedReduction, CoordinationError, CoordinatorClock};
 use super::diagnostic::StepDiagnosticLog;
-use super::evidence::FailedChild;
+use super::evidence::{FailedChild, InputSource};
 use super::input::InputStaging;
 use super::local_run::{CANCELED_OUTCOME, WITHDRAWN_OUTCOME};
 use super::observation::{
@@ -18,14 +18,16 @@ use super::resolution::{WorkflowContentDigest, WorkflowSourceProvenance};
 use super::runtime::{
     ActionId, ActiveStepInvocation, ExportSet, OutputProducer, RecoveryTerminalDisposition,
     RunOutcome, RuntimeState, StepState, StepStateKind, TransitionEvent, WorkflowState,
-    step_outputs,
+    step_outputs, step_source_end,
 };
 use super::step_runtime::{
     AgentExecution, ChildRunDispatcher, ChildRuns, NoChildRunDispatcher, RecoveryFailureKind,
     StepFailureCause, StepFailureKind, WorkflowAgentDispatcher, WorkflowCommitPort,
     WorkflowExecutionStart, execute_workflow_observed_with_children,
 };
-use super::validated::{Scheduling, ValidatedWorkflow};
+use super::validated::{
+    FirstOfChoice, ResolvedOutputSource, Scheduling, SourceEnd, ValidatedWorkflow, choose_first_of,
+};
 use super::value::CapturedValue;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +39,9 @@ pub struct WorkflowExecutionResult<Deadline = ()> {
     pub finalization_summary: Option<super::runtime::FinalizationSummary<Deadline>>,
     pub force_abort: Option<super::runtime::ForceAbortEvidence>,
     pub exports: ExportSet<CapturedValue>,
+    /// The source each export resolved to (INV-ENGINE-45): its `ref`, or the source the
+    /// choice of its `firstOf` settled on.
+    pub export_sources: BTreeMap<String, ResolvedOutputSource>,
     pub provenance: WorkflowSourceProvenance,
     pub content_digest: WorkflowContentDigest,
     /// The attempt ended `cancelled` on a withdrawal honored at a `workflow` step boundary
@@ -47,12 +52,16 @@ pub struct WorkflowExecutionResult<Deadline = ()> {
     pub exit_outcome: Option<String>,
     /// The failed child each `succeeded` `workflow` step recorded, by step (REQ-WFEXEC-77).
     pub failed_children: BTreeMap<String, FailedChild>,
+    /// The sources each step that started with a `firstOf` took, by step (REQ-EVIDENCE-28).
+    pub input_sources: BTreeMap<String, Vec<InputSource>>,
 }
 
 /// The outcome an attempt records on the run record (REQ-WFEXEC-57): `withdrawn` for a run
 /// whose cancellation was a withdrawal (REQ-WFEXEC-73), `canceled` for any other cancelled
 /// run; for a workflow that declares `outcome`, the text of its `from` output when
-/// the run succeeded and `onFailure` when it failed; for an edge-scheduled workflow the exit
+/// the run succeeded, for a `firstOf` that of the first source in written order that
+/// succeeded or was inherited as succeeded, and `onFailure` when it failed or every source of
+/// the `firstOf` was skipped; for an edge-scheduled workflow the exit
 /// outcome its walk recorded in `exit_outcome` when it succeeded, or `failed` when it
 /// recorded none, and `failed` when it failed; otherwise
 /// `succeeded` or `failed`. A waiting or continued attempt chooses no outcome and the run
@@ -86,19 +95,31 @@ pub fn chosen_outcome<Deadline>(
         (RunOutcome::Succeeded, None) => return "succeeded".to_owned(),
         (RunOutcome::Succeeded, Some(declared)) => declared,
     };
-    let outputs = result
-        .steps
-        .get(&declared.source.node.id)
-        .and_then(step_outputs);
-    match outputs.and_then(|outputs| outputs.get(&declared.source.output)) {
+    // The shared choice settles a `firstOf` from the steps the run ended with
+    // (INV-ENGINE-45); a single reference is a list of one.
+    let ended = |source: &ResolvedOutputSource| step_source_end(result.steps.get(&source.node.id));
+    let source = match choose_first_of(declared.source.iter(), ended) {
+        FirstOfChoice::Chosen(source) => source,
+        // Every source skipped is a designed result, not a lost value (REQ-WFFORMAT-108).
+        FirstOfChoice::Blocked(sources)
+            if sources
+                .iter()
+                .all(|source| ended(source) == SourceEnd::Skipped) =>
+        {
+            return declared.on_failure.clone();
+        }
+        FirstOfChoice::Blocked(_) | FirstOfChoice::Waiting => declared.source.first(),
+    };
+    let outputs = result.steps.get(&source.node.id).and_then(step_outputs);
+    match outputs.and_then(|outputs| outputs.get(&source.output)) {
         Some(CapturedValue::Text(text)) => text.as_str().to_owned(),
         // Validation and the capture-time check (INV-ENGINE-17) leave a succeeded run's
-        // source holding a declared text, so this is never reached; the exit still records
-        // a declared name.
+        // chosen source holding a declared text, so this is never reached; the exit still
+        // records a declared name.
         _ => {
             tracing::error!(
                 event = "chosen_outcome_source_unavailable",
-                source = %declared.source.reference(),
+                source = %source.reference(),
             );
             declared.on_failure.clone()
         }
@@ -623,6 +644,7 @@ where
         }
     };
     let mut failed_children = BTreeMap::new();
+    let mut input_sources = BTreeMap::new();
     let (steps, recoveries) = coordinated
         .state
         .steps
@@ -630,6 +652,9 @@ where
         .map(|(step, runtime)| {
             if let Some(failed_child) = runtime.failed_child {
                 failed_children.insert(step.clone(), failed_child);
+            }
+            if !runtime.input_sources.is_empty() {
+                input_sources.insert(step.clone(), runtime.input_sources);
             }
             ((step.clone(), runtime.state), (step, runtime.recovery))
         })
@@ -642,6 +667,7 @@ where
         .state
         .exports
         .ok_or(CoordinationError::ReducerStateUnavailable)?;
+    let export_sources = coordinated.state.export_sources;
     let withdrawn =
         matches!(outcome, RunOutcome::Cancelled { .. }) && cancellation.withdrawal_requested();
     Ok(WorkflowExecutionResult {
@@ -652,11 +678,13 @@ where
         finalization_summary,
         force_abort,
         exports,
+        export_sources,
         provenance,
         content_digest,
         withdrawn,
         exit_outcome,
         failed_children,
+        input_sources,
     })
 }
 

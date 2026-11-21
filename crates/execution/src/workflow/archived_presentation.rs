@@ -171,6 +171,14 @@ pub(crate) fn render_plain(
             .ok_or(ArchivedViewOutputFailure::InvalidProjection)?;
         rendered.push_str(&plain_step_row(step, definition, color));
         rendered.push('\n');
+        // REQ-EVIDENCE-29: the source each `firstOf` of the step took, a line each.
+        for source in &step.input_sources {
+            rendered.push_str(&format!(
+                "  input source {} · from {}\n",
+                safe_text(&source.binding.to_string()),
+                safe_text(source.reference()),
+            ));
+        }
         if let Some(recovery) = &step.recovery {
             let terminal_failure = match &step.detail {
                 ArchivedStepDetail::Evidence(NodeDetail::Failed(failure)) => {
@@ -822,6 +830,7 @@ mod tests {
             recovery: None,
             invocations: Vec::new(),
             failed_child: None,
+            input_sources: Vec::new(),
             committed_outputs: None,
         };
         let detail = |output| {
@@ -885,6 +894,7 @@ mod tests {
                     crate::workflow::evidence::FailureDetail::interrupted_in_execution(),
                 )),
             }),
+            input_sources: Vec::new(),
             committed_outputs: Some(1),
         };
 
@@ -1140,6 +1150,7 @@ mod tests {
                 recovery: None,
                 invocations: Vec::new(),
                 failed_child: None,
+                input_sources: Vec::new(),
                 committed_outputs: None,
             }],
         }

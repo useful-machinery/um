@@ -238,3 +238,106 @@ fn already_provisioned_signup_directs_the_human_to_status() {
     assert!(output.stderr.is_empty());
     server.finish();
 }
+
+fn rate_limit_response(problem_type: &str, retry_after: Option<&str>) -> Vec<u8> {
+    let headers: Vec<(&str, &str)> = retry_after
+        .map(|value| vec![("Retry-After", value)])
+        .unwrap_or_default();
+    http_response_with_headers(
+        "429 Too Many Requests",
+        Some("application/problem+json"),
+        &headers,
+        &serde_json::to_vec(&serde_json::json!({
+            "type": problem_type,
+            "title": "signup-rate-title-sentinel",
+            "status": 429,
+            "detail": "signup-rate-detail-sentinel"
+        }))
+        .unwrap(),
+    )
+}
+
+const RATE_LIMIT_EXCEEDED: &str = "https://api.usefulmachinery.com/problems/rate-limit-exceeded";
+
+// REQ-ACCOUNT-79
+#[test]
+fn rate_limited_signup_reports_the_wait_without_retrying() {
+    let (server, _directory, _path, credential_path) = prepared_signup(
+        vec![rate_limit_response(RATE_LIMIT_EXCEEDED, Some("42"))],
+        "unique-rate-limited-json-signup-synthetic-token",
+    );
+    let environment = signup_environment(&server, &credential_path);
+
+    let output = run_with_env(
+        &["account", "signup", "--json", "--allow-insecure-http"],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!({
+            "schemaVersion": 1,
+            "deployment": server.api_url,
+            "outcome": "rate_limited",
+            "retryAfter": 42
+        })
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(server.finish().len(), 1);
+
+    let (server, _directory, _path, credential_path) = prepared_signup(
+        vec![rate_limit_response(RATE_LIMIT_EXCEEDED, Some("42"))],
+        "unique-rate-limited-human-signup-synthetic-token",
+    );
+    let environment = signup_environment(&server, &credential_path);
+
+    let output = run_with_env(
+        &["account", "signup", "--allow-insecure-http"],
+        &environment,
+    );
+
+    assert_eq!(output.status.code(), Some(4));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("42"));
+    assert!(!stdout.contains("signup-rate-title-sentinel"));
+    assert!(!stdout.contains("signup-rate-detail-sentinel"));
+    assert_eq!(server.finish().len(), 1);
+}
+
+// REQ-ACCOUNT-79
+#[test]
+fn signup_rate_limit_without_a_usable_wait_or_problem_is_a_protocol_failure() {
+    for (problem_type, retry_after) in [
+        (RATE_LIMIT_EXCEEDED, None),
+        (RATE_LIMIT_EXCEEDED, Some("0")),
+        (RATE_LIMIT_EXCEEDED, Some("soon")),
+        (RATE_LIMIT_EXCEEDED, Some("+42")),
+        (
+            "https://api.usefulmachinery.com/problems/quantity-limit-reached",
+            Some("42"),
+        ),
+    ] {
+        let (server, _directory, _path, credential_path) = prepared_signup(
+            vec![rate_limit_response(problem_type, retry_after)],
+            "unique-malformed-rate-signup-synthetic-token",
+        );
+        let environment = signup_environment(&server, &credential_path);
+
+        let output = run_with_env(
+            &["account", "signup", "--json", "--allow-insecure-http"],
+            &environment,
+        );
+
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "{problem_type} {retry_after:?}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("rate_limited"));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(!stderr.contains("signup-rate-title-sentinel"));
+        assert!(!stderr.contains("signup-rate-detail-sentinel"));
+        assert_eq!(server.finish().len(), 1);
+    }
+}

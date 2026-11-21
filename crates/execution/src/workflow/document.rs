@@ -397,15 +397,25 @@ pub enum TriggerControlAction {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ExportDefinition {
-    pub(crate) source: OutputReference,
+    pub(crate) source: SourceReference,
     pub(crate) presentation: Option<ExportPresentation>,
+}
+
+/// An export's source or `outcome.from` as written: one output reference, or a `firstOf` of
+/// two to sixteen distinct output references in the order they are tried (REQ-WFFORMAT-107,
+/// REQ-WFFORMAT-108). Validation checks the two forms by different rules, so the list of one
+/// a single reference resolves to is not written here.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SourceReference {
+    Reference(OutputReference),
+    FirstOf(Vec<OutputReference>),
 }
 
 /// The `outcome` block (REQ-WFFORMAT-88): the output that names a succeeded run's outcome
 /// and the name a failed run takes.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OutcomeDeclaration {
-    pub(crate) from: OutputReference,
+    pub(crate) from: SourceReference,
     pub(crate) on_failure: String,
 }
 
@@ -679,7 +689,9 @@ pub(crate) struct ConditionSelector {
 /// leading to the step) and `ControlsAnswers` (`controls.answers`, the answers recorded
 /// for the step's questions) decode only in a `workflow` step's inputs (REQ-WFFORMAT-95),
 /// as does `Item` (`item`, or `item.<field>` with `field` set), the element a `forEach`
-/// step's child runs for (REQ-WFFORMAT-99).
+/// step's child runs for (REQ-WFFORMAT-99). `FirstOf` (`{firstOf}`, two to sixteen distinct
+/// output references in the order they are tried) decodes only in an ordinary step's
+/// `inputs` and agent message (REQ-WFFORMAT-105).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ValueReference {
     Input { name: String },
@@ -688,6 +700,7 @@ pub(crate) enum ValueReference {
     Wait { field: String },
     ControlsAnswers,
     Item { field: Option<String> },
+    FirstOf(Vec<OutputReference>),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

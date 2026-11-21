@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -24,7 +25,7 @@ use super::claude_code_installation::{
 use super::codex_installation::CodexFixture;
 use super::pi_installation::{COMPLETE_HELP, PiFixture, quote};
 use super::workflow_definition::{read_json, schema};
-use super::workflow_status::status_schema;
+use super::workflow_status::{status_json, status_schema};
 use super::workflow_view::workflow_view_schema;
 use super::{
     CREDENTIALS_FILE_VARIABLE, DEPLOYMENT_VARIABLES, RUNNER_TELEMETRY_VARIABLES, poll_until,
@@ -1185,6 +1186,237 @@ fn conditional_skips_are_viewable_after_publication() {
         String::from_utf8_lossy(&plain.stderr)
     );
     assert!(String::from_utf8_lossy(&plain.stdout).contains("condition_false"));
+}
+
+/// `a` runs when the input `branch` is `a` and `b` when it is `b`, each writing its name to
+/// its text output `result`, and `c` copies `{firstOf: [outputs.a.result, outputs.b.result]}`
+/// to `c.txt` in the execution root (REQ-WFCOND-45).
+pub(super) const FIRST_OF_WORKFLOW: &str = r#"schemaVersion: 1
+inputs:
+  branch: {kind: text}
+steps:
+  a:
+    kind: cmd
+    condition: {equals: [{ref: inputs.branch}, {value: a}]}
+    command: {argv: ["sh", "-c", "printf 'from a' > a.txt"]}
+    outputs:
+      result: {kind: text, from: path, path: a.txt}
+  b:
+    kind: cmd
+    condition: {equals: [{ref: inputs.branch}, {value: b}]}
+    command: {argv: ["sh", "-c", "printf 'from b' > b.txt"]}
+    outputs:
+      result: {kind: text, from: path, path: b.txt}
+  c:
+    kind: cmd
+    inputs:
+      result: {firstOf: [outputs.a.result, outputs.b.result]}
+    command: {argv: ["sh", "-c", "cp \"$USEFUL_STEP_INPUTS/values/result\" c.txt"]}
+"#;
+
+/// Runs `bundle` with `--json` and the text input `branch` into its run directory `name`,
+/// returning the output and the run directory.
+pub(super) fn run_with_branch(bundle: &RunBundle, name: &str, branch: &str) -> (Output, PathBuf) {
+    let destination = bundle.result(name);
+    let mut args = bundle.args(&destination);
+    args.splice(
+        args.len() - 1..args.len() - 1,
+        [
+            "--input-text".to_owned(),
+            "branch".to_owned(),
+            branch.to_owned(),
+            "--json".to_owned(),
+        ],
+    );
+    (run(&args), destination)
+}
+
+/// The `inputSources` of each step in `steps` that carries them, by step id
+/// (REQ-EVIDENCE-28): `steps` is a result's `steps` or an attempt's `progress.steps` in
+/// `state.json`.
+pub(super) fn input_sources(steps: &serde_json::Value) -> BTreeMap<String, serde_json::Value> {
+    steps
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|step| {
+            let sources = step.get("inputSources")?;
+            Some((step["id"].as_str().unwrap().to_owned(), sources.clone()))
+        })
+        .collect()
+}
+
+// REQ-WFCOND-45, REQ-WFCOND-46, REQ-EVIDENCE-28, SC-WFCOND-5
+#[test]
+fn a_first_of_joins_the_branch_that_ran_or_blocks_when_none_did() {
+    let bundle = RunBundle::new(FIRST_OF_WORKFLOW);
+    let run_branch = |branch: &str| {
+        let (output, destination) = run_with_branch(&bundle, &format!("first-of-{branch}"), branch);
+        let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(workflow_run_schema().is_valid(&document), "{document}");
+        let view = isolated_command(&[
+            "workflow".to_owned(),
+            "run".to_owned(),
+            "view".to_owned(),
+            destination.to_string_lossy().into_owned(),
+            "--json".to_owned(),
+        ])
+        .output()
+        .unwrap();
+        assert!(
+            view.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&view.stdout),
+            String::from_utf8_lossy(&view.stderr)
+        );
+        let (_, status) = status_json(&destination);
+        assert!(status_schema().is_valid(&status), "{status}");
+        let progress = status["state"]["attempts"][0]["progress"]["steps"].clone();
+        (output, result_json(&destination), progress)
+    };
+    let step = |result: &serde_json::Value, id: &str| {
+        result["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["id"] == id)
+            .unwrap()
+            .clone()
+    };
+
+    for (branch, expected) in [("a", "from a"), ("b", "from b")] {
+        let copied = bundle.execution_root().join("c.txt");
+        let _ = fs::remove_file(&copied);
+        let (output, result, progress) = run_branch(branch);
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(step(&result, "c")["state"], "succeeded");
+        assert_eq!(fs::read_to_string(&copied).unwrap(), expected);
+        // Only the consumer carries the source it took, in both documents.
+        let recorded = BTreeMap::from([(
+            "c".to_owned(),
+            serde_json::json!([{"input": "result", "ref": format!("outputs.{branch}.result")}]),
+        )]);
+        assert_eq!(input_sources(&result["steps"]), recorded, "{result}");
+        assert_eq!(input_sources(&progress), recorded, "{progress}");
+    }
+
+    let (output, result, progress) = run_branch("neither");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let consumer = step(&result, "c");
+    assert_eq!(consumer["state"], "blocked");
+    assert_eq!(
+        consumer["detail"],
+        serde_json::json!({
+            "code": "prerequisites_unsatisfied",
+            "prerequisites": [
+                {"kind": "body", "ref": "outputs.a.result"},
+                {"kind": "body", "ref": "outputs.b.result"}
+            ]
+        })
+    );
+    assert!(input_sources(&result["steps"]).is_empty(), "{result}");
+    assert!(input_sources(&progress).is_empty(), "{progress}");
+}
+
+/// `a` runs when the input `branch` is `a` and `b` when it is `b`, each writing its name to
+/// its text output `result`; the export `result` takes the first of the two that succeeded
+/// and `direct` names `b`'s output alone (REQ-WFFORMAT-107).
+pub(super) const FIRST_OF_EXPORT_WORKFLOW: &str = r#"schemaVersion: 1
+inputs:
+  branch: {kind: text}
+steps:
+  a:
+    kind: cmd
+    condition: {equals: [{ref: inputs.branch}, {value: a}]}
+    command: {argv: ["sh", "-c", "printf 'from a' > a.txt"]}
+    outputs:
+      result: {kind: text, from: path, path: a.txt}
+  b:
+    kind: cmd
+    condition: {equals: [{ref: inputs.branch}, {value: b}]}
+    command: {argv: ["sh", "-c", "printf 'from b' > b.txt"]}
+    outputs:
+      result: {kind: text, from: path, path: b.txt}
+exports:
+  result: {firstOf: [outputs.a.result, outputs.b.result]}
+  direct: {ref: outputs.b.result}
+"#;
+
+/// Whether `useful workflow run view RUN --json` accepts the run directory (REQ-EVIDENCE-13).
+pub(super) fn assert_run_view_accepts(destination: &Path) {
+    let view = isolated_command(&[
+        "workflow".to_owned(),
+        "run".to_owned(),
+        "view".to_owned(),
+        destination.to_string_lossy().into_owned(),
+        "--json".to_owned(),
+    ])
+    .output()
+    .unwrap();
+    assert!(
+        view.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&view.stdout),
+        String::from_utf8_lossy(&view.stderr)
+    );
+}
+
+// REQ-WFFORMAT-107, REQ-EXPORTS-2, REQ-EXPORTS-3, REQ-ARTIFACTSET-4, REQ-EVIDENCE-13
+#[test]
+fn a_first_of_export_carries_the_branch_that_ran_or_is_skipped_when_none_did() {
+    let bundle = RunBundle::new(FIRST_OF_EXPORT_WORKFLOW);
+    let run_branch = |branch: &str| {
+        let (output, destination) =
+            run_with_branch(&bundle, &format!("first-of-export-{branch}"), branch);
+        assert!(
+            output.status.success(),
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_run_view_accepts(&destination);
+        let exports = result_json(&destination)["exports"].clone();
+        (destination, exports)
+    };
+    let skipped = serde_json::json!({"state": "unavailable", "reason": "source_skipped"});
+    let carried = |destination: &Path, entry: &serde_json::Value| {
+        fs::read_to_string(attempt_result(destination).join(entry["path"].as_str().unwrap()))
+            .unwrap()
+    };
+    let keys = |entry: &serde_json::Value| {
+        entry
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+
+    let (destination, exports) = run_branch("a");
+    assert_eq!(exports["result"]["state"], "available", "{exports}");
+    assert_eq!(carried(&destination, &exports["result"]), "from a");
+    assert_eq!(exports["direct"], skipped);
+
+    let (destination, b_exports) = run_branch("b");
+    assert_eq!(carried(&destination, &b_exports["result"]), "from b");
+    // Both resolve to `b`'s output, so they share one carrier.
+    assert_eq!(b_exports["result"], b_exports["direct"], "{b_exports}");
+    assert_eq!(keys(&exports["result"]), keys(&b_exports["direct"]));
+
+    let (_, exports) = run_branch("neither");
+    assert_eq!(exports["result"], skipped);
+    assert_eq!(exports["direct"], skipped);
 }
 
 // REQ-WFCOND-6, REQ-WFCOND-21, REQ-WFEXEC-24
@@ -7581,6 +7813,57 @@ fn the_run_record_carries_the_attempts_chosen_outcome_once_exited() {
     }
 }
 
+// REQ-WFFORMAT-108, REQ-WFEXEC-57
+#[test]
+fn the_run_record_carries_the_outcome_of_the_first_of_branch_that_ran() {
+    let bundle = TreeBundle::new(
+        r#"schemaVersion: 1
+inputs:
+  pick: {kind: text}
+outcomes: [planned, adopted, failed]
+outcome:
+  from: {firstOf: [outputs.route.verdict, outputs.adopt.verdict]}
+  onFailure: failed
+steps:
+  route:
+    kind: cmd
+    condition: {equals: [{ref: inputs.pick}, {value: route}]}
+    command: {argv: ["sh", "-c", "printf planned > route.txt"]}
+    outputs:
+      verdict: {kind: text, from: path, path: route.txt}
+  adopt:
+    kind: cmd
+    condition: {equals: [{ref: inputs.pick}, {value: adopt}]}
+    command: {argv: ["sh", "-c", "printf adopted > adopt.txt"]}
+    outputs:
+      verdict: {kind: text, from: path, path: adopt.txt}
+"#,
+    );
+    // Each branch's text, and `onFailure` for a succeeded run that skipped both.
+    for (pick, outcome) in [
+        ("route", "planned"),
+        ("adopt", "adopted"),
+        ("neither", "failed"),
+    ] {
+        let destination = bundle.result(pick);
+        let terminal = succeeded(&run(&path_args(
+            bundle.source_root(),
+            bundle.execution_root(),
+            &[
+                "--run-dir",
+                destination.to_str().unwrap(),
+                "--input-text",
+                "pick",
+                pick,
+            ],
+        )));
+        assert_eq!(terminal["result"]["outcome"], "succeeded", "{terminal}");
+        let record = run_record(&destination);
+        assert_eq!(record["state"], "exited", "{record}");
+        assert_eq!(record["outcome"], outcome, "{pick}");
+    }
+}
+
 // REQ-LOCALRUN-174, REQ-LOCALRUN-175, REQ-LOCALRUN-169
 #[test]
 fn a_path_run_selects_a_tree_workflow_file_with_workflow() {
@@ -7903,6 +8186,100 @@ fn workflow_steps_run_child_runs_and_route_on_their_outcomes() {
     assert_eq!(carrier_names(&destination, "design"), ["outcome", "plan"]);
     assert_eq!(run_record(&destination)["outcome"], "failed");
     assert!(!destination.join("children/build").exists());
+}
+
+// REQ-WFFORMAT-91, REQ-WFFORMAT-107
+#[test]
+fn a_childs_first_of_export_reaches_the_next_workflow_step_as_json() {
+    let bundle = TreeBundle::new(
+        "schemaVersion: 1
+inputs:
+  route: {kind: text}
+outcomes: [done, failed]
+steps:
+  plan:
+    kind: workflow
+    workflow: plan.yaml
+    inputs:
+      route: {ref: inputs.route}
+    on:
+      succeeded: use
+      failed: exit.failed
+  use:
+    kind: workflow
+    workflow: use.yaml
+    inputs:
+      parts: {ref: outputs.plan.parts}
+    on:
+      succeeded: exit.done
+      failed: exit.failed
+",
+    );
+    let branch = |name: &str| {
+        format!(
+            "  {name}:
+    kind: cmd
+    condition: {{equals: [{{ref: inputs.route}}, {{value: {name}}}]}}
+    command: {{argv: [sh, -c, \"printf '{{\\\"from\\\":\\\"{name}\\\"}}' > {name}.json\"]}}
+    outputs:
+      parts: {{kind: json, from: path, path: {name}.json, schema: parts.schema.json}}
+"
+        )
+    };
+    bundle.write_source(
+        "plan.yaml",
+        &format!(
+            "schemaVersion: 1
+inputs:
+  route: {{kind: text}}
+steps:
+{}{}exports:
+  parts:
+    firstOf: [outputs.left.parts, outputs.right.parts]
+",
+            branch("left"),
+            branch("right"),
+        ),
+    );
+    bundle.write_source(
+        "use.yaml",
+        r#"schemaVersion: 1
+inputs:
+  parts: {kind: json}
+steps:
+  consume:
+    kind: cmd
+    inputs:
+      parts: {ref: inputs.parts}
+    command: {argv: ["sh", "-c", "cp \"$USEFUL_STEP_INPUTS/values/parts\" used.json"]}
+"#,
+    );
+    bundle.write_source(
+        "parts.schema.json",
+        r#"{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object"}"#,
+    );
+
+    let used = bundle.execution_root().join("used.json");
+    for route in ["left", "right"] {
+        let _ = fs::remove_file(&used);
+        let destination = bundle.result(route);
+        let output = run(&path_args(
+            bundle.source_root(),
+            bundle.execution_root(),
+            &[
+                "--run-dir",
+                destination.to_str().unwrap(),
+                "--input-text",
+                "route",
+                route,
+            ],
+        ));
+        let terminal = succeeded(&output);
+        assert_eq!(run_record(&destination)["outcome"], "done", "{terminal}");
+        let received: serde_json::Value =
+            serde_json::from_slice(&fs::read(&used).unwrap()).unwrap();
+        assert_eq!(received, serde_json::json!({"from": route}));
+    }
 }
 
 // REQ-WFEXEC-77: a child whose run succeeded and chose the outcome `failed` is no failed
