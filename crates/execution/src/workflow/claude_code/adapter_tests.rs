@@ -24,7 +24,7 @@ use super::adapter::{
 use super::result_tool::TOOL_NAME;
 use super::test_support::{
     FixtureRelease, FixtureSignal, PendingClock, RecordingObservationSink, admitted_adapter,
-    invocation_identity,
+    invocation_identity, native_resource_watchdog,
 };
 use super::*;
 use crate::workflow::admission::{CancellationReason, CancellationSource, EnvironmentSnapshot};
@@ -1165,9 +1165,12 @@ fn with_watchdog_limit<Output>(
 
 /// The panic message of a case `with_watchdog_limit` bounded for a millisecond.
 async fn expired_watchdog_message(body: impl Future<Output = ()> + Send + 'static) -> String {
-    let expired = tokio::spawn(with_watchdog_limit(body, Duration::from_millis(1)))
-        .await
-        .unwrap_err();
+    expired_bound_message(with_watchdog_limit(body, Duration::from_millis(1))).await
+}
+
+/// The panic message of an already bounded future whose watchdog expires.
+async fn expired_bound_message(bounded: impl Future<Output = ()> + Send + 'static) -> String {
+    let expired = tokio::spawn(bounded).await.unwrap_err();
     *expired.into_panic().downcast::<String>().unwrap()
 }
 
@@ -1202,6 +1205,38 @@ async fn fixture_watchdog_expiry_names_the_last_fixture_progress() {
     .await;
     assert!(
         message.contains("; last fixture progress: ") && !message.ends_with("none"),
+        "{message:?}"
+    );
+}
+
+// INV-TESTING-18
+#[tokio::test]
+async fn native_resource_watchdog_expiry_carries_the_mcp_observation() {
+    let temporary = tempfile::tempdir().unwrap();
+    let observation = temporary.path().join("native-mcp-observation.txt");
+    std::fs::write(&observation, "started\n{\"method\":\"tools/call\"}\n").unwrap();
+    let message = expired_bound_message(native_resource_watchdog(
+        observation,
+        Duration::from_millis(1),
+        pending::<()>(),
+    ))
+    .await;
+    assert!(
+        message.starts_with("pinned Claude Code conformance watchdog expired after")
+            && message.contains("; MCP observation: started\n{\"method\":\"tools/call\"}\n"),
+        "{message:?}"
+    );
+
+    // An unreadable observation is diagnosed, never a panic that replaces the expiry.
+    let message = expired_bound_message(native_resource_watchdog(
+        temporary.path().join("absent"),
+        Duration::from_millis(1),
+        pending::<()>(),
+    ))
+    .await;
+    assert!(
+        message.starts_with("pinned Claude Code conformance watchdog expired after")
+            && message.contains("; MCP observation: "),
         "{message:?}"
     );
 }

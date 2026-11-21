@@ -29,7 +29,8 @@ use super::test_support::{
     RESULT_TOOL, RecordingObservationSink, RunningProductionClaudeCode, RunningStartedClaudeCode,
     SyntheticClaudeCodeRoot, WATCHDOG, admitted_adapter, assert_backgrounded_subagent_activity,
     assistant_text, conformance_executable, conformance_limits, exclusive_conformance_executable,
-    invocation_identity, next_request_or_outcome, submission, version_probe_environment,
+    invocation_identity, native_resource_watchdog, next_request_or_outcome, submission,
+    version_probe_environment,
 };
 use super::*;
 use crate::workflow::admission::{CancellationReason, CancellationSource};
@@ -208,15 +209,17 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
     // Every exact-binary case deliberately owns a fresh watchdog, loopback provider, and
     // synthetic root; sharing those resources would let one native case contaminate another.
     let (executable, _exclusive) = exclusive_conformance_executable().await;
-    host_scaled_watchdog("pinned Claude Code conformance", WATCHDOG, async {
+    // The watchdog's diagnosis reads the MCP server's observation, so the root and its
+    // fixture exist before the bound; the body borrows them.
+    let root = SyntheticClaudeCodeRoot::new();
+    let resources = root.install_native_resource_fixture(
+        NATIVE_INSTRUCTION_MARKER,
+        NATIVE_SKILL_MARKER,
+        NATIVE_PLUGIN_MARKER,
+        NATIVE_MCP_MARKER,
+    );
+    native_resource_watchdog(resources.mcp_observation.clone(), WATCHDOG, async {
         let mut provider = LoopbackProvider::start().await;
-        let root = SyntheticClaudeCodeRoot::new();
-        let resources = root.install_native_resource_fixture(
-            NATIVE_INSTRUCTION_MARKER,
-            NATIVE_SKILL_MARKER,
-            NATIVE_PLUGIN_MARKER,
-            NATIVE_MCP_MARKER,
-        );
         install_native_resource_plugin(&executable, &root, &provider, &resources.marketplace).await;
         // A second prompt hook observes the same turn without relying on execution order.
         let concurrent_hook_observation = root.private().join("second-hook-observation");
@@ -291,8 +294,8 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
         );
         assert_eq!(fs::read(&concurrent_hook_observation).unwrap(), b"second hook complete\n");
         let mcp_observation = fs::read_to_string(&resources.mcp_observation).unwrap();
-        assert!(mcp_observation.starts_with("started\n"));
-        assert!(mcp_observation.contains("tools/list"));
+        assert!(mcp_observation.starts_with("started\n"), "{mcp_observation}");
+        assert!(mcp_observation.contains("tools/list"), "{mcp_observation}");
         // Deferred tool selection precedes the MCP tool call. The server issues an
         // elicitation that the headless client cannot answer; the native timeout
         // must remain an ordinary tool error, not a protocol or session failure.
@@ -300,12 +303,22 @@ async fn pinned_real_claude_code_01_normal_mode_loopback_conforms_from_a_synthet
         let request = provider.next_request().await;
         assert!(contains_string_fragment(request.body(), NATIVE_MCP_MARKER));
         request.release_tool_use("mcp__scherzo-resource__scherzo_native_resource", json!({}));
-        provider.next_request().await.release_text(RESPONSE);
+        // The cancellation is a notification Claude Code awaits no reply to, and its exit
+        // stops the server; hold the last response until the server has recorded it.
+        let request = provider.next_request().await;
+        resources.mcp_cancelled.receive().await;
+        request.release_text(RESPONSE);
 
         let output = child.wait_with_output().await.unwrap();
         let mcp_observation = fs::read_to_string(&resources.mcp_observation).unwrap();
-        assert!(mcp_observation.contains("\"method\":\"tools/call\""));
-        assert!(mcp_observation.contains("\"method\":\"notifications/cancelled\""));
+        assert!(
+            mcp_observation.contains("\"method\":\"tools/call\""),
+            "{mcp_observation}"
+        );
+        assert!(
+            mcp_observation.contains("\"method\":\"notifications/cancelled\""),
+            "{mcp_observation}"
+        );
         assert!(output.status.success());
         // The pinned release diagnoses the synthetic model on stderr. Its bytes are an
         // actionable process diagnostic, not protocol, and their wording is not a contract.

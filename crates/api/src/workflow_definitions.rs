@@ -81,15 +81,16 @@ impl fmt::Debug for WorkflowTreeFile<'_> {
 
 /// What a create or publish records: the sealed tree, `sha256:<hex>`, the bindings, the
 /// integration bindings (an integration's id to its binding names and their values), and the
-/// tree's files the revision runs executable, in bytewise order; omitted bindings or
-/// integration bindings take the root's defaults on create and the current revision's on
-/// publish (REQ-CLOUDDEF-33), and omitted executable paths keep the bits the tree was sealed
-/// with.
+/// tree's files the revision runs executable, in bytewise order. The bindings and integration
+/// bindings name the bindings the publication sets: `Value::Null` flat, or `None` under an
+/// integration, names a binding for its declared default, and every other binding keeps the
+/// current revision's value on a publish and takes its default on a create
+/// (REQ-CLOUDDEF-41). Omitted executable paths keep the bits the tree was sealed with.
 #[derive(Clone, Copy, Debug)]
 pub struct WorkflowPublication<'a> {
     pub tree_digest: &'a str,
     pub bindings: Option<&'a WorkflowBindingValues>,
-    pub integration_bindings: Option<&'a HashMap<String, HashMap<String, String>>>,
+    pub integration_bindings: Option<&'a HashMap<String, HashMap<String, Option<String>>>>,
     pub executable_paths: Option<&'a [String]>,
 }
 
@@ -1234,6 +1235,7 @@ mod tests {
 
     use useful_test_support::{REQUEST_IDEMPOTENCY_KEY_ECHO, ScriptedHttpServer};
 
+    use std::collections::HashMap;
     use std::error::Error as _;
     use std::fmt;
 
@@ -1499,6 +1501,75 @@ mod tests {
             "{}",
             requests[1]
         );
+    }
+
+    // REQ-CLOUDDEF-41, REQ-CLOUDDEF-33: a create and a publication name a binding for its
+    // declared default with `null`, flat or under an integration, beside the values they set.
+    #[test]
+    fn a_create_and_a_publication_send_null_for_a_binding_named_for_its_default() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let project = "prj_01k0z6r1w8f4jy2m7q9v3x5abc";
+        let definition = "def_01k0z6r1w8f4jy2m7q9v3x5abc";
+        let digest = format!("sha256:{}", "a".repeat(64));
+        let at = "2026-11-10T12:00:00Z";
+        let answer = |revision: i32| {
+            let body = serde_json::json!({
+                "definition": {
+                    "id": definition, "projectId": project, "name": "engineering",
+                    "state": "active", "automaticStarts": false, "executionPrincipalId": null,
+                    "currentRevision": revision, "createdAt": at, "updatedAt": at,
+                },
+                "revision": {
+                    "definitionId": definition, "number": revision, "treeDigest": digest,
+                    "bindings": {}, "resolution": {}, "publishedAt": at,
+                    "publishedBy": "prn_01k0z6r1w8f4jy2m7q9v3x5abc",
+                },
+            });
+            response("201 Created", "application/json", true, &body)
+        };
+        let server = ScriptedHttpServer::respond_in_sequence(vec![answer(1), answer(2)]);
+        let storage = HttpClient::new(HttpTransportPolicy::AllowInsecureHttp).expect("client");
+        let api =
+            WorkflowDefinitionApi::new(&server.api_url, "fixture-token", &storage).expect("api");
+        let bindings = HashMap::from([
+            ("done".to_owned(), serde_json::Value::Null),
+            ("linearTeam".to_owned(), serde_json::json!("ENG")),
+        ]);
+        let integration_bindings = HashMap::from([(
+            "linear".to_owned(),
+            HashMap::from([
+                ("done".to_owned(), None),
+                ("team".to_owned(), Some("ENG".to_owned())),
+            ]),
+        )]);
+        let publication = WorkflowPublication {
+            tree_digest: &digest,
+            bindings: Some(&bindings),
+            integration_bindings: Some(&integration_bindings),
+            executable_paths: None,
+        };
+
+        api.create_definition("acme", project, "create-key", publication, false)
+            .expect("the create");
+        api.publish_revision("acme", project, definition, "publish-key", 1, publication)
+            .expect("the publication");
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        for request in &requests {
+            let (_, body) = request.split_once("\r\n\r\n").expect("a request body");
+            let body: serde_json::Value = serde_json::from_str(body).expect("a JSON body");
+            let flat = &body["bindings"];
+            assert!(
+                flat.get("done").is_some_and(serde_json::Value::is_null),
+                "{body}"
+            );
+            let linear = &body["integrationBindings"]["linear"];
+            assert!(
+                linear.get("done").is_some_and(serde_json::Value::is_null),
+                "{body}"
+            );
+            assert_eq!(linear["team"], "ENG", "{body}");
+        }
     }
 
     // REQ-COMPAT-20: a page longer than the 100-item `limit` maximum this release requests

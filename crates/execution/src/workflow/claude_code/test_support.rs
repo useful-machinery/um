@@ -39,7 +39,7 @@ use crate::workflow::process_group::{
     ProcessGuardStoreError,
 };
 use crate::workflow::runtime::{ActionId, TransitionSequence};
-use crate::workflow::test_support::record_fixture_progress;
+use crate::workflow::test_support::{host_scaled_watchdog_with_diagnosis, record_fixture_progress};
 
 const MAXIMUM_HTTP_HEADER_BYTES: usize = 64 * 1024;
 const MAXIMUM_PROVIDER_REQUEST_BYTES: usize = 16 * 1024 * 1024;
@@ -133,6 +133,28 @@ pub(super) use crate::workflow::test_support::{
     InlineValidationWorker, PendingClock, RecordingObservationSink,
 };
 
+/// `host_scaled_watchdog_with_diagnosis` for the Claude Code conformance case whose synthetic
+/// MCP server records what it read to `observation`: an expiry ends with that record as it
+/// stood, so it shows whether the server saw the tool call and its cancellation. A plain
+/// function, not an `async fn`, so the body reaches the watchdog's heap pin (INV-TESTING-18).
+pub(super) fn native_resource_watchdog<Output>(
+    observation: PathBuf,
+    base: Duration,
+    future: impl Future<Output = Output>,
+) -> impl Future<Output = Output> {
+    // A panic here would replace the expiry, so an unreadable record is diagnosed instead.
+    let diagnosis = move || {
+        Some(match fs::read_to_string(&observation) {
+            Ok(recorded) => format!("MCP observation: {recorded}"),
+            Err(error) => format!(
+                "MCP observation: {} could not be read: {error}",
+                observation.display()
+            ),
+        })
+    };
+    host_scaled_watchdog_with_diagnosis("pinned Claude Code conformance", base, diagnosis, future)
+}
+
 /// The result tool as the agent sees it (REQ-AGENT-84).
 pub(super) const RESULT_TOOL: &str = "mcp__useful_workflow_result__submit";
 
@@ -165,6 +187,9 @@ pub(super) struct NativeResourceFixture {
     pub(super) hook_observation: PathBuf,
     pub(super) expected_hook_observation: String,
     pub(super) mcp_observation: PathBuf,
+    /// Written by the synthetic MCP server once it has appended a `notifications/cancelled`
+    /// to `mcp_observation`, so the case can hold Claude Code until that record exists.
+    pub(super) mcp_cancelled: FixtureSignal,
     pub(super) marketplace: PathBuf,
 }
 
@@ -318,6 +343,7 @@ impl SyntheticClaudeCodeRoot {
         // Exercise the 2026-07-28 discovery path and a tools/list response without
         // optional resultType, ttlMs, or cacheScope members.
         let mcp_observation = self.private.join("native-mcp-observation.txt");
+        let mcp_cancelled = FixtureSignal::create(self.private.join("native-mcp-cancelled"));
         let mcp_server = self.private.join("native-mcp-server.sh");
         fs::write(
             &mcp_server,
@@ -326,6 +352,7 @@ impl SyntheticClaudeCodeRoot {
 printf 'started\n' > '{}'
 while IFS= read -r line; do
   printf '%s\n' "$line" >> '{}'
+  case "$line" in *notifications/cancelled*) printf 'cancelled\n' > '{}' ;; esac
   if [[ "$line" =~ \"id\":\"([^\"]+)\" ]]; then
     id="\"${{BASH_REMATCH[1]}}\""
   elif [[ "$line" =~ \"id\":([0-9]+) ]]; then
@@ -357,6 +384,7 @@ done
 "#,
                 mcp_observation.display(),
                 mcp_observation.display(),
+                mcp_cancelled.path().display(),
                 mcp_marker,
             ),
         )
@@ -421,6 +449,7 @@ done
                 self.config.display()
             ),
             mcp_observation,
+            mcp_cancelled,
             marketplace,
         }
     }

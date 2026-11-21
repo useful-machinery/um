@@ -19,16 +19,17 @@ use serde::{Deserialize, Serialize};
 pub struct CreateWorkflowDefinitionRequest {
     #[serde(rename = "treeDigest")]
     pub tree_digest: String,
-    /// Values keyed by the binding keys the root workflow declares; an omitted key takes its default.
+    /// Values keyed by the binding keys the root workflow declares, each a value or `null` for the key's declared default. On a create a key not named takes its default; on a publish it keeps the current revision's value when that revision holds it with the kind the tree declares, and otherwise takes its default.
     #[serde(rename = "bindings", skip_serializing_if = "Option::is_none")]
     pub bindings: Option<std::collections::HashMap<String, serde_json::Value>>,
-    /// Values of the bindings the root declares under an integration: integration id to binding name to its value, a string. An omitted binding takes its default. The value has no minimum length here: an empty one is answered 422 `binding-unresolved`, as an empty value in `bindings` is.
+    /// Values of the bindings the root declares under an integration: integration id to binding name to its value, a string, or `null` for its declared default. A binding not named takes its default. The value has no minimum length here: an empty one is answered 422 `binding-unresolved`, as an empty value in `bindings` is.
     #[serde(
         rename = "integrationBindings",
         skip_serializing_if = "Option::is_none"
     )]
-    pub integration_bindings:
-        Option<std::collections::HashMap<String, std::collections::HashMap<String, String>>>,
+    pub integration_bindings: Option<
+        std::collections::HashMap<String, std::collections::HashMap<String, Option<String>>>,
+    >,
     /// The tree's files the revision runs executable, in bytewise order, each a file of the tree; `[]` makes none executable. Omitted keeps the bits the tree was sealed with.
     #[serde(rename = "executablePaths", skip_serializing_if = "Option::is_none")]
     pub executable_paths: Option<Vec<String>>,

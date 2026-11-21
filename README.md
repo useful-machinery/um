@@ -1863,18 +1863,27 @@ raw-body signature verification, deduplication, overlap and retention.
 
 ## Cloud workflow definitions
 
-`useful workflow definition publish --cloud ORGANIZATION --project PROJECT` records the
-revision locally and then publishes the tree to that project's Cloud definition: it
-uploads and seals the tree under its digest and publishes the revision with its bindings.
-A home's first publication creates the Cloud definition, or reuses the project's definition
-whose current revision has the same tree, bindings and executable bits, and records its id
-locally; later ones publish to it, and `--cloud-new` creates another. A Cloud refusal leaves
-the local revision recorded and exits 1.
+`useful workflow definition publish --cloud ORGANIZATION --project PROJECT` publishes the
+tree to that project's Cloud definition and then records Cloud's revision locally: it
+uploads and seals the tree under its digest and publishes it with the bindings the
+invocation names, and Cloud keeps every other binding of the definition's current revision.
+The local revision records the bindings Cloud answered. A home's first publication creates
+the Cloud definition, or reuses the project's definition whose current revision has the
+same tree, bindings and executable bits, and records its id locally; later ones publish to
+it, and `--cloud-new` creates another. A Cloud refusal records nothing locally and exits 1.
 
 ```sh
 useful workflow definition publish .useful/engineering --bindings bindings.json \
   --cloud acme-labs --project prj_01k0z6r1w8f4jy2m7q9v3x5abc --json
 ```
+
+A publish names the bindings it sets: in the `--bindings` file, which may name any subset
+and gives a binding `null` for its default, or one at a time beside it with
+`--binding KEY=VALUE` and `--binding-default KEY`. Without `--cloud`, every binding it does
+not name keeps the value of the local definition's current revision, or takes its default on
+a first publish. With `--cloud`, it keeps the value of the Cloud definition's current
+revision, whatever the home holds, and a create gives each binding not named its default, or
+is refused `binding-missing`.
 
 `--to` and `--new` choose the local definition under the home, and `--cloud-to` and
 `--cloud-new` choose the Cloud one. Cloud and the home assign their ids separately, in the
@@ -1885,7 +1894,7 @@ Cloud definition from a home that has never published it, find its id and name i
 
 ```sh
 useful workflow definition cloud list acme-labs prj_01k0z6r1w8f4jy2m7q9v3x5abc
-useful workflow definition publish .useful/engineering --bindings bindings.json \
+useful workflow definition publish .useful/engineering \
   --cloud acme-labs --project prj_01k0z6r1w8f4jy2m7q9v3x5abc --cloud-to DEFINITION
 ```
 

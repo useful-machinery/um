@@ -317,7 +317,7 @@ impl Serialize for BindingsSnapshot {
 }
 
 impl BindingsSnapshot {
-    /// The flat block's bindings, which the Cloud request is built from.
+    /// The flat block's bindings.
     pub fn bindings(&self) -> &BTreeMap<String, BoundBinding> {
         &self.flat
     }
@@ -415,10 +415,11 @@ pub struct BoundIntegrationBinding {
     pub value: String,
 }
 
-/// A `--bindings` file (REQ-WFDEF-20): a JSON object whose members are flat bindings by key,
-/// each the value or an object of `value` with an optional `kind`, and, for an integration
-/// that declares bindings, an object under its id of such members by name. Which a member is,
-/// and whether it fits, is judged against the root's declarations by [`resolve_bindings`].
+/// A `--bindings` file (REQ-WFDEF-20): a JSON object whose members name the bindings a
+/// publish sets, flat bindings by key, each the value, an object of `value` with an optional
+/// `kind`, or `null` for the declared default, and, for an integration that declares
+/// bindings, an object under its id of such members by name. Which a member is, and whether
+/// it fits, is judged against the root's declarations by [`NamedBindings::judge`].
 #[derive(Clone, Eq, PartialEq)]
 pub struct BindingsFile {
     /// The file it was read from, which `bindings_file_invalid` names; absent when parsed.
@@ -455,6 +456,15 @@ impl BindingsFile {
         Self::from_bytes(bytes, None)
     }
 
+    /// The file of `members`, as one already decoded, such as Cloud's answered snapshot;
+    /// like a parsed one it has no path, so a `bindings_file_invalid` about it names none.
+    pub fn from_object(members: serde_json::Map<String, Value>) -> Self {
+        Self {
+            path: None,
+            members: members.into_iter().collect(),
+        }
+    }
+
     fn from_bytes(bytes: &[u8], path: Option<&Path>) -> Result<Self, DefinitionError> {
         let mut file = Self {
             path: path.map(Path::to_owned),
@@ -482,15 +492,17 @@ impl BindingsFile {
         }
     }
 
-    /// The value of the member at `at`, flat or under an integration: the bare value, or an
-    /// object of `value` and an optional string `kind`, which must be the declared kind.
+    /// What the member at `at`, flat or under an integration, names its declared binding for:
+    /// its default when the member is `null`, else its value, the bare value or an object of
+    /// `value` and an optional string `kind`, which must be the declared kind.
     fn judge(
         &self,
         at: BindingAt<'_>,
         member: &Value,
         declared: Declared<'_>,
-    ) -> Result<BindingValue, DefinitionError> {
+    ) -> Result<Named, DefinitionError> {
         let (kind, value) = match member {
+            Value::Null => return Ok(Named::Default),
             Value::Object(fields) => {
                 if fields
                     .keys()
@@ -524,7 +536,165 @@ impl BindingsFile {
             }
             value => (None, value),
         };
-        declared.admit(at, kind, BindingValue::deserialize(value).ok())
+        declared
+            .admit(at, kind, BindingValue::deserialize(value).ok())
+            .map(Named::Value)
+    }
+}
+
+/// What an invocation names a binding for (REQ-WFDEF-20, REQ-WFDEF-21).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Named {
+    /// This value, which fits the declared kind.
+    Value(BindingValue),
+    /// The declared default.
+    Default,
+}
+
+/// A binding the command line names (REQ-WFDEF-41): `--binding KEY=VALUE`, with the `VALUE`,
+/// or `--binding-default KEY`, without one. `KEY` is a flat binding's key or an integration
+/// binding's `<integration>.<name>`.
+#[derive(Clone, Eq, PartialEq)]
+pub struct BindingOption {
+    pub key: String,
+    pub value: Option<String>,
+}
+
+impl fmt::Debug for BindingOption {
+    /// The key and whether a value was given, never the value.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("BindingOption")
+            .field("key", &self.key)
+            .field("default", &self.value.is_none())
+            .finish()
+    }
+}
+
+impl BindingOption {
+    /// Where the binding `KEY` names is declared: under an integration when the text before
+    /// its last `.` is an integration that declares bindings, else in the flat block, where a
+    /// dotted key is never declared.
+    fn at(&self, declarations: Declarations<'_>) -> BindingAt<'_> {
+        match BindingKey::split(&self.key) {
+            BindingKey::Integration { integration, name } => declarations
+                .integration(integration)
+                .map_or(BindingAt::flat(&self.key), |provider| {
+                    BindingAt::under(provider, name)
+                }),
+            BindingKey::Flat(key) => BindingAt::flat(key),
+        }
+    }
+
+    /// What the option names its declared binding at `at` for: its default without a
+    /// `VALUE`, else the `VALUE` fitted to the declared kind, a flat `members` binding's
+    /// split at `,` into ids kept as written, none when it is empty.
+    fn judge(&self, at: BindingAt<'_>, declared: Declared<'_>) -> Result<Named, DefinitionError> {
+        let Some(value) = &self.value else {
+            return Ok(Named::Default);
+        };
+        let value = match declared {
+            Declared::Flat(binding) if binding.kind == BindingKind::Members => {
+                BindingValue::List(if value.is_empty() {
+                    Vec::new()
+                } else {
+                    value.split(',').map(str::to_owned).collect()
+                })
+            }
+            Declared::Flat(_) | Declared::Integration(_) => BindingValue::Text(value.clone()),
+        };
+        declared.admit(at, None, Some(value)).map(Named::Value)
+    }
+}
+
+/// The bindings an invocation names (REQ-WFDEF-20, REQ-WFDEF-41), judged against the root
+/// before the home is touched: the flat block's by key and each integration's under its id
+/// by name. A binding it does not name takes what REQ-WFDEF-21 gives it.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct NamedBindings {
+    flat: BTreeMap<String, Named>,
+    integrations: BTreeMap<IntegrationProvider, BTreeMap<String, Named>>,
+}
+
+impl NamedBindings {
+    /// What `file` and then `options` name, each judged against `tree`'s declarations. In
+    /// the file, a declared flat key is a flat member, the id of an integration that declares
+    /// bindings an object of that integration's members by name, and any other key
+    /// `binding_undeclared`. The whole file is judged first; each option, in the order given,
+    /// then names its binding in place of the file's member for it. Without either nothing is
+    /// named.
+    pub fn judge(
+        tree: &ValidatedTree,
+        file: Option<&BindingsFile>,
+        options: &[BindingOption],
+    ) -> Result<Self, DefinitionError> {
+        let declarations = Declarations {
+            flat: &tree.bindings,
+            integrations: &tree.required_integrations,
+        };
+        let mut named = Self::default();
+        let members = file
+            .iter()
+            .flat_map(|file| file.members.iter().map(move |member| (file, member)));
+        for (file, (key, member)) in members {
+            let at = BindingAt::flat(key);
+            let members = match declarations.integration(key) {
+                Some(provider) if declarations.get(at).is_none() => {
+                    let Value::Object(group) = member else {
+                        return Err(file.invalid(
+                            Some(provider),
+                            None,
+                            "an integration member that is not an object",
+                        ));
+                    };
+                    group
+                        .iter()
+                        .map(|(name, member)| (BindingAt::under(provider, name), member))
+                        .collect()
+                }
+                _ => vec![(at, member)],
+            };
+            for (at, member) in members {
+                let declared = declarations.get(at).ok_or_else(|| at.undeclared())?;
+                named.insert(at, file.judge(at, member, declared)?);
+            }
+        }
+        for option in options {
+            let at = option.at(declarations);
+            let declared = declarations.get(at).ok_or_else(|| at.undeclared())?;
+            named.insert(at, option.judge(at, declared)?);
+        }
+        Ok(named)
+    }
+
+    /// Whether the invocation names no binding.
+    pub fn is_empty(&self) -> bool {
+        self.flat.is_empty() && self.integrations.is_empty()
+    }
+
+    /// The flat bindings named, by key.
+    pub fn bindings(&self) -> &BTreeMap<String, Named> {
+        &self.flat
+    }
+
+    /// The integration bindings named, by integration and name.
+    pub fn integration_bindings(&self) -> &BTreeMap<IntegrationProvider, BTreeMap<String, Named>> {
+        &self.integrations
+    }
+
+    fn insert(&mut self, at: BindingAt<'_>, named: Named) {
+        let names = match at.integration {
+            None => &mut self.flat,
+            Some(provider) => self.integrations.entry(provider).or_default(),
+        };
+        names.insert(at.key.to_owned(), named);
+    }
+
+    fn get(&self, at: BindingAt<'_>) -> Option<&Named> {
+        match at.integration {
+            None => self.flat.get(at.key),
+            Some(provider) => self.integrations.get(&provider)?.get(at.key),
+        }
     }
 }
 
@@ -692,58 +862,40 @@ impl<'a> Declarations<'a> {
 }
 
 /// The snapshot of the bindings the root declares, flat (`declared`) and under its
-/// `integrations` (REQ-WFDEF-20, REQ-WFDEF-21): from `file` when given, otherwise from the
-/// `carried` snapshot with bindings no longer declared dropped; a declared binding neither
-/// supplies takes its default, and a `definition` binding without one has no entry
-/// (REQ-WFDEF-40). A value is recorded as written and never resolved.
+/// `integrations` (REQ-WFDEF-21). Each takes the value `named` gives it, its default when
+/// `named` names it for its default, else the value the `current` snapshot holds for it with
+/// the kind declared now, else its default; a `definition` binding left without one has no
+/// entry (REQ-WFDEF-40). A current binding the root no longer declares, or declares with
+/// another kind, is not kept. A value is recorded as written and never resolved.
 pub(crate) fn resolve_bindings(
     declared: &BTreeMap<String, Binding>,
     integrations: &BTreeMap<IntegrationProvider, Integration>,
-    file: Option<&BindingsFile>,
-    carried: Option<&BindingsSnapshot>,
+    named: &NamedBindings,
+    current: Option<&BindingsSnapshot>,
 ) -> Result<BindingsSnapshot, DefinitionError> {
     let declarations = Declarations {
         flat: declared,
         integrations,
     };
-    let mut supplied = BTreeMap::<BindingAt<'_>, BindingValue>::new();
-    if let Some(file) = file {
-        for (key, member) in &file.members {
-            // A declared flat key is a flat member; otherwise the id of an integration that
-            // declares bindings holds that integration's members.
-            let at = BindingAt::flat(key);
-            let members = match declarations.integration(key) {
-                Some(provider) if declarations.get(at).is_none() => {
-                    let Value::Object(group) = member else {
-                        return Err(file.invalid(
-                            Some(provider),
-                            None,
-                            "an integration member that is not an object",
-                        ));
-                    };
-                    group
-                        .iter()
-                        .map(|(name, member)| (BindingAt::under(provider, name), member))
-                        .collect()
-                }
-                _ => vec![(at, member)],
-            };
-            for (at, member) in members {
-                let declared = declarations.get(at).ok_or_else(|| at.undeclared())?;
-                supplied.insert(at, file.judge(at, member, declared)?);
+    let mut kept = BTreeMap::<BindingAt<'_>, BindingValue>::new();
+    if let Some(current) = current {
+        for (at, kind, value) in current.members() {
+            if declarations
+                .get(at)
+                .is_some_and(|declared| declared.kind() == kind)
+            {
+                kept.insert(at, value);
             }
-        }
-    } else if let Some(carried) = carried {
-        for (at, kind, value) in carried.members() {
-            let Some(declared) = declarations.get(at) else {
-                continue;
-            };
-            supplied.insert(at, declared.admit(at, Some(kind), Some(value))?);
         }
     }
     let mut snapshot = BindingsSnapshot::default();
     for (at, declared) in declarations.all() {
-        let Some(value) = supplied.remove(&at).or_else(|| declared.default()) else {
+        let value = match named.get(at) {
+            Some(Named::Value(value)) => Some(value.clone()),
+            Some(Named::Default) => declared.default(),
+            None => kept.remove(&at).or_else(|| declared.default()),
+        };
+        let Some(value) = value else {
             if declared.may_be_unbound() {
                 continue;
             }
@@ -810,8 +962,44 @@ pub struct EnabledChange {
     pub changed: bool,
 }
 
+/// Where a publish of a root records its revision (REQ-WFDEF-19): the root's `name` and the
+/// record the target resolved to, none when the publish creates one.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PublishPlace {
+    name: String,
+    resolved: Option<StoredDefinition>,
+}
+
+impl PublishPlace {
+    /// The record as resolution read it, unlocked; none for a new record.
+    pub fn record(&self) -> Option<&DefinitionRecord> {
+        self.resolved.as_ref().map(|resolved| &resolved.record)
+    }
+}
+
+/// The first half of a publish of `tree`: refuses a root without `name`
+/// (`definition_name_missing`) and resolves `target` (REQ-WFDEF-19), reading the home without a
+/// lock. `To` reads that record (`definition_id_invalid`, `definition_not_found`), `Resolve`
+/// the one record of the root's name (`definition_name_ambiguous` for more than one) and
+/// `New` none.
+pub fn resolve_publish(
+    home: &WorkflowHome,
+    tree: &ValidatedTree,
+    target: PublishTarget,
+) -> Result<PublishPlace, DefinitionError> {
+    let name = tree.name.clone().ok_or(DefinitionError::NameMissing)?;
+    let resolved = match target {
+        PublishTarget::To(id) => Some(read_definition(home, &id)?),
+        PublishTarget::New => None,
+        PublishTarget::Resolve => resolve_by_name(home, &name)?,
+    };
+    Ok(PublishPlace { name, resolved })
+}
+
 /// Records `tree` as a new revision of the target definition (REQ-WFDEF-19 to
-/// REQ-WFDEF-22). `by` is the publisher's login name, `unknown` when empty. Publishes to
+/// REQ-WFDEF-22) with the bindings `named` sets and, for an existing definition, the rest
+/// of its current snapshot that the root still declares with the same kind (REQ-WFDEF-21).
+/// `by` is the publisher's login name, `unknown` when empty. Publishes to
 /// one definition are serialized by its `publish.lock`, held from the record read through
 /// the record rename; one that finds it held is `publish_conflict`. A refusal writes
 /// nothing; a failure after the revision directory is made removes what this publish
@@ -822,15 +1010,81 @@ pub fn publish(
     home: &WorkflowHome,
     tree: &ValidatedTree,
     target: PublishTarget,
-    bindings: Option<&BindingsFile>,
+    named: &NamedBindings,
     by: &str,
 ) -> Result<Published, DefinitionError> {
-    let name = tree.name.clone().ok_or(DefinitionError::NameMissing)?;
-    let resolved = match target {
-        PublishTarget::To(id) => Some(read_definition(home, &id)?),
-        PublishTarget::New => None,
-        PublishTarget::Resolve => resolve_by_name(home, &name)?,
-    };
+    let place = resolve_publish(home, tree, target)?;
+    write_publication(home, tree, place, None, by, |existing| match existing {
+        Some(existing) => resolve_bindings(
+            &tree.bindings,
+            &tree.required_integrations,
+            named,
+            Some(&read_current_bindings(existing)?),
+        ),
+        None => {
+            let declarations = Declarations {
+                flat: &tree.bindings,
+                integrations: &tree.required_integrations,
+            };
+            if named.is_empty()
+                && declarations
+                    .all()
+                    .any(|(_, declared)| declared.default().is_none() && !declared.may_be_unbound())
+            {
+                return Err(DefinitionError::BindingsRequired);
+            }
+            resolve_bindings(&tree.bindings, &tree.required_integrations, named, None)
+        }
+    })
+}
+
+/// Records `tree` at `place` as a Cloud publication (REQ-WFDEF-19, REQ-WFDEF-22,
+/// REQ-CLOUDDEF-14): the revision's snapshot is `recorded`, the snapshot Cloud answered, and
+/// the record's `cloudId` is `cloud_id`, set in the same record write, on a record this
+/// creates too. The current snapshot is never read. `recorded` is judged as a bindings file
+/// is (`binding_undeclared`, `binding_kind_mismatch`, `binding_value_invalid`) and must give
+/// every declared binding a value, a `definition` binding included (`binding_missing`); a
+/// `cloud_id` that is not a `def_` id is `definition_id_invalid`. The lock, the record read
+/// again under it and the writes are `publish`'s, so a record extended since `place` was
+/// resolved is extended and a held lock is `publish_conflict`.
+pub fn record_publication(
+    home: &WorkflowHome,
+    tree: &ValidatedTree,
+    place: PublishPlace,
+    recorded: &BindingsFile,
+    cloud_id: &str,
+    by: &str,
+) -> Result<Published, DefinitionError> {
+    check_definition_id(cloud_id)?;
+    write_publication(home, tree, place, Some(cloud_id), by, |_| {
+        let named = NamedBindings::judge(tree, Some(recorded), &[])?;
+        let declarations = Declarations {
+            flat: &tree.bindings,
+            integrations: &tree.required_integrations,
+        };
+        if let Some((at, _)) = declarations
+            .all()
+            .find(|(at, _)| !matches!(named.get(*at), Some(Named::Value(_))))
+        {
+            return Err(at.missing());
+        }
+        resolve_bindings(&tree.bindings, &tree.required_integrations, &named, None)
+    })
+}
+
+/// The rest of a publish to `place`: takes the target's lock and reads its record again under
+/// it, makes the revision's snapshot with `snapshot` from that record (none for a new one),
+/// then writes the snapshot, the tree copy and the record, with `cloudId` set to `cloud_id`
+/// when given.
+fn write_publication(
+    home: &WorkflowHome,
+    tree: &ValidatedTree,
+    place: PublishPlace,
+    cloud_id: Option<&str>,
+    by: &str,
+    snapshot: impl FnOnce(Option<&StoredDefinition>) -> Result<BindingsSnapshot, DefinitionError>,
+) -> Result<Published, DefinitionError> {
+    let PublishPlace { name, resolved } = place;
     // Resolution reads every record unlocked; the target's own record is read again under
     // its lock, so a publish that finished in between is extended, never overwritten. A
     // definition this publish creates is reachable by no other until it is renamed into
@@ -842,34 +1096,7 @@ pub fn publish(
         }
         None => (None, None),
     };
-    let snapshot = match &existing {
-        Some(existing) => {
-            let carried = match bindings {
-                Some(_) => None,
-                None => Some(read_current_bindings(existing)?),
-            };
-            resolve_bindings(
-                &tree.bindings,
-                &tree.required_integrations,
-                bindings,
-                carried.as_ref(),
-            )?
-        }
-        None => {
-            let declarations = Declarations {
-                flat: &tree.bindings,
-                integrations: &tree.required_integrations,
-            };
-            if bindings.is_none()
-                && declarations
-                    .all()
-                    .any(|(_, declared)| declared.default().is_none() && !declared.may_be_unbound())
-            {
-                return Err(DefinitionError::BindingsRequired);
-            }
-            resolve_bindings(&tree.bindings, &tree.required_integrations, bindings, None)?
-        }
-    };
+    let snapshot = snapshot(existing.as_ref())?;
     let snapshot_bytes = snapshot
         .canonical_bytes()
         .map_err(|source| unavailable(home.root(), "encode bindings snapshot", source))?;
@@ -895,6 +1122,9 @@ pub fn publish(
         by: if by.is_empty() { UNKNOWN_PUBLISHER } else { by }.to_owned(),
     };
     record.name = name;
+    if let Some(cloud_id) = cloud_id {
+        record.cloud_id = Some(cloud_id.to_owned());
+    }
     record.revisions.insert(0, revision.clone());
     record.current = n;
 
@@ -1047,30 +1277,6 @@ pub fn set_enabled(
         definition,
         changed,
     })
-}
-
-impl WorkflowHome {
-    /// Records `cloud_id` as the `cloudId` of definition `id` (REQ-CLOUDDEF-14), replacing
-    /// the record whole only when it changes, as `set_enabled` does. The write follows a
-    /// publish, so it holds the definition's `publish.lock` and reads the record under it;
-    /// a held lock is `publish_conflict`, and a `cloud_id` that is not a `def_` id is
-    /// `definition_id_invalid`. A method of the home because the store module is crate-private
-    /// and the CLI reaches it through the exported home.
-    pub fn set_cloud_id(
-        &self,
-        id: &str,
-        cloud_id: &str,
-    ) -> Result<StoredDefinition, DefinitionError> {
-        check_definition_id(cloud_id)?;
-        let StoredDefinition { path, .. } = read_definition(self, id)?;
-        let _lock = PublishLock::acquire(&path, id)?;
-        let mut definition = read_stored(path, id)?;
-        if definition.record.cloud_id.as_deref() != Some(cloud_id) {
-            definition.record.cloud_id = Some(cloud_id.to_owned());
-            write_record(&definition.path, &definition.record)?;
-        }
-        Ok(definition)
-    }
 }
 
 /// A refused or failed definition command, with the id, ids, binding key (and its integration,
@@ -1277,7 +1483,7 @@ impl fmt::Display for DefinitionError {
                 write!(formatter, ": {reason}")
             }
             Self::BindingsRequired => formatter
-                .write_str("the root declares a binding without a default; pass a bindings file"),
+                .write_str("the root declares a binding without a default and the publish names no binding; name its value in a bindings file"),
             Self::BindingUndeclared { integration, key } => {
                 write!(
                     formatter,

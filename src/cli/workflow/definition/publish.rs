@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, anyhow};
 use clap::Args;
 use serde::Serialize;
+use serde_json::json;
 
 use super::super::super::{
     self as cli, CommonArgs, OrganizationArg, PrincipalAuthenticationArgs, ProjectArg, WorkflowJson,
@@ -13,12 +14,13 @@ use super::cloud::{resend_once, with_api};
 use super::report::{display, write_invalid, write_json};
 use crate::exit_code::ExitCode;
 use useful_api::{
-    WorkflowBindingValues, WorkflowDefinitionApi, WorkflowDefinitionFailure, WorkflowProblemDetail,
-    WorkflowPublication, WorkflowTreeFile,
+    WorkflowBindingValues, WorkflowDefinitionApi, WorkflowDefinitionFailure,
+    WorkflowDefinitionRevision, WorkflowProblemDetail, WorkflowPublication, WorkflowTreeFile,
 };
 use useful_execution::{
-    BindingsFile, PublishTarget, Published, ValidatedTree, WorkflowHome, check_definition_id,
-    publish, validate_workflow_tree,
+    BindingOption, BindingValue, BindingsFile, Named, NamedBindings, PublishTarget, Published,
+    ValidatedTree, WorkflowHome, check_definition_id, publish, record_publication, resolve_publish,
+    validate_workflow_tree,
 };
 use useful_human_auth::Deployment;
 
@@ -41,9 +43,24 @@ pub(super) struct Command {
     #[arg(
         long,
         value_name = "FILE",
-        help = "JSON object of binding values, an integration's nested under its id, resolved from the initial working directory"
+        help = "JSON object naming the binding values to set, null for a binding's default, an integration's nested under its id, resolved from the initial working directory"
     )]
     bindings: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "KEY=VALUE",
+        value_parser = parse_binding,
+        help = "Set binding KEY, `<integration>.<name>` for an integration's, to VALUE; a members value is comma-separated ids (repeatable)"
+    )]
+    binding: Vec<(String, String)>,
+
+    #[arg(
+        long,
+        value_name = "KEY",
+        help = "Set binding KEY to its declared default (repeatable)"
+    )]
+    binding_default: Vec<String>,
 
     #[arg(
         long,
@@ -63,7 +80,7 @@ pub(super) struct Command {
         long,
         value_name = OrganizationArg::VALUE_NAME,
         requires = "project",
-        help = "Also publish the revision to Cloud in this organization (ID or exact slug)"
+        help = "Publish to Cloud in this organization (ID or exact slug) and record the revision Cloud answered locally"
     )]
     cloud: Option<OrganizationArg>,
 
@@ -93,6 +110,45 @@ pub(super) struct Command {
 
     #[command(flatten)]
     options: CommonArgs<WorkflowJson, PrincipalAuthenticationArgs>,
+}
+
+/// REQ-WFDEF-41: `KEY=VALUE`, split at the first `=`.
+fn parse_binding(value: &str) -> Result<(String, String), String> {
+    let (key, value) = value
+        .split_once('=')
+        .ok_or_else(|| "expected KEY=VALUE".to_owned())?;
+    Ok((key.to_owned(), value.to_owned()))
+}
+
+/// REQ-WFDEF-41: the bindings `--binding` and then `--binding-default` name, in the order
+/// given, each `KEY` named at most once across both.
+fn binding_options(
+    values: Vec<(String, String)>,
+    defaults: Vec<String>,
+) -> anyhow::Result<Vec<BindingOption>> {
+    let options = values
+        .into_iter()
+        .map(|(key, value)| BindingOption {
+            key,
+            value: Some(value),
+        })
+        .chain(
+            defaults
+                .into_iter()
+                .map(|key| BindingOption { key, value: None }),
+        )
+        .collect::<Vec<_>>();
+    let mut keys = HashSet::new();
+    if let Some(repeated) = options
+        .iter()
+        .find(|option| !keys.insert(option.key.as_str()))
+    {
+        return Err(anyhow!(
+            "--binding and --binding-default name `{}` more than once",
+            repeated.key
+        ));
+    }
+    Ok(options)
 }
 
 /// Where `--cloud` publishes (REQ-CLOUDDEF-14).
@@ -141,8 +197,8 @@ impl CloudTarget {
 }
 
 /// The Cloud definition a publication reached and its current revision: the one it recorded,
-/// or for a reused definition the one it already had; and whether Cloud already held the tree
-/// sealed.
+/// or for a reused definition the one it already had, with that revision's snapshot; and
+/// whether Cloud already held the tree sealed.
 struct CloudPublished {
     definition: String,
     created: bool,
@@ -150,11 +206,16 @@ struct CloudPublished {
     revision: i32,
     tree_digest: String,
     tree_reused: bool,
+    /// The revision's flat bindings and each integration's under its id, each as `{kind,
+    /// value}`, which the local revision records (REQ-CLOUDDEF-14).
+    bindings: BindingsFile,
 }
 
 impl Command {
     pub(super) fn execute(self) -> cli::CommandResult {
         let json = self.options.json;
+        let options = binding_options(self.binding, self.binding_default)
+            .map_err(|error| cli::CommandFailure::with_exit_code(error, ExitCode::UsageError))?;
         let tree = match validate_workflow_tree(&self.directory) {
             Ok(tree) => tree,
             Err(diagnostics) => {
@@ -188,8 +249,7 @@ impl Command {
         {
             return super::finish::<()>(COMMAND_NAME, REFUSED, Err(error), json, |_, _| Ok(()));
         }
-        // The deployment is configuration, read before anything is written; the Cloud
-        // steps follow the local publish, which runs as it does without `--cloud`.
+        // The deployment is configuration, read before the home is touched.
         let deployment = cloud
             .as_ref()
             .map(|_| {
@@ -198,85 +258,102 @@ impl Command {
                     .context("configure Useful Machinery workflow definition publication")
             })
             .transpose()?;
-        let published = WorkflowHome::from_environment().and_then(|home| {
-            let bindings = self
+        let judged = WorkflowHome::from_environment().and_then(|home| {
+            let file = self
                 .bindings
                 .as_deref()
                 .map(BindingsFile::read)
                 .transpose()?;
-            publish(
-                &home,
-                &tree,
-                target,
-                bindings.as_ref(),
-                &super::super::login_name(),
-            )
-            .map(|published| (home, published))
+            NamedBindings::judge(&tree, file.as_ref(), &options).map(|named| (home, named))
         });
         let (Some(cloud), Some(deployment)) = (cloud, deployment) else {
-            return super::finish(
-                COMMAND_NAME,
-                REFUSED,
-                published.map(|(_, published)| published),
-                json,
-                |published, json| {
-                    if json {
-                        write_json(
-                            &published_report(published, None),
-                            "workflow definition publish",
-                        )
-                    } else {
-                        write_human_published(published)
-                    }
-                },
-            );
+            let published = judged.and_then(|(home, named)| {
+                publish(&home, &tree, target, &named, &super::super::login_name())
+            });
+            return super::finish(COMMAND_NAME, REFUSED, published, json, |published, json| {
+                if json {
+                    write_json(
+                        &published_report(Some(published), None),
+                        "workflow definition publish",
+                    )
+                } else {
+                    write_human_published(published)
+                }
+            });
         };
-        let (home, published) = match published {
-            Ok(published) => published,
+        // The local record is resolved before anything is sent, refusing as without
+        // `--cloud`, and written only once Cloud has answered (REQ-CLOUDDEF-14).
+        let resolved = judged.and_then(|(home, named)| {
+            resolve_publish(&home, &tree, target).map(|place| (home, named, place))
+        });
+        let (home, named, place) = match resolved {
+            Ok(resolved) => resolved,
             Err(error) => {
                 return super::finish::<()>(COMMAND_NAME, REFUSED, Err(error), json, |_, _| Ok(()));
             }
         };
-        let reached = publish_to_cloud(&deployment, &self.options, &cloud, &tree, &published)?;
-        // The record names the Cloud definition its last successful publication reached.
-        if let Ok(reached) = &reached
-            && published.record.cloud_id.as_deref() != Some(reached.definition.as_str())
-            && let Err(error) = home.set_cloud_id(&published.record.id, &reached.definition)
-        {
-            writeln!(
-                io::stderr().lock(),
-                "error: Cloud definition {} was reached at revision {} but is not recorded as the cloudId of {}",
-                display(&reached.definition),
-                reached.revision,
-                display(&published.record.id)
-            )
+        let recorded = place.record().and_then(|record| record.cloud_id.clone());
+        let addressed = cloud.existing(recorded.as_deref());
+        let reached = match publish_to_cloud(
+            &deployment,
+            &self.options,
+            &cloud,
+            &tree,
+            &named,
+            recorded.as_deref(),
+        )? {
+            Ok(reached) => reached,
+            Err(failure) => {
+                write_cloud_failed(&cloud, addressed, &failure, json)
+                    .context("write workflow definition publish result")?;
+                return Ok(cloud_failure(&failure).1);
+            }
+        };
+        let published = match record_publication(
+            &home,
+            &tree,
+            place,
+            &reached.bindings,
+            &reached.definition,
+            &super::super::login_name(),
+        ) {
+            Ok(published) => published,
+            Err(error) => {
+                writeln!(
+                    io::stderr().lock(),
+                    "error: Cloud definition {} was reached at revision {} but no local revision was recorded",
+                    display(&reached.definition),
+                    reached.revision
+                )
+                .context("write workflow definition publish result")?;
+                return super::finish::<()>(COMMAND_NAME, REFUSED, Err(error), json, |_, _| Ok(()));
+            }
+        };
+        write_cloud_published(&published, &cloud, addressed, &reached, json)
             .context("write workflow definition publish result")?;
-            return super::finish::<()>(COMMAND_NAME, REFUSED, Err(error), json, |_, _| Ok(()));
-        }
-        write_cloud_published(&published, &cloud, &reached, json)
-            .context("write workflow definition publish result")?;
-        Ok(match &reached {
-            Ok(_) => ExitCode::Success,
-            Err(failure) => cloud_failure(failure).1,
-        })
+        Ok(ExitCode::Success)
     }
 }
 
 /// Uploads and seals the tree, then publishes to the Cloud definition `--cloud-to` names
-/// or, without it, the one the local record names unless `--cloud-new`, over the current
-/// revision it reads first (REQ-CLOUDDEF-14, REQ-CLOUDDEF-20). Otherwise it creates one:
-/// `--cloud-new` always, and a record with no `cloudId` asking Cloud for the project's
-/// identical definition first (REQ-CLOUDDEF-22). A refused read or publication of an
-/// existing definition never falls through to a create. The revision's bindings snapshot is
-/// sent whole, a `members` value as an array, each integration's bindings under its id with
-/// their text values (no member when the root declares none), with the tree's executable
-/// files; one fresh key covers the seal and the publication for the whole invocation.
+/// or, without it, the one the local record names (`recorded`) unless `--cloud-new`, over
+/// the current revision it reads first (REQ-CLOUDDEF-14, REQ-CLOUDDEF-20). Otherwise it
+/// creates one: `--cloud-new` always, and a record with no `cloudId` asking Cloud for the
+/// project's identical definition first (REQ-CLOUDDEF-22). A refused read or publication of
+/// an existing definition never falls through to a create. It sends the bindings `named`
+/// names and nothing else, `null` for one named for its default, so Cloud keeps every other
+/// binding of the current revision or, for a create, gives it its default
+/// (REQ-CLOUDDEF-41): the flat ones in `bindings`, a `members` value as an array, and each
+/// integration's under its id in `integrationBindings`, each member absent when it would be
+/// empty. It sends the tree's executable files too; one fresh key covers the seal and the
+/// publication for the whole invocation.
 fn publish_to_cloud(
     deployment: &Deployment,
     options: &CommonArgs<WorkflowJson, PrincipalAuthenticationArgs>,
     target: &CloudTarget,
     tree: &ValidatedTree,
-    published: &Published,
+    named: &NamedBindings,
+    recorded: Option<&str>,
 ) -> anyhow::Result<Result<CloudPublished, WorkflowDefinitionFailure>> {
     let key = useful_support::generate_idempotency_key()
         .context("generate Cloud workflow definition request identity")?;
@@ -289,27 +366,42 @@ fn publish_to_cloud(
             executable: file.executable,
         })
         .collect::<Vec<_>>();
-    let bindings = published
-        .snapshot
+    let bindings = named
         .bindings()
         .iter()
-        .map(|(binding, bound)| Ok((binding.clone(), serde_json::to_value(&bound.value)?)))
+        .map(|(binding, named)| {
+            let value = match named {
+                Named::Value(value) => serde_json::to_value(value)?,
+                Named::Default => serde_json::Value::Null,
+            };
+            Ok((binding.clone(), value))
+        })
         .collect::<Result<WorkflowBindingValues, serde_json::Error>>()
-        .context("encode the bindings snapshot")?;
-    let integration_bindings = published.snapshot.integration_bindings();
-    // A root that declares no integration binding sends no member, as before Cloud read it.
-    let integration_bindings = (!integration_bindings.is_empty()).then(|| {
-        integration_bindings
-            .iter()
-            .map(|(provider, group)| {
-                let values = group
-                    .iter()
-                    .map(|(name, bound)| (name.clone(), bound.value.clone()))
-                    .collect::<HashMap<_, _>>();
-                (provider.as_str().to_owned(), values)
-            })
-            .collect::<HashMap<_, _>>()
-    });
+        .context("encode the named bindings")?;
+    let integration_bindings = named
+        .integration_bindings()
+        .iter()
+        .map(|(provider, group)| {
+            let values = group
+                .iter()
+                .map(|(name, named)| {
+                    let value = match named {
+                        Named::Value(BindingValue::Text(text)) => Some(text.clone()),
+                        Named::Value(BindingValue::List(_)) => {
+                            return Err(anyhow!(
+                                "integration binding `{}.{name}` holds a list",
+                                provider.as_str()
+                            ));
+                        }
+                        Named::Default => None,
+                    };
+                    Ok((name.clone(), value))
+                })
+                .collect::<anyhow::Result<HashMap<_, _>>>()?;
+            Ok((provider.as_str().to_owned(), values))
+        })
+        .collect::<anyhow::Result<HashMap<_, _>>>()
+        .context("encode the named integration bindings")?;
     // Every executable file, `[]` when none is, so clearing the last bit is published too.
     let executable_paths = tree
         .files
@@ -317,15 +409,16 @@ fn publish_to_cloud(
         .filter(|(_, file)| file.executable)
         .map(|(path, _)| path.clone())
         .collect::<Vec<_>>();
+    let digest = format!("{}:{}", tree.digest.algorithm.as_str(), tree.digest.value);
     let steps = CloudSteps {
         target,
-        digest: &published.revision.tree,
+        digest: &digest,
         files: &files,
-        bindings: &bindings,
-        integration_bindings: integration_bindings.as_ref(),
+        bindings: (!bindings.is_empty()).then_some(&bindings),
+        integration_bindings: (!integration_bindings.is_empty()).then_some(&integration_bindings),
         executable_paths: &executable_paths,
-        existing: target.existing(published.record.cloud_id.as_deref()),
-        reuse_identical: target.reuses_identical(published.record.cloud_id.as_deref()),
+        existing: target.existing(recorded),
+        reuse_identical: target.reuses_identical(recorded),
         key: &key,
     };
     with_api(deployment, options, |api| steps.run(api))
@@ -338,10 +431,11 @@ struct CloudSteps<'a> {
     /// The tree digest, `sha256:<hex>`.
     digest: &'a str,
     files: &'a [WorkflowTreeFile<'a>],
-    bindings: &'a WorkflowBindingValues,
-    /// Each integration's binding values by name, under its id; `None` when the root declares
-    /// no integration binding.
-    integration_bindings: Option<&'a HashMap<String, HashMap<String, String>>>,
+    /// The flat bindings named, `Value::Null` for a default; `None` when none is named.
+    bindings: Option<&'a WorkflowBindingValues>,
+    /// Each integration's bindings named, by name under its id, `None` for a default; `None`
+    /// when none is named.
+    integration_bindings: Option<&'a HashMap<String, HashMap<String, Option<String>>>>,
     /// The tree's executable files, in bytewise order.
     executable_paths: &'a [String],
     /// The Cloud definition `--cloud-to` or the local record names, unless `--cloud-new`.
@@ -364,7 +458,7 @@ impl CloudSteps<'_> {
         let (_, tree_reused) = api.upload_tree(organization, self.digest, self.files, self.key)?;
         let publication = WorkflowPublication {
             tree_digest: self.digest,
-            bindings: Some(self.bindings),
+            bindings: self.bindings,
             integration_bindings: self.integration_bindings,
             executable_paths: Some(self.executable_paths),
         };
@@ -389,6 +483,7 @@ impl CloudSteps<'_> {
             })?,
         };
         Ok(CloudPublished {
+            bindings: answered_bindings(&publication.revision),
             definition: publication.definition.id,
             created: self.existing.is_none() && !reused,
             reused,
@@ -397,6 +492,35 @@ impl CloudSteps<'_> {
             tree_reused,
         })
     }
+}
+
+/// The snapshot of the revision Cloud answered, as the file the local revision is judged and
+/// recorded from: each flat binding and each integration's under its id, as `{kind, value}`, a
+/// flat binding without a value as `null`, which the judge refuses (REQ-CLOUDDEF-14).
+fn answered_bindings(revision: &WorkflowDefinitionRevision) -> BindingsFile {
+    let mut members = revision
+        .bindings
+        .iter()
+        .map(|(key, binding)| {
+            (
+                key.clone(),
+                json!({"kind": binding.kind.to_string(), "value": binding.value}),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    for (integration, group) in revision.integration_bindings.iter().flatten() {
+        let group = group
+            .iter()
+            .map(|(name, binding)| {
+                (
+                    name.clone(),
+                    json!({"kind": binding.kind.to_string(), "value": binding.value}),
+                )
+            })
+            .collect();
+        members.insert(integration.clone(), serde_json::Value::Object(group));
+    }
+    BindingsFile::from_object(members)
 }
 
 /// The JSON `failure` of a Cloud failure and its exit status: 1 for a refusal.
@@ -456,174 +580,188 @@ impl InvalidResponseDiagnostic {
     }
 }
 
-fn write_cloud_published(
-    published: &Published,
-    target: &CloudTarget,
-    reached: &Result<CloudPublished, WorkflowDefinitionFailure>,
-    json: bool,
-) -> anyhow::Result<()> {
+/// The `cloud` object of `--json`: what the publication reached, or its failure.
+fn json_cloud<'a>(
+    target: &'a CloudTarget,
+    addressed: Option<&'a str>,
+    reached: Result<&'a CloudPublished, &'a WorkflowDefinitionFailure>,
+) -> JsonCloud<'a> {
     let refusal = match reached {
         Err(WorkflowDefinitionFailure::Refused(refusal)) => Some(refusal),
         _ => None,
     };
-    let addressed = target.existing(published.record.cloud_id.as_deref());
+    let reached_ok = reached.ok();
+    JsonCloud {
+        organization_ref: &target.organization,
+        project_id: &target.project,
+        target: addressed,
+        definition: reached_ok.map(|reached| reached.definition.as_str()),
+        created: reached_ok.map(|reached| reached.created),
+        reused: reached_ok.map(|reached| reached.reused),
+        revision: reached_ok.map(|reached| reached.revision),
+        tree_digest: reached_ok.map(|reached| reached.tree_digest.as_str()),
+        tree_reused: reached_ok.map(|reached| reached.tree_reused),
+        failure: reached.err().map(|failure| cloud_failure(failure).0),
+        status: refusal.map(|refusal| refusal.status),
+        problem: refusal.map(|refusal| refusal.problem.as_str()),
+        workflow: refusal.and_then(|refusal| refusal.workflow.as_ref()),
+        diagnostic: reached.err().and_then(invalid_response_diagnostic),
+    }
+}
+
+/// Reports the local revision recorded and the Cloud definition and revision it records.
+fn write_cloud_published(
+    published: &Published,
+    target: &CloudTarget,
+    addressed: Option<&str>,
+    reached: &CloudPublished,
+    json: bool,
+) -> anyhow::Result<()> {
     if json {
-        let reached_ok = reached.as_ref().ok();
-        let cloud = JsonCloud {
-            organization_ref: &target.organization,
-            project_id: &target.project,
-            target: addressed,
-            definition: reached_ok.map(|reached| reached.definition.as_str()),
-            created: reached_ok.map(|reached| reached.created),
-            reused: reached_ok.map(|reached| reached.reused),
-            revision: reached_ok.map(|reached| reached.revision),
-            tree_digest: reached_ok.map(|reached| reached.tree_digest.as_str()),
-            tree_reused: reached_ok.map(|reached| reached.tree_reused),
-            failure: reached
-                .as_ref()
-                .err()
-                .map(|failure| cloud_failure(failure).0),
-            status: refusal.map(|refusal| refusal.status),
-            problem: refusal.map(|refusal| refusal.problem.as_str()),
-            workflow: refusal.and_then(|refusal| refusal.workflow.as_ref()),
-            diagnostic: reached.as_ref().err().and_then(invalid_response_diagnostic),
-        };
         return write_json(
-            &published_report(published, Some(cloud)),
+            &published_report(
+                Some(published),
+                Some(json_cloud(target, addressed, Ok(reached))),
+            ),
             "workflow definition publish",
         );
     }
     write_human_published(published)?;
-    match reached {
-        Ok(reached) => {
-            let mut stdout = io::stdout().lock();
-            writeln!(stdout, "cloud definition: {}", display(&reached.definition))?;
-            writeln!(stdout, "cloud created: {}", super::yes_no(reached.created))?;
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "cloud definition: {}", display(&reached.definition))?;
+    writeln!(stdout, "cloud created: {}", super::yes_no(reached.created))?;
+    writeln!(
+        stdout,
+        "cloud definition reused: {}",
+        super::yes_no(reached.reused)
+    )?;
+    writeln!(stdout, "cloud revision: {}", reached.revision)?;
+    writeln!(stdout, "cloud tree: {}", display(&reached.tree_digest))?;
+    writeln!(
+        stdout,
+        "cloud tree reused: {}",
+        super::yes_no(reached.tree_reused)
+    )?;
+    Ok(())
+}
+
+/// Reports a Cloud refusal or failure, after which nothing was recorded locally
+/// (REQ-CLOUDDEF-14).
+fn write_cloud_failed(
+    target: &CloudTarget,
+    addressed: Option<&str>,
+    failure: &WorkflowDefinitionFailure,
+    json: bool,
+) -> anyhow::Result<()> {
+    if json {
+        return write_json(
+            &published_report(None, Some(json_cloud(target, addressed, Err(failure)))),
+            "workflow definition publish",
+        );
+    }
+    let refusal = match failure {
+        WorkflowDefinitionFailure::Refused(refusal) => Some(refusal),
+        _ => None,
+    };
+    let mut stderr = io::stderr().lock();
+    let publication = addressed.map_or_else(
+        || "Cloud publication".to_owned(),
+        |id| format!("Cloud publication to {}", display(id)),
+    );
+    match refusal {
+        Some(refusal) => {
             writeln!(
-                stdout,
-                "cloud definition reused: {}",
-                super::yes_no(reached.reused)
+                stderr,
+                "error: {publication} refused: {} (HTTP {})",
+                refusal.problem, refusal.status
             )?;
-            writeln!(stdout, "cloud revision: {}", reached.revision)?;
-            writeln!(stdout, "cloud tree: {}", display(&reached.tree_digest))?;
-            writeln!(
-                stdout,
-                "cloud tree reused: {}",
-                super::yes_no(reached.tree_reused)
-            )?;
-        }
-        Err(failure) => {
-            let mut stderr = io::stderr().lock();
-            let publication = addressed.map_or_else(
-                || "Cloud publication".to_owned(),
-                |id| format!("Cloud publication to {}", display(id)),
-            );
-            match refusal {
-                Some(refusal) => {
-                    writeln!(
-                        stderr,
-                        "error: {publication} refused: {} (HTTP {})",
-                        refusal.problem, refusal.status
-                    )?;
-                    if let Some(current) = refusal
-                        .workflow
-                        .as_ref()
-                        .and_then(|detail| detail.current_revision)
-                    {
-                        writeln!(stderr, "cloud current revision: {current}")?;
-                    }
-                    if let Some(integration) = refusal
-                        .workflow
-                        .as_ref()
-                        .and_then(|detail| detail.integration.as_deref())
-                    {
-                        writeln!(stderr, "integration: {}", display(integration))?;
-                    }
-                    if let Some(key) = refusal
-                        .workflow
-                        .as_ref()
-                        .and_then(|detail| detail.binding_key.as_deref())
-                    {
-                        writeln!(stderr, "binding: {}", display(key))?;
-                    }
-                    // The loop the publication would close, in start order (REQ-CLOUDDEF-35).
-                    if let Some(ids) = refusal
-                        .workflow
-                        .as_ref()
-                        .and_then(|detail| detail.r#loop.as_deref())
-                    {
-                        let ids = ids.iter().map(|id| display(id)).collect::<Vec<_>>();
-                        writeln!(stderr, "loop: {}", ids.join(" -> "))?;
-                    }
-                    if let Some(ids) = refusal
-                        .workflow
-                        .as_ref()
-                        .and_then(|detail| detail.definition_ids.as_deref())
-                    {
-                        let ids = ids.iter().map(|id| display(id)).collect::<Vec<_>>();
-                        writeln!(stderr, "cloud definitions: {}", ids.join(", "))?;
-                    }
-                }
-                None => {
-                    writeln!(
-                        stderr,
-                        "error: {publication} failed: {}",
-                        cloud_failure(failure).0
-                    )?;
-                    if let Some(diagnostic) = invalid_response_diagnostic(failure) {
-                        diagnostic.write(&mut stderr)?;
-                    }
-                }
+            if let Some(current) = refusal
+                .workflow
+                .as_ref()
+                .and_then(|detail| detail.current_revision)
+            {
+                writeln!(stderr, "cloud current revision: {current}")?;
             }
-            let ambiguous =
-                refusal.is_some_and(|refusal| refusal.problem == DEFINITION_REUSE_AMBIGUOUS);
-            // The addressed definition, named or recorded, is not found in the project: the
-            // owner creates another or names one, as the next attempt at the same target
-            // would be refused again (REQ-CLOUDDEF-14).
-            let addressed_not_found =
-                addressed.is_some() && refusal.is_some_and(|refusal| refusal.problem == NOT_FOUND);
-            match target.named() {
-                _ if addressed_not_found => writeln!(
-                    stderr,
-                    "\nRevision {} of {} stays recorded locally. Cloud does not hold that definition in the project. Publish again to create another Cloud definition, or to one that you choose:\n  useful workflow definition publish <DIR> --cloud {} --project {} --cloud-new\n  useful workflow definition publish <DIR> --cloud {} --project {} --cloud-to <CLOUD_ID>",
-                    published.revision.n,
-                    display(&published.record.id),
-                    display(&target.organization),
-                    display(&target.project),
-                    display(&target.organization),
-                    display(&target.project)
-                )?,
-                // The record's Cloud definition was not changed, so the next attempt names
-                // the target again.
-                Some(id) => writeln!(
-                    stderr,
-                    "\nRevision {} of {} stays recorded locally, without {} as its Cloud definition. Resolve the error and publish again with the target:\n  useful workflow definition publish <DIR> --cloud {} --project {} --cloud-to {}",
-                    published.revision.n,
-                    display(&published.record.id),
-                    display(id),
-                    display(&target.organization),
-                    display(&target.project),
-                    display(id)
-                )?,
-                // Several identical definitions answered the reuse: the owner chooses one.
-                None if ambiguous => writeln!(
-                    stderr,
-                    "\nRevision {} of {} stays recorded locally. Several Cloud definitions of the project are identical to it. Publish again to the one listed that you choose, or create another:\n  useful workflow definition publish <DIR> --cloud {} --project {} --cloud-to <CLOUD_ID>\n  useful workflow definition publish <DIR> --cloud {} --project {} --cloud-new",
-                    published.revision.n,
-                    display(&published.record.id),
-                    display(&target.organization),
-                    display(&target.project),
-                    display(&target.organization),
-                    display(&target.project)
-                )?,
-                None => writeln!(
-                    stderr,
-                    "\nRevision {} of {} stays recorded locally; resolve the error and publish again.",
-                    published.revision.n,
-                    display(&published.record.id)
-                )?,
+            if let Some(integration) = refusal
+                .workflow
+                .as_ref()
+                .and_then(|detail| detail.integration.as_deref())
+            {
+                writeln!(stderr, "integration: {}", display(integration))?;
+            }
+            if let Some(key) = refusal
+                .workflow
+                .as_ref()
+                .and_then(|detail| detail.binding_key.as_deref())
+            {
+                writeln!(stderr, "binding: {}", display(key))?;
+            }
+            // The loop the publication would close, in start order (REQ-CLOUDDEF-35).
+            if let Some(ids) = refusal
+                .workflow
+                .as_ref()
+                .and_then(|detail| detail.r#loop.as_deref())
+            {
+                let ids = ids.iter().map(|id| display(id)).collect::<Vec<_>>();
+                writeln!(stderr, "loop: {}", ids.join(" -> "))?;
+            }
+            if let Some(ids) = refusal
+                .workflow
+                .as_ref()
+                .and_then(|detail| detail.definition_ids.as_deref())
+            {
+                let ids = ids.iter().map(|id| display(id)).collect::<Vec<_>>();
+                writeln!(stderr, "cloud definitions: {}", ids.join(", "))?;
             }
         }
+        None => {
+            writeln!(
+                stderr,
+                "error: {publication} failed: {}",
+                cloud_failure(failure).0
+            )?;
+            if let Some(diagnostic) = invalid_response_diagnostic(failure) {
+                diagnostic.write(&mut stderr)?;
+            }
+        }
+    }
+    let ambiguous = refusal.is_some_and(|refusal| refusal.problem == DEFINITION_REUSE_AMBIGUOUS);
+    // The addressed definition, named or recorded, is not found in the project: the owner
+    // creates another or names one, as the next attempt at the same target would be refused
+    // again (REQ-CLOUDDEF-14).
+    let addressed_not_found =
+        addressed.is_some() && refusal.is_some_and(|refusal| refusal.problem == NOT_FOUND);
+    match target.named() {
+        _ if addressed_not_found => writeln!(
+            stderr,
+            "\nNothing was recorded locally. Cloud does not hold that definition in the project. Publish again to create another Cloud definition, or to one that you choose:\n  useful workflow definition publish <DIR> --cloud {} --project {} --cloud-new\n  useful workflow definition publish <DIR> --cloud {} --project {} --cloud-to <CLOUD_ID>",
+            display(&target.organization),
+            display(&target.project),
+            display(&target.organization),
+            display(&target.project)
+        )?,
+        // The record's Cloud definition was not changed, so the next attempt names the
+        // target again.
+        Some(id) => writeln!(
+            stderr,
+            "\nNothing was recorded locally. Resolve the error and publish again with the target:\n  useful workflow definition publish <DIR> --cloud {} --project {} --cloud-to {}",
+            display(&target.organization),
+            display(&target.project),
+            display(id)
+        )?,
+        // Several identical definitions answered the reuse: the owner chooses one.
+        None if ambiguous => writeln!(
+            stderr,
+            "\nNothing was recorded locally. Several Cloud definitions of the project are identical to the publication. Publish again to the one listed that you choose, or create another:\n  useful workflow definition publish <DIR> --cloud {} --project {} --cloud-to <CLOUD_ID>\n  useful workflow definition publish <DIR> --cloud {} --project {} --cloud-new",
+            display(&target.organization),
+            display(&target.project),
+            display(&target.organization),
+            display(&target.project)
+        )?,
+        None => writeln!(
+            stderr,
+            "\nNothing was recorded locally; resolve the error and publish again."
+        )?,
     }
     Ok(())
 }
@@ -650,12 +788,12 @@ fn write_human_published(published: &Published) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The `--json` report: the local revision `published` recorded, none when a Cloud failure
+/// recorded nothing, and the Cloud half of `--cloud`.
 fn published_report<'a>(
-    published: &'a Published,
+    published: Option<&'a Published>,
     cloud: Option<JsonCloud<'a>>,
 ) -> JsonPublished<'a> {
-    let record = &published.record;
-    let revision = &published.revision;
     JsonPublished {
         schema_version: 1,
         command: COMMAND_NAME,
@@ -664,21 +802,21 @@ fn published_report<'a>(
         } else {
             "published"
         },
-        definition: JsonDefinition {
-            id: &record.id,
-            name: &record.name,
-            enabled: record.enabled,
-            current: record.current,
+        definition: published.map(|published| JsonDefinition {
+            id: &published.record.id,
+            name: &published.record.name,
+            enabled: published.record.enabled,
+            current: published.record.current,
             created: published.created,
             path: published.path.to_string_lossy().into_owned(),
-        },
-        revision: JsonRevision {
-            n: revision.n,
-            tree: &revision.tree,
-            bindings: &revision.bindings,
-            published_at: &revision.published_at,
-            by: &revision.by,
-        },
+        }),
+        revision: published.map(|published| JsonRevision {
+            n: published.revision.n,
+            tree: &published.revision.tree,
+            bindings: &published.revision.bindings,
+            published_at: &published.revision.published_at,
+            by: &published.revision.by,
+        }),
         cloud,
     }
 }
@@ -689,8 +827,12 @@ struct JsonPublished<'a> {
     schema_version: u8,
     command: &'static str,
     outcome: &'static str,
-    definition: JsonDefinition<'a>,
-    revision: JsonRevision<'a>,
+    /// The local definition and revision recorded; absent for `cloud_failed`, which records
+    /// none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    definition: Option<JsonDefinition<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<JsonRevision<'a>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cloud: Option<JsonCloud<'a>>,
 }

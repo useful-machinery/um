@@ -80,10 +80,11 @@ pub use workflow::coordinator::{
     ClassifiedCommitError, CommitFailure, CommitFailureClass, CoordinationError, CoordinatorClock,
 };
 pub use workflow::definition_store::{
-    BindingsFile, BindingsSnapshot, BoundBinding, BoundIntegrationBinding, DefinitionError,
-    DefinitionRecord, EnabledChange, PublishTarget, Published, RevisionRecord, StoredDefinition,
-    WorkflowHome, check_definition_id, list_definitions, publish, read_current_bindings,
-    read_definition, read_revision_bindings, set_enabled,
+    BindingOption, BindingsFile, BindingsSnapshot, BoundBinding, BoundIntegrationBinding,
+    DefinitionError, DefinitionRecord, EnabledChange, Named, NamedBindings, PublishPlace,
+    PublishTarget, Published, RevisionRecord, StoredDefinition, WorkflowHome, check_definition_id,
+    list_definitions, publish, read_current_bindings, read_definition, read_revision_bindings,
+    record_publication, resolve_publish, set_enabled,
 };
 pub use workflow::diagnostic::StepDiagnosticLog;
 pub use workflow::diagnostic::{CapturedDiagnosticStream, StepDiagnostic};

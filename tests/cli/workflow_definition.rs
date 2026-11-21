@@ -1372,6 +1372,43 @@ fn publish_refuses_missing_or_unusable_bindings() {
     home.assert_no_runs();
 }
 
+// REQ-WFDEF-20, REQ-WFDEF-21
+#[test]
+fn a_later_publish_with_a_partial_bindings_file_changes_only_what_it_names() {
+    let home = Home::new();
+    let tree = Tree::engineering();
+    let bindings = tree.engineering_bindings();
+    let first = home.publish(&tree, &["--bindings", &bindings]);
+    let id = text(&first["definition"]["id"], "definition id").to_owned();
+    let original = home.json(&["show", &id])["bindings"].clone();
+
+    let partial = tree.bindings_file(
+        "partial.json",
+        &json!({"linearTeam": "ENG", "done": "Shipped"}),
+    );
+    home.publish(&tree, &["--bindings", &partial]);
+    let mut expected = original.clone();
+    expected["linearTeam"]["value"] = json!("ENG");
+    expected["done"]["value"] = json!("Shipped");
+    assert_eq!(home.json(&["show", &id])["bindings"], expected);
+
+    let reset = tree.bindings_file("reset.json", &json!({"done": null}));
+    home.publish(&tree, &["--bindings", &reset]);
+    let shown = home.json(&["show", &id]);
+    assert_eq!(shown["bindings"]["done"], original["done"]);
+    assert_eq!(shown["bindings"]["done"]["value"], "Done");
+    assert_eq!(shown["bindings"]["linearTeam"]["value"], "ENG");
+
+    let without_default = tree.bindings_file("repository.json", &json!({"repository": null}));
+    let missing = home.refused(&tree, &["--bindings", &without_default], "binding_missing");
+    assert_eq!(missing["binding"], "repository");
+    assert_eq!(
+        home.json(&["show", &id])["definition"]["current"],
+        shown["definition"]["current"]
+    );
+    home.assert_no_runs();
+}
+
 // REQ-WFDEF-20, REQ-WFDEF-26, REQ-WFDEF-27: integration bindings nested under their id are
 // published, shown as `<id>.<name>`, and a refusal about one names the integration.
 #[test]
@@ -1501,6 +1538,163 @@ fn member_bindings_are_reported_and_shown_as_typed_values() {
             "nightlyOwner: prn_x (member)",
         ],
     );
+}
+
+const BINDING_VALUE_SENTINEL: &str = "unique-binding-value-sentinel";
+
+// REQ-WFDEF-41, REQ-WFDEF-21: `--binding KEY=VALUE` and `--binding-default KEY` each name one
+// binding, flat or `<integration>.<name>`, in place of the file's member for it; every other
+// binding keeps the current revision's value. A refusal names the binding and never the
+// value, and a malformed or repeated `KEY` is a usage error that writes nothing.
+#[test]
+fn binding_options_name_one_binding_each_beside_the_file() {
+    let nested = Tree::nested();
+    let by_file = Home::new();
+    let file = nested.nested_bindings();
+    let from_file = by_file.publish(&nested, &["--bindings", &file]);
+    let file_id = text(&from_file["definition"]["id"], "definition id").to_owned();
+    let expected = by_file.json(&["show", &file_id])["bindings"].clone();
+
+    let home = Home::new();
+    let published = home.publish(
+        &nested,
+        &[
+            "--binding",
+            "linear.team=AUTO",
+            "--binding",
+            "github.repository=useful-machinery/platform",
+        ],
+    );
+    let id = text(&published["definition"]["id"], "definition id").to_owned();
+    assert_eq!(home.json(&["show", &id])["bindings"], expected);
+
+    home.publish(&nested, &["--binding", "linear.ownedState=Doing"]);
+    let mut doing = expected.clone();
+    doing["linear"]["ownedState"]["value"] = json!("Doing");
+    assert_eq!(home.json(&["show", &id])["bindings"], doing);
+    home.publish(&nested, &["--binding-default", "linear.ownedState"]);
+    let shown = home.json(&["show", &id]);
+    assert_eq!(shown["bindings"], expected);
+
+    // A refusal leaves `current` as it was and prints no value, in either form.
+    let refuse = |home: &Home, tree: &Tree, args: &[&str], code: &str| {
+        let diagnostic = home.refused(tree, args, code);
+        assert!(
+            !diagnostic.to_string().contains(BINDING_VALUE_SENTINEL),
+            "{diagnostic}"
+        );
+        let mut human = vec!["publish", tree.path()];
+        human.extend_from_slice(args);
+        let output = home.run(&human);
+        assert_eq!(output.status.code(), Some(1), "{output:?}");
+        for stream in [&output.stdout, &output.stderr] {
+            assert!(!String::from_utf8_lossy(stream).contains(BINDING_VALUE_SENTINEL));
+        }
+        diagnostic
+    };
+    let undeclared_value = format!("nope={BINDING_VALUE_SENTINEL}");
+    let undeclared = refuse(
+        &home,
+        &nested,
+        &["--binding", &undeclared_value],
+        "binding_undeclared",
+    );
+    assert_eq!(undeclared["binding"], "nope", "{undeclared}");
+    assert!(undeclared.get("integration").is_none(), "{undeclared}");
+    let under_linear = format!("linear.nope={BINDING_VALUE_SENTINEL}");
+    let undeclared = refuse(
+        &home,
+        &nested,
+        &["--binding", &under_linear],
+        "binding_undeclared",
+    );
+    assert_eq!(undeclared["integration"], "linear", "{undeclared}");
+    assert_eq!(undeclared["binding"], "nope", "{undeclared}");
+    let undeclared = refuse(
+        &home,
+        &nested,
+        &["--binding-default", "nope"],
+        "binding_undeclared",
+    );
+    assert_eq!(undeclared["binding"], "nope", "{undeclared}");
+    assert_eq!(
+        home.json(&["show", &id])["definition"]["current"],
+        shown["definition"]["current"]
+    );
+
+    let owners_tree = Tree::with(MEMBER_ROOT, DESIGN_WORKFLOW);
+    let owners = Home::new();
+    let owners_file = owners_tree.bindings_file(
+        "owners.json",
+        &json!({"nightlyOwner": "prn_x", "includedOwners": ["prn_a"]}),
+    );
+    let published = owners.publish(
+        &owners_tree,
+        &[
+            "--bindings",
+            &owners_file,
+            "--binding",
+            "nightlyOwner=prn_y",
+            "--binding",
+            "includedOwners=prn_a,prn_b",
+        ],
+    );
+    let owners_id = text(&published["definition"]["id"], "definition id").to_owned();
+    let owners_bindings = |home: &Home| home.json(&["show", &owners_id])["bindings"].clone();
+    let shown = owners_bindings(&owners);
+    assert_eq!(shown["nightlyOwner"]["value"], "prn_y");
+    assert_eq!(shown["includedOwners"]["value"], json!(["prn_a", "prn_b"]));
+    owners.publish(&owners_tree, &["--binding-default", "includedOwners"]);
+    assert_eq!(
+        owners_bindings(&owners)["includedOwners"]["value"],
+        json!([])
+    );
+    owners.publish(&owners_tree, &["--binding", "includedOwners=prn_c"]);
+    owners.publish(&owners_tree, &["--binding", "includedOwners="]);
+    let shown = owners_bindings(&owners);
+    assert_eq!(shown["includedOwners"]["value"], json!([]));
+    assert_eq!(shown["nightlyOwner"]["value"], "prn_y");
+
+    let current = owners.json(&["show", &owners_id])["definition"]["current"].clone();
+    for (option, binding) in [
+        ("nightlyOwner=", "nightlyOwner"),
+        ("includedOwners=prn_a,,prn_b", "includedOwners"),
+    ] {
+        let invalid = refuse(
+            &owners,
+            &owners_tree,
+            &["--binding", option],
+            "binding_value_invalid",
+        );
+        assert_eq!(invalid["binding"], binding, "{invalid}");
+    }
+    assert_eq!(
+        owners.json(&["show", &owners_id])["definition"]["current"],
+        current
+    );
+
+    let engineering = Tree::engineering();
+    let fresh = Home::new();
+    let repeated = format!("connection={BINDING_VALUE_SENTINEL}");
+    for args in [
+        vec!["--binding", "connection"],
+        vec!["--binding", &repeated, "--binding", "connection=b"],
+        vec!["--binding", &repeated, "--binding-default", "connection"],
+        vec!["--binding-default", "done", "--binding-default", "done"],
+    ] {
+        let mut full = vec!["publish", engineering.path()];
+        full.extend_from_slice(&args);
+        full.push("--json");
+        let output = fresh.run(&full);
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(output.stdout.is_empty(), "{args:?}: {output:?}");
+        assert!(
+            !String::from_utf8_lossy(&output.stderr).contains(BINDING_VALUE_SENTINEL),
+            "{args:?}: {output:?}"
+        );
+    }
+    assert!(fresh.workflow_entries().is_empty());
+    fresh.assert_no_runs();
 }
 
 /// The engineering root with a start policy on `start` and a `nightly` schedule trigger that
@@ -2183,8 +2377,9 @@ impl GatewayRequest {
     }
 }
 
-/// What the fake Gateway holds between invocations: the file contents the organization
-/// retains, the sealed tree digests, each definition, whether the next publication to an id
+/// What the fake Gateway holds between invocations: the bindings the published root declares,
+/// the file contents the organization retains, the sealed tree digests, each definition,
+/// whether the next publication to an id
 /// loses a race to another publisher or is forbidden, whether the reply to the next create,
 /// publication or delete is lost after it is applied, the problems the next keyed definition
 /// requests are answered with before they are applied, the fault the next request on the
@@ -2192,6 +2387,7 @@ impl GatewayRequest {
 /// its `Idempotency-Key`, and the `Idempotency-Key` of each applied delete.
 #[derive(Default)]
 struct GatewayState {
+    declarations: Declarations,
     retained: std::collections::BTreeSet<String>,
     sealed: std::collections::BTreeSet<String>,
     definitions: std::collections::BTreeMap<String, FakeDefinition>,
@@ -2222,10 +2418,14 @@ impl GatewayState {
         if let Some((status, replayed)) = self.publications.get(key) {
             return keyed(status, replayed.clone());
         }
-        let (status, published) = match publish(self) {
+        let (status, mut published) = match publish(self) {
             Ok(published) => published,
             Err(refusal) => return refusal,
         };
+        if self.fault(Fault::StrayBinding) {
+            published["revision"]["bindings"]["stray"] =
+                json!({"kind": "linear.team", "value": "STRAY"});
+        }
         self.publications
             .insert(key.to_owned(), (status, published.clone()));
         if std::mem::take(&mut self.drop_next_publication_reply) {
@@ -2248,14 +2448,172 @@ pub(super) enum Fault {
     ReadOtherDefinition,
     /// A setting change or a delete is applied and answered without its `Idempotency-Key`.
     ChangeWithoutKey,
+    /// A create or publication is applied and answered with a revision that also holds a flat
+    /// `stray` binding, which the root does not declare.
+    StrayBinding,
+}
+
+/// A binding the fake's root declares: its kind and its default, none when it has none.
+type DeclaredBinding = (&'static str, Option<&'static str>);
+
+/// The `linear.state` bindings both roots declare, each with its default.
+const DECLARED_STATES: [(&str, &str); 4] = [
+    ("ownedState", "Engineering"),
+    ("backlog", "Backlog"),
+    ("canceled", "Canceled"),
+    ("done", "Done"),
+];
+
+/// The bindings the root every request publishes declares: the flat block's by key and each
+/// integration's by name under its id.
+#[derive(Default)]
+struct Declarations {
+    flat: std::collections::BTreeMap<&'static str, DeclaredBinding>,
+    integrations: std::collections::BTreeMap<
+        &'static str,
+        std::collections::BTreeMap<&'static str, DeclaredBinding>,
+    >,
+}
+
+impl Declarations {
+    /// `ROOT_WORKFLOW`'s.
+    fn engineering() -> Self {
+        let mut flat = std::collections::BTreeMap::from([
+            ("connection", ("connection", None)),
+            ("linearTeam", ("linear.team", None)),
+            ("repository", ("github.repository", None)),
+        ]);
+        flat.extend(DECLARED_STATES.map(|(key, default)| (key, ("linear.state", Some(default)))));
+        Self {
+            flat,
+            integrations: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// `NESTED_ROOT`'s.
+    fn nested() -> Self {
+        let mut linear = std::collections::BTreeMap::from([("team", ("team", None))]);
+        linear.extend(DECLARED_STATES.map(|(name, default)| (name, ("state", Some(default)))));
+        Self {
+            flat: std::collections::BTreeMap::new(),
+            integrations: std::collections::BTreeMap::from([
+                ("linear", linear),
+                (
+                    "github",
+                    std::collections::BTreeMap::from([("repository", ("repository", None))]),
+                ),
+            ]),
+        }
+    }
+
+    /// What a create (`current` none) or a publication over a current revision that published
+    /// `current` records from request `body`, as Cloud merges it (REQ-CLOUDDEF-41): each
+    /// declared binding takes its named value, its default when it is named `null` or, by a
+    /// create, not named, and otherwise its current value, as `{kind, value}`. A named binding
+    /// the root does not declare is 422 `binding-unresolved`, and one left without a value 422
+    /// `binding-missing`.
+    fn merge(&self, body: &Value, current: Option<&Value>) -> Result<Value, Vec<u8>> {
+        let none = serde_json::Map::new();
+        let named = body["bindings"].as_object().unwrap_or(&none);
+        let named_groups = body["integrationBindings"].as_object().unwrap_or(&none);
+        if let Some(key) = named
+            .keys()
+            .find(|key| !self.flat.contains_key(key.as_str()))
+        {
+            return Err(binding_refusal("binding-unresolved", None, key));
+        }
+        for (integration, group) in named_groups {
+            let declared = self.integrations.get(integration.as_str());
+            let group = group
+                .as_object()
+                .expect("an integration's bindings should be an object");
+            if let Some(name) = group
+                .keys()
+                .find(|name| !declared.is_some_and(|declared| declared.contains_key(name.as_str())))
+            {
+                return Err(binding_refusal(
+                    "binding-unresolved",
+                    Some(integration),
+                    name,
+                ));
+            }
+        }
+        let mut bindings = serde_json::Map::new();
+        for (key, (kind, default)) in &self.flat {
+            let value = bound_value(
+                named.get(*key),
+                *default,
+                current.map(|current| &current["bindings"][*key]["value"]),
+            )
+            .ok_or_else(|| binding_refusal("binding-missing", None, key))?;
+            bindings.insert((*key).to_owned(), json!({"kind": kind, "value": value}));
+        }
+        let mut groups = serde_json::Map::new();
+        for (integration, declared) in &self.integrations {
+            let mut group = serde_json::Map::new();
+            for (name, (kind, default)) in declared {
+                let value = bound_value(
+                    named_groups
+                        .get(*integration)
+                        .and_then(|group| group.get(*name)),
+                    *default,
+                    current.map(
+                        |current| &current["integrationBindings"][*integration][*name]["value"],
+                    ),
+                )
+                .ok_or_else(|| binding_refusal("binding-missing", Some(integration), name))?;
+                group.insert((*name).to_owned(), json!({"kind": kind, "value": value}));
+            }
+            groups.insert((*integration).to_owned(), Value::Object(group));
+        }
+        Ok(json!({
+            "treeDigest": body["treeDigest"],
+            "bindings": bindings,
+            "integrationBindings": groups,
+            "executablePaths": body["executablePaths"],
+        }))
+    }
+}
+
+/// The value a declared binding takes from what the request names for it: the named value,
+/// its default when named `null` or, by a create (`current` none), not named, and otherwise
+/// the current value; none when that leaves it without one.
+fn bound_value(
+    named: Option<&Value>,
+    default: Option<&str>,
+    current: Option<&Value>,
+) -> Option<Value> {
+    match (named, current) {
+        (Some(Value::Null), _) | (None, None) => default.map(Value::from),
+        (Some(value), _) => Some(value.clone()),
+        (None, Some(current)) => Some(current.clone()).filter(|value| !value.is_null()),
+    }
+}
+
+/// The 422 refusal `slug` of binding `key`, under `integration` for an integration's.
+fn binding_refusal(slug: &str, integration: Option<&str>, key: &str) -> Vec<u8> {
+    let mut workflow = json!({"bindingKey": key});
+    if let Some(integration) = integration {
+        workflow["integration"] = json!(integration);
+    }
+    super::problem_http_response(
+        "422 Unprocessable Entity",
+        json!({
+            "type": format!("{PROBLEMS}{slug}"),
+            "title": "Binding refused",
+            "status": 422,
+            "workflow": workflow,
+        }),
+    )
 }
 
 /// The password a faulty upload capability URL carries.
 const CAPABILITY_PASSWORD: &str = "unique-capability-password-sentinel";
 
 /// One Cloud definition the fake Gateway holds: its current revision, what that revision
-/// published (`publication_of` the request), its settings and whether its revisions hold
-/// integration bindings.
+/// published (its `treeDigest`, its merged `bindings` and `integrationBindings` and its
+/// `executablePaths`), its settings and whether the revisions `cloud` reads hold integration
+/// bindings.
 #[derive(Clone, Default)]
 struct FakeDefinition {
     current: i64,
@@ -2279,7 +2637,17 @@ pub(super) struct FakeGateway {
 }
 
 impl FakeGateway {
+    /// A Gateway whose published root declares `ROOT_WORKFLOW`'s bindings.
     pub(super) fn new() -> Self {
+        Self::declaring(Declarations::engineering())
+    }
+
+    /// A Gateway whose published root declares `NESTED_ROOT`'s bindings.
+    pub(super) fn nested() -> Self {
+        Self::declaring(Declarations::nested())
+    }
+
+    fn declaring(declarations: Declarations) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("fake Gateway should bind");
         let api_url = format!("http://{}/api", listener.local_addr().unwrap());
         let directory = super::private_credential_directory();
@@ -2295,7 +2663,10 @@ impl FakeGateway {
             api_url,
             credentials: credentials.to_str().unwrap().to_owned(),
             _credentials: directory,
-            state: std::sync::Arc::default(),
+            state: std::sync::Arc::new(std::sync::Mutex::new(GatewayState {
+                declarations,
+                ..GatewayState::default()
+            })),
         }
     }
 
@@ -2349,23 +2720,26 @@ impl FakeGateway {
         self.state.lock().unwrap().fault = Some(fault);
     }
 
-    /// Holds definition `id` at revision `current`, active, disabled and with no principal.
+    /// Holds definition `id` at revision `current`, active, disabled and with no principal,
+    /// its current revision publishing `engineering_published`.
     pub(super) fn define(&self, id: &str, current: i64) {
         self.state.lock().unwrap().definitions.insert(
             id.to_owned(),
             FakeDefinition {
                 current,
+                published: engineering_published(current),
                 ..FakeDefinition::default()
             },
         );
     }
 
-    /// As [`Self::define`], each revision also holding `gateway_integrations`.
+    /// As [`Self::define`], each revision `cloud` reads also holding `gateway_integrations`.
     pub(super) fn define_with_integrations(&self, id: &str, current: i64) {
         self.state.lock().unwrap().definitions.insert(
             id.to_owned(),
             FakeDefinition {
                 current,
+                published: engineering_published(current),
                 integrations: true,
                 ..FakeDefinition::default()
             },
@@ -2567,9 +2941,10 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
         }
         let body = request.json();
         return state.publication(&key, keyed, |state| {
-            let published = publication_of(&body);
+            let published = state.declarations.merge(&body, None)?;
             // `reuseIdentical` answers the active definition whose current revision published
-            // the same, and refuses when several did (REQ-CLOUDDEF-21).
+            // the same tree, snapshot and executable files, and refuses when several did
+            // (REQ-CLOUDDEF-21).
             if body["reuseIdentical"] == true {
                 let identical = state
                     .definitions
@@ -2723,8 +3098,10 @@ fn respond(state: &mut GatewayState, request: &GatewayRequest, address: &str) ->
                     }),
                 ));
             }
+            definition.published = state
+                .declarations
+                .merge(&body, Some(&definition.published))?;
             definition.current += 1;
-            definition.published = publication_of(&body);
             Ok(("201 Created", gateway_publication(id, definition)))
         });
     }
@@ -2966,40 +3343,61 @@ fn withhold_diagnostic(evaluation: &mut Value) {
     }
 }
 
-/// What a create or publication request asks its revision to publish.
-fn publication_of(body: &Value) -> Value {
-    json!({
-        "treeDigest": body["treeDigest"],
-        "bindings": body["bindings"],
-        "integrationBindings": body["integrationBindings"],
-        "executablePaths": body["executablePaths"],
-    })
-}
-
-/// Definition `id` and its current revision, as a create or publication answers them.
-fn gateway_publication(id: &str, definition: &FakeDefinition) -> Value {
-    json!({
-        "definition": gateway_definition(id, definition),
-        "revision": {
-            "definitionId": id,
-            "number": definition.current,
-            "treeDigest": definition.published["treeDigest"],
-            "bindings": {},
-            "resolution": {},
-            "publishedAt": CLOUD_TIME,
-            "publishedBy": CLOUD_PUBLISHER,
+/// What revision `current` of a definition `define` holds publishes: the engineering root
+/// with `connection` `local`, `linearTeam` `AUTO`, `repository` `useful-machinery/platform`
+/// and the defaults.
+fn engineering_published(current: i64) -> Value {
+    let body = json!({
+        "treeDigest": gateway_tree_digest(current),
+        "bindings": {
+            "connection": "local",
+            "linearTeam": "AUTO",
+            "repository": "useful-machinery/platform",
         },
-    })
+        "executablePaths": [],
+    });
+    Declarations::engineering()
+        .merge(&body, None)
+        .unwrap_or_else(|_| panic!("the engineering snapshot should merge"))
 }
 
+/// Definition `id` and its current revision, as a create or publication answers them: the
+/// snapshot that revision published, its integrations' only when it holds any.
+fn gateway_publication(id: &str, definition: &FakeDefinition) -> Value {
+    let published = &definition.published;
+    let mut revision = json!({
+        "definitionId": id,
+        "number": definition.current,
+        "treeDigest": published["treeDigest"],
+        "bindings": published["bindings"],
+        "resolution": {},
+        "publishedAt": CLOUD_TIME,
+        "publishedBy": CLOUD_PUBLISHER,
+    });
+    if published["integrationBindings"]
+        .as_object()
+        .is_some_and(|groups| !groups.is_empty())
+    {
+        revision["integrationBindings"] = published["integrationBindings"].clone();
+    }
+    json!({"definition": gateway_definition(id, definition), "revision": revision})
+}
+
+/// `useful workflow definition publish TREE --bindings BINDINGS --cloud ... EXTRA`.
 fn cloud_publish_args<'a>(tree: &'a Tree, bindings: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec!["--bindings", bindings];
+    args.extend_from_slice(extra);
+    cloud_publish(tree, &args)
+}
+
+/// `useful workflow definition publish TREE --cloud ... EXTRA`, naming bindings only as
+/// `extra` does.
+fn cloud_publish<'a>(tree: &'a Tree, extra: &[&'a str]) -> Vec<&'a str> {
     let mut args = vec![
         "workflow",
         "definition",
         "publish",
         tree.path(),
-        "--bindings",
-        bindings,
         "--cloud",
         CLOUD_ORGANIZATION,
         "--project",
@@ -3012,6 +3410,290 @@ fn cloud_publish_args<'a>(tree: &'a Tree, bindings: &'a str, extra: &[&'a str]) 
 
 fn routes(requests: &[GatewayRequest]) -> Vec<String> {
     requests.iter().map(GatewayRequest::route).collect()
+}
+
+/// The body of the one request of `requests` on `route`.
+fn sent_to(requests: &[GatewayRequest], route: &str) -> Value {
+    let sent = requests
+        .iter()
+        .filter(|request| request.route() == route)
+        .collect::<Vec<_>>();
+    assert_eq!(sent.len(), 1, "{route}: {:?}", routes(requests));
+    sent[0].json()
+}
+
+/// The local definition id `report` published.
+fn local_definition(report: &Value) -> String {
+    text(&report["definition"]["id"], "definition id").to_owned()
+}
+
+// REQ-CLOUDDEF-14, REQ-CLOUDDEF-20, REQ-CLOUDDEF-41: a create and a publication send only the
+// bindings the invocation names, `null` for a default, so a home that holds none of them
+// publishes to an existing definition, and each records the snapshot Cloud answered.
+#[test]
+fn publish_cloud_sends_only_the_bindings_it_names_and_records_what_cloud_recorded() {
+    let (first_home, second_home) = (Home::new(), Home::new());
+    let tree = Tree::engineering();
+    let bindings = tree.engineering_bindings();
+    let gateway = FakeGateway::new();
+    let definitions = format!(
+        "/api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions"
+    );
+
+    // The create sends the file's members and nothing for the bindings it does not name.
+    let (output, requests) = gateway.run(
+        &first_home,
+        &cloud_publish_args(&tree, &bindings, &["--json"]),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let created = report(&output);
+    let cloud_id = cloud_definition(&created);
+    let first_id = local_definition(&created);
+    let create = sent_to(&requests, &format!("POST {definitions}"));
+    assert_eq!(
+        create["bindings"],
+        json!({
+            "connection": "local",
+            "linearTeam": "AUTO",
+            "repository": "useful-machinery/platform",
+        }),
+        "{create}"
+    );
+    assert!(create.get("integrationBindings").is_none(), "{create}");
+
+    // A publication sends the one binding named.
+    let publications = format!("POST {definitions}/{cloud_id}/revisions");
+    let (output, requests) = gateway.run(
+        &first_home,
+        &cloud_publish(&tree, &["--binding", "done=Shipped", "--json"]),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let published = sent_to(&requests, &publications);
+    assert_eq!(
+        published["bindings"],
+        json!({"done": "Shipped"}),
+        "{published}"
+    );
+    let latest = first_home.json(&["show", &first_id])["bindings"].clone();
+    assert_eq!(
+        latest["done"],
+        json!({"kind": "linear.state", "value": "Shipped"}),
+        "{latest}"
+    );
+
+    // A home that holds none of the bindings publishes naming none and records Cloud's.
+    let (output, requests) = gateway.run(
+        &second_home,
+        &cloud_publish(&tree, &["--cloud-to", &cloud_id, "--json"]),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let targeted = report(&output);
+    assert_eq!(targeted["outcome"], "published", "{targeted}");
+    let published = sent_to(&requests, &publications);
+    for member in ["bindings", "integrationBindings"] {
+        assert!(published.get(member).is_none(), "{member}: {published}");
+    }
+    let second_id = local_definition(&targeted);
+    assert_eq!(second_home.json(&["show", &second_id])["bindings"], latest);
+    assert_eq!(
+        published_record(&second_home, &targeted)["cloudId"],
+        cloud_id.as_str()
+    );
+
+    // `--binding-default` sends `null`, which Cloud records as the default.
+    let (output, requests) = gateway.run(
+        &second_home,
+        &cloud_publish(&tree, &["--binding-default", "done", "--json"]),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert_eq!(
+        sent_to(&requests, &publications)["bindings"],
+        json!({"done": null})
+    );
+    assert_eq!(
+        second_home.json(&["show", &second_id])["bindings"]["done"],
+        json!({"kind": "linear.state", "value": "Done"})
+    );
+
+    // An integration's binding is named under its id, and the rest of the snapshot stays.
+    let home = Home::new();
+    let tree = Tree::nested();
+    let bindings = tree.nested_bindings();
+    let gateway = FakeGateway::nested();
+    let (output, _) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let created = report(&output);
+    let id = local_definition(&created);
+    let publications = format!(
+        "POST {definitions}/{}/revisions",
+        cloud_definition(&created)
+    );
+    for (named, sent, recorded) in [
+        (
+            ["--binding", "linear.ownedState=Doing"],
+            json!("Doing"),
+            "Doing",
+        ),
+        (
+            ["--binding-default", "linear.ownedState"],
+            Value::Null,
+            "Engineering",
+        ),
+    ] {
+        let mut args = named.to_vec();
+        args.push("--json");
+        let (output, requests) = gateway.run(&home, &cloud_publish(&tree, &args));
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        let published = sent_to(&requests, &publications);
+        assert_eq!(
+            published["integrationBindings"],
+            json!({"linear": {"ownedState": sent}}),
+            "{published}"
+        );
+        assert!(published.get("bindings").is_none(), "{published}");
+        let shown = home.json(&["show", &id])["bindings"].clone();
+        assert_eq!(
+            shown["linear"]["ownedState"],
+            json!({"kind": "state", "value": recorded}),
+            "{shown}"
+        );
+        assert_eq!(
+            shown["github"]["repository"],
+            json!({"kind": "repository", "value": "useful-machinery/platform"}),
+            "{shown}"
+        );
+    }
+}
+
+// REQ-CLOUDDEF-14, REQ-CLOUDDEF-20, REQ-CLOUDDEF-22, REQ-CLOUDDEF-25: a publication Cloud
+// refuses or does not complete records no local revision, from a fresh home or one that has
+// published, and its report carries no local definition or revision.
+#[test]
+fn a_cloud_refusal_or_failure_records_no_local_revision() {
+    let tree = Tree::engineering();
+    let bindings = tree.engineering_bindings();
+    let gateway = FakeGateway::new();
+    // The `cloud_failed` report of `args` from `home`, asserting its exit status and that it
+    // names no local definition or revision.
+    let failed = |home: &Home, args: &[&str], status: i32| {
+        let (output, _) = gateway.run(home, args);
+        assert_eq!(output.status.code(), Some(status), "{output:?}");
+        let failed = report(&output);
+        assert_eq!(failed["outcome"], "cloud_failed", "{failed}");
+        assert!(failed["cloud"].is_object(), "{failed}");
+        for member in ["definition", "revision"] {
+            assert!(failed.get(member).is_none(), "{member}: {failed}");
+        }
+        failed
+    };
+    // From a fresh home, `args` is refused with `status` and `problem` and records nothing.
+    let refused = |args: &[&str], status: u16, problem: &str| {
+        let home = Home::new();
+        let refused = failed(&home, args, 1);
+        assert_eq!(refused["cloud"]["failure"], "refused", "{refused}");
+        assert_eq!(refused["cloud"]["status"], status, "{refused}");
+        assert_eq!(refused["cloud"]["problem"], problem, "{refused}");
+        assert!(home.workflow_entries().is_empty(), "{refused}");
+        refused
+    };
+
+    refused(
+        &cloud_publish(&tree, &["--cloud-to", CLOUD_TARGET, "--json"]),
+        404,
+        "not-found",
+    );
+    let missing = refused(&cloud_publish(&tree, &["--json"]), 422, "binding-missing");
+    assert_eq!(
+        missing["cloud"]["workflow"]["bindingKey"], "connection",
+        "{missing}"
+    );
+    assert!(gateway_definitions(&gateway).is_empty());
+    for extra in [&["--json"][..], &["--cloud-new", "--json"]] {
+        publish_from_a_fresh_home(&gateway, &tree, &bindings, extra);
+    }
+    refused(
+        &cloud_publish_args(&tree, &bindings, &["--json"]),
+        409,
+        "definition-reuse-ambiguous",
+    );
+
+    // A home whose record holds revision 1 and its `cloudId` keeps the record as it was.
+    let home = Home::new();
+    let (output, _) = gateway.run(
+        &home,
+        &cloud_publish_args(&tree, &bindings, &["--cloud-new", "--json"]),
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let created = report(&output);
+    let record_path = home
+        .definition_directory(&local_definition(&created))
+        .join("definition.json");
+    let record = read_json(&record_path);
+    assert_eq!(record["current"], 1, "{record}");
+    assert_eq!(record["cloudId"], cloud_definition(&created).as_str());
+    let before = fs::read(&record_path).expect("record should be readable");
+
+    gateway.lose_next_publication();
+    let lost = failed(&home, &cloud_publish_args(&tree, &bindings, &["--json"]), 1);
+    assert_eq!(lost["cloud"]["status"], 409, "{lost}");
+    assert_eq!(fs::read(&record_path).expect("record"), before);
+
+    for _ in 0..2 {
+        gateway.answer_next_keyed_with("503 Service Unavailable", 503, "service-unavailable");
+    }
+    let unavailable = failed(&home, &cloud_publish_args(&tree, &bindings, &["--json"]), 4);
+    assert_eq!(
+        unavailable["cloud"]["failure"], "unavailable",
+        "{unavailable}"
+    );
+    assert_eq!(fs::read(&record_path).expect("record"), before);
+}
+
+// REQ-CLOUDDEF-14: a revision Cloud recorded that the local record cannot hold is refused
+// locally, naming the Cloud definition and revision reached, and the next publish of the same
+// tree reuses that definition.
+#[test]
+fn a_local_revision_that_cannot_be_recorded_after_cloud_answered_names_the_cloud_revision() {
+    let home = Home::new();
+    let tree = Tree::engineering();
+    let bindings = tree.engineering_bindings();
+    let gateway = FakeGateway::new();
+
+    gateway.answer_next_with(Fault::StrayBinding);
+    let (output, _) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    let refused = report(&output);
+    assert_eq!(refused["outcome"], "refused", "{refused}");
+    let diagnostics = refused["diagnostics"].as_array().expect("diagnostics");
+    assert_eq!(diagnostics.len(), 1, "{refused}");
+    assert_eq!(diagnostics[0]["code"], "binding_undeclared", "{refused}");
+    assert_eq!(diagnostics[0]["binding"], "stray", "{refused}");
+    let held = gateway_definitions(&gateway);
+    let [(cloud_id, revision)] = held.as_slice() else {
+        panic!("one Cloud definition should be held: {held:?}");
+    };
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.lines().any(|line| line.contains(cloud_id.as_str())
+            && line
+                .replace(cloud_id.as_str(), "")
+                .split(|character: char| !character.is_ascii_digit())
+                .any(|number| number == revision.to_string())),
+        "{stderr}"
+    );
+    assert!(home.workflow_entries().is_empty());
+
+    let (output, _) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let reused = report(&output);
+    assert_eq!(reused["cloud"]["reused"], true, "{reused}");
+    assert_eq!(reused["cloud"]["definition"], cloud_id.as_str());
+    assert_eq!(reused["revision"]["n"], 1);
+    assert_eq!(
+        published_record(&home, &reused)["cloudId"],
+        cloud_id.as_str()
+    );
+    assert_eq!(gateway_definitions(&gateway), held);
 }
 
 // REQ-CLOUDDEF-14, REQ-CLOUDDEF-22, REQ-WFDEF-7, REQ-WFDEF-23
@@ -3116,7 +3798,8 @@ fn publish_cloud_creates_then_publishes_to_the_recorded_cloud_definition() {
     let created = requests[4].json();
     assert_eq!(created["treeDigest"], digest.as_str());
     assert_eq!(created["bindings"]["linearTeam"], "AUTO");
-    assert_eq!(created["bindings"]["ownedState"], "Engineering");
+    // A binding the invocation does not name is not sent, so Cloud gives it its default.
+    assert!(created["bindings"].get("ownedState").is_none(), "{created}");
     // A home with no recorded Cloud definition asks Cloud for an identical one first.
     assert_eq!(created["reuseIdentical"], true);
     // A root that declares no integration binding sends no integration values.
@@ -3149,7 +3832,7 @@ fn publish_cloud_creates_then_publishes_to_the_recorded_cloud_definition() {
     assert_ne!(requests[2].header("idempotency-key"), Some(key.as_str()));
     assert_eq!(read_json(&record_path)["cloudId"], cloud_id.as_str());
 
-    // A refusal leaves the local revision recorded and names the problem type.
+    // A refusal records no local revision and names the problem type.
     gateway.lose_next_publication();
     let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &[]));
     assert_eq!(output.status.code(), Some(1), "{output:?}");
@@ -3157,7 +3840,7 @@ fn publish_cloud_creates_then_publishes_to_the_recorded_cloud_definition() {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("definition-revision-conflict"), "{stderr}");
     let record = read_json(&record_path);
-    assert_eq!(record["current"], 3);
+    assert_eq!(record["current"], 2);
     assert_eq!(record["cloudId"], cloud_id.as_str());
 
     // `--cloud-new` creates another Cloud definition and records it.
@@ -3171,7 +3854,7 @@ fn publish_cloud_creates_then_publishes_to_the_recorded_cloud_definition() {
     assert_ne!(other, cloud_id);
     assert_eq!(fourth["cloud"]["created"], true);
     assert_eq!(fourth["cloud"]["revision"], 1);
-    assert_eq!(fourth["revision"]["n"], 4);
+    assert_eq!(fourth["revision"]["n"], 3);
     assert_eq!(
         routes(&requests),
         vec![
@@ -3184,27 +3867,18 @@ fn publish_cloud_creates_then_publishes_to_the_recorded_cloud_definition() {
 }
 
 // REQ-CLOUDDEF-14, REQ-CLOUDDEF-33: the create and the publication of a root that declares
-// bindings under its integrations send each integration's binding names with their values as
-// the local snapshot holds them, defaults applied, beside an empty flat block.
+// bindings under its integrations send each integration's bindings the file names, by name
+// under its id, and no flat block.
 #[test]
 fn publish_cloud_sends_each_integrations_binding_values() {
     let home = Home::new();
     let tree = Tree::nested();
     let bindings = tree.nested_bindings();
-    let gateway = FakeGateway::new();
+    let gateway = FakeGateway::nested();
     let definitions = format!(
         "/api/v1/organizations/{CLOUD_ORGANIZATION}/projects/{CLOUD_PROJECT}/workflow-definitions"
     );
-    let expected = json!({
-        "linear": {
-            "team": "AUTO",
-            "ownedState": "Engineering",
-            "backlog": "Backlog",
-            "canceled": "Canceled",
-            "done": "Done",
-        },
-        "github": {"repository": "useful-machinery/platform"},
-    });
+    let expected = nested_bindings();
 
     let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
     assert_eq!(output.status.code(), Some(0), "{output:?}");
@@ -3216,7 +3890,7 @@ fn publish_cloud_sends_each_integrations_binding_values() {
         .expect("the create")
         .json();
     assert_eq!(created["integrationBindings"], expected, "{created}");
-    assert_eq!(created["bindings"], json!({}), "{created}");
+    assert!(created.get("bindings").is_none(), "{created}");
 
     let (output, requests) = gateway.run(&home, &cloud_publish_args(&tree, &bindings, &["--json"]));
     assert_eq!(output.status.code(), Some(0), "{output:?}");
@@ -3226,7 +3900,7 @@ fn publish_cloud_sends_each_integrations_binding_values() {
         .expect("the publication")
         .json();
     assert_eq!(published["integrationBindings"], expected, "{published}");
-    assert_eq!(published["bindings"], json!({}), "{published}");
+    assert!(published.get("bindings").is_none(), "{published}");
 }
 
 // REQ-CLOUDDEF-14, REQ-CLOUDDEF-34: a refusal about an integration binding names the
@@ -3362,8 +4036,8 @@ fn publish_cloud_resends_a_lost_publication_once_and_publishes_executable_bits()
 }
 
 // REQ-CLOUDDEF-14, REQ-CLOUDDEF-25, REQ-CLOUDDEF-28: a create or publication answered with a
-// transient problem is sent once more under its key; a second such answer leaves the local
-// revision recorded and is reported as Cloud being unavailable, and a 503 naming its own cause
+// transient problem is sent once more under its key; a second such answer records no local
+// revision and is reported as Cloud being unavailable, and a 503 naming its own cause
 // is refused, neither with a diagnostic.
 #[test]
 fn publish_cloud_resends_a_create_or_publication_answered_with_a_transient_problem_once() {
@@ -3409,12 +4083,14 @@ fn publish_cloud_resends_a_create_or_publication_answered_with_a_transient_probl
     for member in ["status", "problem", "workflow", "diagnostic"] {
         assert!(failed["cloud"].get(member).is_none(), "{failed}");
     }
-    assert_eq!(failed["revision"]["n"], 2);
+    for member in ["definition", "revision"] {
+        assert!(failed.get(member).is_none(), "{failed}");
+    }
     let sent = keyed_to(&requests, &publications);
     assert_eq!(sent.len(), 2, "{:?}", routes(&requests));
     assert_eq!(sent[0].0, sent[1].0);
-    let record = published_record(&home, &failed);
-    assert_eq!(record["current"], 2);
+    let record = published_record(&home, &first);
+    assert_eq!(record["current"], 1);
     assert_eq!(record["cloudId"], cloud_id.as_str());
     assert_eq!(gateway_definitions(&gateway), vec![(cloud_id.clone(), 1)]);
 
@@ -3483,9 +4159,8 @@ fn publish_cloud_reports_the_stage_and_check_of_an_invalid_response() {
         for member in ["status", "problem", "workflow"] {
             assert!(failed["cloud"].get(member).is_none(), "{failed}");
         }
-        let record = published_record(&home, &failed);
-        assert_eq!(record["current"], failed["revision"]["n"], "{record}");
-        assert_eq!(record["cloudId"], Value::Null, "{record}");
+        assert!(failed.get("revision").is_none(), "{failed}");
+        assert!(home.workflow_entries().is_empty(), "{failed}");
         let sent = routes(&requests);
         let seal = |route: &String| route.starts_with("POST ") && route.ends_with("/seal");
         match fault {
@@ -3772,7 +4447,7 @@ fn publish_cloud_to_replaces_the_recorded_cloud_definition_only_once_cloud_accep
     assert_eq!(refused["cloud"]["failure"], "refused", "{refused}");
     assert_eq!(refused["cloud"]["target"], absent.as_str());
     assert_no_definition_created(&requests);
-    assert_eq!(published_record(&home, &refused)["cloudId"], named);
+    assert_eq!(published_record(&home, &moved)["cloudId"], named);
     assert_eq!(
         gateway_definitions(&gateway),
         vec![(recorded, 1), (named.to_owned(), 6)]
@@ -3781,15 +4456,14 @@ fn publish_cloud_to_replaces_the_recorded_cloud_definition_only_once_cloud_accep
 
 // REQ-CLOUDDEF-20, REQ-CLOUDDEF-14, REQ-WFDEF-27
 #[test]
-fn publish_cloud_to_refusals_create_nothing_and_leave_the_record_unlinked() {
+fn publish_cloud_to_refusals_create_nothing_and_record_nothing() {
     let tree = Tree::engineering();
     let bindings = tree.engineering_bindings();
     let gateway = FakeGateway::new();
     let cloud_id = format!("{CLOUD_ID_STEM}c");
     gateway.define(&cloud_id, 2);
     // Publishes from a fresh home with `args`, asserting a Cloud refusal of `target` with
-    // `status` and `problem`, no create in any project, and a local record still without a
-    // `cloudId`.
+    // `status` and `problem`, no create in any project, and nothing recorded locally.
     let refused = |args: &[&str], target: &str, status: u16, problem: &str| {
         let home = Home::new();
         let (output, requests) = gateway.run(&home, args);
@@ -3802,7 +4476,7 @@ fn publish_cloud_to_refusals_create_nothing_and_leave_the_record_unlinked() {
         assert_eq!(failed["cloud"]["target"], target);
         assert!(failed["cloud"].get("definition").is_none(), "{failed}");
         assert_no_definition_created(&requests);
-        assert_eq!(published_record(&home, &failed)["cloudId"], Value::Null);
+        assert!(home.workflow_entries().is_empty(), "{failed}");
         failed
     };
 
@@ -3874,7 +4548,8 @@ fn publish_cloud_to_refusals_create_nothing_and_leave_the_record_unlinked() {
 
 // REQ-CLOUDDEF-14, REQ-CLOUDDEF-20: a publication addressed to a Cloud definition that is no
 // longer found, by the record's `cloudId` or by `--cloud-to`, is refused without a create,
-// keeps the recorded id and says to publish again with `--cloud-new` or `--cloud-to`.
+// records no local revision, keeps the recorded id and says to publish again with
+// `--cloud-new` or `--cloud-to`.
 #[test]
 fn publish_cloud_to_a_deleted_definition_is_refused_and_says_how_to_publish_again() {
     let home = Home::new();
@@ -3911,10 +4586,9 @@ fn publish_cloud_to_a_deleted_definition_is_refused_and_says_how_to_publish_agai
     assert_eq!(failed["cloud"]["status"], 404);
     assert_eq!(failed["cloud"]["problem"], "not-found");
     assert_eq!(failed["cloud"]["target"], deleted.as_str());
-    assert_eq!(
-        published_record(&home, &failed)["cloudId"],
-        deleted.as_str()
-    );
+    let record = published_record(&home, &created);
+    assert_eq!(record["current"], 1);
+    assert_eq!(record["cloudId"], deleted.as_str());
     assert_no_definition_created(&requests);
 
     // The indented command lines of a human report's remedy.
@@ -4131,9 +4805,9 @@ fn publish_cloud_new_creates_another_definition_although_an_identical_one_exists
 }
 
 // REQ-CLOUDDEF-22: with several identical definitions held, a fresh home's publication is
-// refused, names them all and leaves its record unlinked.
+// refused, names them all and records nothing locally.
 #[test]
-fn publish_cloud_refuses_an_ambiguous_reuse_and_leaves_the_record_unlinked() {
+fn publish_cloud_refuses_an_ambiguous_reuse_and_records_nothing() {
     let tree = Tree::engineering();
     let bindings = tree.engineering_bindings();
     let gateway = FakeGateway::new();
@@ -4162,9 +4836,8 @@ fn publish_cloud_refuses_an_ambiguous_reuse_and_leaves_the_record_unlinked() {
             "{member}: {refused}"
         );
     }
-    assert_eq!(refused["revision"]["n"], 1);
-    assert_eq!(published_record(&home, &refused)["current"], 1);
-    assert_eq!(published_record(&home, &refused)["cloudId"], Value::Null);
+    assert!(refused.get("revision").is_none(), "{refused}");
+    assert!(home.workflow_entries().is_empty(), "{refused}");
     assert_eq!(gateway_definitions(&gateway), held);
 
     // The human report names every matching definition and both ways out.
@@ -4179,7 +4852,7 @@ fn publish_cloud_refuses_an_ambiguous_reuse_and_leaves_the_record_unlinked() {
 
 // REQ-CLOUDDEF-35, REQ-CLOUDDEF-7: each `binding-unresolved` refusal Cloud answers a
 // publication with names the binding, and one that would close a loop of definitions reports
-// the loop in start order; every refusal leaves the record unlinked and Cloud unchanged.
+// the loop in start order; every refusal records nothing locally and leaves Cloud unchanged.
 #[test]
 fn publish_cloud_prints_the_loop_a_publication_would_close() {
     let tree = Tree::engineering();
@@ -4235,11 +4908,7 @@ fn publish_cloud_prints_the_loop_a_publication_would_close() {
                 "{row}: {refused}"
             ),
         }
-        assert_eq!(
-            published_record(&home, &refused)["cloudId"],
-            Value::Null,
-            "{row}"
-        );
+        assert!(home.workflow_entries().is_empty(), "{row}: {refused}");
         assert_eq!(
             gateway_definitions(&gateway),
             vec![(cloud_id.clone(), 2)],
